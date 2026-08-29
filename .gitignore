@@ -1,0 +1,20 @@
+# ============================================================
+# Whitelist-style .gitignore
+# Default: EVERYTHING is ignored. Only files/directories
+# explicitly un-ignored below are tracked.
+# To add a new tracked path, append a negation rule here.
+# ============================================================
+
+# Ignore everything at all levels
+*
+
+# But let git descend into directories
+!*/
+
+# --- Repository base files ---
+!.gitignore
+!LICENSE
+!README.md
+
+# --- Project directories ---
+!/hooks/**
