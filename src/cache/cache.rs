@@ -62,7 +62,7 @@ pub struct Cache<C: Clock, F: Fetcher> {
     pub clock: Arc<C>,
     pub fetcher: Arc<F>,
     pub state: RwLock<CacheState>,
-    pub inflight: Inflight<Fetched>,
+    pub inflight: Inflight<Fetched, FetchError>,
     pub routes: RouteTable,
 }
 
