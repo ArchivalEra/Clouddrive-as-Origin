@@ -22,9 +22,11 @@ serde_json = "1"
 toml = "0.8"
 anyhow = "1"
 thiserror = "1"
+walkdir = "2"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"
 
 [profile.release]
 lto = "thin"
