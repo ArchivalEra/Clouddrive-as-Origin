@@ -18,3 +18,4 @@
 
 # --- Project directories ---
 !/hooks/**
+!/docs/**
