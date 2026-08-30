@@ -1,0 +1,30 @@
+[package]
+name = "origin-cache"
+version = "0.1.0"
+edition = "2021"
+description = "OneDrive pull-through origin cache — Pingora front + axum business plane (single binary)"
+license = "MIT"
+repository = "https://github.com/ArchivalEra/Onedrive-as-Origin"
+
+[[bin]]
+name = "origin-cache"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "io-util"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

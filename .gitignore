@@ -22,3 +22,7 @@
 !/CONTEXT.md
 !/config.example.toml
 !/docs/adr/**
+!/Cargo.toml
+!/Cargo.lock
+!/src/**
+!/deploy/**

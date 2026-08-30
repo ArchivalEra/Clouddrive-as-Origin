@@ -1,0 +1,23 @@
+[Unit]
+Description=Onedrive-as-Origin skeleton (P1 — proves the B-seam)
+After=network.target
+
+[Service]
+Type=simple
+# Config path is the first arg; defaults to 127.0.0.1:8443→127.0.0.1:8080 when absent.
+ExecStart=/usr/local/bin/origin-cache /etc/origin-cache/config.toml
+Restart=on-failure
+RestartSec=2
+# Graceful upgrade: replace binary then `systemctl reload` (SIGTERM → graceful drain).
+KillSignal=SIGTERM
+TimeoutStopSec=10
+# Run as unprivileged user; skeleton binds 8443 (no cap_net_bind_service needed).
+User=origin-cache
+Group=origin-cache
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/origin-cache /var/log/origin-cache
+
+[Install]
+WantedBy=multi-user.target
