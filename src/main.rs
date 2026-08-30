@@ -5,6 +5,7 @@ mod config;
 mod inflight;
 mod key;
 mod routing;
+mod upstream;
 
 use anyhow::Context;
 use std::net::SocketAddr;
