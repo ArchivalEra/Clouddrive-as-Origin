@@ -58,15 +58,15 @@ impl Default for CacheState {
 }
 
 pub struct Cache<C: Clock, F: Fetcher> {
-    config: Arc<Config>,
-    clock: Arc<C>,
-    fetcher: Arc<F>,
-    state: RwLock<CacheState>,
-    inflight: Inflight<Fetched>,
-    routes: RouteTable,
+    pub config: Arc<Config>,
+    pub clock: Arc<C>,
+    pub fetcher: Arc<F>,
+    pub state: RwLock<CacheState>,
+    pub inflight: Inflight<Fetched>,
+    pub routes: RouteTable,
 }
 
-impl<C: Clock, F: Fetcher> Cache<C, F> {
+impl<C: Clock + Clone, F: Fetcher + Clone> Cache<C, F> {
     pub fn new(config: Arc<Config>, clock: Arc<C>, fetcher: Arc<F>) -> Self {
         let routes = config.routes.clone();
         Self {
@@ -359,6 +359,7 @@ mod tests {
     use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
     use tempfile::tempdir;
 
+    #[derive(Clone)]
     struct StaticFetcher {
         bytes: Vec<u8>,
         etag: Option<String>,

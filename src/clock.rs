@@ -3,13 +3,11 @@ use std::sync::{
     Arc,
 };
 
-/// Clock abstraction so tests can accelerate time (spec §3.3/§3.5/§3.6).
-/// Production uses wall time; tests advance a mock clock without sleeping.
 pub trait Clock: Send + Sync + 'static {
     fn now_millis(&self) -> u64;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SystemClock;
 
 impl Clock for SystemClock {
@@ -21,15 +19,14 @@ impl Clock for SystemClock {
     }
 }
 
-/// Mock clock for tests — starts at `initial` and advances via `advance`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MockClock {
-    millis: AtomicU64,
+    millis: Arc<AtomicU64>,
 }
 
 impl MockClock {
     pub fn new(initial_millis: u64) -> Self {
-        Self { millis: AtomicU64::new(initial_millis) }
+        Self { millis: Arc::new(AtomicU64::new(initial_millis)) }
     }
 
     pub fn advance(&self, delta_millis: u64) {

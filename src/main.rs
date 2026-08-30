@@ -8,10 +8,27 @@ mod routing;
 mod upstream;
 
 use anyhow::Context;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
+
+use crate::{
+    cache::cache::{Cache, Fetcher, Fetched, FetchError},
+    clock::SystemClock,
+};
+
+/// No-op fetcher for local/skeleton runs (no real OneDrive configured).
+/// Returns 404 for every key; the cache then serves 404 / negative path.
+/// Real fetcher (Graph) will replace this when Slice 4's network path lands.
+#[derive(Clone)]
+struct NoopFetcher;
+#[async_trait::async_trait]
+impl Fetcher for NoopFetcher {
+    async fn fetch(&self, _key: &str, _upstream: &str) -> Result<Fetched, FetchError> {
+        Err(FetchError::NotFound)
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,18 +40,21 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg_path = std::env::args().nth(1);
-    let cfg = config::Config::from_file_or_default(cfg_path.as_deref())
-        .context("load config")?;
+    let cfg = Arc::new(config::Config::from_file_or_default(cfg_path.as_deref()).context("load config")?);
 
     info!(
         front_listen = %cfg.front_listen,
         listen_addr = %cfg.listen_addr,
-        "origin-cache skeleton starting (single binary, two planes)"
+        cache_dir = %cfg.cache_dir.display(),
+        "origin-cache starting (single binary, two planes)"
     );
 
-    // Business plane on loopback owns healthz; front plane reverse-proxies to it.
-    // Both live in the same tokio runtime here. Production will replace the
-    // front's plain-TCP proxy with Pingora (TLS/H2) while keeping this seam.
+    // Cache + business state.
+    let clock = Arc::new(SystemClock);
+    let fetcher: Arc<NoopFetcher> = Arc::new(NoopFetcher);
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), clock, fetcher));
+    let app_state = business::AppState { cache, config: Arc::clone(&cfg) };
+
     let business_addr = cfg.listen_addr;
     let front_addr = cfg.front_listen;
 
@@ -43,14 +63,15 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx.changed().await.ok();
     };
 
-    let business_handle = tokio::spawn(async move {
-        if let Err(e) = business::serve(business_addr, business_shutdown).await {
-            warn!(error = %e, "business plane exited with error");
+    let business_handle = tokio::spawn({
+        let state = app_state.clone();
+        async move {
+            if let Err(e) = business::serve(business_addr, state, business_shutdown).await {
+                warn!(error = %e, "business plane exited with error");
+            }
         }
     });
 
-    // Tiny reverse-proxy front: accept on front_listen, proxy HTTP to business.
-    // Enough to prove the B-seam (shared binary, clean shutdown) before Pingora.
     let front_handle = tokio::spawn(async move {
         if let Err(e) = run_front(front_addr, business_addr).await {
             warn!(error = %e, "front plane exited with error");
@@ -59,11 +80,10 @@ async fn main() -> anyhow::Result<()> {
 
     wait_shutdown().await;
     let _ = shutdown_tx.send(true);
-    // Give planes a moment to drain, then abort front listener.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     front_handle.abort();
     let _ = business_handle.await;
-    info!("origin-cache skeleton shut down cleanly");
+    info!("origin-cache shut down cleanly");
     Ok(())
 }
 
@@ -82,18 +102,13 @@ async fn run_front(front: SocketAddr, business: SocketAddr) -> anyhow::Result<()
 }
 
 async fn proxy_one(inbound: &mut TcpStream, business: SocketAddr) -> anyhow::Result<()> {
-    // Read the inbound request (simple: read until blank line, then forward).
-    // This skeleton handles one request per connection — enough for the prototype.
     let mut buf = vec![0u8; 8192];
     let n = inbound.read(&mut buf).await?;
     if n == 0 {
         return Ok(());
     }
-    // Basic host header rewrite: forward as-is to business plane.
-    // In production Pingora will handle Host/SNI properly.
     let mut outbound = TcpStream::connect(business).await?;
     outbound.write_all(&buf[..n]).await?;
-    // Pipe response back.
     tokio::io::copy_bidirectional(inbound, &mut outbound).await?;
     Ok(())
 }
@@ -102,11 +117,9 @@ async fn wait_shutdown() {
     #[cfg(unix)]
     {
         let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("sigterm");
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("sigterm");
         let mut sigint =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                .expect("sigint");
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("sigint");
         tokio::select! {
             _ = sigterm.recv() => info!("received SIGTERM"),
             _ = sigint.recv() => info!("received SIGINT"),
