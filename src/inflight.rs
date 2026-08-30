@@ -3,37 +3,37 @@ use tokio::sync::{OnceCell, Mutex};
 
 /// Per-key single-flight: concurrent callers for the same key coalesce to
 /// one execution (spec §3.2). Different keys do not block each other.
-/// Internal map is sharded by a single async mutex — contention is only
-/// on table entry creation, not on the fetch itself.
-pub struct Inflight<V: Clone + Send + Sync + 'static> {
-    cells: Mutex<HashMap<String, Arc<OnceCell<V>>>>,
+/// Both success and error are cached in the cell so concurrent waiters
+/// share the same outcome; the cell is removed after the first batch
+/// completes so later calls re-execute.
+pub struct Inflight<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> {
+    cells: Mutex<HashMap<String, Arc<OnceCell<Result<V, E>>>>>,
 }
 
-impl<V: Clone + Send + Sync + 'static> Default for Inflight<V> {
+impl<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Default for Inflight<V, E> {
     fn default() -> Self {
         Self { cells: Mutex::new(HashMap::new()) }
     }
 }
 
-impl<V: Clone + Send + Sync + 'static> Inflight<V> {
+impl<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Inflight<V, E> {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Run `f` once per `key` — concurrent callers await the same result.
-    /// The cell is removed after completion so a later call re-executes.
-    pub async fn run<F, Fut, E>(&self, key: String, f: F) -> Result<V, E>
+    /// The result (Ok or Err) is shared; the cell is removed after completion
+    /// so a later call re-executes.
+    pub async fn run<F, Fut>(&self, key: String, f: F) -> Result<V, E>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<V, E>> + Send,
-        E: Clone + Send + Sync + 'static,
     {
         let cell = {
             let mut guard = self.cells.lock().await;
             Arc::clone(guard.entry(key.clone()).or_insert_with(|| Arc::new(OnceCell::new())))
         };
-        let res = cell.get_or_try_init(|| f()).await.cloned();
-        // Remove so next call re-fetches; keep alive until all waiters cloned.
+        let res = cell.get_or_init(|| f()).await.clone();
         {
             let mut guard = self.cells.lock().await;
             if let Some(c) = guard.get(&key) {
@@ -53,7 +53,7 @@ mod tests {
 
     #[tokio::test]
     async fn coalesces_concurrent_same_key() {
-        let inflight: Arc<Inflight<usize>> = Arc::new(Inflight::new());
+        let inflight: Arc<Inflight<usize, String>> = Arc::new(Inflight::new());
         let counter = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
         for _ in 0..20 {
@@ -75,13 +75,39 @@ mod tests {
         for h in handles {
             assert_eq!(h.await.unwrap(), 42);
         }
-        // Exactly one execution despite 20 concurrent callers.
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn coalesces_error_too() {
+        let inflight: Arc<Inflight<usize, String>> = Arc::new(Inflight::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let inf = Arc::clone(&inflight);
+            let ctr = Arc::clone(&counter);
+            handles.push(tokio::spawn(async move {
+                inf.run("err-key".into(), || {
+                    let ctr = Arc::clone(&ctr);
+                    async move {
+                        ctr.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        Err::<usize, String>("boom".into())
+                    }
+                })
+                .await
+                .unwrap_err()
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), "boom");
+        }
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn different_keys_do_not_block() {
-        let inflight = Arc::new(Inflight::<String>::new());
+        let inflight = Arc::new(Inflight::<String, String>::new());
         let a = {
             let inf = Arc::clone(&inflight);
             tokio::spawn(async move {
@@ -100,7 +126,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_call_after_first_re_executes() {
-        let inflight = Inflight::<u32>::new();
+        let inflight = Inflight::<u32, String>::new();
         let c = Arc::new(AtomicUsize::new(0));
         let c1 = Arc::clone(&c);
         inflight

@@ -1,26 +1,16 @@
-mod business;
-mod cache;
-mod clock;
-mod config;
-mod inflight;
-mod key;
-mod routing;
-mod upstream;
-
 use anyhow::Context;
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
+use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
-use crate::{
+use origin_cache::{
     cache::cache::{Cache, Fetcher, Fetched, FetchError},
     clock::SystemClock,
+    config,
 };
 
-/// No-op fetcher for local/skeleton runs (no real OneDrive configured).
-/// Returns 404 for every key; the cache then serves 404 / negative path.
-/// Real fetcher (Graph) will replace this when Slice 4's network path lands.
 #[derive(Clone)]
 struct NoopFetcher;
 #[async_trait::async_trait]
@@ -34,8 +24,7 @@ impl Fetcher for NoopFetcher {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -49,11 +38,10 @@ async fn main() -> anyhow::Result<()> {
         "origin-cache starting (single binary, two planes)"
     );
 
-    // Cache + business state.
     let clock = Arc::new(SystemClock);
     let fetcher: Arc<NoopFetcher> = Arc::new(NoopFetcher);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), clock, fetcher));
-    let app_state = business::AppState { cache, config: Arc::clone(&cfg) };
+    let app_state = origin_cache::business::AppState { cache, config: Arc::clone(&cfg) };
 
     let business_addr = cfg.listen_addr;
     let front_addr = cfg.front_listen;
@@ -66,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     let business_handle = tokio::spawn({
         let state = app_state.clone();
         async move {
-            if let Err(e) = business::serve(business_addr, state, business_shutdown).await {
+            if let Err(e) = origin_cache::business::serve(business_addr, state, business_shutdown).await {
                 warn!(error = %e, "business plane exited with error");
             }
         }
