@@ -189,18 +189,26 @@ Per-upstream persisted state (all `0600`, under the data directory):
 
 ## 7. Configuration (single TOML file)
 
-All timeouts / limits have defaults. Secrets are **env references**
-(never literals). Sketch:
+All timeouts / limits have defaults. Secrets and hostnames are **env
+references** (never literals). Canonical shape is `config.example.toml`:
 
 ```toml
-listen_addr = "127.0.0.1:8080"          # axum business plane
+# Planes
 front_listen = "0.0.0.0:443"            # Pingora front plane
+listen_addr = "127.0.0.1:8080"          # axum business plane (loopback only)
+tls_cert_env = "ORIGIN_TLS_CERT_PATH"
+tls_key_env = "ORIGIN_TLS_KEY_PATH"
+
+# Cache & TTLs
 cache_dir = "/var/lib/origin-cache"
 max_size_bytes = 107374182400           # 100 GiB
 inactive_ttl_secs = 1200               # 20 min
 revalidate_ttl_secs = 60
 negative_ttl_secs = 60
 graph_concurrency_per_upstream = 3
+retry_max_attempts = 4
+retry_base_ms = 200
+retry_max_ms = 30000
 
 [[upstreams]]
 id = "primary"
@@ -210,12 +218,13 @@ client_secret_env = "ONEDRIVE_PRIMARY_CLIENT_SECRET"
 refresh_token_env = "ONEDRIVE_PRIMARY_REFRESH_TOKEN"
 
 [[routes]]
-prefix = ""
+prefix = ""                            # default (catch-all)
 upstream = "primary"
 ```
 
-`prewarm_shared_secret_env`, TLS `cert_path` / `key_path` are likewise
-env-backed.
+`prewarm_shared_secret_env` and `allowed_download_suffixes` are likewise
+configurable; TLS/hostname material always via `*_env` indirection so the
+repo never contains `${ORIGIN_HOST}`'s real value.
 
 ## 8. Observability
 

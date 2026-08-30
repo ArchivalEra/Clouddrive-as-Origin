@@ -19,3 +19,6 @@
 # --- Project directories ---
 !/hooks/**
 !/docs/**
+!/CONTEXT.md
+!/config.example.toml
+!/docs/adr/**
