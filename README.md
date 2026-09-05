@@ -1,4 +1,4 @@
-# Onedrive-as-Origin
+# Clouddrive-as-Origin
 
 Pull-through origin cache for OneDrive — a general-purpose image (and
 static-asset) origin that fronts one or more OneDrive accounts via

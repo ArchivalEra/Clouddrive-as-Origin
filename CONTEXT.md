@@ -1,4 +1,4 @@
-# Onedrive-as-Origin
+# Clouddrive-as-Origin
 
 Pull-through origin cache for OneDrive. EdgeOne CDN origin-pulls `GET /<key>` over HTTPS; the service serves from a local hot cache backed by one or more OneDrive accounts via Microsoft Graph (delegated auth).
 
