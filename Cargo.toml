@@ -1,10 +1,14 @@
 [package]
-name = "origin-cache"
+name = "clouddrive-as-origin"
 version = "0.1.0"
 edition = "2021"
-description = "OneDrive pull-through origin cache — Pingora front + axum business plane (single binary)"
+description = "Multi-backend pull-through origin shield (Google Drive, OneDrive, ...) — Pingora front + axum business plane, single binary"
 license = "MIT"
-repository = "https://github.com/ArchivalEra/Onedrive-as-Origin"
+repository = "https://github.com/ArchivalEra/Clouddrive-as-Origin"
+
+[lib]
+name = "origin_cache"
+path = "src/lib.rs"
 
 [[bin]]
 name = "origin-cache"

@@ -1,4 +1,4 @@
-# Example config for Onedrive-as-Origin.
+# Example config for Clouddrive-as-Origin.
 # Copy to config.toml, fill env var names, never commit real secrets.
 # Every secret/hostname is an env var reference — no usable literals.
 # See docs/spec.md §§5,7 for semantics and defaults.
