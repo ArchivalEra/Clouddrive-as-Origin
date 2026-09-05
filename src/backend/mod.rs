@@ -204,4 +204,38 @@ mod tests {
 // Re-export the mock for integration tests (cfg(test) modules in other
 // crates cannot see it; integration tests use the lib target).
 #[doc(hidden)]
+#[cfg(test)]
 pub use self::tests::MockBackend as TestMockBackend;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+/// One configured upstream's runtime pieces: the provider backend plus
+/// its Graph/Drive concurrency gate (spec §4: per-upstream ≤ N).
+pub struct BackendSlot {
+    pub backend: Arc<dyn StorageBackend>,
+    pub gate: Arc<Semaphore>,
+}
+
+/// Registry of constructed backends, keyed by upstream id (from config).
+/// Built once at boot from `[[upstreams]]`; business code resolves
+/// `key → upstream id (routing) → BackendSlot (this registry)`.
+#[derive(Default)]
+pub struct BackendRegistry {
+    slots: HashMap<String, Arc<BackendSlot>>,
+}
+
+impl BackendRegistry {
+    pub fn new(slots: HashMap<String, Arc<BackendSlot>>) -> Self {
+        Self { slots }
+    }
+
+    pub fn get(&self, upstream_id: &str) -> Option<Arc<BackendSlot>> {
+        self.slots.get(upstream_id).cloned()
+    }
+
+    pub fn ids(&self) -> Vec<String> {
+        self.slots.keys().cloned().collect()
+    }
+}

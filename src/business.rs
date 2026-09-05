@@ -12,22 +12,22 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::{
-    cache::cache::{Cache, Fetcher},
+    backend::BackendError,
+    cache::cache::{Cache, CacheOutcome},
     clock::Clock,
     config::Config,
     key::validate_key,
 };
 
 #[derive(Clone)]
-pub struct AppState<C: Clock + Clone, F: Fetcher + Clone> {
-    pub cache: Arc<Cache<C, F>>,
+pub struct AppState<C: Clock + Clone> {
+    pub cache: Arc<Cache<C>>,
     pub config: Arc<Config>,
 }
 
-async fn healthz<C, F>(State(state): State<AppState<C, F>>) -> impl IntoResponse
+async fn healthz<C>(State(state): State<AppState<C>>) -> impl IntoResponse
 where
     C: Clock + Clone,
-    F: Fetcher + Clone,
 {
     let (count, bytes) = {
         let s = state.cache.state.read().await;
@@ -45,16 +45,10 @@ where
     )
 }
 
-async fn get_key<C, F>(
-    State(state): State<AppState<C, F>>,
-    Path(key): Path<String>,
-    headers: HeaderMap,
-) -> Response
+async fn get_key<C>(State(state): State<AppState<C>>, Path(key): Path<String>, headers: HeaderMap) -> Response
 where
     C: Clock + Clone,
-    F: Fetcher + Clone,
 {
-    let is_head = false;
     match state.cache.get(&key).await {
         Ok((bytes, outcome)) => {
             let range = headers.get("range").and_then(|v| v.to_str().ok());
@@ -93,35 +87,46 @@ where
             if let Some(et) = etag {
                 builder = builder.header("etag", et);
             }
-            if outcome == crate::cache::cache::CacheOutcome::Stale {
+            if outcome == CacheOutcome::Stale {
                 builder = builder.header("warning", "110 - \"Response is Stale\"");
             }
-            let body = if is_head { Body::empty() } else { Body::from(body_bytes) };
-            builder.body(body).unwrap()
+            builder.body(Body::from(body_bytes)).unwrap()
         }
-        Err(crate::cache::cache::FetchError::NotFound) => {
+        Err(BackendError::NotFound) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
         }
-        Err(crate::cache::cache::FetchError::Other(msg))
+        Err(BackendError::RateLimited { retry_after_millis }) => {
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "upstream rate limited"})),
+            )
+                .into_response();
+            if let Some(ms) = retry_after_millis {
+                if let Ok(v) = axum::http::HeaderValue::from_str(&(ms / 1000).to_string()) {
+                    resp.headers_mut().insert("retry-after", v);
+                }
+            }
+            resp
+        }
+        Err(BackendError::Other(msg))
             if msg.contains("traversal") || msg.contains("Empty") || msg.contains("Absolute") =>
         {
             (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
         }
         Err(e) => {
-            warn!(key = %key, error = ?format!("{e:?}"), "cache fetch error");
+            warn!(key = %key, error = %e, "cache fetch error");
             (StatusCode::BAD_GATEWAY, Json(json!({"error": "upstream error"}))).into_response()
         }
     }
 }
 
-async fn prewarm<C, F>(
-    State(state): State<AppState<C, F>>,
+async fn prewarm<C>(
+    State(state): State<AppState<C>>,
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse
 where
     C: Clock + Clone,
-    F: Fetcher + Clone,
 {
     if let Some(env_name) = &state.config.prewarm_shared_secret_env {
         let expected = std::env::var(env_name).unwrap_or_default();
@@ -144,7 +149,7 @@ where
     }
     match state.cache.get(&key).await {
         Ok(_) => (StatusCode::OK, Json(json!({"status": "fetched"}))).into_response(),
-        Err(crate::cache::cache::FetchError::NotFound) => {
+        Err(BackendError::NotFound) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
         }
         Err(_) => (StatusCode::BAD_GATEWAY, Json(json!({"error": "upstream error"}))).into_response(),
@@ -171,27 +176,25 @@ fn parse_range(header: &str, total: u64) -> Option<(u64, Option<u64>)> {
     Some((start, end))
 }
 
-pub fn router<C, F>(state: AppState<C, F>) -> Router
+pub fn router<C>(state: AppState<C>) -> Router
 where
     C: Clock + Clone,
-    F: Fetcher + Clone,
 {
     Router::new()
-        .route("/_internal/healthz", get(healthz::<C, F>))
-        .route("/_internal/prewarm/{key}", post(prewarm::<C, F>))
-        .route("/{*key}", get(get_key::<C, F>).head(get_key::<C, F>))
+        .route("/_internal/healthz", get(healthz::<C>))
+        .route("/_internal/prewarm/{key}", post(prewarm::<C>))
+        .route("/{*key}", get(get_key::<C>).head(get_key::<C>))
         .fallback(not_found)
         .with_state(state)
 }
 
-pub async fn serve<C, F>(
+pub async fn serve<C>(
     addr: SocketAddr,
-    state: AppState<C, F>,
+    state: AppState<C>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()>
 where
     C: Clock + Clone,
-    F: Fetcher + Clone,
 {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "business plane listening");

@@ -1,22 +1,38 @@
 use anyhow::Context;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use origin_cache::{
-    cache::cache::{Cache, Fetcher, Fetched, FetchError},
+    backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, Key, ObjectMeta, StorageBackend},
+    cache::cache::Cache,
     clock::SystemClock,
     config,
 };
 
-#[derive(Clone)]
-struct NoopFetcher;
+/// Placeholder backend until the real GoogleDrive/OneDrive providers land:
+/// every key is not-found, so the cache serves the negative path.
+struct NullBackend;
+
 #[async_trait::async_trait]
-impl Fetcher for NoopFetcher {
-    async fn fetch(&self, _key: &str, _upstream: &str) -> Result<Fetched, FetchError> {
-        Err(FetchError::NotFound)
+impl StorageBackend for NullBackend {
+    async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
+        Err(BackendError::NotFound)
+    }
+
+    async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<origin_cache::backend::StreamSource, BackendError> {
+        Err(BackendError::NotFound)
+    }
+
+    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn id(&self) -> &str {
+        "null"
     }
 }
 
@@ -39,8 +55,17 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let clock = Arc::new(SystemClock);
-    let fetcher: Arc<NoopFetcher> = Arc::new(NoopFetcher);
-    let cache = Arc::new(Cache::new(Arc::clone(&cfg), clock, fetcher));
+    let mut slots = HashMap::new();
+    for u in &cfg.upstreams {
+        slots.insert(
+            u.id.clone(),
+            Arc::new(BackendSlot {
+                backend: Arc::new(NullBackend),
+                gate: Arc::new(Semaphore::new(cfg.concurrency_per_upstream)),
+            }),
+        );
+    }
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), clock, BackendRegistry::new(slots)));
     let app_state = origin_cache::business::AppState { cache, config: Arc::clone(&cfg) };
 
     let business_addr = cfg.listen_addr;
