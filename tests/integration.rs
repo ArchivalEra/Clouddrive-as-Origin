@@ -7,6 +7,7 @@ use tempfile::tempdir;
 use origin_cache::{
     backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, Key, ObjectMeta, StreamSource, StorageBackend},
     cache::cache::{Cache, CacheOutcome},
+    cache::flight::BodyStream,
     clock::MockClock,
     config::Config,
     routing::{RouteRule, RouteTable},
@@ -71,6 +72,26 @@ fn registry_with(backend: Arc<dyn StorageBackend>) -> BackendRegistry {
     BackendRegistry::new(slots)
 }
 
+async fn read_body(body: &mut BodyStream) -> Vec<u8> {
+    use futures::StreamExt;
+    let mut out = Vec::new();
+    while let Some(chunk) = body.next().await {
+        out.extend_from_slice(&chunk.unwrap());
+    }
+    out
+}
+
+/// Wait until the driver task has installed the metadata row for `key`.
+async fn wait_installed(cache: &Cache<MockClock>, key: &str) {
+    for _ in 0..200 {
+        if cache.state.read().await.entries.contains_key(key) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("entry {key} never installed");
+}
+
 #[tokio::test]
 async fn single_flight_20_concurrent_same_key_one_fetch() {
     let dir = tempdir().unwrap();
@@ -88,14 +109,18 @@ async fn single_flight_20_concurrent_same_key_one_fetch() {
     let mut handles = Vec::new();
     for _ in 0..20 {
         let c = Arc::clone(&cache);
-        handles.push(tokio::spawn(async move { c.get("same.png").await.map(|(b, _)| b) }));
+        handles.push(tokio::spawn(async move {
+            let mut hit = c.get("same.png").await?;
+            let mut body = hit.body;
+            origin_cache::cache::flight::drain(&mut body)
+                .await
+                .map(|_| hit.outcome)
+        }));
     }
     for h in handles {
-        assert_eq!(h.await.unwrap().unwrap(), b"payload");
+        assert_eq!(h.await.unwrap().unwrap(), CacheOutcome::Miss);
     }
-    // Spec §10: exactly ONE metadata call + ONE download for the whole
-    // stampede (the winner's flight); everyone else serves from disk via
-    // the double-check inside the flight.
+    // Spec §10: exactly ONE metadata call + ONE download for the stampede.
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
@@ -136,7 +161,9 @@ async fn inactive_ttl_expiry_removes_file_and_meta() {
         fail: None,
     };
     let cache = Cache::new(cfg, Arc::clone(&clock), registry_with(Arc::new(backend)));
-    cache.get("a.png").await.unwrap();
+    let mut hit = cache.get("a.png").await.unwrap();
+    read_body(&mut hit.body).await;
+    wait_installed(&cache, "a.png").await;
     assert!(dir.path().join("a.png").exists());
     clock.advance(2000);
     cache.tick().await;
@@ -161,11 +188,12 @@ async fn max_size_evicts_lru_order() {
         fail: None,
     };
     let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend)));
-    cache.get("a.png").await.unwrap();
-    clock.advance(10);
-    cache.get("b.png").await.unwrap();
-    clock.advance(10);
-    cache.get("c.png").await.unwrap();
+    for k in ["a.png", "b.png", "c.png"] {
+        let mut hit = cache.get(k).await.unwrap();
+        read_body(&mut hit.body).await;
+        wait_installed(&cache, k).await;
+        clock.advance(10);
+    }
     let remaining = cache.state.read().await.entries.len();
     assert!(remaining < 3);
     assert!(!cache.state.read().await.entries.contains_key("a.png"));
@@ -190,8 +218,9 @@ async fn revalidation_uses_stat_and_serves_updated_content() {
     impl StorageBackend for VersionedBackend {
         async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
             let v = self.version.load(Ordering::SeqCst);
+            let bytes = format!("bytes-v{v}").into_bytes();
             Ok(ObjectMeta {
-                size_bytes: 7,
+                size_bytes: bytes.len() as u64,
                 etag: Some(format!("v{v}")),
                 last_modified: None,
                 mime_hint: Some("image/png".into()),
@@ -219,26 +248,29 @@ async fn revalidation_uses_stat_and_serves_updated_content() {
         registry_with(Arc::new(VersionedBackend { version: Arc::clone(&version) })),
     );
 
-    let (b1, o1) = cache.get("a.png").await.unwrap();
-    assert_eq!(o1, CacheOutcome::Miss);
-    assert_eq!(b1, b"bytes-v1");
+    let hit = cache.get("a.png").await.unwrap();
+    assert_eq!(hit.outcome, CacheOutcome::Miss);
+    let mut hit = hit;
+    assert_eq!(read_body(&mut hit.body).await, b"bytes-v1");
+    wait_installed(&cache, "a.png").await;
 
     version.store(2, Ordering::SeqCst);
     clock.advance(2000); // past revalidate ttl
 
-    let (b2, o2) = cache.get("a.png").await.unwrap();
-    assert_eq!(o2, CacheOutcome::Miss); // stat: v2 != cached v1 -> refetch
-    assert_eq!(b2, b"bytes-v2");
+    let mut hit2 = cache.get("a.png").await.unwrap();
+    assert_eq!(hit2.outcome, CacheOutcome::Miss); // stat: v2 != cached v1 -> refetch
+    assert_eq!(read_body(&mut hit2.body).await, b"bytes-v2");
+    wait_installed(&cache, "a.png").await;
 
     // Third get within ttl: fresh hit, no upstream.
-    let (b3, o3) = cache.get("a.png").await.unwrap();
-    assert_eq!(o3, CacheOutcome::Hit);
-    assert_eq!(b3, b"bytes-v2");
+    let mut hit3 = cache.get("a.png").await.unwrap();
+    assert_eq!(hit3.outcome, CacheOutcome::Hit);
+    assert_eq!(read_body(&mut hit3.body).await, b"bytes-v2");
 }
 
 #[tokio::test]
 async fn revalidation_not_modified_serves_revalidated() {
-    // Same etag: stat says unmodified → serve from disk (Revalidated).
+    // Same etag: stat says unmodified -> serve from disk (Revalidated).
     let dir = tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.cache_dir = dir.path().to_path_buf();
@@ -253,13 +285,14 @@ async fn revalidation_not_modified_serves_revalidated() {
         fail: None,
     };
     let cache = Cache::new(cfg, Arc::clone(&clock), registry_with(Arc::new(backend)));
-    let (b1, o1) = cache.get("a.png").await.unwrap();
-    assert_eq!(o1, CacheOutcome::Miss);
-    assert_eq!(b1, b"stable");
+    let mut hit = cache.get("a.png").await.unwrap();
+    assert_eq!(hit.outcome, CacheOutcome::Miss);
+    assert_eq!(read_body(&mut hit.body).await, b"stable");
+    wait_installed(&cache, "a.png").await;
     clock.advance(2000);
-    let (b2, o2) = cache.get("a.png").await.unwrap();
-    assert_eq!(o2, CacheOutcome::Revalidated);
-    assert_eq!(b2, b"stable");
+    let mut hit2 = cache.get("a.png").await.unwrap();
+    assert_eq!(hit2.outcome, CacheOutcome::Revalidated);
+    assert_eq!(read_body(&mut hit2.body).await, b"stable");
 }
 
 #[tokio::test]
@@ -275,8 +308,14 @@ async fn traversal_payloads_are_400_via_fetch_error() {
         fail: None,
     };
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
-    let err = cache.get("../etc/passwd").await.unwrap_err();
+    let err = match cache.get("../etc/passwd").await {
+        Err(e) => e,
+        Ok(_) => panic!("traversal key must not resolve"),
+    };
     assert!(matches!(err, BackendError::Other(_)));
-    let err2 = cache.get("%2e%2e%2fetc/passwd").await.unwrap_err();
+    let err2 = match cache.get("%2e%2e%2fetc/passwd").await {
+        Err(e) => e,
+        Ok(_) => panic!("encoded traversal key must not resolve"),
+    };
     assert!(matches!(err2, BackendError::Other(_)));
 }
