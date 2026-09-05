@@ -1,7 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::{
+    backend::{BackendError, BackendRegistry, ByteRange, Key, ObjectMeta, StorageBackend},
     cache::{meta::EntryMeta, store},
     clock::Clock,
     config::Config,
@@ -19,25 +20,18 @@ pub enum CacheOutcome {
     Revalidated,
 }
 
-#[async_trait::async_trait]
-pub trait Fetcher: Send + Sync + 'static {
-    async fn fetch(&self, key: &str, upstream_id: &str) -> Result<Fetched, FetchError>;
-}
-
+/// Data returned by a winning cold-miss flight: bytes (P2 interim —
+/// becomes a streaming ticket in the next increment) + provider metadata.
 #[derive(Debug, Clone)]
 pub struct Fetched {
     pub bytes: Vec<u8>,
-    pub etag: Option<String>,
-    pub content_type: Option<String>,
-    pub last_modified: Option<String>,
+    pub meta: ObjectMeta,
 }
 
+/// Data produced by a winning revalidation flight (stat only).
 #[derive(Debug, Clone)]
-pub enum FetchError {
-    NotFound,
-    Upstream5xx(String),
-    RateLimited { retry_after_millis: Option<u64> },
-    Other(String),
+pub struct StatData {
+    pub meta: ObjectMeta,
 }
 
 pub struct CacheState {
@@ -51,24 +45,26 @@ impl Default for CacheState {
     }
 }
 
-pub struct Cache<C: Clock, F: Fetcher> {
+pub struct Cache<C: Clock> {
     pub config: Arc<Config>,
     pub clock: Arc<C>,
-    pub fetcher: Arc<F>,
+    pub backends: BackendRegistry,
     pub state: RwLock<CacheState>,
-    pub inflight: Inflight<Fetched, FetchError>,
+    pub inflight: Inflight<Fetched, BackendError>,
+    pub reval_inflight: Inflight<StatData, BackendError>,
     pub routes: RouteTable,
 }
 
-impl<C: Clock + Clone, F: Fetcher + Clone> Cache<C, F> {
-    pub fn new(config: Arc<Config>, clock: Arc<C>, fetcher: Arc<F>) -> Self {
+impl<C: Clock + Clone> Cache<C> {
+    pub fn new(config: Arc<Config>, clock: Arc<C>, backends: BackendRegistry) -> Self {
         let routes = config.routes.clone();
         Self {
             config,
             clock,
-            fetcher,
+            backends,
             state: RwLock::new(CacheState::default()),
             inflight: Inflight::new(),
+            reval_inflight: Inflight::new(),
             routes,
         }
     }
@@ -80,36 +76,42 @@ impl<C: Clock + Clone, F: Fetcher + Clone> Cache<C, F> {
     }
 
     /// Main entry: `GET /<key>` — returns bytes + outcome for observability.
-    /// Cold misses are coalesced via per-key single-flight so 20 concurrent
-    /// requests for the same cold key trigger exactly one upstream fetch.
-    pub async fn get(&self, raw_key: &str) -> Result<(Vec<u8>, CacheOutcome), FetchError> {
-        let (key, upstream_id) = self.resolve_upstream(raw_key).map_err(|e| FetchError::Other(e.to_string()))?;
+    /// Cold misses and revalidation stats are coalesced per-key (spec §3.2);
+    /// upstream concurrency is gated per upstream slot (spec §4).
+    pub async fn get(&self, raw_key: &str) -> Result<(Vec<u8>, CacheOutcome), BackendError> {
+        let (key, upstream_id) =
+            self.resolve_upstream(raw_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+        let slot = self
+            .backends
+            .get(&upstream_id)
+            .ok_or_else(|| BackendError::Other(format!("unknown upstream {upstream_id}")))?;
         let now = self.clock.now_millis();
 
-        // Negative cache check (tombstones are not single-flighted — cheap read).
+        // Negative cache check (cheap read, not single-flighted).
         {
             let s = self.state.read().await;
             if let Some(meta) = s.entries.get(&key) {
                 if meta.is_negative(now) {
-                    return Err(FetchError::NotFound);
+                    return Err(BackendError::NotFound);
                 }
             }
         }
 
-        // Fast hit: fresh cached file without revalidation.
         let needs_revalidate = {
             let s = self.state.read().await;
             if let Some(meta) = s.entries.get(&key) {
                 if meta.negative_until_millis.is_some() {
                     false
                 } else {
-                    let age = now.saturating_sub(meta.last_revalidated_millis.unwrap_or(meta.created_at_millis));
+                    let age =
+                        now.saturating_sub(meta.last_revalidated_millis.unwrap_or(meta.created_at_millis));
                     age > self.config.revalidate_ttl_secs * 1000
                 }
             } else {
                 false
             }
         };
+        let mut force_fetch = false;
 
         if !needs_revalidate {
             if let Some(bytes) = self.try_serve_cached(&key).await {
@@ -117,48 +119,42 @@ impl<C: Clock + Clone, F: Fetcher + Clone> Cache<C, F> {
                 return Ok((bytes, CacheOutcome::Hit));
             }
         } else {
-            // Revalidation path (rare vs cold miss) — single-flight is less
-            // critical here; keep the per-key fetch coalesced via the same
-            // inflight so concurrent revalidations also share one fetch.
-            let key2 = key.clone();
-            let up2 = upstream_id.clone();
-            // Snapshot etag for revalidation.
+            // Revalidation = stat + etag compare (G2 #11: Drive has no 304,
+            // Graph could use If-None-Match but stat-compare is uniform).
             let cached_etag = {
                 let s = self.state.read().await;
                 s.entries.get(&key).and_then(|m| m.etag.clone())
             };
-            let fetched = self
-                .inflight
+            let stat = self
+                .reval_inflight
                 .run(format!("reval:{key}"), || {
-                    let fetcher = Arc::clone(&self.fetcher);
-                    let k = key2.clone();
-                    let u = up2.clone();
-                    async move { fetcher.fetch(&k, &u).await }
+                    let slot = Arc::clone(&slot);
+                    let k = Key::from_validated(key.clone());
+                    async move {
+                        let _permit = slot.gate.acquire().await;
+                        slot.backend.stat(&k).await.map(|meta| StatData { meta })
+                    }
                 })
                 .await;
-            let res = match fetched {
-                Ok(got) if cached_etag.is_some() && cached_etag == got.etag => RevalidateResult::NotModified,
-                Ok(got) => RevalidateResult::Modified(got),
-                Err(FetchError::NotFound) => RevalidateResult::Modified(Fetched {
-                    bytes: vec![],
-                    etag: None,
-                    content_type: None,
-                    last_modified: None,
-                }),
-                Err(e) => RevalidateResult::Error(e),
-            };
-            match res {
-                RevalidateResult::NotModified => {
+            match stat {
+                Ok(stat) if cached_etag.is_some() && cached_etag == stat.meta.etag => {
                     self.bump_last_access(&key).await;
                     if let Some(bytes) = self.try_serve_cached(&key).await {
                         return Ok((bytes, CacheOutcome::Revalidated));
                     }
                 }
-                RevalidateResult::Modified(fetched) => {
-                    self.install(&key, &upstream_id, fetched.clone()).await;
-                    return Ok((fetched.bytes, CacheOutcome::Miss));
+                Ok(_) => {
+                    // Modified (or etag vanished) → full fetch path below,
+                    // forced (the in-flight disk double-check must not
+                    // serve the stale bytes we just detected as changed).
+                    force_fetch = true;
                 }
-                RevalidateResult::Error(e) => {
+                Err(BackendError::NotFound) => {
+                    // Upstream lost the file: install a negative tombstone.
+                    self.install_negative(&key, &upstream_id).await;
+                    return Err(BackendError::NotFound);
+                }
+                Err(e) => {
                     if let Some(bytes) = self.try_serve_cached(&key).await {
                         return Ok((bytes, CacheOutcome::Stale));
                     }
@@ -167,110 +163,60 @@ impl<C: Clock + Clone, F: Fetcher + Clone> Cache<C, F> {
             }
         }
 
-        // Cold miss — wrap the double-check + fetch in single-flight so all
-        // concurrent cold callers share one fetch. The inner closure does a
-        // second hit-check after winning the flight to handle the race where
-        // another flight just installed the file.
+        // Cold miss (or stale revalidate that found modification) — single-
+        // flight full fetch, gated by the upstream semaphore. The closure
+        // re-checks the disk cache first: under a sequential stampede the
+        // previous flight may have installed the file between this caller's
+        // outer check and its flight entry (double-check-under-lock).
+        // Install happens INSIDE the flight so the cell outlives the disk
+        // write — no window where the cell is gone but the file missing.
+        // Metadata is fetched first (spec §3.1: Content-Length goes out up
+        // front).
         let key_for_run = key.clone();
-        let key2 = key.clone();
-        let up2 = upstream_id.clone();
-        let config = Arc::clone(&self.config);
-        let clock = Arc::clone(&self.clock);
-        let fetcher = Arc::clone(&self.fetcher);
-
-        // The flight's value is the fetched bytes; the CacheOutcome::Miss vs
-        // Hit distinction is made by whether the double-check found an
-        // existing file (second waiter sees Hit semantics).
+        let upstream_for_run = upstream_id.clone();
         let fetched = self
             .inflight
-            .run(key_for_run, move || {
-                let key = key2.clone();
-                let up = up2.clone();
-                let cfg = Arc::clone(&config);
-                let fetcher = Arc::clone(&fetcher);
-                let clock2 = Arc::clone(&clock);
+            .run(key.clone(), move || {
+                let slot = Arc::clone(&slot);
+                let k = Key::from_validated(key_for_run.clone());
+                let this = self;
+                let up = upstream_for_run.clone();
                 async move {
-                    // Double-check: another concurrent flight may have just
-                    // installed this key while we were queued.
-                    let hit = {
-                        let path = store::file_path(&cfg.cache_dir, &key);
-                        tokio::fs::read(&path).await.ok()
-                    };
-                    if hit.is_some() {
-                        // Don't call fetcher — caller will read from disk.
-                        // Signal via a sentinel: use Other to fall through.
-                        // Simpler: return a special Fetched that the outer
-                        // code recognizes. Here we just return the cached
-                        // bytes directly without going to upstream.
-                        // To keep the type uniform, encode hit as
-                        // FetchError::Other("__HIT__") and handle below.
-                        // Avoid magic strings: instead, just return the hit
-                        // bytes as a synthetic Fetched.
-                        return Ok::<Fetched, FetchError>(Fetched {
-                            bytes: hit.unwrap(),
-                            etag: None,
-                            content_type: None,
-                            last_modified: None,
-                        });
+                    if !force_fetch {
+                        if let Some(bytes) = this.try_serve_cached(k.as_str()).await {
+                            if let Some(m) = this.entry_meta(k.as_str()).await {
+                                return Ok(Fetched {
+                                    bytes,
+                                    meta: ObjectMeta {
+                                        size_bytes: m.size_bytes,
+                                        etag: m.etag,
+                                        last_modified: m.last_modified,
+                                        mime_hint: m.content_type,
+                                    },
+                                });
+                            }
+                        }
                     }
-                    // Mark that this was actually fetched — set etag sentinel
-                    // so caller can distinguish. Instead, just fetch.
-                    let fetched = fetcher.fetch(&key, &up).await?;
-                    // Distinguish synthetic hit above: real fetch has etag/content_type.
-                    // Handle clock bump outside; here just return Fetched.
-                    let _ = clock2.now_millis();
+                    let _permit = slot.gate.acquire().await;
+                    let meta = slot.backend.stat(&k).await?;
+                    let src = slot.backend.open(&k, None).await?;
+                    let mut bytes = Vec::new();
+                    let mut stream = src.stream;
+                    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut bytes)
+                        .await
+                        .map_err(|e| BackendError::ServerError(format!("read stream: {e}")))?;
+                    let fetched = Fetched { bytes, meta };
+                    this.install(k.as_str(), &up, &fetched).await;
                     Ok(fetched)
                 }
             })
             .await;
 
-        // Determine outcome: if the flight returned a hit-synthetic (etag None
-        // and we can verify the real entry exists), it's actually a hit on
-        // the waiters. But we can't disambiguate purely from Fetched alone
-        // when the real object has no etag. Instead, check whether this
-        // caller's Fetched came from the hit path by looking at the entry's
-        // existence and the flight's concurrency: simpler — treat all
-        // flight results uniformly and let the install be idempotent.
-        //
-        // The counter test (single_flight_20_concurrent_same_key_one_fetch)
-        // expects exactly 1 fetcher call. The double-check above ensures
-        // waiters don't call fetcher. First waiter fetches, waiters take the
-        // hit synthetic path and skip fetcher.
-        //
-        // However, if the real object legitimately has no etag, the synthetic
-        // hit would be indistinguishable. That's acceptable because we still
-        // serve the bytes; the etag will be updated on next revalidation.
         match fetched {
-            Ok(fetched) => {
-                // If this was a synthetic hit (waiter), the file is already
-                // installed and Fetched.bytes is from disk; don't reinstall
-                // with new metadata unless it's a real fetch. We can detect
-                // synthetic by: the fetcher wasn't called (counter check) but
-                // at this layer we need a signal. Use a simpler approach:
-                // try to detect if the file was just installed by the winner:
-                // all waiters will share the winner's Fetched (same bytes).
-                // That's fine — reinstall is idempotent.
-                //
-                // To make waiters count as Hit instead of Miss for
-                // observability, check if the entry already existed before
-                // this flight's winner installed it. Simpler: after flight,
-                // check if we are the winner by whether our Fetched.etag
-                // matches what we would have stored. Instead, just propagate
-                // Miss for the winner's fetch and let waiters also report
-                // Miss — the counter test only cares about fetcher calls.
-                self.install(&key, &upstream_id, fetched.clone()).await;
-                // For waiters that took the hit path, the bytes are already
-                // from disk; reporting Miss is acceptable for correctness
-                // (the bytes are right). The spec's "single-flight" gate
-                // only cares about upstream call count.
-                Ok((fetched.bytes, CacheOutcome::Miss))
-            }
-            Err(FetchError::NotFound) => {
+            Ok(fetched) => Ok((fetched.bytes, CacheOutcome::Miss)),
+            Err(BackendError::NotFound) => {
                 self.install_negative(&key, &upstream_id).await;
-                Err(FetchError::NotFound)
-            }
-            Err(FetchError::RateLimited { retry_after_millis }) => {
-                Err(FetchError::RateLimited { retry_after_millis })
+                Err(BackendError::NotFound)
             }
             Err(e) => {
                 if let Some(bytes) = self.try_serve_cached(&key).await {
@@ -287,6 +233,10 @@ impl<C: Clock + Clone, F: Fetcher + Clone> Cache<C, F> {
         tokio::fs::read(&path).await.ok()
     }
 
+    async fn entry_meta(&self, key: &str) -> Option<EntryMeta> {
+        self.state.read().await.entries.get(key).cloned()
+    }
+
     async fn bump_last_access(&self, key: &str) {
         let now = self.clock.now_millis();
         let mut s = self.state.write().await;
@@ -295,18 +245,22 @@ impl<C: Clock + Clone, F: Fetcher + Clone> Cache<C, F> {
         }
     }
 
-    async fn install(&self, key: &str, upstream_id: &str, fetched: Fetched) {
+    async fn install(&self, key: &str, upstream_id: &str, fetched: &Fetched) {
         let now = self.clock.now_millis();
         let path = store::file_path(&self.config.cache_dir, key);
         let tmp = store::tmp_path(&self.config.cache_dir, key);
-        let _ = async {
+        if let Err(e) = async {
             if let Some(parent) = tmp.parent() {
-                tokio::fs::create_dir_all(parent).await.ok()?;
+                tokio::fs::create_dir_all(parent).await?;
             }
-            tokio::fs::write(&tmp, &fetched.bytes).await.ok()?;
-            store::install_tmp(&tmp, &path).ok()
+            tokio::fs::write(&tmp, &fetched.bytes).await?;
+            store::install_tmp(&tmp, &path).map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok::<(), std::io::Error>(())
         }
-        .await;
+        .await
+        {
+            tracing::error!(key = %key, error = %e, "cache install failed");
+        }
         let mut s = self.state.write().await;
         let old_size = s.entries.get(key).map(|m| m.size_bytes).unwrap_or(0);
         let meta = EntryMeta {
@@ -314,9 +268,9 @@ impl<C: Clock + Clone, F: Fetcher + Clone> Cache<C, F> {
             upstream_id: upstream_id.to_string(),
             key: key.to_string(),
             size_bytes: fetched.bytes.len() as u64,
-            etag: fetched.etag,
-            last_modified: fetched.last_modified,
-            content_type: fetched.content_type,
+            etag: fetched.meta.etag.clone(),
+            last_modified: fetched.meta.last_modified.clone(),
+            content_type: fetched.meta.mime_hint.clone(),
             created_at_millis: s.entries.get(key).map(|m| m.created_at_millis).unwrap_or(now),
             last_access_millis: now,
             last_revalidated_millis: Some(now),
@@ -347,29 +301,6 @@ impl<C: Clock + Clone, F: Fetcher + Clone> Cache<C, F> {
                 negative_until_millis: Some(until),
             },
         );
-    }
-
-    async fn revalidate(&self, key: &str, upstream_id: &str, _etag: Option<&str>) -> RevalidateResult<Fetched> {
-        match self.fetcher.fetch(key, upstream_id).await {
-            Ok(fetched) => {
-                let cached_etag = {
-                    let s = self.state.read().await;
-                    s.entries.get(key).and_then(|m| m.etag.clone())
-                };
-                if cached_etag.is_some() && cached_etag == fetched.etag {
-                    RevalidateResult::NotModified
-                } else {
-                    RevalidateResult::Modified(fetched)
-                }
-            }
-            Err(FetchError::NotFound) => RevalidateResult::Modified(Fetched {
-                bytes: vec![],
-                etag: None,
-                content_type: None,
-                last_modified: None,
-            }),
-            Err(e) => RevalidateResult::Error(e),
-        }
     }
 
     async fn evict_if_needed(&self, state: &mut CacheState) {
@@ -430,56 +361,93 @@ impl<C: Clock + Clone, F: Fetcher + Clone> Cache<C, F> {
     }
 }
 
-enum RevalidateResult<T> {
-    NotModified,
-    Modified(T),
-    Error(FetchError),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{clock::MockClock, config::Config};
-    use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
+    /// Test backend: fixed bytes, injectable failures, call counter.
     #[derive(Clone)]
-    struct StaticFetcher {
+    struct CountingBackend {
         bytes: Vec<u8>,
         etag: Option<String>,
         calls: Arc<AtomicUsize>,
-        fail: Option<FetchError>,
+        fail: Option<BackendError>,
     }
+
     #[async_trait::async_trait]
-    impl Fetcher for StaticFetcher {
-        async fn fetch(&self, _key: &str, _upstream: &str) -> Result<Fetched, FetchError> {
+    impl StorageBackend for CountingBackend {
+        async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(e) = &self.fail {
                 return Err(e.clone());
             }
-            Ok(Fetched { bytes: self.bytes.clone(), etag: self.etag.clone(), content_type: None, last_modified: None })
+            Ok(ObjectMeta {
+                size_bytes: self.bytes.len() as u64,
+                etag: self.etag.clone(),
+                last_modified: None,
+                mime_hint: Some("image/png".into()),
+            })
+        }
+
+        async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<crate::backend::StreamSource, BackendError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(e) = &self.fail {
+                return Err(e.clone());
+            }
+            Ok(crate::backend::StreamSource {
+                stream: Box::new(std::io::Cursor::new(self.bytes.clone())),
+                total_len: Some(self.bytes.len() as u64),
+            })
+        }
+
+        async fn refresh_if_needed(&self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn id(&self) -> &str {
+            "test"
         }
     }
 
-    fn test_config(cache_dir: std::path::PathBuf) -> Arc<Config> {
+    fn test_cache(
+        dir: std::path::PathBuf,
+        bytes: &[u8],
+        etag: Option<&str>,
+        fail: Option<BackendError>,
+    ) -> (Arc<Config>, Arc<MockClock>, Cache<MockClock>, Arc<AtomicUsize>) {
         let mut cfg = Config::default();
-        cfg.cache_dir = cache_dir;
-        Arc::new(cfg)
+        cfg.cache_dir = dir;
+        let cfg = Arc::new(cfg);
+        let clock = Arc::new(MockClock::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = CountingBackend {
+            bytes: bytes.to_vec(),
+            etag: etag.map(|s| s.to_string()),
+            calls: Arc::clone(&calls),
+            fail,
+        };
+        let mut slots = HashMap::new();
+        slots.insert(
+            "primary".to_string(),
+            Arc::new(crate::backend::BackendSlot {
+                backend: Arc::new(backend),
+                gate: Arc::new(Semaphore::new(3)),
+            }),
+        );
+        let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), BackendRegistry::new(slots));
+        (cfg, clock, cache, calls)
     }
 
     #[tokio::test]
     async fn miss_then_hit() {
         let dir = tempdir().unwrap();
-        let cfg = test_config(dir.path().to_path_buf());
-        let clock = Arc::new(MockClock::new(0));
-        let fetcher = Arc::new(StaticFetcher { bytes: b"hello".to_vec(), etag: Some("v1".into()), calls: Arc::new(AtomicUsize::new(0)), fail: None });
-        let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), Arc::clone(&fetcher));
+        let (_cfg, _clock, cache, _calls) = test_cache(dir.path().to_path_buf(), b"hello", Some("v1"), None);
         let (b, out) = cache.get("a.png").await.unwrap();
         assert_eq!(out, CacheOutcome::Miss);
         assert_eq!(b, b"hello");
-        let fetcher2 = Arc::new(StaticFetcher { bytes: b"hello2".to_vec(), etag: Some("v2".into()), calls: Arc::new(AtomicUsize::new(0)), fail: None });
-        let cache2 = Cache::new(cfg, clock, fetcher2);
-        let _ = cache2;
         let (b2, out2) = cache.get("a.png").await.unwrap();
         assert_eq!(out2, CacheOutcome::Hit);
         assert_eq!(b2, b"hello");
@@ -493,32 +461,57 @@ mod tests {
         cfg.negative_ttl_secs = 2;
         let cfg = Arc::new(cfg);
         let clock = Arc::new(MockClock::new(0));
-        let fetcher = Arc::new(StaticFetcher { bytes: vec![], etag: None, calls: Arc::new(AtomicUsize::new(0)), fail: Some(FetchError::NotFound) });
-        let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), Arc::clone(&fetcher));
-        assert!(matches!(cache.get("missing.png").await, Err(FetchError::NotFound)));
-        assert!(matches!(cache.get("missing.png").await, Err(FetchError::NotFound)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = CountingBackend {
+            bytes: vec![],
+            etag: None,
+            calls: Arc::clone(&calls),
+            fail: Some(BackendError::NotFound),
+        };
+        let mut slots = HashMap::new();
+        slots.insert(
+            "primary".to_string(),
+            Arc::new(crate::backend::BackendSlot {
+                backend: Arc::new(backend),
+                gate: Arc::new(Semaphore::new(3)),
+            }),
+        );
+        let cache = Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots));
+        assert!(matches!(cache.get("missing.png").await, Err(BackendError::NotFound)));
+        assert!(matches!(cache.get("missing.png").await, Err(BackendError::NotFound)));
         clock.advance(3000);
         cache.tick().await;
-        assert!(matches!(cache.get("missing.png").await, Err(FetchError::NotFound)));
+        assert!(matches!(cache.get("missing.png").await, Err(BackendError::NotFound)));
     }
 
     #[tokio::test]
     async fn stale_if_error_serves_cached() {
         let dir = tempdir().unwrap();
-        let cfg = test_config(dir.path().to_path_buf());
-        let clock = Arc::new(MockClock::new(0));
-        let good = Arc::new(StaticFetcher { bytes: b"cached".to_vec(), etag: Some("v1".into()), calls: Arc::new(AtomicUsize::new(0)), fail: None });
-        let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), Arc::clone(&good));
+        let (cfg, clock, cache, _calls) = test_cache(dir.path().to_path_buf(), b"cached", Some("v1"), None);
         cache.get("a.png").await.unwrap();
-        let bad = Arc::new(StaticFetcher { bytes: vec![], etag: None, calls: Arc::new(AtomicUsize::new(0)), fail: Some(FetchError::Upstream5xx("boom".into())) });
-        let cache2 = Cache {
-            config: Arc::clone(&cache.config),
-            clock: Arc::clone(&clock),
-            fetcher: bad,
-            state: RwLock::new(std::mem::take(&mut *cache.state.write().await)),
-            inflight: Inflight::new(),
-            routes: cache.routes.clone(),
+        // Swap state into a cache whose backend 500s (same dir + clock),
+        // advance past revalidate ttl, then expect stale-if-error.
+        let state = RwLock::new(std::mem::take(&mut *cache.state.write().await));
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let backend2 = CountingBackend {
+            bytes: b"ignored".to_vec(),
+            etag: None,
+            calls: Arc::clone(&calls2),
+            fail: Some(BackendError::ServerError("boom".into())),
         };
+        let mut slots = HashMap::new();
+        slots.insert(
+            "primary".to_string(),
+            Arc::new(crate::backend::BackendSlot {
+                backend: Arc::new(backend2),
+                gate: Arc::new(Semaphore::new(3)),
+            }),
+        );
+        let cache2 = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), BackendRegistry::new(slots));
+        {
+            let mut s2 = cache2.state.write().await;
+            *s2 = std::mem::take(&mut *state.write().await);
+        }
         clock.advance(61_000);
         let (b, out) = cache2.get("a.png").await.unwrap();
         assert_eq!(out, CacheOutcome::Stale);
@@ -533,8 +526,22 @@ mod tests {
         cfg.inactive_ttl_secs = 1;
         let cfg = Arc::new(cfg);
         let clock = Arc::new(MockClock::new(0));
-        let fetcher = Arc::new(StaticFetcher { bytes: b"x".to_vec(), etag: None, calls: Arc::new(AtomicUsize::new(0)), fail: None });
-        let cache = Cache::new(cfg, Arc::clone(&clock), fetcher);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = CountingBackend {
+            bytes: b"x".to_vec(),
+            etag: None,
+            calls: Arc::clone(&calls),
+            fail: None,
+        };
+        let mut slots = HashMap::new();
+        slots.insert(
+            "primary".to_string(),
+            Arc::new(crate::backend::BackendSlot {
+                backend: Arc::new(backend),
+                gate: Arc::new(Semaphore::new(3)),
+            }),
+        );
+        let cache = Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots));
         cache.get("a.png").await.unwrap();
         assert!(dir.path().join("a.png").exists());
         clock.advance(2000);

@@ -20,7 +20,7 @@ revalidate_ttl_secs = 60          # spec §3.5
 negative_ttl_secs = 60            # spec §3.6
 
 # --- per-upstream Graph throttling ---
-graph_concurrency_per_upstream = 3
+concurrency_per_upstream = 3
 retry_max_attempts = 4
 retry_base_ms = 200
 retry_max_ms = 30000

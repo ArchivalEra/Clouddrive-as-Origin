@@ -35,7 +35,8 @@ pub struct RawConfig {
     #[serde(default = "default_negative_ttl")]
     pub negative_ttl_secs: u64,
     #[serde(default = "default_concurrency")]
-    pub graph_concurrency_per_upstream: usize,
+    #[serde(alias = "graph_concurrency_per_upstream")]
+    pub concurrency_per_upstream: usize,
     #[serde(default = "default_retry_max")]
     pub retry_max_attempts: u32,
     #[serde(default = "default_retry_base")]
@@ -84,7 +85,7 @@ pub struct Config {
     pub inactive_ttl_secs: u64,
     pub revalidate_ttl_secs: u64,
     pub negative_ttl_secs: u64,
-    pub graph_concurrency_per_upstream: usize,
+    pub concurrency_per_upstream: usize,
     pub retry_max_attempts: u32,
     pub retry_base_ms: u64,
     pub retry_max_ms: u64,
@@ -140,7 +141,7 @@ impl Config {
             inactive_ttl_secs: raw.inactive_ttl_secs,
             revalidate_ttl_secs: raw.revalidate_ttl_secs,
             negative_ttl_secs: raw.negative_ttl_secs,
-            graph_concurrency_per_upstream: raw.graph_concurrency_per_upstream,
+            concurrency_per_upstream: raw.concurrency_per_upstream,
             retry_max_attempts: raw.retry_max_attempts,
             retry_base_ms: raw.retry_base_ms,
             retry_max_ms: raw.retry_max_ms,
@@ -164,7 +165,7 @@ impl Default for Config {
             inactive_ttl_secs: default_inactive_ttl(),
             revalidate_ttl_secs: default_revalidate_ttl(),
             negative_ttl_secs: default_negative_ttl(),
-            graph_concurrency_per_upstream: default_concurrency(),
+            concurrency_per_upstream: default_concurrency(),
             retry_max_attempts: default_retry_max(),
             retry_base_ms: default_retry_base(),
             retry_max_ms: default_retry_max_ms(),
