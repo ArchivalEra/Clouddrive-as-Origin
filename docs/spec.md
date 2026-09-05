@@ -1,4 +1,4 @@
-# OneDrive Pull-Through Origin Cache — Specification
+# Clouddrive-as-Origin — Multi-Backend Pull-Through Origin Shield
 
 > Handoff spec: an implementer (human or agent) can complete the
 > build without follow-up questions.
@@ -10,7 +10,10 @@
 > H2, connection management, reverse-proxy to localhost — plus
 > **axum / hyper / tokio as business plane** on `127.0.0.1` which owns
 > **all** cache semantics. Metadata store: **redb** (pure-Rust,
-> embedded, ACID). Acceptance criteria are framework-agnostic.
+> embedded, ACID). Upstream storage is abstracted behind a
+> **StorageBackend** trait (§5.1): v1 ships real **GoogleDrive** (first,
+> OAuth refresh-token flow) and **OneDrive** (Graph) providers behind
+> one flat key namespace. Acceptance criteria are framework-agnostic.
 
 ## 1. Goal
 
@@ -44,19 +47,36 @@ repo** — it is injected at runtime via an environment variable (e.g.
 
   ```toml
   [[upstreams]]
-  id = "primary"
-  drive_root_path = "/drive/root:/assets"
-  client_id = "${ONEDRIVE_PRIMARY_CLIENT_ID}"  # env reference, no literal
+  id = "od-music"
+  type = "onedrive"
+  drive_root_path = "/Music"
+  client_id_env = "OD_MUSIC_CLIENT_ID"
+  client_secret_env = "OD_MUSIC_CLIENT_SECRET"
+  refresh_token_env = "OD_MUSIC_REFRESH_TOKEN"
+
+  [[upstreams]]
+  id = "gd-albums"
+  type = "googledrive"
+  folder_id = "1A2B3C..."
+  client_id_env = "GD_CLIENT_ID"
+  client_secret_env = "GD_CLIENT_SECRET"
+  refresh_token_env = "GD_REFRESH_TOKEN"
 
   [[routes]]
-  prefix = ""          # default upstream
-  upstream = "primary"
+  prefix = "music/"     # -> od-music
+  upstream = "od-music"
+  [[routes]]
+  prefix = "albums/"    # -> gd-albums
+  upstream = "gd-albums"
+  [[routes]]
+  prefix = ""           # default (catch-all)
+  upstream = "od-music"
   ```
 
-  At request time the service resolves `key → upstream`, then calls
-  Graph `GET /me/drive/root:<drive_root_path>/<key>` to obtain
-  `@microsoft.graph.downloadUrl` and metadata (`size`, `eTag`,
-  `lastModifiedDateTime`), then fetches the `downloadUrl`.
+  At request time the service resolves `key → upstream` (longest
+  prefix first), then calls the upstream's **StorageBackend** (§5.1)
+  `stat` for metadata and `open` for bytes. The business plane never
+  knows which provider answered.
 
 - **Security hard constraints (acceptance gates):**
   - Outbound only to `https://`. Before every server-initiated request,
@@ -76,9 +96,11 @@ repo** — it is injected at runtime via an environment variable (e.g.
     or env references.
 
 - `POST /_internal/prewarm/<key>`: requires a shared-secret header
-  whose value is injected via env. On hit, no-op; on miss, fetch from
-  the owning upstream and populate the cache without streaming to the
-  caller. The upload pipeline calls this after uploading an image.
+  whose value is injected via env. On hit, no-op (200); on miss,
+  answer `202 Accepted` immediately and fetch from the owning upstream
+  in a background task (still passing single-flight and the
+  per-upstream concurrency gate). CI/CD calls this after syncing new
+  media so the first visitor is a 100% disk hit.
 
 - `GET /_internal/healthz`: `200` with basic info — entry count, disk
   usage, token status per upstream. No secrets in the response.
@@ -125,15 +147,30 @@ repo** — it is injected at runtime via an environment variable (e.g.
    as `stale-if-error` (with a `Warning` header); otherwise `502`.
    All backoff has an upper bound and jitter.
 
-8. **Range:** clients may send `Range`. For cached files, slice bytes
-   directly. For a cold miss that carries `Range`, fetching the whole
-   file is acceptable (Graph `downloadUrl` supports `Range`; serving
-   `Range` while streaming is optional — acceptance is lenient).
+8. **Range (full 206 support, dual-channel cold miss):**
+   - **Hit:** serve `206 Partial Content` from the cached file via
+     file seek (zero upstream traffic) — audio/video seek must be
+     milliseconds.
+   - **Cold miss with `Range`:** NEVER download-then-serve, and never
+     write a partial file into the cache. Dual-channel: the client
+     stream passes through immediately from the backend at the
+     requested offset (minimum TTFB), while a full-file fetch — sharing
+     the same single-flight window — populates the complete cache in
+     the background. The visitor hears the music while the cache
+     quietly becomes complete; subsequent visitors are 100% disk hits.
+   - Backend `open(key, range)` must pass the range through to the
+     source when supported (Graph `downloadUrl` and Drive `alt=media`
+     both honor `Range`).
 
 9. **Response headers:** pass through `Content-Type`, `ETag`,
    `Last-Modified`; overwrite `Cache-Control` to
    `public, max-age=31536000, immutable` (filenames carry a version
    timestamp; the upload pipeline enforces the naming discipline).
+   **MIME fallback:** many provider APIs return generic
+   `application/octet-stream` for media (`.flac`, `.webp`, `.avif`,
+   `.lrc`, ...). The business layer maintains a static extension →
+   MIME table and overrides generic/missing values, so browsers stream
+   audio/video in-player instead of popping a download dialog.
 
 10. **Survives restart:** entries and their last-access timestamps are
     persisted in **redb** so the clock and eviction order survive a
@@ -167,6 +204,37 @@ Per-upstream persisted state (all `0600`, under the data directory):
   change — no URL migration.
 - The global cache pool is shared; each entry's redb record stores
   `upstream_id` so revalidation and `prewarm` hit the correct upstream.
+
+### 5.1 StorageBackend trait (provider decoupling)
+
+Upstream storage is abstracted as a unified trait; the business plane
+only knows virtual keys and standard metadata — it never knows which
+cloud answered:
+
+```rust
+#[async_trait]
+pub trait StorageBackend: Send + Sync {
+    /// Standard remote-object metadata (size, etag/hash, mtime, mime hint).
+    async fn stat(&self, key: &Key) -> Result<ObjectMeta, BackendError>;
+    /// Read-only byte stream; passes Range through to the source when supported.
+    async fn open(&self, key: &Key, range: Option<ByteRange>)
+        -> Result<StreamSource, BackendError>;
+    /// Credential rotation + health probe (OAuth refresh, quota check).
+    async fn refresh_if_needed(&self) -> Result<(), BackendError>;
+}
+```
+
+- `StreamSource` = a byte stream (`AsyncRead`) with a known-or-unknown
+  length; `ByteRange = (offset, Option<length>)`.
+- `BackendError` is a unified enum (NotFound / RateLimited / ServerError
+  / Auth / Other) so cache semantics (negative cache, stale-if-error,
+  backoff) are provider-agnostic.
+- v1 providers: `src/backend/googledrive.rs` (first — OAuth refresh
+  token is available now) and `src/backend/onedrive.rs` (Graph port).
+  The former whole-object `Fetcher` trait is deleted; the cache core
+  becomes stream-based.
+- Adding MinIO/S3 later is a new `impl StorageBackend` plus a config
+  block — zero changes to the business plane.
 
 ## 6. Deployment & TLS
 
@@ -265,3 +333,17 @@ repo never contains `${ORIGIN_HOST}`'s real value.
 - [ ] Two-upstream routing: keys matching different prefixes hit
       different upstreams; adding a third upstream requires only a
       config change.
+- [ ] Range: cached file serves `206` via file seek; cold-miss `Range`
+      passes through from the backend at the requested offset (first
+      byte before any full download completes) while the background
+      full fetch lands a complete cache file — never a partial one.
+- [ ] MIME fallback: `.flac` / `.webp` / `.avif` served with correct
+      `Content-Type` even when the provider returns
+      `application/octet-stream`.
+- [ ] `prewarm` returns `202` immediately; the background fetch passes
+      single-flight (concurrent prewarm + visitor = one upstream fetch)
+      and `healthz` reports the prewarm queue depth.
+- [ ] GoogleDrive backend: refresh-token flow, folder-indexed key
+      resolution, `Range` passthrough — wiremock-tested end to end.
+- [ ] Restart survival holds with redb (already in §3.10) for BOTH
+      provider types.
