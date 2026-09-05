@@ -50,47 +50,51 @@ where
     C: Clock + Clone,
 {
     match state.cache.get(&key).await {
-        Ok((bytes, outcome)) => {
+        Ok(hit) => {
+            let size = hit.meta.size;
+            let complete = !matches!(hit.outcome, CacheOutcome::Miss);
+
+            // Range (spec §3.8): cached-file hits slice via file seek.
+            // Cold-miss (growing body) Range arrives with the dual-channel
+            // slice (P2-2d); until then a Range on a growing body is served
+            // whole with 200 (spec acceptance is lenient on cold misses).
             let range = headers.get("range").and_then(|v| v.to_str().ok());
-            let (body_bytes, status, content_range) = if let Some(range) = range {
-                if let Some((start, end)) = parse_range(range, bytes.len() as u64) {
-                    let end = end.unwrap_or(bytes.len() as u64);
-                    let slice = bytes[start as usize..end as usize].to_vec();
-                    let cr = format!("bytes {}-{}/{}", start, end - 1, bytes.len());
-                    (slice, StatusCode::PARTIAL_CONTENT, Some(cr))
-                } else {
-                    (bytes, StatusCode::OK, None)
+            let sliced = range.and_then(|r| parse_range(r, size)).filter(|_| complete);
+            let (status, content_range, body) = match sliced {
+                Some((start, end_excl)) => {
+                    let end = end_excl.unwrap_or(size);
+                    let cr = format!("bytes {}-{}/{}", start, end - 1, size);
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        Some(cr),
+                        crate::cache::flight::file_body(
+                            state.config.cache_dir.join(&key),
+                            start,
+                            end - start,
+                        ),
+                    )
                 }
-            } else {
-                (bytes, StatusCode::OK, None)
+                None => (StatusCode::OK, None, hit.body),
             };
 
-            info!(key = %key, outcome = ?outcome, bytes = body_bytes.len(), "cache response");
+            info!(key = %key, outcome = ?hit.outcome, size = hit.meta.size, "cache response");
 
             let mut builder = Response::builder()
                 .status(status)
                 .header("cache-control", "public, max-age=31536000, immutable");
-            if let Some(cr) = content_range {
+            if let Some(cr) = &content_range {
                 builder = builder.header("content-range", cr);
             }
-            let content_type = {
-                let s = state.cache.state.read().await;
-                s.entries.get(&key).and_then(|m| m.content_type.clone())
-            };
-            if let Some(ct) = content_type {
+            if let Some(ct) = &hit.meta.content_type {
                 builder = builder.header("content-type", ct);
             }
-            let etag = {
-                let s = state.cache.state.read().await;
-                s.entries.get(&key).and_then(|m| m.etag.clone())
-            };
-            if let Some(et) = etag {
+            if let Some(et) = &hit.meta.etag {
                 builder = builder.header("etag", et);
             }
-            if outcome == CacheOutcome::Stale {
+            if hit.outcome == CacheOutcome::Stale {
                 builder = builder.header("warning", "110 - \"Response is Stale\"");
             }
-            builder.body(Body::from(body_bytes)).unwrap()
+            builder.body(Body::from_stream(body)).unwrap()
         }
         Err(BackendError::NotFound) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
@@ -148,7 +152,16 @@ where
         return (StatusCode::OK, Json(json!({"status": "hit"}))).into_response();
     }
     match state.cache.get(&key).await {
-        Ok(_) => (StatusCode::OK, Json(json!({"status": "fetched"}))).into_response(),
+        Ok(mut hit) => {
+            // Prewarm fetches without streaming to a client: drain the body.
+            match crate::cache::flight::drain(&mut hit.body).await {
+                Ok(_) => (StatusCode::OK, Json(json!({"status": "fetched"}))).into_response(),
+                Err(e) => {
+                    warn!(key = %key, error = %e, "prewarm drain failed");
+                    (StatusCode::BAD_GATEWAY, Json(json!({"error": "upstream error"}))).into_response()
+                }
+            }
+        }
         Err(BackendError::NotFound) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
         }
@@ -202,21 +215,4 @@ where
         .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
-}
-
-pub fn skeleton_router() -> Router {
-    Router::new()
-        .route("/_internal/healthz", get(skeleton_healthz))
-        .fallback(not_found)
-}
-
-async fn skeleton_healthz() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(json!({
-            "status": "ok",
-            "plane": "business",
-            "version": env!("CARGO_PKG_VERSION"),
-        })),
-    )
 }
