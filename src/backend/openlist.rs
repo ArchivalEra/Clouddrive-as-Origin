@@ -22,9 +22,14 @@ use futures::StreamExt;
 use tokio_util::io::StreamReader;
 
 use crate::{
-    backend::{BackendError, ByteRange, DirectUrl, Key, ObjectMeta, StreamSource, StorageBackend},
+    backend::{BackendError, ByteRange, DirectUrl, Key, ListEntry, ObjectMeta, StreamSource, StorageBackend},
     config::UpstreamConfig,
 };
+
+/// Guards for recursive listings: a pathological upstream tree must not
+/// wedge the proxy. Bounds chosen well above any real media library.
+const MAX_LIST_ENTRIES: usize = 50_000;
+const MAX_LIST_DEPTH: usize = 64;
 
 /// A WebDAV resource path within the OpenList mount. Kept as a type so
 /// backends can never receive raw unvalidated input.
@@ -39,6 +44,59 @@ fn dav_path(root: &Option<String>, key: &Key) -> String {
     }
     p.push_str(key.as_str());
     p
+}
+
+/// DAV path of a listing folder: like `dav_path` but for a directory —
+/// `folder` is empty (mount root) or ends with `/`.
+fn dav_folder(root: &Option<String>, folder: &str) -> String {
+    let mut p = String::from("/");
+    if let Some(r) = root {
+        let r = r.trim_matches('/');
+        if !r.is_empty() {
+            p.push_str(r);
+            p.push('/');
+        }
+    }
+    p.push_str(folder);
+    p
+}
+
+/// Path component of the WebDAV base URL ("/dav" for
+/// "http://127.0.0.1:5244/dav"); empty when the base has no path.
+/// PROPFIND hrefs are server-path-absolute, so this prefixes every href.
+fn base_url_path(base_url: &str) -> String {
+    let rest = base_url.split_once("://").map(|(_, r)| r).unwrap_or(base_url);
+    match rest.split_once('/') {
+        Some((_, p)) if !p.is_empty() => format!("/{p}"),
+        _ => String::new(),
+    }
+}
+
+/// Decode a PROPFIND href to a raw server path (percent-decoded, always
+/// starting with `/`). Full URLs are reduced to their path component.
+fn href_to_path(href: &str) -> String {
+    let path = match href.split_once("://") {
+        Some((_, rest)) => match rest.split_once('/') {
+            Some((_, p)) => format!("/{p}"),
+            None => "/".to_string(),
+        },
+        None => href.to_string(),
+    };
+    percent_encoding::percent_decode_str(&path).decode_utf8_lossy().into_owned()
+}
+
+/// Child name of a decoded href relative to the requested folder path:
+/// `""` for the folder itself, `None` when the href is outside it.
+/// Trailing slashes are normalized away; the caller re-adds them for
+/// directories.
+fn strip_base(base: &str, href_path: &str) -> Option<String> {
+    let h = href_path.trim_end_matches('/');
+    let b = base.trim_end_matches('/');
+    let rest = h.strip_prefix(b)?;
+    if rest.is_empty() {
+        return Some(String::new());
+    }
+    rest.strip_prefix('/').map(|s| s.to_string())
 }
 
 pub struct OpenListBackend {
@@ -133,6 +191,18 @@ impl OpenListBackend {
         format!("{}{}", self.base_url, path)
     }
 
+    fn dav_client(&self) -> Result<reqwest_dav::Client, BackendError> {
+        reqwest_dav::ClientBuilder::new()
+            .set_agent(self.http.clone())
+            .set_host(self.base_url.clone())
+            .set_auth(reqwest_dav::types::Auth::Basic(
+                self.username.clone(),
+                self.password.clone(),
+            ))
+            .build()
+            .map_err(|e| BackendError::Other(format!("dav client: {e}")))
+    }
+
     fn map_status(status: u16, body: String) -> BackendError {
         match status {
             404 => BackendError::NotFound,
@@ -142,6 +212,18 @@ impl OpenListBackend {
             _ => BackendError::Other(format!("{status}: {body}")),
         }
     }
+
+    /// Defense in depth for listing folders: the business layer already
+    /// validates, but a backend must never PROPFIND an unchecked path.
+    fn validate_folder(folder: &str) -> Result<(), BackendError> {
+        if folder.contains('\0') || folder.contains('\\') || folder.starts_with('/') {
+            return Err(BackendError::Other("invalid folder".into()));
+        }
+        if folder.split('/').any(|s| s == "..") {
+            return Err(BackendError::Other("invalid folder".into()));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -149,15 +231,7 @@ impl StorageBackend for OpenListBackend {
     /// `PROPFIND Depth:0` via reqwest_dav. OpenList reports getetag (often
     /// a content hash per driver), getcontentlength, getlastmodified.
     async fn stat(&self, key: &Key) -> Result<ObjectMeta, BackendError> {
-        let dav = reqwest_dav::ClientBuilder::new()
-            .set_agent(self.http.clone())
-            .set_host(self.base_url.clone())
-            .set_auth(reqwest_dav::types::Auth::Basic(
-                self.username.clone(),
-                self.password.clone(),
-            ))
-            .build()
-            .map_err(|e| BackendError::Other(format!("dav client: {e}")))?;
+        let dav = self.dav_client()?;
         let path = dav_path(&self.root_path, key);
         let item = dav.list(&path, reqwest_dav::types::Depth::Number(0)).await;
         let items = match item {
@@ -279,19 +353,82 @@ impl StorageBackend for OpenListBackend {
 
     async fn refresh_if_needed(&self) -> Result<(), BackendError> {        // OpenList owns provider credential rotation; WebDAV basic auth has
         // no token lifecycle on our side. Health probe = cheap PROPFIND.
-        let dav = reqwest_dav::ClientBuilder::new()
-            .set_agent(self.http.clone())
-            .set_host(self.base_url.clone())
-            .set_auth(reqwest_dav::types::Auth::Basic(
-                self.username.clone(),
-                self.password.clone(),
-            ))
-            .build()
-            .map_err(|e| BackendError::Other(format!("dav client: {e}")))?;
+        let dav = self.dav_client()?;
         match dav.list("/", reqwest_dav::types::Depth::Number(0)).await {
             Ok(_) => Ok(()),
             Err(e) => Err(map_dav_error(e)),
         }
+    }
+
+    /// PROPFIND `Depth:1` per directory. Recursive mode walks the subtree
+    /// with manual BFS (one Depth:1 request per directory): `Depth:Infinity`
+    /// is optional per RFC 4918 and OpenList drivers commonly reject it,
+    /// so we never depend on it. Directories are emitted only in
+    /// non-recursive mode (they become CommonPrefixes there); recursive
+    /// mode emits files only, matching AWS `Contents`.
+    async fn list(&self, folder: &str, recursive: bool) -> Result<Vec<ListEntry>, BackendError> {
+        Self::validate_folder(folder)?;
+        let dav = self.dav_client()?;
+        let href_base = base_url_path(&self.base_url);
+        let mut out = Vec::new();
+        // BFS work item: DAV path of a directory + the key prefix its
+        // children accumulate (always `""` or ends with `/`).
+        let mut queue = vec![(dav_folder(&self.root_path, folder), folder.to_string(), 0usize)];
+        while let Some((dav_dir, key_prefix, depth)) = queue.pop() {
+            let items = dav
+                .list(&dav_dir, reqwest_dav::types::Depth::Number(1))
+                .await
+                .map_err(map_dav_error)?;
+            let base = format!("{href_base}{dav_dir}");
+            for item in items {
+                match item {
+                    reqwest_dav::types::list_cmd::ListEntity::File(f) => {
+                        let name = strip_base(&base, &href_to_path(&f.href)).unwrap_or_default();
+                        if name.is_empty() || name.ends_with('/') {
+                            continue;
+                        }
+                        out.push(ListEntry {
+                            key: format!("{key_prefix}{name}"),
+                            size: f.content_length.max(0) as u64,
+                            etag: f.tag.clone(),
+                            last_modified: Some(f.last_modified.to_rfc2822()),
+                            is_dir: false,
+                        });
+                    }
+                    reqwest_dav::types::list_cmd::ListEntity::Folder(d) => {
+                        let name = strip_base(&base, &href_to_path(&d.href)).unwrap_or_default();
+                        let name = name.trim_end_matches('/');
+                        if name.is_empty() {
+                            continue; // the requested folder itself
+                        }
+                        if recursive {
+                            if depth + 1 >= MAX_LIST_DEPTH {
+                                continue;
+                            }
+                            queue.push((
+                                format!("{dav_dir}{name}/"),
+                                format!("{key_prefix}{name}/"),
+                                depth + 1,
+                            ));
+                        } else {
+                            out.push(ListEntry {
+                                key: format!("{key_prefix}{name}/"),
+                                size: 0,
+                                etag: d.tag.clone(),
+                                last_modified: Some(d.last_modified.to_rfc2822()),
+                                is_dir: true,
+                            });
+                        }
+                    }
+                }
+            }
+            if out.len() > MAX_LIST_ENTRIES {
+                return Err(BackendError::ServerError(format!(
+                    "listing exceeds {MAX_LIST_ENTRIES} entries"
+                )));
+            }
+        }
+        Ok(out)
     }
 
     fn id(&self) -> &str {

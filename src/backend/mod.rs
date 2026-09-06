@@ -86,6 +86,19 @@ pub struct ContentRange {
     pub total: u64,
 }
 
+/// One entry from a backend listing (ListObjectsV2 support, map #24).
+/// `key` is the full key path relative to the upstream root: no leading
+/// slash, never percent-encoded. Directory entries end with `/` and carry
+/// `is_dir = true`, `size = 0`; file entries never end with `/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListEntry {
+    pub key: String,
+    pub size: u64,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub is_dir: bool,
+}
+
 impl ContentRange {
     /// Render `bytes first-last/total` (206 responses).
     pub fn header_value(&self) -> String {
@@ -192,6 +205,17 @@ pub trait StorageBackend: Send + Sync + 'static {
         Err(BackendError::Other("direct links not supported".into()))
     }
 
+    /// List entries under `folder` — a validated directory path ending
+    /// with `/`, or empty for the mount root. `recursive = false` returns
+    /// the immediate children (files AND directories); `recursive = true`
+    /// returns every file in the subtree and omits directories. The
+    /// caller filters by prefix, sorts, folds, and paginates — the
+    /// backend only does transport + href→key reconstruction. Default:
+    /// unsupported (zero changes for existing backends).
+    async fn list(&self, _folder: &str, _recursive: bool) -> Result<Vec<ListEntry>, BackendError> {
+        Err(BackendError::Other("listing not supported by this backend".into()))
+    }
+
     /// Upstream id this backend serves (for logs and redb records).
     fn id(&self) -> &str;
 }
@@ -256,11 +280,18 @@ mod tests {
         bytes: Vec<u8>,
         etag: Option<String>,
         mime: Option<String>,
+        listing: Vec<ListEntry>,
     }
 
     impl MockBackend {
         pub fn new(bytes: &[u8], etag: Option<String>, mime: Option<String>) -> Self {
-            Self { bytes: bytes.to_vec(), etag, mime }
+            Self { bytes: bytes.to_vec(), etag, mime, listing: Vec::new() }
+        }
+
+        /// Seed an in-memory listing for `list()` tests.
+        pub fn with_listing(mut self, listing: Vec<ListEntry>) -> Self {
+            self.listing = listing;
+            self
         }
     }
 
@@ -300,6 +331,18 @@ mod tests {
 
         async fn refresh_if_needed(&self) -> Result<(), BackendError> {
             Ok(())
+        }
+
+        async fn list(&self, folder: &str, recursive: bool) -> Result<Vec<ListEntry>, BackendError> {
+            Ok(self
+                .listing
+                .iter()
+                .filter(|e| {
+                    let Some(rest) = e.key.strip_prefix(folder) else { return false };
+                    recursive || !rest.trim_end_matches('/').contains('/')
+                })
+                .cloned()
+                .collect())
         }
 
         fn id(&self) -> &str {

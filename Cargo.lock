@@ -265,6 +265,7 @@ dependencies = [
  "futures",
  "http-range-header",
  "mime_guess",
+ "percent-encoding",
  "rcgen",
  "redb",
  "reqwest",
