@@ -263,6 +263,37 @@ impl<C: Clock + Clone> Cache<C> {
         Some(m.size_bytes)
     }
 
+    /// Whether a fresh (no revalidation due) memory entry exists: the
+    /// hit-first gate for the A relief valve. Pure peek — no upstream,
+    /// no mutation, no flights.
+    pub(crate) async fn memory_hit_fresh(&self, raw_key: &str) -> bool {
+        let key = match validate_key(raw_key) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        let now = self.clock.now_millis();
+        let s = self.state.read().await;
+        match s.entries.get(&key) {
+            Some(m) if m.negative_until_millis.is_none() => {
+                let age = now.saturating_sub(m.last_revalidated_millis.unwrap_or(m.created_at_millis));
+                age <= self.config.revalidate_ttl_secs * 1000
+            }
+            _ => false,
+        }
+    }
+
+    /// Background fill: full fetch + drain, no client attached. Powers the
+    /// A relief valve (307 now, bytes later) and shares the prewarm path —
+    /// one primitive, two callers.
+    pub async fn prefetch(&self, full: String, pinned: Option<(String, String)>) -> Result<(), BackendError> {
+        let mut hit = match pinned {
+            Some((backend, upstream)) => self.get_pinned(full, backend, upstream, None).await?,
+            None => self.get(&full, None).await?,
+        };
+        flight::drain(&mut hit.body).await?;
+        Ok(())
+    }
+
     /// Main entry: `GET /<key>` — streaming response. Cold misses attach
     /// to a shared download flight; hits stream the cached file; revalidation
     /// stats the upstream (no bytes) and compares etags. A Range request on

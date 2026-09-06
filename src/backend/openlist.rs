@@ -10,6 +10,10 @@
 //! Wheel reuse: `reqwest_dav` owns the PROPFIND/XML machinery for stat;
 //! the ranged GET uses our own reqwest client because the water-pipe
 //! requires a streaming body (reqwest_dav's GET does not stream).
+//! Direct links (A relief valve) come from OpenList's `/api/fs/link`
+//! endpoint (Tier 1 per R2): issue, normalize, 1-byte-probe. Header-pinned
+//! links (Tier 2) are a later ticket — they fail the probe today and fall
+//! back to proxying, with zero hardcoded driver names (D2 decision).
 
 use std::time::Duration;
 
@@ -18,7 +22,7 @@ use futures::StreamExt;
 use tokio_util::io::StreamReader;
 
 use crate::{
-    backend::{BackendError, ByteRange, Key, ObjectMeta, StreamSource, StorageBackend},
+    backend::{BackendError, ByteRange, DirectUrl, Key, ObjectMeta, StreamSource, StorageBackend},
     config::UpstreamConfig,
 };
 
@@ -44,10 +48,51 @@ pub struct OpenListBackend {
     root_path: Option<String>,
     username: String,
     password: String,
+    /// Static admin token for `/api/fs/link` (Tier 1 direct links). Read
+    /// from `link_api_token_env` when the upstream opts into
+    /// `cold_miss = "redirect"`; `None` otherwise (link never attempted).
+    api_token: Option<String>,
     /// Shared TLS-configured client: used directly for ranged streaming
     /// GETs and injected into reqwest_dav for PROPFIND (set_agent), so
     /// both paths share identical TLS policy.
     http: reqwest::Client,
+}
+
+/// `/api/fs/link` response envelope. `data.header` (server-side replay
+/// headers, possibly cookie-bearing) is deliberately ignored: we never
+/// forward it to viewers (Tier 2 resolution is a later ticket).
+#[derive(Debug, serde::Deserialize)]
+struct LinkResponse {
+    code: i64,
+    #[allow(dead_code)]
+    message: String,
+    data: Option<LinkData>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LinkData {
+    url: String,
+}
+
+/// Origin (scheme + authority) of a URL: the API root OpenList serves
+/// REST + WebDAV on, and the self-host comparator for Tier 3 detection.
+fn url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let auth = rest.split('/').next().unwrap_or("");
+    if auth.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{auth}"))
+}
+
+/// Host of a URL's authority, lowercased, brackets stripped.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let auth = rest.split('/').next().unwrap_or("");
+    if auth.is_empty() {
+        return None;
+    }
+    Some(auth.to_ascii_lowercase())
 }
 
 impl OpenListBackend {
@@ -67,12 +112,19 @@ impl OpenListBackend {
             builder = builder.danger_accept_invalid_certs(true);
         }
         let http = builder.build().map_err(|e| format!("upstream {}: http client: {e}", cfg.id))?;
+        let api_token = match &cfg.link_api_token_env {
+            Some(env) => Some(std::env::var(env).map_err(|_| {
+                format!("upstream {}: env {} not set (cold_miss redirect needs it)", cfg.id, env)
+            })?),
+            None => None,
+        };
         Ok(Self {
             id: cfg.id.clone(),
             base_url,
             root_path: cfg.root_path.clone(),
             username,
             password,
+            api_token,
             http,
         })
     }
@@ -164,8 +216,68 @@ impl StorageBackend for OpenListBackend {
         Ok(StreamSource { stream: Box::new(reader), total_len })
     }
 
-    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
-        // OpenList owns provider credential rotation; WebDAV basic auth has
+    /// Tier 1 direct link (A relief valve): issue via `/api/fs/link`,
+    /// normalize, accept only foreign https (or loopback-http) targets,
+    /// then 1-byte-probe for Range fidelity. Everything else — no token,
+    /// link error, empty/self-referential/non-https URL, probe non-206 —
+    /// is Tier 3 (`Err` = proxy instead). No driver names anywhere: the
+    /// probe result alone decides (D2 decision).
+    async fn direct_url(&self, key: &Key, viewer_ua: Option<&str>) -> Result<DirectUrl, BackendError> {
+        let no_link = |why: &str| BackendError::Other(format!("openlist: no direct link ({why})"));
+        let token = self
+            .api_token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| no_link("no link token"))?;
+        let api = url_origin(&self.base_url).ok_or_else(|| no_link("bad base_url"))?;
+        let mut req = self
+            .http
+            .post(format!("{api}/api/fs/link"))
+            .header("authorization", token)
+            .json(&serde_json::json!({ "path": dav_path(&self.root_path, key) }))
+            .timeout(Duration::from_secs(5));
+        if let Some(ua) = viewer_ua {
+            req = req.header("user-agent", ua.to_string());
+        }
+        let resp = req.send().await.map_err(|e| no_link(&format!("link api unreachable: {e}")))?;
+        let link: LinkResponse =
+            resp.json().await.map_err(|e| no_link(&format!("link decode: {e}")))?;
+        if link.code != 200 {
+            return Err(no_link(&format!("link api code {}", link.code)));
+        }
+        let mut url = link.data.map(|d| d.url).unwrap_or_default();
+        if url.is_empty() {
+            return Err(no_link("empty link url"));
+        }
+        if let Some(rest) = url.strip_prefix("//") {
+            url = format!("https://{rest}");
+        }
+        // Tier 3: self-referential (proxy-backed /p or /d on our own host)
+        // or anything the redirect policy forbids.
+        let host = url_host(&url).ok_or_else(|| no_link("relative link url"))?;
+        let own = url_host(&api).unwrap_or_default();
+        if host == own {
+            return Err(no_link("self-referential link url"));
+        }
+        if !crate::backend::redirect_target_allowed(&url) {
+            return Err(no_link("link target fails redirect policy"));
+        }
+        // Probe mimics the viewer: 1-byte Range, 206-only acceptance.
+        // Redirects are followed; the 307 target is the post-follow final
+        // URL (saves the viewer a hop).
+        let mut probe =
+            self.http.get(&url).header("range", "bytes=0-0").timeout(Duration::from_secs(5));
+        if let Some(ua) = viewer_ua {
+            probe = probe.header("user-agent", ua.to_string());
+        }
+        let presp = probe.send().await.map_err(|e| no_link(&format!("probe unreachable: {e}")))?;
+        if presp.status().as_u16() != 206 {
+            return Err(no_link(&format!("probe status {}", presp.status().as_u16())));
+        }
+        Ok(DirectUrl { url: presp.url().to_string() })
+    }
+
+    async fn refresh_if_needed(&self) -> Result<(), BackendError> {        // OpenList owns provider credential rotation; WebDAV basic auth has
         // no token lifecycle on our side. Health probe = cheap PROPFIND.
         let dav = reqwest_dav::ClientBuilder::new()
             .set_agent(self.http.clone())
