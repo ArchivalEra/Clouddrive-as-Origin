@@ -6,9 +6,12 @@ pub fn file_path(cache_dir: &Path, key: &str) -> PathBuf {
 }
 
 pub fn tmp_path(cache_dir: &Path, key: &str) -> PathBuf {
-    // .tmp.<key>.<rand> — rand suffix avoids collision under concurrent fetch.
+    // .tmp.<key>.<rand> — rand suffix avoids collision under concurrent
+    // fetch; slashes are flattened so nested keys still land in a flat
+    // temp file (the seal rename creates the nested final directory).
     let rand: u32 = rand_suffix();
-    cache_dir.join(format!(".tmp.{key}.{rand:08x}"))
+    let flat = key.replace('/', "_");
+    cache_dir.join(format!(".tmp.{flat}.{rand:08x}"))
 }
 
 fn rand_suffix() -> u32 {

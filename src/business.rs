@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::{
-    backend::BackendError,
+    backend::{BackendError, ByteRange},
     cache::cache::{Cache, CacheOutcome},
     clock::Clock,
     config::Config,
@@ -45,46 +45,35 @@ where
     )
 }
 
+fn client_range(headers: &HeaderMap) -> Option<ByteRange> {
+    let raw = headers.get("range").and_then(|v| v.to_str().ok())?;
+    // Strict RFC-9110 parsing (wheel reuse: http-range-header, same crate
+    // tower-http's range logic is built around). Multi-range requests are
+    // served whole with 200 — a server MAY ignore Range per the spec.
+    let parsed = http_range_header::parse_range_header(raw).ok()?;
+    parsed.validate(u64::MAX).ok()?.into_iter().next().map(|r| {
+        let start = *r.start();
+        let end_excl = *r.end() + 1;
+        ByteRange::bounded(start, end_excl - start)
+    })
+}
+
 async fn get_key<C>(State(state): State<AppState<C>>, Path(key): Path<String>, headers: HeaderMap) -> Response
 where
     C: Clock + Clone,
 {
-    match state.cache.get(&key).await {
+    let range = client_range(&headers);
+    match state.cache.get(&key, range).await {
         Ok(hit) => {
-            let size = hit.meta.size;
-            let complete = !matches!(hit.outcome, CacheOutcome::Miss);
-
-            // Range (spec §3.8): cached-file hits slice via file seek.
-            // Cold-miss (growing body) Range arrives with the dual-channel
-            // slice (P2-2d); until then a Range on a growing body is served
-            // whole with 200 (spec acceptance is lenient on cold misses).
-            let range = headers.get("range").and_then(|v| v.to_str().ok());
-            let sliced = range.and_then(|r| parse_range(r, size)).filter(|_| complete);
-            let (status, content_range, body) = match sliced {
-                Some((start, end_excl)) => {
-                    let end = end_excl.unwrap_or(size);
-                    let cr = format!("bytes {}-{}/{}", start, end - 1, size);
-                    (
-                        StatusCode::PARTIAL_CONTENT,
-                        Some(cr),
-                        crate::cache::flight::file_body(
-                            state.config.cache_dir.join(&key),
-                            start,
-                            end - start,
-                        ),
-                    )
-                }
-                None => (StatusCode::OK, None, hit.body),
-            };
-
+            let status =
+                if hit.content_range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
             info!(key = %key, outcome = ?hit.outcome, size = hit.meta.size, "cache response");
 
-            let mut builder = Response::builder()
-                .status(status)
-                .header("cache-control", "public, max-age=31536000, immutable");
-            if let Some(cr) = &content_range {
+            let mut builder = Response::builder().status(status);
+            if let Some(cr) = &hit.content_range {
                 builder = builder.header("content-range", cr);
             }
+            builder = builder.header("cache-control", "public, max-age=31536000, immutable");
             if let Some(ct) = &hit.meta.content_type {
                 builder = builder.header("content-type", ct);
             }
@@ -94,10 +83,13 @@ where
             if hit.outcome == CacheOutcome::Stale {
                 builder = builder.header("warning", "110 - \"Response is Stale\"");
             }
-            builder.body(Body::from_stream(body)).unwrap()
+            builder.body(Body::from_stream(hit.body)).unwrap()
         }
         Err(BackendError::NotFound) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+        }
+        Err(BackendError::RangeNotSatisfiable) => {
+            (StatusCode::RANGE_NOT_SATISFIABLE, Json(json!({"error": "range not satisfiable"}))).into_response()
         }
         Err(BackendError::RateLimited { retry_after_millis }) => {
             let mut resp = (
@@ -151,7 +143,7 @@ where
     if already {
         return (StatusCode::OK, Json(json!({"status": "hit"}))).into_response();
     }
-    match state.cache.get(&key).await {
+    match state.cache.get(&key, None).await {
         Ok(mut hit) => {
             // Prewarm fetches without streaming to a client: drain the body.
             match crate::cache::flight::drain(&mut hit.body).await {
@@ -171,22 +163,6 @@ where
 
 async fn not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
-}
-
-fn parse_range(header: &str, total: u64) -> Option<(u64, Option<u64>)> {
-    let h = header.trim();
-    let bytes = h.strip_prefix("bytes=")?;
-    let (start_s, end_s) = bytes.split_once('-')?;
-    let start: u64 = start_s.parse().ok()?;
-    let end: Option<u64> = if end_s.is_empty() {
-        None
-    } else {
-        Some(end_s.parse::<u64>().ok()? + 1)
-    };
-    if start >= total {
-        return None;
-    }
-    Some((start, end))
 }
 
 pub fn router<C>(state: AppState<C>) -> Router

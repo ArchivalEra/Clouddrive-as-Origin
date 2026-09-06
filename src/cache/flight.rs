@@ -15,6 +15,23 @@ use crate::{
 /// Body stream handed to the business plane.
 pub type BodyStream = BoxStream<'static, Result<Bytes, std::io::Error>>;
 
+/// Convert a backend stream directly into a body (dual-channel Range
+/// passthrough, spec §3.8: the client stream starts at the requested
+/// offset immediately while the full-file flight fills the cache).
+pub fn passthrough_body(mut src: StreamSource) -> BodyStream {
+    Box::pin(async_stream::try_stream! {
+        let mut buf = vec![0u8; 256 * 1024];
+        use tokio::io::AsyncReadExt;
+        loop {
+            let n = src.stream.read(&mut buf).await.map_err(|e| std::io::Error::other(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            yield Bytes::copy_from_slice(&buf[..n]);
+        }
+    })
+}
+
 #[derive(Debug, Clone)]
 pub enum FlightProgress {
     /// Driver started; metadata not yet available.
@@ -88,14 +105,22 @@ pub fn growing_reader(flight: std::sync::Arc<FlightShared>) -> BodyStream {
                 match tokio::fs::File::open(&flight.tmp_path).await {
                     Ok(f) => file = Some(f),
                     Err(_) => {
-                        let done = matches!(&*rx.borrow(), FlightProgress::Done);
-                        if done {
-                            match tokio::fs::File::open(&flight.final_path).await {
-                                Ok(f) => file = Some(f),
-                                Err(e) => Err(e)?,
+                        let st = rx.borrow().clone();
+                        match st {
+                            FlightProgress::Done => {
+                                match tokio::fs::File::open(&flight.final_path).await {
+                                    Ok(f) => file = Some(f),
+                                    Err(e) => Err(e)?,
+                                }
                             }
-                        } else if rx.changed().await.is_err() {
-                            break; // sender dropped without Done
+                            FlightProgress::Failed(e) => {
+                                Err(std::io::Error::other(format!("upstream download failed: {e}")))?;
+                            }
+                            _ => {
+                                if rx.changed().await.is_err() {
+                                    break; // sender dropped without Done
+                                }
+                            }
                         }
                         continue;
                     }

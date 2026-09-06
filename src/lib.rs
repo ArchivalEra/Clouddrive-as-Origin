@@ -5,5 +5,6 @@ pub mod clock;
 pub mod config;
 pub mod inflight;
 pub mod key;
+pub mod mime;
 pub mod routing;
 pub mod upstream;
