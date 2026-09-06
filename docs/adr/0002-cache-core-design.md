@@ -2,25 +2,38 @@
 
 Decided on the R1/R2/R3 + D1 inputs. This ADR freezes the shapes D3's test harness will mock against.
 
+> 2026-09-06 refresh (C8 prune): the OpenList pivot retired the Graph/Drive
+> world this ADR was written for. `upstream/` (registry, auth, fetch) is
+> deleted — `backend/` (`StorageBackend` trait, per-upstream gate, registry)
+> is the seam now. redb is down to one table (`entries`); the `by_last_access`
+> index and `globals` counters are deleted (reaper/evictor/healthz scan the
+> in-memory state; startup rebuilds it from `entries`). Outbound is S3-shaped
+> (business plane) with an opt-in 307 relief valve. The module tree below is
+> the current one; the 2026-08 tree is kept in git history.
+
 ## Module tree (business plane, `src/`)
 
 ```
 src/
-  main.rs       — binary entry, planes wiring
-  config.rs     — TOML → Config (already exists, P1)
-  business.rs   — axum router assembly
+  main.rs       — binary entry, planes wiring (TCP front proxy + business)
+  config.rs     — TOML → Config (upstreams, prefix routes, per-upstream cold_miss)
+  business.rs   — axum router + S3 response shaping + relief-valve 307
+  routing.rs    — longest-prefix RouteTable (+ bucket-alias pinning at the seam)
+  key.rs        — key validation (traversal rejection)
+  mime.rs       — provider-hint MIME fallback
+  inflight.rs   — generic single-flight (revalidation stats)
+  backend/
+    mod.rs      — StorageBackend trait (stat/open/refresh/direct_url),
+                  DirectUrl, redirect-target policy, BackendRegistry + gate
+    openlist.rs — WebDAV backend (PROPFIND stat, ranged GET, link+probe)
   cache/
-    mod.rs      — public Cache API (get_or_fetch, prewarm, health, tick)
-    store.rs    — disk layout (cache_dir/<key> files, .tmp.<key>.<rand> temps)
-    meta.rs     — redb schema + EntryMeta codec
-    inflight.rs — per-key single-flight (DashMap-keyed JoinSet / OnceCell)
-    fetch.rs    — Graph metadata + downloadUrl fetch, host allow-list, retry/backoff
-    evict.rs    — inactive reaper + max_size LRU scanner (both walk by_last_access)
-  upstream/
-    mod.rs      — Upstream registry, Route table (longest-prefix), per-upstream
-                  concurrency semaphore (≤3) + token state
-    auth.rs     — delegated refresh (proactive T-5m, reactive 401 single-flight,
-                  0600 atomic persist, needs_reauth surfacing)
+    mod.rs      — cache module root
+    cache.rs    — Cache: get/get_pinned, head_meta, prefetch, flights,
+                  reaper + max_size evictor (memory scans)
+    flight.rs   — water-pipe driver protocol (progress watch, readers)
+    store.rs    — disk layout (cache_dir/<key> files, tmp seal + prune)
+    meta.rs     — EntryMeta (negative tombstones, eligible-at)
+    persist.rs  — redb `entries` table (insert/remove/bump/load_all)
 
 Observability (tracing) and key validation (traversal rejection) are free
 functions on the cache boundary, not modules.
@@ -40,13 +53,13 @@ functions on the cache boundary, not modules.
 
 `store.rs` atomically replaces on revalidation-miss (`write .tmp + fsync + rename`). Startup deletes all `.tmp.*`. Parent dirs pruned when empty after eviction/expiry.
 
-## redb schema (R1 recommendation adopted)
+## redb schema (R1 recommendation adopted, C8-pruned to one table)
 
-Tables in one `Database` (`cache_dir/redb.db`):
+One table in one `Database` (`cache_dir/redb.db`):
 
-- `entries: Table<&str, &[u8]>` — key `"<key>"` → postcard `EntryMeta` (versioned).
-- `by_last_access: Table<&[u8], ()>` — key `BE64(last_access_millis) || 0x00 || key_bytes`, value `()`. Sorted = eligible-at order because `inactive_ttl` is global.
-- `globals: Table<&str, &[u8]>` — `total_bytes`, `entry_count` (avoids full scan on startup/healthz).
+- `entries: Table<&str, &[u8]>` — key `"<key>"` → serialized `EntryMeta`.
+- (Deleted C8: `by_last_access` ordered index — zero prod readers; the
+  reaper/evictor scan memory. `globals` counters — healthz reads memory.)
 
 `EntryMeta` (postcard/bincode, versioned):
 

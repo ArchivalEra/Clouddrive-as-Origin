@@ -304,10 +304,10 @@ mod tests {
         let toml = r#"
             [[upstreams]]
             id = "a"
-            drive_root_path = "/drive/root:/a"
-            client_id_env = "A_ID"
-            client_secret_env = "A_SECRET"
-            refresh_token_env = "A_TOKEN"
+            type = "openlist"
+            base_url = "http://127.0.0.1:5244/dav"
+            username_env = "A_USER"
+            password_env = "A_PASS"
             [[routes]]
             prefix = ""
             upstream = "missing"
@@ -384,10 +384,10 @@ mod tests {
         let toml = r#"
             [[upstreams]]
             id = "a"
-            drive_root_path = "/drive/root:/a"
-            client_id_env = "A_ID"
-            client_secret_env = "A_SECRET"
-            refresh_token_env = "A_TOKEN"
+            type = "openlist"
+            base_url = "http://127.0.0.1:5244/dav"
+            username_env = "A_USER"
+            password_env = "A_PASS"
             [[routes]]
             prefix = "a/"
             upstream = "a"
