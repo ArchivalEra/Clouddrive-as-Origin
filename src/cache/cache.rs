@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    backend::{BackendError, BackendRegistry, BackendSlot, Key, ObjectMeta},
+    backend::{BackendError, BackendRegistry, BackendSlot, ContentRange, Key, ObjectMeta},
     cache::{
         flight::{self, BodyStream, FlightProgress, FlightShared},
         meta::EntryMeta,
@@ -77,13 +77,13 @@ fn hit_meta_entry(key: &str, m: &EntryMeta) -> HitMeta {
 /// A cache response: headers' worth of metadata plus a streaming body
 /// (water-pipe — the body may still be downloading from the backend).
 /// `content_range` is Some for 206 responses (cached-file slices and
-/// cold-miss Range passthrough per §3.8). `content_length` is the exact
-/// byte count the body will deliver when known up front (S3 shape: the
-/// business plane renders it as `Content-Length` instead of chunked).
+/// cold-miss Range passthrough per §3.8): pure data, rendered by the
+/// response module (C3). `content_length` is the exact byte count the
+/// body will deliver when known up front.
 pub struct CacheHit {
     pub outcome: CacheOutcome,
     pub meta: HitMeta,
-    pub content_range: Option<String>,
+    pub content_range: Option<ContentRange>,
     pub content_length: Option<u64>,
     pub body: BodyStream,
 }
@@ -433,7 +433,7 @@ impl<C: Clock + Clone> Cache<C> {
                 (
                     r.offset,
                     end - r.offset,
-                    Some(format!("bytes {}-{}/{}", r.offset, end - 1, size)),
+                    Some(ContentRange { first: r.offset, last: end - 1, total: size }),
                 )
             }
         };
@@ -521,7 +521,11 @@ impl<C: Clock + Clone> Cache<C> {
                             return Ok(CacheHit {
                                 outcome: CacheOutcome::Miss,
                                 meta: meta_out,
-                                content_range: Some(format!("bytes 0-{last}/{}", meta.size_bytes)),
+                                content_range: Some(ContentRange {
+                                    first: 0,
+                                    last,
+                                    total: meta.size_bytes,
+                                }),
                                 content_length: Some(meta.size_bytes),
                                 body: flight::growing_reader(flight),
                             });
@@ -540,7 +544,11 @@ impl<C: Clock + Clone> Cache<C> {
                             return Ok(CacheHit {
                                 outcome: CacheOutcome::Miss,
                                 meta: meta_out,
-                                content_range: Some(format!("bytes {}-{}/{}", r.offset, end, meta.size_bytes)),
+                                content_range: Some(ContentRange {
+                                    first: r.offset,
+                                    last: end,
+                                    total: meta.size_bytes,
+                                }),
                                 content_length: Some(end.saturating_sub(r.offset).saturating_add(1)),
                                 body: flight::passthrough_body(src),
                             });
@@ -713,7 +721,10 @@ async fn insert_meta(
         size_bytes: meta.size_bytes,
         etag: meta.etag.clone(),
         last_modified: meta.last_modified.clone(),
-        content_type: crate::mime::resolve(key, &meta.mime_hint),
+        // Raw provider hint: MIME resolution happens once, at read time
+        // (hit_meta_*), never at write (C3). Old rows holding resolved
+        // values re-resolve idempotently (resolve passes specifics through).
+        content_type: meta.mime_hint.clone(),
         created_at_millis: s.entries.get(key).map(|m| m.created_at_millis).unwrap_or(now),
         last_access_millis: now,
         last_revalidated_millis: Some(now),

@@ -75,6 +75,29 @@ pub struct DirectUrl {
     pub url: String,
 }
 
+/// A satisfiable byte range over a known total: pure data, no HTTP. The
+/// single construction site for `Content-Range` rendering (C3) — cache
+/// builds values, the response module formats them. Invariant: `first <=
+/// last < total` (empty objects never carry a range).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentRange {
+    pub first: u64,
+    pub last: u64,
+    pub total: u64,
+}
+
+impl ContentRange {
+    /// Render `bytes first-last/total` (206 responses).
+    pub fn header_value(&self) -> String {
+        format!("bytes {}-{}/{}", self.first, self.last, self.total)
+    }
+
+    /// Render `bytes */total` (416 responses).
+    pub fn unsatisfiable(total: u64) -> String {
+        format!("bytes */{total}")
+    }
+}
+
 /// A readable byte stream with a known-or-unknown total length.
 /// `total_len` is `Some` when the provider returned it (stat or
 /// Content-Range total); the water-pipe uses it for `Content-Length`.
@@ -182,6 +205,15 @@ mod tests {
         assert_eq!(ByteRange::from_offset(0).http_header_value(), "bytes=0-");
         assert_eq!(ByteRange::from_offset(100).http_header_value(), "bytes=100-");
         assert_eq!(ByteRange::bounded(100, 50).http_header_value(), "bytes=100-149");
+    }
+
+    #[test]
+    fn content_range_rendering() {
+        assert_eq!(
+            ContentRange { first: 0, last: 9, total: 443 }.header_value(),
+            "bytes 0-9/443"
+        );
+        assert_eq!(ContentRange::unsatisfiable(443), "bytes */443");
     }
 
     #[test]

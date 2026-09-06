@@ -365,7 +365,7 @@ async fn range_on_cached_file_slices_and_reports_content_range() {
         .await
         .unwrap();
     assert_eq!(part.outcome, CacheOutcome::Hit);
-    assert_eq!(part.content_range.as_deref(), Some("bytes 2-5/10"));
+    assert_eq!(part.content_range.as_ref().map(|c| c.header_value()).as_deref(), Some("bytes 2-5/10"));
     assert_eq!(read_body(&mut part.body).await, b"2345");
     assert_eq!(calls.load(Ordering::SeqCst), before);
 }
@@ -388,7 +388,7 @@ async fn range_cold_miss_offset_zero_streams_full_with_content_range() {
         .await
         .unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
-    assert_eq!(hit.content_range.as_deref(), Some("bytes 0-9/10"));
+    assert_eq!(hit.content_range.as_ref().map(|c| c.header_value()).as_deref(), Some("bytes 0-9/10"));
     assert_eq!(read_body(&mut hit.body).await, b"0123456789");
     wait_installed(&cache, "a.png").await;
 }
@@ -414,7 +414,7 @@ async fn range_cold_miss_dual_channel_passthrough_and_background_fill() {
         .await
         .unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
-    assert_eq!(hit.content_range.as_deref(), Some("bytes 3-9/10"));
+    assert_eq!(hit.content_range.as_ref().map(|c| c.header_value()).as_deref(), Some("bytes 3-9/10"));
     assert_eq!(read_body(&mut hit.body).await, b"3456789");
     wait_installed(&cache, "a.png").await;
     assert_eq!(
