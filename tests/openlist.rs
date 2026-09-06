@@ -25,6 +25,7 @@ fn upstream(base: String) -> UpstreamConfig {
         accept_invalid_certs: false,
         cold_miss: ColdMiss::Proxy,
         link_api_token_env: Some("OPENLIST_LINK_TOKEN".into()),
+        cache_profile: "standard".into(),
     }
 }
 
@@ -179,6 +180,7 @@ async fn unknown_type_is_rejected() {
         accept_invalid_certs: false,
         cold_miss: ColdMiss::Proxy,
         link_api_token_env: None,
+        cache_profile: "standard".into(),
     };
     assert!(origin_cache::backend::OpenListBackend::from_config(&cfg).is_err());
 }
