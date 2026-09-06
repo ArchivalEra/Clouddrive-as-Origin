@@ -55,11 +55,33 @@ impl From<&EntryMeta> for HitMeta {
     }
 }
 
+/// Build response headers' metadata with MIME fallback applied (§3.9).
+fn hit_meta_remote(key: &str, m: &ObjectMeta) -> HitMeta {
+    HitMeta {
+        size: m.size_bytes,
+        etag: m.etag.clone(),
+        content_type: crate::mime::resolve(key, &m.mime_hint),
+        last_modified: m.last_modified.clone(),
+    }
+}
+
+fn hit_meta_entry(key: &str, m: &EntryMeta) -> HitMeta {
+    HitMeta {
+        size: m.size_bytes,
+        etag: m.etag.clone(),
+        content_type: crate::mime::resolve(key, &m.content_type),
+        last_modified: m.last_modified.clone(),
+    }
+}
+
 /// A cache response: headers' worth of metadata plus a streaming body
 /// (water-pipe — the body may still be downloading from the backend).
+/// `content_range` is Some for 206 responses (cached-file slices and
+/// cold-miss Range passthrough per §3.8).
 pub struct CacheHit {
     pub outcome: CacheOutcome,
     pub meta: HitMeta,
+    pub content_range: Option<String>,
     pub body: BodyStream,
 }
 
@@ -114,8 +136,15 @@ impl<C: Clock + Clone> Cache<C> {
 
     /// Main entry: `GET /<key>` — streaming response. Cold misses attach
     /// to a shared download flight; hits stream the cached file; revalidation
-    /// stats the upstream (no bytes) and compares etags.
-    pub async fn get(&self, raw_key: &str) -> Result<CacheHit, BackendError> {
+    /// stats the upstream (no bytes) and compares etags. A Range request on
+    /// a cached file slices locally; on a cold miss with offset > 0 the
+    /// backend stream passes through at that offset while the flight fills
+    /// the cache in the background (dual-channel, spec §3.8).
+    pub async fn get(
+        &self,
+        raw_key: &str,
+        range: Option<crate::backend::ByteRange>,
+    ) -> Result<CacheHit, BackendError> {
         let (key, upstream_id) =
             self.resolve_upstream(raw_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
         let slot = self
@@ -150,9 +179,12 @@ impl<C: Clock + Clone> Cache<C> {
         };
 
         if !needs_revalidate {
-            if let Some(hit) = self.serve_from_disk(&key, CacheOutcome::Hit).await {
-                self.bump_last_access(&key).await;
-                return Ok(hit);
+            match self.serve_from_disk(&key, CacheOutcome::Hit, range).await? {
+                Some(hit) => {
+                    self.bump_last_access(&key).await;
+                    return Ok(hit);
+                }
+                None => {}
             }
         } else {
             // Revalidation = stat + etag compare (G2 #11: Drive has no 304;
@@ -175,47 +207,71 @@ impl<C: Clock + Clone> Cache<C> {
             match stat {
                 Ok(stat) if cached_etag.is_some() && cached_etag == stat.meta.etag => {
                     self.bump_last_access(&key).await;
-                    if let Some(hit) = self.serve_from_disk(&key, CacheOutcome::Revalidated).await {
-                        return Ok(hit);
+                    match self.serve_from_disk(&key, CacheOutcome::Revalidated, range).await? {
+                        Some(hit) => return Ok(hit),
+                        None => {}
                     }
                 }
                 Ok(_) => {
                     // Modified (or etag vanished): forced refetch below; the
                     // old file keeps serving other readers until the rename.
-                    return self
-                        .forced_fetch(slot, key, upstream_id, now)
-                        .await;
+                    return self.forced_fetch(slot, key, upstream_id, range).await;
                 }
                 Err(BackendError::NotFound) => {
                     self.install_negative(&key, &upstream_id).await;
                     return Err(BackendError::NotFound);
                 }
                 Err(e) => {
-                    if let Some(hit) = self.serve_from_disk(&key, CacheOutcome::Stale).await {
-                        return Ok(hit);
+                    match self.serve_from_disk(&key, CacheOutcome::Stale, range).await? {
+                        Some(hit) => return Ok(hit),
+                        None => return Err(e),
                     }
-                    return Err(e);
                 }
             }
         }
 
         // Cold miss: attach-or-create the shared download flight.
-        let flight = self.attach_or_start(&key, &upstream_id, slot).await;
-        self.await_flight(flight, &key, &upstream_id, CacheOutcome::Miss, now).await
+        let flight = self.attach_or_start(&key, &upstream_id, Arc::clone(&slot)).await;
+        self.await_flight(flight, &key, &upstream_id, CacheOutcome::Miss, slot, range).await
     }
 
     /// Serve a complete cached file from disk, if both file and meta exist.
-    async fn serve_from_disk(&self, key: &str, outcome: CacheOutcome) -> Option<CacheHit> {
-        let m = self.entry_meta(key).await?;
-        if m.negative_until_millis.is_some() {
-            return None;
-        }
+    /// Returns Err(RangeNotSatisfiable) when a Range cannot be satisfied.
+    async fn serve_from_disk(
+        &self,
+        key: &str,
+        outcome: CacheOutcome,
+        range: Option<crate::backend::ByteRange>,
+    ) -> Result<Option<CacheHit>, BackendError> {
+        let m = match self.entry_meta(key).await {
+            Some(m) if m.negative_until_millis.is_none() => m,
+            _ => return Ok(None),
+        };
         let path = store::file_path(&self.config.cache_dir, key);
         if tokio::fs::metadata(&path).await.is_err() {
-            return None;
+            return Ok(None);
         }
         let size = m.size_bytes;
-        Some(CacheHit { outcome, meta: (&m).into(), body: flight::file_body(path, 0, size) })
+        let (offset, len, content_range) = match range {
+            None => (0, size, None),
+            Some(r) => {
+                if r.offset >= size {
+                    return Err(BackendError::RangeNotSatisfiable);
+                }
+                let end = r.length.map_or(size, |l| (r.offset + l).min(size));
+                (
+                    r.offset,
+                    end - r.offset,
+                    Some(format!("bytes {}-{}/{}", r.offset, end - 1, size)),
+                )
+            }
+        };
+        Ok(Some(CacheHit {
+            outcome,
+            meta: hit_meta_entry(key, &m),
+            content_range,
+            body: flight::file_body(path, offset, len),
+        }))
     }
 
     /// Attach to an existing flight for this key, or create one and spawn
@@ -253,40 +309,78 @@ impl<C: Clock + Clone> Cache<C> {
     }
 
     /// Wait for a flight's metadata, then return the streaming body.
-    /// Failed flights fall back to stale-if-error.
+    /// Range handling (§3.8): offset 0 → the growing body itself (it starts
+    /// at byte 0); offset > 0 → dual-channel passthrough from the backend at
+    /// that offset while the flight fills the cache. Failed flights fall
+    /// back to stale-if-error.
     async fn await_flight(
         &self,
         flight: Arc<FlightShared>,
         key: &str,
         upstream_id: &str,
         outcome: CacheOutcome,
-        now: u64,
+        slot: Arc<BackendSlot>,
+        range: Option<crate::backend::ByteRange>,
     ) -> Result<CacheHit, BackendError> {
-        let _ = now;
         let mut rx = flight.subscribe();
         loop {
             let st = rx.borrow().clone();
             match st {
                 FlightProgress::Meta(meta) => {
                     self.bump_last_access(key).await;
-                    return Ok(CacheHit {
-                        outcome,
-                        meta: (&meta).into(),
-                        body: flight::growing_reader(flight),
-                    });
+                    let meta_out = hit_meta_remote(key, &meta);
+                    match range {
+                        None => {
+                            return Ok(CacheHit {
+                                outcome,
+                                meta: meta_out,
+                                content_range: None,
+                                body: flight::growing_reader(flight),
+                            });
+                        }
+                        Some(r) if r.offset == 0 => {
+                            // The growing reader already streams from byte 0.
+                            let last = meta.size_bytes.saturating_sub(1);
+                            return Ok(CacheHit {
+                                outcome,
+                                meta: meta_out,
+                                content_range: Some(format!("bytes 0-{last}/{}", meta.size_bytes)),
+                                body: flight::growing_reader(flight),
+                            });
+                        }
+                        Some(r) => {
+                            // Dual-channel: client stream passes through at
+                            // the offset; the flight keeps filling the cache.
+                            if r.offset >= meta.size_bytes {
+                                return Err(BackendError::RangeNotSatisfiable);
+                            }
+                            let _permit = slot.gate.acquire().await;
+                            let src = slot.backend.open(&Key::from_validated(key.to_string()), Some(r)).await?;
+                            let end = r
+                                .length
+                                .map_or(meta.size_bytes.saturating_sub(1), |l| (r.offset + l - 1).min(meta.size_bytes - 1));
+                            return Ok(CacheHit {
+                                outcome,
+                                meta: meta_out,
+                                content_range: Some(format!("bytes {}-{}/{}", r.offset, end, meta.size_bytes)),
+                                body: flight::passthrough_body(src),
+                            });
+                        }
+                    }
                 }
                 FlightProgress::Done => {
                     // Late attacher: the whole flight finished before we
                     // subscribed (watch keeps only the latest value). The
                     // file is sealed and its meta installed — serve disk.
-                    if let Some(hit) = self.serve_from_disk(key, outcome).await {
+                    if let Some(hit) = self.serve_from_disk(key, outcome, range).await? {
                         return Ok(hit);
                     }
                     return Err(BackendError::Other("flight done but entry missing".into()));
                 }
                 FlightProgress::Failed(e) => {
-                    if let Some(hit) = self.serve_from_disk(key, CacheOutcome::Stale).await {
-                        return Ok(hit);
+                    match self.serve_from_disk(key, CacheOutcome::Stale, range).await? {
+                        Some(hit) => return Ok(hit),
+                        None => {}
                     }
                     if matches!(e, BackendError::NotFound) {
                         self.install_negative(key, upstream_id).await;
@@ -310,7 +404,7 @@ impl<C: Clock + Clone> Cache<C> {
         slot: Arc<BackendSlot>,
         key: String,
         upstream_id: String,
-        now: u64,
+        range: Option<crate::backend::ByteRange>,
     ) -> Result<CacheHit, BackendError> {
         let flight = Arc::new(FlightShared::new(
             store::tmp_path(&self.config.cache_dir, &key),
@@ -326,8 +420,7 @@ impl<C: Clock + Clone> Cache<C> {
         tokio::spawn(async move {
             drive_flight(driver_f, driver_slot, driver_key, driver_up, cfg, state, flights_none(), clock).await;
         });
-        let _ = now;
-        self.await_flight(flight, &key, &upstream_id, CacheOutcome::Miss, self.clock.now_millis()).await
+        self.await_flight(flight, &key, &upstream_id, CacheOutcome::Miss, slot, range).await
     }
 
     async fn try_serve_cached(&self, key: &str) -> Option<Vec<u8>> {
@@ -444,7 +537,7 @@ async fn insert_meta(
         size_bytes: meta.size_bytes,
         etag: meta.etag.clone(),
         last_modified: meta.last_modified.clone(),
-        content_type: meta.mime_hint.clone(),
+        content_type: crate::mime::resolve(key, &meta.mime_hint),
         created_at_millis: s.entries.get(key).map(|m| m.created_at_millis).unwrap_or(now),
         last_access_millis: now,
         last_revalidated_millis: Some(now),
@@ -591,7 +684,7 @@ mod tests {
     async fn miss_then_hit() {
         let dir = tempdir().unwrap();
         let (_cfg, _clock, cache, _calls) = test_cache(dir.path().to_path_buf(), b"hello", Some("v1"), None);
-        let mut hit = cache.get("a.png").await.unwrap();
+        let mut hit = cache.get("a.png", None).await.unwrap();
         assert_eq!(hit.outcome, CacheOutcome::Miss);
         let b = read_body(&mut hit.body).await;
         assert_eq!(b, b"hello");
@@ -602,7 +695,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let mut hit2 = cache.get("a.png").await.unwrap();
+        let mut hit2 = cache.get("a.png", None).await.unwrap();
         assert_eq!(hit2.outcome, CacheOutcome::Hit);
         let b2 = read_body(&mut hit2.body).await;
         assert_eq!(b2, b"hello");
@@ -629,18 +722,18 @@ mod tests {
             Arc::new(BackendSlot { backend: Arc::new(backend), gate: Arc::new(tokio::sync::Semaphore::new(3)) }),
         );
         let cache = Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots));
-        assert!(matches!(cache.get("missing.png").await, Err(BackendError::NotFound)));
-        assert!(matches!(cache.get("missing.png").await, Err(BackendError::NotFound)));
+        assert!(matches!(cache.get("missing.png", None).await, Err(BackendError::NotFound)));
+        assert!(matches!(cache.get("missing.png", None).await, Err(BackendError::NotFound)));
         clock.advance(3000);
         cache.tick().await;
-        assert!(matches!(cache.get("missing.png").await, Err(BackendError::NotFound)));
+        assert!(matches!(cache.get("missing.png", None).await, Err(BackendError::NotFound)));
     }
 
     #[tokio::test]
     async fn stale_if_error_serves_cached() {
         let dir = tempdir().unwrap();
         let (cfg, clock, cache, _calls) = test_cache(dir.path().to_path_buf(), b"cached", Some("v1"), None);
-        let mut hit = cache.get("a.png").await.unwrap();
+        let mut hit = cache.get("a.png", None).await.unwrap();
         assert_eq!(read_body(&mut hit.body).await, b"cached");
         for _ in 0..100 {
             if cache.state.read().await.entries.contains_key("a.png") {
@@ -668,7 +761,7 @@ mod tests {
             *s2 = std::mem::take(&mut *state.write().await);
         }
         clock.advance(61_000);
-        let mut hit2 = cache2.get("a.png").await.unwrap();
+        let mut hit2 = cache2.get("a.png", None).await.unwrap();
         assert_eq!(hit2.outcome, CacheOutcome::Stale);
         assert_eq!(read_body(&mut hit2.body).await, b"cached");
     }
@@ -694,7 +787,7 @@ mod tests {
             Arc::new(BackendSlot { backend: Arc::new(backend), gate: Arc::new(tokio::sync::Semaphore::new(3)) }),
         );
         let cache = Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots));
-        let mut hit = cache.get("a.png").await.unwrap();
+        let mut hit = cache.get("a.png", None).await.unwrap();
         read_body(&mut hit.body).await;
         for _ in 0..100 {
             if cache.state.read().await.entries.contains_key("a.png") {

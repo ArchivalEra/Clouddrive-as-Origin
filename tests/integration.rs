@@ -33,17 +33,34 @@ impl StorageBackend for CountingBackend {
             size_bytes: self.bytes.len() as u64,
             etag: self.etag.clone(),
             last_modified: None,
-            mime_hint: Some("image/png".into()),
+            mime_hint: Some("application/octet-stream".into()),
         })
     }
 
-    async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
+    async fn open(&self, _key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(e) = &self.fail {
             return Err(e.clone());
         }
+        let bytes: Vec<u8> = match range {
+            None => self.bytes.clone(),
+            Some(r) => {
+                let start = r.offset as usize;
+                if start > self.bytes.len() {
+                    return Err(BackendError::RangeNotSatisfiable);
+                }
+                match r.length {
+                    None => self.bytes[start..].to_vec(),
+                    Some(len) => {
+                        let end = (start + len as usize).min(self.bytes.len());
+                        self.bytes[start..end].to_vec()
+                    }
+                }
+            }
+        };
         Ok(StreamSource {
-            stream: Box::new(std::io::Cursor::new(self.bytes.clone())),
+            stream: Box::new(std::io::Cursor::new(bytes)),
+            // total_len = FULL object length (trait contract), not the slice.
             total_len: Some(self.bytes.len() as u64),
         })
     }
@@ -110,7 +127,7 @@ async fn single_flight_20_concurrent_same_key_one_fetch() {
     for _ in 0..20 {
         let c = Arc::clone(&cache);
         handles.push(tokio::spawn(async move {
-            let mut hit = c.get("same.png").await?;
+            let mut hit = c.get("same.png", None).await?;
             let mut body = hit.body;
             origin_cache::cache::flight::drain(&mut body)
                 .await
@@ -161,7 +178,7 @@ async fn inactive_ttl_expiry_removes_file_and_meta() {
         fail: None,
     };
     let cache = Cache::new(cfg, Arc::clone(&clock), registry_with(Arc::new(backend)));
-    let mut hit = cache.get("a.png").await.unwrap();
+    let mut hit = cache.get("a.png", None).await.unwrap();
     read_body(&mut hit.body).await;
     wait_installed(&cache, "a.png").await;
     assert!(dir.path().join("a.png").exists());
@@ -189,7 +206,7 @@ async fn max_size_evicts_lru_order() {
     };
     let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend)));
     for k in ["a.png", "b.png", "c.png"] {
-        let mut hit = cache.get(k).await.unwrap();
+        let mut hit = cache.get(k, None).await.unwrap();
         read_body(&mut hit.body).await;
         wait_installed(&cache, k).await;
         clock.advance(10);
@@ -248,7 +265,7 @@ async fn revalidation_uses_stat_and_serves_updated_content() {
         registry_with(Arc::new(VersionedBackend { version: Arc::clone(&version) })),
     );
 
-    let hit = cache.get("a.png").await.unwrap();
+    let hit = cache.get("a.png", None).await.unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
     let mut hit = hit;
     assert_eq!(read_body(&mut hit.body).await, b"bytes-v1");
@@ -257,13 +274,13 @@ async fn revalidation_uses_stat_and_serves_updated_content() {
     version.store(2, Ordering::SeqCst);
     clock.advance(2000); // past revalidate ttl
 
-    let mut hit2 = cache.get("a.png").await.unwrap();
+    let mut hit2 = cache.get("a.png", None).await.unwrap();
     assert_eq!(hit2.outcome, CacheOutcome::Miss); // stat: v2 != cached v1 -> refetch
     assert_eq!(read_body(&mut hit2.body).await, b"bytes-v2");
     wait_installed(&cache, "a.png").await;
 
     // Third get within ttl: fresh hit, no upstream.
-    let mut hit3 = cache.get("a.png").await.unwrap();
+    let mut hit3 = cache.get("a.png", None).await.unwrap();
     assert_eq!(hit3.outcome, CacheOutcome::Hit);
     assert_eq!(read_body(&mut hit3.body).await, b"bytes-v2");
 }
@@ -285,12 +302,12 @@ async fn revalidation_not_modified_serves_revalidated() {
         fail: None,
     };
     let cache = Cache::new(cfg, Arc::clone(&clock), registry_with(Arc::new(backend)));
-    let mut hit = cache.get("a.png").await.unwrap();
+    let mut hit = cache.get("a.png", None).await.unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
     assert_eq!(read_body(&mut hit.body).await, b"stable");
     wait_installed(&cache, "a.png").await;
     clock.advance(2000);
-    let mut hit2 = cache.get("a.png").await.unwrap();
+    let mut hit2 = cache.get("a.png", None).await.unwrap();
     assert_eq!(hit2.outcome, CacheOutcome::Revalidated);
     assert_eq!(read_body(&mut hit2.body).await, b"stable");
 }
@@ -308,14 +325,148 @@ async fn traversal_payloads_are_400_via_fetch_error() {
         fail: None,
     };
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
-    let err = match cache.get("../etc/passwd").await {
+    let err = match cache.get("../etc/passwd", None).await {
         Err(e) => e,
         Ok(_) => panic!("traversal key must not resolve"),
     };
     assert!(matches!(err, BackendError::Other(_)));
-    let err2 = match cache.get("%2e%2e%2fetc/passwd").await {
+    let err2 = match cache.get("%2e%2e%2fetc/passwd", None).await {
         Err(e) => e,
         Ok(_) => panic!("encoded traversal key must not resolve"),
     };
     assert!(matches!(err2, BackendError::Other(_)));
+}
+
+#[tokio::test]
+async fn range_on_cached_file_slices_and_reports_content_range() {
+    let dir = tempdir().unwrap();
+    let cfg = test_config(dir.path().to_path_buf());
+    let clock = Arc::new(MockClock::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = CountingBackend {
+        bytes: b"0123456789".to_vec(),
+        etag: Some("v1".into()),
+        calls: Arc::clone(&calls),
+        fail: None,
+    };
+    let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
+    let mut full = cache.get("a.png", None).await.unwrap();
+    read_body(&mut full.body).await;
+    wait_installed(&cache, "a.png").await;
+
+    // Cached-file Range: sliced via file seek, no upstream traffic.
+    let before = calls.load(Ordering::SeqCst);
+    let mut part = cache
+        .get("a.png", Some(ByteRange::bounded(2, 4)))
+        .await
+        .unwrap();
+    assert_eq!(part.outcome, CacheOutcome::Hit);
+    assert_eq!(part.content_range.as_deref(), Some("bytes 2-5/10"));
+    assert_eq!(read_body(&mut part.body).await, b"2345");
+    assert_eq!(calls.load(Ordering::SeqCst), before);
+}
+
+#[tokio::test]
+async fn range_cold_miss_offset_zero_streams_full_with_content_range() {
+    let dir = tempdir().unwrap();
+    let cfg = test_config(dir.path().to_path_buf());
+    let clock = Arc::new(MockClock::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = CountingBackend {
+        bytes: b"0123456789".to_vec(),
+        etag: None,
+        calls: Arc::clone(&calls),
+        fail: None,
+    };
+    let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
+    let mut hit = cache
+        .get("a.png", Some(ByteRange::from_offset(0)))
+        .await
+        .unwrap();
+    assert_eq!(hit.outcome, CacheOutcome::Miss);
+    assert_eq!(hit.content_range.as_deref(), Some("bytes 0-9/10"));
+    assert_eq!(read_body(&mut hit.body).await, b"0123456789");
+    wait_installed(&cache, "a.png").await;
+}
+
+#[tokio::test]
+async fn range_cold_miss_dual_channel_passthrough_and_background_fill() {
+    let dir = tempdir().unwrap();
+    let cfg = test_config(dir.path().to_path_buf());
+    let clock = Arc::new(MockClock::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = CountingBackend {
+        bytes: b"0123456789".to_vec(),
+        etag: None,
+        calls: Arc::clone(&calls),
+        fail: None,
+    };
+    let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
+
+    // Cold miss seeking to byte 3: client gets bytes 3.. immediately
+    // (passthrough), while the full flight fills the cache in background.
+    let mut hit = cache
+        .get("a.png", Some(ByteRange::from_offset(3)))
+        .await
+        .unwrap();
+    assert_eq!(hit.outcome, CacheOutcome::Miss);
+    assert_eq!(hit.content_range.as_deref(), Some("bytes 3-9/10"));
+    assert_eq!(read_body(&mut hit.body).await, b"3456789");
+    wait_installed(&cache, "a.png").await;
+    assert_eq!(
+        std::fs::read(dir.path().join("a.png")).unwrap(),
+        b"0123456789".to_vec(),
+        "background flight must land a COMPLETE cache file"
+    );
+
+    // Next access is a full disk hit.
+    let mut hit2 = cache.get("a.png", None).await.unwrap();
+    assert_eq!(hit2.outcome, CacheOutcome::Hit);
+    assert_eq!(read_body(&mut hit2.body).await, b"0123456789");
+}
+
+#[tokio::test]
+async fn unsatisfiable_range_rejected() {
+    let dir = tempdir().unwrap();
+    let cfg = test_config(dir.path().to_path_buf());
+    let clock = Arc::new(MockClock::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = CountingBackend {
+        bytes: b"short".to_vec(),
+        etag: None,
+        calls: Arc::clone(&calls),
+        fail: None,
+    };
+    let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
+    let mut hit = cache.get("a.png", None).await.unwrap();
+    read_body(&mut hit.body).await;
+    wait_installed(&cache, "a.png").await;
+
+    let err = match cache
+        .get("a.png", Some(ByteRange::from_offset(99)))
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("out-of-bounds range must be rejected"),
+    };
+    assert!(matches!(err, BackendError::RangeNotSatisfiable));
+}
+
+#[tokio::test]
+async fn mime_fallback_overrides_octet_stream() {
+    let dir = tempdir().unwrap();
+    let cfg = test_config(dir.path().to_path_buf());
+    let clock = Arc::new(MockClock::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    // CountingBackend always hints application/octet-stream.
+    let backend = CountingBackend {
+        bytes: b"id3".to_vec(),
+        etag: None,
+        calls: Arc::clone(&calls),
+        fail: None,
+    };
+    let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
+    let mut hit = cache.get("music/dazbee.flac", None).await.unwrap();
+    read_body(&mut hit.body).await;
+    assert_eq!(hit.meta.content_type.as_deref(), Some("audio/flac"));
 }

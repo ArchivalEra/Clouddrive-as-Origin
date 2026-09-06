@@ -86,6 +86,9 @@ pub enum BackendError {
     /// Credential invalid/revoked — needs re-auth; surfaced in healthz.
     #[error("authentication required (re-auth needed)")]
     AuthRequired,
+    /// Client requested a Range beyond the object size (HTTP 416).
+    #[error("range not satisfiable")]
+    RangeNotSatisfiable,
     /// Includes SSRF allow-list rejections and malformed responses.
     #[error("backend error: {0}")]
     Other(String),
