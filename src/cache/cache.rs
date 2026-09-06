@@ -101,6 +101,12 @@ pub struct Cache<C: Clock> {
     pub clock: Arc<C>,
     pub backends: BackendRegistry,
     pub state: Arc<RwLock<CacheState>>,
+    /// redb-backed metadata persistence (spec §3.10: entries + access clock
+    /// + eviction order survive restarts).
+    pub meta: Arc<crate::cache::persist::MetaStore>,
+    /// Access-clock bumps awaiting the coalesced flush (R1: per-hit fsync
+    /// would bottleneck; flush at most once per second).
+    pub dirty_access: Arc<Mutex<HashMap<String, u64>>>,
     /// In-flight cold-miss downloads, keyed by cache key. Inserted
     /// synchronously before any await so every concurrent caller attaches
     /// to the same flight (no TOCTOU stampede window).
@@ -117,15 +123,59 @@ struct StatData {
 impl<C: Clock + Clone> Cache<C> {
     pub fn new(config: Arc<Config>, clock: Arc<C>, backends: BackendRegistry) -> Self {
         let routes = config.routes.clone();
+        let meta = Arc::new(crate::cache::persist::MetaStore::open(&config.cache_dir.join("redb.db")).expect("open redb metadata store"));
+        let dirty_access = Arc::new(Mutex::new(HashMap::new()));
         Self {
             config,
             clock,
             backends,
             state: Arc::new(RwLock::new(CacheState::default())),
+            meta,
+            dirty_access,
             flights: Arc::new(Mutex::new(HashMap::new())),
             reval_inflight: Inflight::new(),
             routes,
         }
+    }
+
+    /// Startup: load persisted entries (drop rows whose file vanished),
+    /// sweep partial-download temps, and start the coalesced flush task.
+    pub async fn load_and_start(&self) {
+        // Startup self-heal (spec §3.10): temp files from crashed downloads.
+        let _ = store::cleanup_tmps(&self.config.cache_dir);
+
+        let persisted = self.meta.load_all().await.unwrap_or_default();
+        let mut state = self.state.write().await;
+        for m in persisted {
+            let path = store::file_path(&self.config.cache_dir, &m.key);
+            if tokio::fs::metadata(&path).await.is_ok() {
+                state.total_bytes += m.size_bytes;
+                state.entries.insert(m.key.clone(), m);
+            } else {
+                // File lost while we were down — drop the row too.
+                let _ = self.meta.remove(&m.key).await;
+            }
+        }
+
+        // Coalesced access-clock flusher: at most one redb write per second
+        // no matter the hit rate (R1: fsync is the bottleneck).
+        let dirty = Arc::clone(&self.dirty_access);
+        let meta = Arc::clone(&self.meta);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(1000));
+            loop {
+                tick.tick().await;
+                let batch: Vec<(String, u64)> = {
+                    let mut d = dirty.lock().await;
+                    d.drain().collect()
+                };
+                for (key, ms) in batch {
+                    if let Err(e) = meta.bump_last_access(&key, ms).await {
+                        tracing::warn!(key = %key, error = %e, "access-clock flush failed");
+                    }
+                }
+            }
+        });
     }
 
     pub fn resolve_upstream(&self, raw_key: &str) -> Result<(String, String), crate::key::KeyError> {
@@ -300,10 +350,11 @@ impl<C: Clock + Clone> Cache<C> {
         let driver_up = upstream_id.to_string();
         let cfg = Arc::clone(&self.config);
         let state = Arc::clone(&self.state);
+        let meta_store = Arc::clone(&self.meta);
         let flights = Arc::clone(&self.flights);
         let clock = Arc::clone(&self.clock);
         tokio::spawn(async move {
-            drive_flight(driver_f, driver_slot, driver_key, driver_up, cfg, state, flights, clock).await;
+            drive_flight(driver_f, driver_slot, driver_key, driver_up, cfg, state, meta_store, flights, clock).await;
         });
         f
     }
@@ -416,9 +467,10 @@ impl<C: Clock + Clone> Cache<C> {
         let driver_up = upstream_id.clone();
         let cfg = Arc::clone(&self.config);
         let state = Arc::clone(&self.state);
+        let meta_store = Arc::clone(&self.meta);
         let clock = Arc::clone(&self.clock);
         tokio::spawn(async move {
-            drive_flight(driver_f, driver_slot, driver_key, driver_up, cfg, state, flights_none(), clock).await;
+            drive_flight(driver_f, driver_slot, driver_key, driver_up, cfg, state, meta_store, flights_none(), clock).await;
         });
         self.await_flight(flight, &key, &upstream_id, CacheOutcome::Miss, slot, range).await
     }
@@ -434,39 +486,43 @@ impl<C: Clock + Clone> Cache<C> {
 
     async fn bump_last_access(&self, key: &str) {
         let now = self.clock.now_millis();
-        let mut s = self.state.write().await;
-        if let Some(m) = s.entries.get_mut(key) {
-            m.last_access_millis = now;
+        {
+            let mut s = self.state.write().await;
+            if let Some(m) = s.entries.get_mut(key) {
+                m.last_access_millis = now;
+            }
         }
+        // Coalesced redb flush (R1): mark dirty; the flusher writes at most
+        // once per second across all keys.
+        self.dirty_access.lock().await.insert(key.to_string(), now);
     }
 
     async fn install_negative(&self, key: &str, upstream_id: &str) {
         let now = self.clock.now_millis();
         let until = now + self.config.negative_ttl_secs * 1000;
+        let entry = EntryMeta {
+            version: 1,
+            upstream_id: upstream_id.to_string(),
+            key: key.to_string(),
+            size_bytes: 0,
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            created_at_millis: now,
+            last_access_millis: now,
+            last_revalidated_millis: None,
+            negative_until_millis: Some(until),
+        };
+        let _ = self.meta.insert(&entry).await;
         let mut s = self.state.write().await;
-        s.entries.insert(
-            key.to_string(),
-            EntryMeta {
-                version: 1,
-                upstream_id: upstream_id.to_string(),
-                key: key.to_string(),
-                size_bytes: 0,
-                etag: None,
-                last_modified: None,
-                content_type: None,
-                created_at_millis: now,
-                last_access_millis: now,
-                last_revalidated_millis: None,
-                negative_until_millis: Some(until),
-            },
-        );
+        s.entries.insert(key.to_string(), entry);
     }
 
     /// Drive both reapers: inactive expiry + max_size LRU. Called by `tick()`.
     pub async fn tick(&self) {
         let now = self.clock.now_millis();
         let mut s = self.state.write().await;
-        reap(&mut s, &self.config, now).await;
+        reap(&mut s, &self.config, &self.meta, now).await;
     }
 
     /// Serve a byte range from the cached file (spec §3.8).
@@ -486,8 +542,9 @@ fn flights_none() -> Arc<Mutex<HashMap<String, Arc<FlightShared>>>> {
 }
 
 /// One cold-miss download driver: gate → stat → publish Meta → pump to
-/// temp file → seal (rename) → install metadata row → Done. Detached from
-/// its creator so a disconnecting client never kills the download.
+/// temp file → seal (rename) → install metadata row (disk + redb) → Done.
+/// Detached from its creator so a disconnecting client never kills the
+/// download.
 async fn drive_flight<C: Clock>(
     flight: Arc<FlightShared>,
     slot: Arc<BackendSlot>,
@@ -495,6 +552,7 @@ async fn drive_flight<C: Clock>(
     upstream_id: String,
     config: Arc<Config>,
     state: Arc<RwLock<CacheState>>,
+    meta_store: Arc<crate::cache::persist::MetaStore>,
     flights: Arc<Mutex<HashMap<String, Arc<FlightShared>>>>,
     clock: Arc<C>,
 ) {
@@ -510,7 +568,7 @@ async fn drive_flight<C: Clock>(
 
     match outcome {
         Ok(meta) => {
-            insert_meta(&state, &config, k.as_str(), &upstream_id, &meta, clock.now_millis()).await;
+            insert_meta(&state, &config, &meta_store, k.as_str(), &upstream_id, &meta, clock.now_millis()).await;
             let _ = flight.progress_tx.send(FlightProgress::Done);
         }
         Err(e) => {
@@ -523,6 +581,7 @@ async fn drive_flight<C: Clock>(
 async fn insert_meta(
     state: &RwLock<CacheState>,
     config: &Config,
+    meta_store: &crate::cache::persist::MetaStore,
     key: &str,
     upstream_id: &str,
     meta: &ObjectMeta,
@@ -543,13 +602,18 @@ async fn insert_meta(
         last_revalidated_millis: Some(now),
         negative_until_millis: None,
     };
+    // Persist first: on crash between redb and memory, startup rebuilds
+    // memory from redb; the reverse order would lose the row.
+    if let Err(e) = meta_store.insert(&entry).await {
+        tracing::error!(key = %key, error = %e, "redb insert failed");
+    }
     s.total_bytes = s.total_bytes.saturating_sub(old_size) + entry.size_bytes;
     s.entries.insert(key.to_string(), entry);
-    evict_if_needed(&mut s, config).await;
+    evict_if_needed(&mut s, config, meta_store).await;
 }
 
 /// Inactive expiry + max_size LRU over one state lock hold.
-async fn reap(state: &mut CacheState, config: &Config, now: u64) {
+async fn reap(state: &mut CacheState, config: &Config, meta_store: &crate::cache::persist::MetaStore, now: u64) {
     let ttl_ms = config.inactive_ttl_secs * 1000;
     let expired: Vec<String> = state
         .entries
@@ -565,14 +629,15 @@ async fn reap(state: &mut CacheState, config: &Config, now: u64) {
     for k in expired {
         if let Some(m) = state.entries.remove(&k) {
             state.total_bytes = state.total_bytes.saturating_sub(m.size_bytes);
+            let _ = meta_store.remove(&k).await;
             let path = store::file_path(&config.cache_dir, &k);
             let _ = tokio::fs::remove_file(&path).await;
         }
     }
-    evict_if_needed(state, config).await;
+    evict_if_needed(state, config, meta_store).await;
 }
 
-async fn evict_if_needed(state: &mut CacheState, config: &Config) {
+async fn evict_if_needed(state: &mut CacheState, config: &Config, meta_store: &crate::cache::persist::MetaStore) {
     while state.total_bytes > config.max_size_bytes && !state.entries.is_empty() {
         let victim = state
             .entries
@@ -583,6 +648,7 @@ async fn evict_if_needed(state: &mut CacheState, config: &Config) {
         if let Some(k) = victim {
             if let Some(m) = state.entries.remove(&k) {
                 state.total_bytes = state.total_bytes.saturating_sub(m.size_bytes);
+                let _ = meta_store.remove(&k).await;
                 let path = store::file_path(&config.cache_dir, &k);
                 let _ = tokio::fs::remove_file(&path).await;
                 store::prune_empty_parents(&config.cache_dir, &path);

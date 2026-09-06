@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), clock, BackendRegistry::new(slots)));
+    cache.load_and_start().await;
     let app_state = origin_cache::business::AppState { cache, config: Arc::clone(&cfg) };
 
     let business_addr = cfg.listen_addr;

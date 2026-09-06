@@ -36,6 +36,7 @@ mime_guess = "2"
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 tokio-util = { version = "0.7", features = ["io"] }
 reqwest_dav = "0.3"
+redb = "2"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
