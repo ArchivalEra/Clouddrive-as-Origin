@@ -302,3 +302,213 @@ async fn direct_url_without_token_is_unavailable() {
     let err = b.direct_url(&Key::from_validated("f.bin".into()), None).await.unwrap_err();
     assert!(matches!(err, BackendError::Other(_)), "got {err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Listing (ListObjectsV2 support): PROPFIND Depth:1 mapping, manual BFS for
+// recursive mode, href -> key reconstruction.
+// ---------------------------------------------------------------------------
+
+/// Multistatus XML for one directory listing: the folder itself, two
+/// files, and one subdirectory — the shape OpenList returns for Depth:1.
+fn propfind_dir_xml(dir_href: &str, files: &[(&str, u64)], subdirs: &[&str]) -> String {
+    let mut responses = format!(
+        r#"<D:response>
+    <D:href>{dir_href}</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getlastmodified>Wed, 21 Oct 2026 07:28:00 GMT</D:getlastmodified>
+        <D:resourcetype><D:collection/></D:resourcetype>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>"#
+    );
+    for (href, size) in files {
+        responses.push_str(&format!(
+            r#"
+  <D:response>
+    <D:href>{href}</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"e1"</D:getetag>
+        <D:getcontentlength>{size}</D:getcontentlength>
+        <D:getcontenttype>application/octet-stream</D:getcontenttype>
+        <D:getlastmodified>Wed, 21 Oct 2026 07:28:00 GMT</D:getlastmodified>
+        <D:resourcetype/>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>"#
+        ));
+    }
+    for href in subdirs {
+        responses.push_str(&format!(
+            r#"
+  <D:response>
+    <D:href>{href}</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getlastmodified>Wed, 21 Oct 2026 07:28:00 GMT</D:getlastmodified>
+        <D:resourcetype><D:collection/></D:resourcetype>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>"#
+        ));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  {responses}
+</D:multistatus>"#
+    )
+}
+
+fn entry_key(e: &origin_cache::backend::ListEntry) -> (&str, bool) {
+    (e.key.as_str(), e.is_dir)
+}
+
+#[tokio::test]
+async fn list_depth1_maps_files_and_folders() {
+    let server = MockServer::start().await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/media/"))
+        .and(header("Depth", "1"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(propfind_dir_xml(
+            "/media/",
+            &[("/media/a.flac", 10), ("/media/b.mp3", 20)],
+            &["/media/sub/"],
+        )))
+        .mount(&server)
+        .await;
+    let b = backend_for(server.uri());
+    let entries = b.list("media/", false).await.unwrap();
+    let mut got: Vec<_> = entries.iter().map(entry_key).collect();
+    got.sort();
+    assert_eq!(got, vec![("media/a.flac", false), ("media/b.mp3", false), ("media/sub/", true)]);
+    let a = entries.iter().find(|e| e.key == "media/a.flac").unwrap();
+    assert_eq!(a.size, 10);
+    assert_eq!(a.etag.as_deref(), Some("\"e1\""));
+    assert!(a.last_modified.is_some());
+}
+
+#[tokio::test]
+async fn list_bucket_root_folder() {
+    let server = MockServer::start().await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/media/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(propfind_dir_xml(
+            "/media/",
+            &[("/media/x.bin", 5)],
+            &[],
+        )))
+        .mount(&server)
+        .await;
+    let b = backend_for(server.uri());
+    let entries = b.list("media/", false).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key, "media/x.bin");
+}
+
+#[tokio::test]
+async fn list_with_root_path_strips_mount_prefix() {
+    let server = MockServer::start().await;
+    std::env::set_var("OPENLIST_USERNAME", "test-user");
+    std::env::set_var("OPENLIST_PASSWORD", "test-pass");
+    let mut cfg = upstream(server.uri());
+    cfg.root_path = Some("music".into());
+    let b = origin_cache::backend::OpenListBackend::from_config(&cfg).unwrap();
+    Mock::given(method("PROPFIND"))
+        .and(path("/music/2026/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(propfind_dir_xml(
+            "/music/2026/",
+            &[("/music/2026/song.flac", 99)],
+            &[],
+        )))
+        .mount(&server)
+        .await;
+    let entries = b.list("2026/", false).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key, "2026/song.flac");
+}
+
+#[tokio::test]
+async fn list_recursive_bfs_walks_subtree_and_skips_dirs() {
+    let server = MockServer::start().await;
+    // Root page: one file + one subdir.
+    Mock::given(method("PROPFIND"))
+        .and(path("/media/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(propfind_dir_xml(
+            "/media/",
+            &[("/media/top.bin", 1)],
+            &["/media/sub/"],
+        )))
+        .mount(&server)
+        .await;
+    // Subdir page: nested file.
+    Mock::given(method("PROPFIND"))
+        .and(path("/media/sub/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(propfind_dir_xml(
+            "/media/sub/",
+            &[("/media/sub/nested.bin", 2)],
+            &[],
+        )))
+        .mount(&server)
+        .await;
+    let b = backend_for(server.uri());
+
+    // Recursive: files only, nested key reconstructed.
+    let all = b.list("media/", true).await.unwrap();
+    let mut keys: Vec<&str> = all.iter().map(|e| e.key.as_str()).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["media/sub/nested.bin", "media/top.bin"]);
+    assert!(all.iter().all(|e| !e.is_dir));
+
+    // Non-recursive: the subdir appears as a directory entry.
+    let shallow = b.list("media/", false).await.unwrap();
+    let mut got: Vec<_> = shallow.iter().map(entry_key).collect();
+    got.sort();
+    assert_eq!(got, vec![("media/sub/", true), ("media/top.bin", false)]);
+}
+
+#[tokio::test]
+async fn list_percent_encoded_href_decoded() {
+    let server = MockServer::start().await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/media/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(propfind_dir_xml(
+            "/media/",
+            &[("/media/my%20song.flac", 7)],
+            &[],
+        )))
+        .mount(&server)
+        .await;
+    let b = backend_for(server.uri());
+    let entries = b.list("media/", false).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key, "media/my song.flac");
+}
+
+#[tokio::test]
+async fn list_missing_folder_maps_to_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("PROPFIND"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let b = backend_for(server.uri());
+    let err = b.list("gone/", false).await.unwrap_err();
+    assert!(matches!(err, BackendError::NotFound), "got {err:?}");
+}
+
+#[tokio::test]
+async fn list_bad_credentials_map_to_auth_required() {
+    let server = MockServer::start().await;
+    Mock::given(method("PROPFIND"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let b = backend_for(server.uri());
+    let err = b.list("media/", false).await.unwrap_err();
+    assert!(matches!(err, BackendError::AuthRequired), "got {err:?}");
+}

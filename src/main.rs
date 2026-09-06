@@ -46,23 +46,6 @@ async fn main() -> anyhow::Result<()> {
             }),
         );
     }
-    let clock = Arc::new(SystemClock);
-    let mut slots = HashMap::new();
-    for u in &cfg.upstreams {
-        let backend: Arc<dyn StorageBackend> = match u.backend_type.as_str() {
-            "openlist" => Arc::new(
-                OpenListBackend::from_config(u).map_err(|e| anyhow::anyhow!(e))?,
-            ),
-            other => anyhow::bail!("upstream {}: unknown type {other:?} (v1 supports \"openlist\")", u.id),
-        };
-        slots.insert(
-            u.id.clone(),
-            Arc::new(BackendSlot {
-                backend,
-                gate: Arc::new(Semaphore::new(cfg.concurrency_per_upstream)),
-            }),
-        );
-    }
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), clock, BackendRegistry::new(slots)));
     cache.load_and_start().await;
     let app_state = origin_cache::business::AppState { cache, config: Arc::clone(&cfg) };
