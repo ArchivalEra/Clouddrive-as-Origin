@@ -20,10 +20,10 @@ use tracing::{info, warn};
 
 use crate::{
     backend::{BackendError, ByteRange, Key},
-    cache::cache::{Cache, CacheHit, CacheOutcome, HitMeta},
+    cache::cache::{Cache, CacheOutcome, HitMeta},
     clock::Clock,
     config::{ColdMiss, Config},
-    key::validate_key,
+    key::ResolvedKey,
 };
 
 #[derive(Clone)]
@@ -130,20 +130,6 @@ fn parse_client_range(headers: &HeaderMap) -> Result<ClientRange, ()> {
 }
 
 // ---------------------------------------------------------------------------
-// Bucket alias: bucket namespace = upstream ids, zero new config.
-// `/{bucket}/{rest}` with a known bucket pins the upstream; anything else
-// falls through to legacy prefix-table routing.
-// ---------------------------------------------------------------------------
-
-fn split_bucket<'a>(path: &'a str, ids: &[String]) -> Option<(&'a str, &'a str)> {
-    let (first, rest) = path.split_once('/')?;
-    if rest.is_empty() || !ids.iter().any(|id| id == first) {
-        return None;
-    }
-    Some((first, rest))
-}
-
-// ---------------------------------------------------------------------------
 // Shared response builders.
 // ---------------------------------------------------------------------------
 
@@ -240,88 +226,36 @@ fn error_response(
     }
 }
 
-/// Resolve the fetch target: bucket alias (pinned upstream + stripped
-/// backend path) or legacy full path. Returns the full request path plus
-/// the alias split when the first segment names a known upstream.
-/// Cache identity is always the full path (prevents cross-upstream flight
-/// and entry collisions); the backend sees the stripped path.
-fn resolve_target<C: Clock + Clone>(
-    state: &AppState<C>,
-    path_key: &str,
-) -> (String, Option<(String, String)>) {
-    let ids = state.cache.backends.ids();
-    if let Some((bucket, rest)) = split_bucket(path_key, &ids) {
-        return (path_key.to_string(), Some((rest.to_string(), bucket.to_string())));
-    }
-    (path_key.to_string(), None)
-}
-
-async fn fetch_key<C: Clock + Clone>(
-    state: &AppState<C>,
-    full: String,
-    pinned: Option<(String, String)>,
-    range: Option<ByteRange>,
-) -> Result<CacheHit, BackendError> {
-    match pinned {
-        Some((backend, upstream)) => state.cache.get_pinned(full, backend, upstream, range).await,
-        None => state.cache.get(&full, range).await,
-    }
-}
-
-async fn head_lookup<C: Clock + Clone>(
-    state: &AppState<C>,
-    full: &str,
-    pinned: &Option<(String, String)>,
-) -> Result<HitMeta, BackendError> {
-    match pinned {
-        Some((backend, upstream)) => {
-            state.cache.head_meta_pinned(full.to_string(), backend.clone(), upstream.clone()).await
-        }
-        None => state.cache.head_meta(full).await,
-    }
-}
-
 /// A relief valve (P1): cold + redirect-capable upstream → 307 to the
 /// upstream-issued direct link, bytes filled in background. Returns
 /// `Some(response)` only on the 307 path; `None` means "serve from cache
 /// / proxy as usual". Hit-first: a fresh memory entry never redirects.
-/// Every failure (disabled, unresolvable, unsupported, rejected target,
-/// slow link) silently falls through to the water-pipe — the valve can
-/// only save bandwidth, never break a fetch.
+/// Every failure (disabled, unsupported, rejected target, slow link)
+/// silently falls through to the water-pipe — the valve can only save
+/// bandwidth, never break a fetch.
 async fn try_relief_valve<C: Clock + Clone>(
     state: &AppState<C>,
-    full: &str,
-    pinned: &Option<(String, String)>,
+    rk: &ResolvedKey,
     headers: &HeaderMap,
 ) -> Option<Response> {
-    let (backend_path, upstream_id) = match pinned {
-        Some((rest, bucket)) => (rest.clone(), bucket.clone()),
-        None => {
-            let (_, u) = state.cache.resolve_upstream(full).ok()?;
-            (full.to_string(), u)
-        }
-    };
     let redirect = state
         .config
-        .upstream(&upstream_id)
+        .upstream(&rk.upstream_id)
         .map(|u| u.cold_miss == ColdMiss::Redirect)
         .unwrap_or(false);
     if !redirect {
         return None;
     }
-    if state.cache.memory_hit_fresh(full).await {
+    if state.cache.memory_hit_fresh(&rk.cache_key).await {
         return None;
     }
-    // Backend identity must validate; if it doesn't, the B path below
-    // reports the 400 properly — the valve stays out of the way.
-    let bkey = validate_key(&backend_path).ok()?;
-    let slot = state.cache.backends.get(&upstream_id)?;
+    let slot = state.cache.backends.get(&rk.upstream_id)?;
     let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
     // Bound the link round-trips: a slow link source must not stall the
     // viewer before the proxy fallback engages.
     let link = tokio::time::timeout(
         Duration::from_secs(8),
-        slot.backend.direct_url(&Key::from_validated(bkey), ua),
+        slot.backend.direct_url(&Key::from_validated(rk.backend_key.clone()), ua),
     )
     .await
     .ok()?
@@ -331,10 +265,9 @@ async fn try_relief_valve<C: Clock + Clone>(
     }
     // Fill in background; the viewer leaves now.
     let cache = Arc::clone(&state.cache);
-    let f = full.to_string();
-    let p = pinned.clone();
+    let rk_owned = rk.clone();
     tokio::spawn(async move {
-        let _ = cache.prefetch(f, p).await;
+        let _ = cache.prefetch(&rk_owned).await;
     });
     let (req_id, host_id) = request_ids();
     let location: axum::http::HeaderValue = link.url.parse().ok()?;
@@ -357,19 +290,34 @@ where
     C: Clock + Clone,
 {
     let (req_id, host_id) = request_ids();
-    let (key, pinned) = resolve_target(&state, &path_key);
+    // Single resolution seam (C2): routing + bucket alias + validation,
+    // once. Everything below takes `rk` — no re-resolution, no re-validation.
+    let rk = match state.cache.resolve(&path_key) {
+        Ok(rk) => rk,
+        Err(e) => {
+            return error_response(
+                BackendError::Other(format!("invalid key: {e}")),
+                &path_key,
+                &req_id,
+                &host_id,
+                false,
+                None,
+            );
+        }
+    };
+    let key = &rk.cache_key;
 
     // AWS error precedence: malformed/multi Ranges 416 before anything else.
     let parsed = match parse_client_range(&headers) {
         Err(()) | Ok(ClientRange::Multi) => {
-            let hint = state.cache.memory_size(&key).await;
-            return error_response(BackendError::RangeNotSatisfiable, &key, &req_id, &host_id, false, hint);
+            let hint = state.cache.memory_size(key).await;
+            return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, false, hint);
         }
         Ok(r) => r,
     };
     // A relief valve: cold + redirect-capable upstreams leave via 307
     // (hits never redirect — checked inside). Falls through to proxy.
-    if let Some(redirect) = try_relief_valve(&state, &key, &pinned, &headers).await {
+    if let Some(redirect) = try_relief_valve(&state, &rk, &headers).await {
         return redirect;
     }
     // Suffix ranges need the object size up front: one lightweight stat
@@ -379,14 +327,14 @@ where
         ClientRange::Multi => unreachable!("rejected above"),
         ClientRange::Single(r) => Some(r),
         ClientRange::Suffix(n) => {
-            let size = match head_lookup(&state, &key, &pinned).await {
+            let size = match state.cache.head_resolved(&rk).await {
                 Ok(m) => m.size,
                 Err(e) => {
-                    return error_response(e, &key, &req_id, &host_id, false, None);
+                    return error_response(e, key, &req_id, &host_id, false, None);
                 }
             };
             if size == 0 || n == 0 {
-                return error_response(BackendError::RangeNotSatisfiable, &key, &req_id, &host_id, false, Some(size));
+                return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, false, Some(size));
             }
             // RFC 9110: suffix longer than the representation → whole object,
             // still 206 (not 200).
@@ -394,7 +342,7 @@ where
         }
     };
 
-    match fetch_key(&state, key.clone(), pinned, range).await {
+    match state.cache.get_resolved(&rk, range).await {
         Ok(hit) => {
             let status =
                 if hit.content_range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
@@ -416,8 +364,8 @@ where
         Err(e) => {
             // Size hint for 416 Content-Range: best-effort memory peek, no
             // upstream call (SHOULD-level per R1).
-            let hint = state.cache.memory_size(&key).await;
-            error_response(e, &key, &req_id, &host_id, false, hint)
+            let hint = state.cache.memory_size(key).await;
+            error_response(e, key, &req_id, &host_id, false, hint)
         }
     }
 }
@@ -430,23 +378,36 @@ where
     C: Clock + Clone,
 {
     let (req_id, host_id) = request_ids();
-    let (key, pinned) = resolve_target(&state, &path_key);
+    let rk = match state.cache.resolve(&path_key) {
+        Ok(rk) => rk,
+        Err(e) => {
+            return error_response(
+                BackendError::Other(format!("invalid key: {e}")),
+                &path_key,
+                &req_id,
+                &host_id,
+                true,
+                None,
+            );
+        }
+    };
+    let key = &rk.cache_key;
 
     // One lightweight stat up front (memory or a single PROPFIND — never a
     // flight, never file bytes), then resolve any range against its size.
     let parsed = match parse_client_range(&headers) {
         Err(()) | Ok(ClientRange::Multi) => {
-            let hint = state.cache.memory_size(&key).await;
-            return error_response(BackendError::RangeNotSatisfiable, &key, &req_id, &host_id, true, hint);
+            let hint = state.cache.memory_size(key).await;
+            return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, true, hint);
         }
         Ok(r) => r,
     };
     // Suffix form needs no size yet; single/absent neither. The stat below
     // serves both freshness and size — exactly one upstream call at most.
-    let meta = match head_lookup(&state, &key, &pinned).await {
+    let meta = match state.cache.head_resolved(&rk).await {
         Ok(m) => m,
         Err(e) => {
-            return error_response(e, &key, &req_id, &host_id, true, None);
+            return error_response(e, key, &req_id, &host_id, true, None);
         }
     };
     let (len, content_range) = match parsed {
@@ -454,14 +415,14 @@ where
         ClientRange::Multi => unreachable!("rejected above"),
         ClientRange::Single(r) => {
             if r.offset >= meta.size {
-                return error_response(BackendError::RangeNotSatisfiable, &key, &req_id, &host_id, true, Some(meta.size));
+                return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, true, Some(meta.size));
             }
             let end = r.length.map_or(meta.size, |l| (r.offset + l).min(meta.size));
             (end - r.offset, Some(format!("bytes {}-{}/{}", r.offset, end - 1, meta.size)))
         }
         ClientRange::Suffix(n) => {
             if meta.size == 0 || n == 0 {
-                return error_response(BackendError::RangeNotSatisfiable, &key, &req_id, &host_id, true, Some(meta.size));
+                return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, true, Some(meta.size));
             }
             let (offset, len) = if n >= meta.size { (0, meta.size) } else { (meta.size - n, n) };
             (len, Some(format!("bytes {}-{}/{}", offset, offset + len - 1, meta.size)))
@@ -515,18 +476,21 @@ where
             return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
         }
     }
-    if validate_key(&key).is_err() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid key"}))).into_response();
-    }
+    let rk = match state.cache.resolve(&key) {
+        Ok(rk) => rk,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid key"}))).into_response();
+        }
+    };
     let s = state.cache.state.read().await;
-    let already = s.entries.contains_key(&key);
+    let already = s.entries.contains_key(&rk.cache_key);
     drop(s);
     if already {
         return (StatusCode::OK, Json(json!({"status": "hit"}))).into_response();
     }
     // Same primitive as the relief valve's background fill: full fetch, no
     // client attached.
-    match state.cache.prefetch(key.clone(), None).await {
+    match state.cache.prefetch(&rk).await {
         Ok(()) => (StatusCode::OK, Json(json!({"status": "fetched"}))).into_response(),
         Err(BackendError::NotFound) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
@@ -797,15 +761,6 @@ mod tests {
         assert!(parse_client_range(&headers(&[("range", "bytes=100-50")])).is_err());
         assert!(parse_client_range(&headers(&[("range", "bytes=-0")])).is_err());
         assert!(parse_client_range(&headers(&[("range", "items=0-1")])).is_err());
-    }
-
-    #[test]
-    fn bucket_split_rules() {
-        let ids = vec!["primary".to_string(), "archive".to_string()];
-        assert_eq!(split_bucket("archive/f.bin", &ids), Some(("archive", "f.bin")));
-        assert_eq!(split_bucket("a.bin", &ids), None);
-        assert_eq!(split_bucket("unknown/f.bin", &ids), None);
-        assert_eq!(split_bucket("archive/", &ids), None);
     }
 
     #[tokio::test]

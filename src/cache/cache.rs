@@ -11,7 +11,7 @@ use crate::{
     clock::Clock,
     config::Config,
     inflight::Inflight,
-    key::validate_key,
+    key::{ResolvedKey, resolve_key, validate_key},
     routing::RouteTable,
 };
 
@@ -181,10 +181,10 @@ impl<C: Clock + Clone> Cache<C> {
         });
     }
 
-    pub fn resolve_upstream(&self, raw_key: &str) -> Result<(String, String), crate::key::KeyError> {
-        let key = validate_key(raw_key)?;
-        let upstream = self.routes.resolve(&key).to_string();
-        Ok((key, upstream))
+    /// Resolve a request path to serving coordinates (C2: the single
+    /// upstream-resolution seam — bucket alias + prefix routes + validation).
+    pub fn resolve(&self, raw_path: &str) -> Result<ResolvedKey, crate::key::KeyError> {
+        resolve_key(raw_path, &self.routes, &self.backends.ids())
     }
 
     /// HEAD-grade metadata lookup: memory entry when fresh, else a single
@@ -193,23 +193,16 @@ impl<C: Clock + Clone> Cache<C> {
     /// installs; a confirmed absence installs a negative tombstone so
     /// HEAD 404s share the negative-cache window with GET).
     pub async fn head_meta(&self, raw_key: &str) -> Result<HitMeta, BackendError> {
-        let (key, upstream_id) =
-            self.resolve_upstream(raw_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
-        self.head_meta_pinned(key.clone(), key, upstream_id).await
+        let rk = self.resolve(raw_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+        self.head_resolved(&rk).await
     }
 
-    /// Same as [`Cache::head_meta`] with the upstream pre-pinned (S3
-    /// bucket alias + suffix-range size resolution). Same two-namespace
-    /// split as [`Cache::get_pinned`]: `cache_key` for memory rows,
-    /// `backend_key` for the upstream stat.
-    pub async fn head_meta_pinned(
-        &self,
-        cache_key: String,
-        backend_key: String,
-        upstream_id: String,
-    ) -> Result<HitMeta, BackendError> {
-        let key = validate_key(&cache_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
-        let backend_key = validate_key(&backend_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+    /// [`Cache::head_meta`] for a pre-resolved key (no re-validation:
+    /// [`ResolvedKey`] is valid by construction).
+    pub async fn head_resolved(&self, rk: &ResolvedKey) -> Result<HitMeta, BackendError> {
+        let key = rk.cache_key.clone();
+        let backend_key = rk.backend_key.clone();
+        let upstream_id = rk.upstream_id.clone();
         let now = self.clock.now_millis();
         {
             let s = self.state.read().await;
@@ -285,11 +278,8 @@ impl<C: Clock + Clone> Cache<C> {
     /// Background fill: full fetch + drain, no client attached. Powers the
     /// A relief valve (307 now, bytes later) and shares the prewarm path —
     /// one primitive, two callers.
-    pub async fn prefetch(&self, full: String, pinned: Option<(String, String)>) -> Result<(), BackendError> {
-        let mut hit = match pinned {
-            Some((backend, upstream)) => self.get_pinned(full, backend, upstream, None).await?,
-            None => self.get(&full, None).await?,
-        };
+    pub async fn prefetch(&self, rk: &ResolvedKey) -> Result<(), BackendError> {
+        let mut hit = self.get_resolved(rk, None).await?;
         flight::drain(&mut hit.body).await?;
         Ok(())
     }
@@ -305,31 +295,26 @@ impl<C: Clock + Clone> Cache<C> {
         raw_key: &str,
         range: Option<crate::backend::ByteRange>,
     ) -> Result<CacheHit, BackendError> {
-        let (key, upstream_id) =
-            self.resolve_upstream(raw_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
-        self.get_pinned(key.clone(), key, upstream_id, range).await
+        let rk = self.resolve(raw_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+        self.get_resolved(&rk, range).await
     }
 
-    /// Same as [`Cache::get`] but with the upstream pre-pinned: skips route
-    /// resolution. Used by the S3 path-style `/{bucket}/{key}` alias, where
-    /// the bucket names the upstream directly (bucket namespace = upstream
-    /// ids, zero new config).
+    /// [`Cache::get`] for a pre-resolved key (no re-validation).
     ///
-    /// Two key namespaces: `key` is the cache identity (full request path,
-    /// bucket included — state rows, flights, store paths, reval labels);
-    /// `backend_key` is the provider-side object path (bucket stripped).
-    /// They coincide for legacy routing; they differ only for the alias.
+    /// Two key namespaces: [`ResolvedKey::cache_key`] is the cache identity
+    /// (full request path — state rows, flights, store paths, reval labels);
+    /// [`ResolvedKey::backend_key`] is the provider-side object path. They
+    /// coincide for legacy routing; they differ only for the bucket alias.
     /// Sharing one namespace would collide flights and entries across
     /// upstreams, so the split is load-bearing, not cosmetic.
-    pub async fn get_pinned(
+    pub async fn get_resolved(
         &self,
-        key: String,
-        backend_key: String,
-        upstream_id: String,
+        rk: &ResolvedKey,
         range: Option<crate::backend::ByteRange>,
     ) -> Result<CacheHit, BackendError> {
-        let key = validate_key(&key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
-        let backend_key = validate_key(&backend_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+        let key = rk.cache_key.clone();
+        let backend_key = rk.backend_key.clone();
+        let upstream_id = rk.upstream_id.clone();
         let slot = self
             .backends
             .get(&upstream_id)

@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::routing::RouteTable;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum KeyError {
     #[error("empty key")]
@@ -89,6 +91,48 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// A request path fully resolved to its serving coordinates: the cache
+/// identity (full path, bucket included — state rows, flights, store
+/// paths), the provider-side object path (bucket stripped), and the
+/// owning upstream. Built once at the business seam; every downstream
+/// caller takes this instead of a `(String, String, String)` triple that
+/// compiles when misordered (the P0-a alias collision is the exhibit).
+/// Both paths are validated at construction, so holders never re-validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedKey {
+    pub cache_key: String,
+    pub backend_key: String,
+    pub upstream_id: String,
+}
+
+/// Single upstream-resolution seam (C2): bucket alias first (first path
+/// segment naming a known upstream pins it — additive to ADR-0001, legacy
+/// routes untouched), else longest-prefix route table. Validation of both
+/// namespaces happens here, once.
+pub fn resolve_key(raw_path: &str, routes: &RouteTable, buckets: &[String]) -> Result<ResolvedKey, KeyError> {
+    if let Some((bucket, rest)) = split_bucket(raw_path, buckets) {
+        return Ok(ResolvedKey {
+            cache_key: validate_key(raw_path)?,
+            backend_key: validate_key(rest)?,
+            upstream_id: bucket.to_string(),
+        });
+    }
+    let cache_key = validate_key(raw_path)?;
+    let upstream_id = routes.resolve(&cache_key).to_string();
+    Ok(ResolvedKey { backend_key: cache_key.clone(), cache_key, upstream_id })
+}
+
+/// S3 path-style bucket split: `/{bucket}/{rest}` where the first segment
+/// names a known upstream id and `rest` is non-empty. Anything else is a
+/// legacy path.
+fn split_bucket<'a>(path: &'a str, ids: &[String]) -> Option<(&'a str, &'a str)> {
+    let (first, rest) = path.split_once('/')?;
+    if rest.is_empty() || !ids.iter().any(|id| id == first) {
+        return None;
+    }
+    Some((first, rest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +168,58 @@ mod tests {
         assert_eq!(validate_key(""), Err(KeyError::Empty));
         assert_eq!(validate_key("a\0b"), Err(KeyError::Nul));
         assert_eq!(validate_key("a%00b"), Err(KeyError::Nul));
+    }
+
+    fn test_routes() -> RouteTable {
+        RouteTable::new(vec![
+            crate::routing::RouteRule { prefix: "".into(), upstream: "primary".into() },
+            crate::routing::RouteRule { prefix: "archive/".into(), upstream: "archive".into() },
+        ])
+    }
+
+    fn buckets() -> Vec<String> {
+        vec!["primary".into(), "archive".into()]
+    }
+
+    #[test]
+    fn bucket_split_rules() {
+        assert_eq!(split_bucket("archive/f.bin", &buckets()), Some(("archive", "f.bin")));
+        assert_eq!(split_bucket("a.bin", &buckets()), None);
+        assert_eq!(split_bucket("unknown/f.bin", &buckets()), None);
+        assert_eq!(split_bucket("archive/", &buckets()), None);
+    }
+
+    #[test]
+    fn resolve_prefers_bucket_alias() {
+        // Prefix "archive/" routes elsewhere, but the bucket segment pins
+        // the archive upstream and strips the backend path.
+        let routes = RouteTable::new(vec![
+            crate::routing::RouteRule { prefix: "".into(), upstream: "primary".into() },
+            crate::routing::RouteRule { prefix: "archive/".into(), upstream: "deep-archive".into() },
+        ]);
+        let r = resolve_key("archive/f.bin", &routes, &buckets()).unwrap();
+        assert_eq!(
+            r,
+            ResolvedKey {
+                cache_key: "archive/f.bin".into(),
+                backend_key: "f.bin".into(),
+                upstream_id: "archive".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_legacy_prefix_routing() {
+        let r = resolve_key("2026/08/a.png", &test_routes(), &buckets()).unwrap();
+        assert_eq!(r.upstream_id, "primary");
+        assert_eq!(r.backend_key, "2026/08/a.png");
+        assert_eq!(r.cache_key, "2026/08/a.png");
+    }
+
+    #[test]
+    fn resolve_rejects_traversal_in_either_namespace() {
+        assert_eq!(resolve_key("archive/../x", &test_routes(), &buckets()), Err(KeyError::Traversal));
+        assert_eq!(resolve_key("../x", &test_routes(), &buckets()), Err(KeyError::Traversal));
+        assert_eq!(resolve_key("", &test_routes(), &buckets()), Err(KeyError::Empty));
     }
 }
