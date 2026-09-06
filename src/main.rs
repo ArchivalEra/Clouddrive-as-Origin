@@ -1,8 +1,5 @@
 use anyhow::Context;
 use std::{collections::HashMap, sync::Arc};
-use std::net::SocketAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
@@ -11,6 +8,7 @@ use origin_cache::{
     cache::cache::Cache,
     clock::SystemClock,
     config,
+    front,
 };
 
 #[tokio::main]
@@ -55,9 +53,10 @@ async fn main() -> anyhow::Result<()> {
     let business_addr = cfg.listen_addr;
     let front_addr = cfg.front_listen;
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let business_shutdown = async move {
-        shutdown_rx.changed().await.ok();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let business_shutdown = {
+        let mut rx = shutdown_rx.clone();
+        async move { rx.changed().await.ok(); }
     };
 
     let business_handle = tokio::spawn({
@@ -69,9 +68,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let front_handle = tokio::spawn(async move {
-        if let Err(e) = run_front(front_addr, business_addr).await {
-            warn!(error = %e, "front plane exited with error");
+    let tls = front::acceptor_from_env(cfg.tls_cert_env.as_deref(), cfg.tls_key_env.as_deref())
+        .context("load front TLS material")?;
+    let front_handle = tokio::spawn({
+        let mut rx = shutdown_rx.clone();
+        async move {
+            if let Err(e) = front::run_front(front_addr, business_addr, tls, async move {
+                rx.changed().await.ok();
+            })
+            .await
+            {
+                warn!(error = %e, "front plane exited with error");
+            }
         }
     });
 
@@ -81,32 +89,6 @@ async fn main() -> anyhow::Result<()> {
     front_handle.abort();
     let _ = business_handle.await;
     info!("origin-cache shut down cleanly");
-    Ok(())
-}
-
-async fn run_front(front: SocketAddr, business: SocketAddr) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(front).await?;
-    info!(%front, business = %business, "front plane (plain-TCP proxy) listening");
-    loop {
-        let (mut inbound, peer) = listener.accept().await?;
-        let business = business.clone();
-        tokio::spawn(async move {
-            if let Err(e) = proxy_one(&mut inbound, business).await {
-                warn!(%peer, error = %e, "proxy error");
-            }
-        });
-    }
-}
-
-async fn proxy_one(inbound: &mut TcpStream, business: SocketAddr) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; 8192];
-    let n = inbound.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-    let mut outbound = TcpStream::connect(business).await?;
-    outbound.write_all(&buf[..n]).await?;
-    tokio::io::copy_bidirectional(inbound, &mut outbound).await?;
     Ok(())
 }
 
