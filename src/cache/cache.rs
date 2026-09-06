@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
@@ -135,6 +135,9 @@ pub struct Cache<C: Clock> {
     /// key. Segment files on disk are the source of truth; this map is
     /// the working view, rebuilt by scan on startup.
     pub coverage: Arc<Mutex<HashMap<String, store::Coverage>>>,
+    /// Keys with a promotion task in flight (P2-b single-flight: threshold
+    /// re-hits while promoting attach to nothing — the task re-verifies).
+    pub promotions: Arc<Mutex<HashSet<String>>>,
     pub reval_inflight: Inflight<StatData, BackendError>,
     pub routes: RouteTable,
 }
@@ -158,6 +161,7 @@ impl<C: Clock + Clone> Cache<C> {
             dirty_access,
             flights: Arc::new(Mutex::new(HashMap::new())),
             coverage: Arc::new(Mutex::new(HashMap::new())),
+            promotions: Arc::new(Mutex::new(HashSet::new())),
             reval_inflight: Inflight::new(),
             routes,
         }
@@ -349,6 +353,19 @@ impl<C: Clock + Clone> Cache<C> {
             }
             Err(e) => return Err(e),
         };
+        // Version gate: a flipped object restarts staged history BEFORE
+        // serving, so new bytes land on a clean ledger (finalize keeps a
+        // same-file backstop for races).
+        {
+            let known = self.coverage.lock().await.get(&rk.cache_key).and_then(|e| e.etag.clone());
+            let changed = match (known.as_deref(), meta.etag.as_deref()) {
+                (Some(a), Some(b)) => a != b,
+                _ => false,
+            };
+            if changed {
+                reset_coverage(&self.coverage, &self.state, &self.config.cache_dir, &rk.cache_key).await;
+            }
+        }
         if meta.size_bytes < min_file_size {
             return Err(BackendError::Other("below min_file_size".into()));
         }
@@ -380,8 +397,14 @@ impl<C: Clock + Clone> Cache<C> {
         let coverage = Arc::clone(&self.coverage);
         let state = Arc::clone(&self.state);
         let clock = Arc::clone(&self.clock);
+        let config = Arc::clone(&self.config);
+        let backends = self.backends.clone();
+        let meta_store = Arc::clone(&self.meta);
+        let promotions = Arc::clone(&self.promotions);
         let cache_dir = self.config.cache_dir.clone();
         let cache_key = rk.cache_key.clone();
+        let backend_key = rk.backend_key.clone();
+        let upstream_id = rk.upstream_id.clone();
         let segpart = store::segpart_path(&cache_dir, &cache_key, start, end);
         let mut src_stream = src.stream;
         let body: BodyStream = Box::pin(async_stream::try_stream! {
@@ -412,6 +435,8 @@ impl<C: Clock + Clone> Cache<C> {
                 let span = FinalizedSpan {
                     cache_dir: cache_dir.clone(),
                     key: cache_key.clone(),
+                    backend_key: backend_key.clone(),
+                    upstream_id: upstream_id.clone(),
                     etag,
                     total,
                     start,
@@ -420,6 +445,21 @@ impl<C: Clock + Clone> Cache<C> {
                     now_millis: now,
                 };
                 finalize_coverage(&coverage, &state, span).await;
+                // Coverage-triggered promotion (P2-b): threshold met →
+                // background assemble + seal. Fire-and-forget by design.
+                maybe_promote(
+                    &coverage,
+                    &config,
+                    &backends,
+                    &meta_store,
+                    &promotions,
+                    &state,
+                    &cache_dir,
+                    &cache_key,
+                    &upstream_id,
+                    now,
+                )
+                .await;
             } else if file.is_some() {
                 let _ = tokio::fs::remove_file(&segpart).await;
             }
@@ -861,6 +901,8 @@ fn flights_none() -> Arc<Mutex<HashMap<String, Arc<FlightShared>>>> {
 struct FinalizedSpan {
     cache_dir: std::path::PathBuf,
     key: String,
+    backend_key: String,
+    upstream_id: String,
     etag: Option<String>,
     total: u64,
     start: u64,
@@ -882,7 +924,9 @@ async fn finalize_coverage(
             _ => false,
         };
         if version_changed {
-            remove_key_segments(&span.cache_dir, &span.key);
+            // New bytes already sealed above: keep this file, drop the rest.
+            let fresh = store::seg_path(&span.cache_dir, &span.key, span.start, span.end);
+            remove_key_segments(&span.cache_dir, &span.key, Some(&fresh));
             *entry = store::Coverage::default();
         }
         if span.etag.is_some() {
@@ -891,10 +935,21 @@ async fn finalize_coverage(
         if span.total != 0 {
             entry.total = span.total;
         }
+        if !span.backend_key.is_empty() {
+            entry.backend_key = span.backend_key.clone();
+        }
+        if !span.upstream_id.is_empty() {
+            entry.upstream_id = span.upstream_id.clone();
+        }
         entry.add_interval(span.start, span.end);
         entry.last_touch_millis = span.now_millis;
     }
-    let meta = store::SegMeta { etag: span.etag.clone(), total: span.total };
+    let meta = store::SegMeta {
+        etag: span.etag.clone(),
+        total: span.total,
+        backend_key: span.backend_key.clone(),
+        upstream_id: span.upstream_id.clone(),
+    };
     if let Ok(b) = serde_json::to_vec(&meta) {
         let _ = tokio::fs::write(store::segmeta_path(&span.cache_dir, &span.key), b).await;
     }
@@ -903,18 +958,268 @@ async fn finalize_coverage(
 
 /// Drop a key's completed segments + version marker (etag reset path).
 /// In-flight `.segpart.*` files are left alone (concurrent transfers).
-fn remove_key_segments(cache_dir: &std::path::Path, key: &str) {
+fn remove_key_segments(cache_dir: &std::path::Path, key: &str, keep: Option<&std::path::Path>) {
     let esc = store::escape_key(key);
     let prefix = format!(".seg.{esc}.");
     if let Ok(rd) = std::fs::read_dir(cache_dir) {
         for entry in rd.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with(&prefix) {
+                if keep.is_some_and(|k| entry.path() == k) {
+                    continue;
+                }
                 let _ = std::fs::remove_file(entry.path());
             }
         }
     }
     let _ = std::fs::remove_file(store::segmeta_path(cache_dir, key));
+}
+
+/// Full history reset for one key: drop staged files + version marker +
+/// ledger row + accounting. Used on version drift (serve pre-check,
+/// finalize backstop, promotion verify) — never assembles mixed versions.
+async fn reset_coverage(
+    coverage: &Arc<Mutex<HashMap<String, store::Coverage>>>,
+    state: &Arc<RwLock<CacheState>>,
+    cache_dir: &std::path::Path,
+    key: &str,
+) {
+    let mut freed = 0u64;
+    for path in store::key_segment_files(cache_dir, key) {
+        freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let _ = std::fs::remove_file(&path);
+    }
+    let _ = std::fs::remove_file(store::segmeta_path(cache_dir, key));
+    coverage.lock().await.remove(key);
+    {
+        let mut s = state.write().await;
+        s.segment_bytes = s.segment_bytes.saturating_sub(freed);
+    }
+}
+
+/// Coverage-triggered promotion check (P2-b): runs at the end of every
+/// staged C transfer. Threshold met → spawn exactly one promotion task
+/// per key (single-flight via `promotions`); anything else → no-op.
+/// Lock discipline: no lock held across the spawn.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_promote(
+    coverage: &Arc<Mutex<HashMap<String, store::Coverage>>>,
+    config: &Arc<Config>,
+    backends: &BackendRegistry,
+    meta_store: &Arc<crate::cache::persist::MetaStore>,
+    promotions: &Arc<Mutex<HashSet<String>>>,
+    state: &Arc<RwLock<CacheState>>,
+    cache_dir: &std::path::Path,
+    key: &str,
+    upstream_id: &str,
+    now_millis: u64,
+) {
+    let prof = config.cache_profile(upstream_id);
+    if !prof.efficient {
+        return;
+    }
+    let ready = {
+        let cov = coverage.lock().await;
+        cov.get(key).and_then(|c| c.ratio()).is_some_and(|r| r >= prof.coverage_threshold)
+    };
+    if !ready {
+        return;
+    }
+    {
+        let mut p = promotions.lock().await;
+        if !p.insert(key.to_string()) {
+            return;
+        }
+    }
+    let (backends, meta_store, state, coverage, config, cache_dir, key, upstream_id, promotions) = (
+        backends.clone(),
+        Arc::clone(meta_store),
+        Arc::clone(state),
+        Arc::clone(coverage),
+        Arc::clone(config),
+        cache_dir.to_path_buf(),
+        key.to_string(),
+        upstream_id.to_string(),
+        Arc::clone(promotions),
+    );
+    tokio::spawn(async move {
+        promote_key(&backends, &meta_store, &state, &coverage, &config, &cache_dir, &key, &upstream_id, now_millis).await;
+        promotions.lock().await.remove(&key);
+    });
+}
+
+/// Assemble a promoted entry: re-verify the version by fresh stat (abort +
+/// reset on ANY drift — never a mixed-version file), copy covered slices
+/// from sidecars, fetch gaps by exact Range, seal, install, clean staged
+/// history. All failures abort silently (segments stay for a later retry).
+#[allow(clippy::too_many_arguments)]
+async fn promote_key(
+    backends: &BackendRegistry,
+    meta_store: &Arc<crate::cache::persist::MetaStore>,
+    state: &Arc<RwLock<CacheState>>,
+    coverage: &Arc<Mutex<HashMap<String, store::Coverage>>>,
+    config: &Arc<Config>,
+    cache_dir: &std::path::Path,
+    key: &str,
+    upstream_id: &str,
+    now_millis: u64,
+) {
+    // Snapshot the ledger (unknown version/size or unmapped keys wait for
+    // fresh transfers — conservative by design).
+    let cov = {
+        match coverage.lock().await.get(key).cloned() {
+            Some(c) if !c.backend_key.is_empty() && c.total != 0 && c.etag.is_some() => c,
+            _ => return,
+        }
+    };
+    let etag = cov.etag.clone().unwrap();
+    let total = cov.total;
+    let slot = match backends.get(upstream_id) {
+        Some(s) => s,
+        None => return,
+    };
+    let bkey = Key::from_validated(cov.backend_key.clone());
+    let _permit = slot.gate.acquire().await;
+    let live = match slot.backend.stat(&bkey).await {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if live.etag != Some(etag) || live.size_bytes != total {
+        // Drifted under us: drop staged history, start over.
+        reset_coverage(coverage, state, cache_dir, key).await;
+        return;
+    }
+    let tmp = store::tmp_path(cache_dir, key);
+    if !assemble_file(&slot, &bkey, cache_dir, key, &cov, &tmp).await {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    let dest = store::file_path(cache_dir, key);
+    if store::install_tmp(&tmp, &dest).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    insert_meta(state, config, meta_store, key, upstream_id, &live, now_millis).await;
+    // History is now redundant: drop sidecars + ledger row.
+    reset_coverage(coverage, state, cache_dir, key).await;
+}
+
+/// Fill `tmp` with the full object: covered slices copied from sidecars,
+/// gaps fetched by exact Range. Walks the merged intervals in order; every
+/// write is an absolute seek, so order is a courtesy, not a requirement.
+async fn assemble_file(
+    slot: &Arc<BackendSlot>,
+    bkey: &Key,
+    cache_dir: &std::path::Path,
+    key: &str,
+    cov: &store::Coverage,
+    tmp: &std::path::Path,
+) -> bool {
+    use tokio::io::AsyncWriteExt;
+    // Index segment files by interval (parsed names only).
+    let mut segs: Vec<(u64, u64, std::path::PathBuf)> = Vec::new();
+    for path in store::key_segment_files(cache_dir, key) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        if let Some((_, s, e)) = store::parse_seg_name(&name) {
+            segs.push((s, e, path));
+        }
+    }
+    segs.sort();
+    let mut out = match tokio::fs::File::create(tmp).await {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut pos = 0u64;
+    for &(s, e) in cov.intervals.iter() {
+        if pos < s && !fetch_gap(slot, bkey, &mut out, &mut buf, pos, s).await {
+            return false;
+        }
+        if !copy_span(&mut out, &segs, &mut buf, s.max(pos), e).await {
+            return false;
+        }
+        pos = pos.max(e);
+    }
+    if pos < cov.total && !fetch_gap(slot, bkey, &mut out, &mut buf, pos, cov.total).await {
+        return false;
+    }
+    out.flush().await.is_ok()
+}
+
+/// Copy one covered span `[a, b)` from whichever sidecars hold it.
+async fn copy_span(
+    out: &mut tokio::fs::File,
+    segs: &[(u64, u64, std::path::PathBuf)],
+    buf: &mut [u8],
+    mut a: u64,
+    b: u64,
+) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    while a < b {
+        let holder = segs.iter().find(|(s, e, _)| *s <= a && a < *e);
+        let (fs, fe, path) = match holder {
+            Some(h) => h,
+            None => return false,
+        };
+        let n = (*fe).min(b) - a;
+        let mut f = match tokio::fs::File::open(path).await {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        if f.seek(std::io::SeekFrom::Start(a - fs)).await.is_err() {
+            return false;
+        }
+        let mut remaining = n;
+        out.seek(std::io::SeekFrom::Start(a)).await.ok();
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let r = match f.read(&mut buf[..want]).await {
+                Ok(0) => return false,
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+            if out.write_all(&buf[..r]).await.is_err() {
+                return false;
+            }
+            remaining -= r as u64;
+            a += r as u64;
+        }
+    }
+    true
+}
+
+/// Fetch one missing span by exact Range into `out` at absolute `start`.
+async fn fetch_gap(
+    slot: &Arc<BackendSlot>,
+    bkey: &Key,
+    out: &mut tokio::fs::File,
+    buf: &mut [u8],
+    start: u64,
+    end: u64,
+) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    let src = match slot.backend.open(bkey, Some(crate::backend::ByteRange::bounded(start, end - start))).await {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut stream = src.stream;
+    if out.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return false;
+    }
+    let mut remaining = end - start;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = match stream.read(&mut buf[..want]).await {
+            Ok(0) => return false, // short backend read: do not seal a short file
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if out.write_all(&buf[..n]).await.is_err() {
+            return false;
+        }
+        remaining -= n as u64;
+    }
+    true
 }
 
 /// One cold-miss download driver: gate → stat → publish Meta → pump to

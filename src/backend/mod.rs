@@ -328,7 +328,7 @@ pub struct BackendSlot {
 /// Registry of constructed backends, keyed by upstream id (from config).
 /// Built once at boot from `[[upstreams]]`; business code resolves
 /// `key → upstream id (routing) → BackendSlot (this registry)`.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BackendRegistry {
     slots: HashMap<String, Arc<BackendSlot>>,
 }
