@@ -81,6 +81,10 @@ pub struct Coverage {
     /// Clock-domain last touch (stage or rebuild time): drives age sweep
     /// in MockClock-testable time, unlike fs mtime.
     pub last_touch_millis: u64,
+    /// Provider-side object path + owning upstream: promotion (P2-b)
+    /// fetches gaps through these, never by re-splitting the cache key.
+    pub backend_key: String,
+    pub upstream_id: String,
 }
 
 impl Coverage {
@@ -172,6 +176,10 @@ pub fn segmeta_path(cache_dir: &Path, key: &str) -> PathBuf {
 pub struct SegMeta {
     pub etag: Option<String>,
     pub total: u64,
+    #[serde(default)]
+    pub backend_key: String,
+    #[serde(default)]
+    pub upstream_id: String,
 }
 
 /// Parse a `.seg.*` filename back to `(key, start, end)`. The range part
@@ -235,13 +243,15 @@ pub fn scan_segments(cache_dir: &Path, now_millis: u64) -> (std::collections::Ha
             std::fs::read(segmeta_path(cache_dir, &key))
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or(SegMeta { etag: None, total: 0 })
+                .unwrap_or(SegMeta { etag: None, total: 0, backend_key: String::new(), upstream_id: String::new() })
         });
         let cov = ledger.entry(key).or_insert_with(|| Coverage {
             etag: meta.etag.clone(),
             total: meta.total,
             intervals: Vec::new(),
             last_touch_millis: now_millis,
+            backend_key: meta.backend_key.clone(),
+            upstream_id: meta.upstream_id.clone(),
         });
         cov.add_interval(start, end.min(start.saturating_add(len)));
         staged_bytes += len;
@@ -403,7 +413,7 @@ mod tests {
         std::fs::write(seg_path(dir.path(), "v/f.bin", 50, 80), vec![0u8; 30]).unwrap();
         std::fs::write(
             segmeta_path(dir.path(), "v/f.bin"),
-            serde_json::to_vec(&SegMeta { etag: Some("e1".into()), total: 100 }).unwrap(),
+            serde_json::to_vec(&SegMeta { etag: Some("e1".into()), total: 100, backend_key: "v/f.bin".into(), upstream_id: "primary".into() }).unwrap(),
         )
         .unwrap();
         std::fs::write(segpart_path(dir.path(), "v/f.bin", 80, 100), vec![0u8; 5]).unwrap();

@@ -431,15 +431,18 @@ mod tests {
 
     /// Counting backend: fixed bytes per upstream id, call counters on
     /// stat/open — proves HEAD never opens flights and alias pins upstreams.
+    /// `etag` is interior-mutable (version-flip tests); `opens` records
+    /// every open's (offset, length) for gap-fetch assertions.
     struct ProbeBackend {
         id: String,
         bytes: Vec<u8>,
-        etag: Option<String>,
+        etag: Arc<std::sync::Mutex<Option<String>>>,
         always_missing: bool,
         direct: Option<String>,
         stat_calls: Arc<AtomicUsize>,
         open_calls: Arc<AtomicUsize>,
         direct_calls: Arc<AtomicUsize>,
+        opens: Arc<std::sync::Mutex<Vec<(u64, Option<u64>)>>>,
     }
 
     #[async_trait::async_trait]
@@ -451,7 +454,7 @@ mod tests {
             }
             Ok(ObjectMeta {
                 size_bytes: self.bytes.len() as u64,
-                etag: self.etag.clone(),
+                etag: self.etag.lock().unwrap().clone(),
                 last_modified: Some("Wed, 01 Jan 2025 00:00:00 GMT".into()),
                 mime_hint: Some("application/octet-stream".into()),
             })
@@ -461,6 +464,11 @@ mod tests {
             self.open_calls.fetch_add(1, Ordering::SeqCst);
             if self.always_missing {
                 return Err(BackendError::NotFound);
+            }
+            if let Some(r) = range {
+                self.opens.lock().unwrap().push((r.offset, r.length));
+            } else {
+                self.opens.lock().unwrap().push((0, None));
             }
             let bytes: Vec<u8> = match range {
                 None => self.bytes.clone(),
@@ -507,6 +515,8 @@ mod tests {
         stat_calls: Arc<AtomicUsize>,
         open_calls: Arc<AtomicUsize>,
         direct_calls: Arc<AtomicUsize>,
+        etag: Arc<std::sync::Mutex<Option<String>>>,
+        opens: Arc<std::sync::Mutex<Vec<(u64, Option<u64>)>>>,
     }
 
     /// Single-upstream ("primary") fixture. `extra` adds more upstreams
@@ -534,16 +544,19 @@ mod tests {
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let open_calls = Arc::new(AtomicUsize::new(0));
         let direct_calls = Arc::new(AtomicUsize::new(0));
+        let etag = Arc::new(std::sync::Mutex::new(etag.map(|s| s.into())));
+        let opens = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut slots = HashMap::new();
         let mk = |id: &str, b: Vec<u8>| ProbeBackend {
             id: id.into(),
             bytes: b,
-            etag: etag.map(|s| s.into()),
+            etag: Arc::clone(&etag),
             always_missing: missing,
             direct: direct.map(|s| s.into()),
             stat_calls: Arc::clone(&stat_calls),
             open_calls: Arc::clone(&open_calls),
             direct_calls: Arc::clone(&direct_calls),
+            opens: Arc::clone(&opens),
         };
         slots.insert(
             "primary".to_string(),
@@ -568,6 +581,8 @@ mod tests {
             stat_calls,
             open_calls,
             direct_calls,
+            etag,
+            opens,
         }
     }
 
@@ -582,15 +597,18 @@ mod tests {
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let open_calls = Arc::new(AtomicUsize::new(0));
         let direct_calls = Arc::new(AtomicUsize::new(0));
+        let etag = Arc::new(std::sync::Mutex::new(Some("v1".into())));
+        let opens = Arc::new(std::sync::Mutex::new(Vec::new()));
         let backend = ProbeBackend {
             id: "primary".into(),
             bytes: bytes.to_vec(),
-            etag: Some("v1".into()),
+            etag: Arc::clone(&etag),
             always_missing: false,
             direct: None,
             stat_calls: Arc::clone(&stat_calls),
             open_calls: Arc::clone(&open_calls),
             direct_calls: Arc::clone(&direct_calls),
+            opens: Arc::clone(&opens),
         };
         let mut slots = HashMap::new();
         slots.insert(
@@ -604,6 +622,8 @@ mod tests {
             stat_calls,
             open_calls,
             direct_calls,
+            etag,
+            opens,
         }
     }
 
@@ -1068,5 +1088,86 @@ mod tests {
         let resp = healthz(State(fx.state.clone())).await.into_response();
         let (_, _, body) = body_text(resp).await;
         assert!(body.contains("\"segment_bytes\":4"), "{body}");
+    }
+
+    /// Pull two disjoint halves (union 80% >= 0.75): promotion assembles
+    /// from sidecars + fetches exactly the missing tail — then full GET
+    /// hits disk with byte-exact content.
+    #[tokio::test]
+    async fn promotion_assembles_from_segments_plus_gap() {
+        let bytes: Vec<u8> = (0..100u8).collect();
+        let fx = fixture_efficient(&bytes, 0.75, 4);
+        for range in ["bytes=0-49", "bytes=50-79"] {
+            let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", range)])).await;
+            let (status, _, _) = body_text(resp).await;
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        }
+        // Background promotion installs the entry.
+        wait_installed(&fx, "f.bin").await;
+        // Gap fetch was exactly [80,100): no full re-download.
+        let opens = fx.opens.lock().unwrap().clone();
+        assert!(opens.contains(&(80, Some(20))), "{opens:?}");
+        assert!(!opens.iter().any(|(o, l)| *o == 0 && l.is_none()), "{opens:?}");
+        // Assembled bytes are exact: sidecar copies + fetched gap.
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[])).await;
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_bytes(), bytes.as_slice());
+        // Staged history cleaned up after promotion.
+        assert!(staged_segments(&fx, "f.bin").is_empty());
+        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 0);
+    }
+
+    /// Threshold 1.0: partial pulls never promote; the completing pull
+    /// promotes with zero gap fetches.
+    #[tokio::test]
+    async fn promotion_at_full_coverage_needs_no_gap_fetch() {
+        let bytes: Vec<u8> = (0..100u8).collect();
+        let fx = fixture_efficient(&bytes, 1.0, 4);
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")])).await;
+        body_text(resp).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-99")])).await;
+        body_text(resp).await;
+        wait_installed(&fx, "f.bin").await;
+        // Only the two viewer pulls opened the backend — no gap fetch.
+        assert_eq!(fx.opens.lock().unwrap().len(), 2);
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[])).await;
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_bytes(), bytes.as_slice());
+    }
+
+    /// Below threshold: staged, never promoted.
+    #[tokio::test]
+    async fn below_threshold_stays_staged() {
+        let bytes: Vec<u8> = (0..100u8).collect();
+        let fx = fixture_efficient(&bytes, 0.9, 4);
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")])).await;
+        body_text(resp).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
+        assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
+    }
+
+    /// Version flip between staging and promotion: history resets, no
+    /// mixed-version entry is ever installed.
+    #[tokio::test]
+    async fn etag_flip_resets_staged_history() {
+        let bytes: Vec<u8> = (0..100u8).collect();
+        let fx = fixture_efficient(&bytes, 0.75, 4);
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")])).await;
+        body_text(resp).await;
+        assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
+        // Object replaced upstream: next transfer restarts history.
+        *fx.etag.lock().unwrap() = Some("v2".into());
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-79")])).await;
+        body_text(resp).await;
+        // Old segments dropped, ledger re-anchored on v2, no entry yet.
+        assert_eq!(staged_segments(&fx, "f.bin"), vec![(50, 80)]);
+        let cov = fx.state.cache.coverage.lock().await;
+        assert_eq!(cov.get("f.bin").unwrap().etag.as_deref(), Some("v2"));
+        assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
     }
 }
