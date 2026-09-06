@@ -621,11 +621,6 @@ impl<C: Clock + Clone> Cache<C> {
         self.await_flight(flight, &key, backend_key.as_str(), &upstream_id, slot, range).await
     }
 
-    async fn try_serve_cached(&self, key: &str) -> Option<Vec<u8>> {
-        let path = store::file_path(&self.config.cache_dir, key);
-        tokio::fs::read(&path).await.ok()
-    }
-
     async fn entry_meta(&self, key: &str) -> Option<EntryMeta> {
         self.state.read().await.entries.get(key).cloned()
     }
@@ -669,16 +664,6 @@ impl<C: Clock + Clone> Cache<C> {
         let now = self.clock.now_millis();
         let mut s = self.state.write().await;
         reap(&mut s, &self.config, &self.meta, now).await;
-    }
-
-    /// Serve a byte range from the cached file (spec §3.8).
-    pub async fn range(&self, key: &str, start: u64, end: Option<u64>) -> Option<Vec<u8>> {
-        let bytes = self.try_serve_cached(key).await?;
-        let end = end.unwrap_or(bytes.len() as u64);
-        if start >= bytes.len() as u64 || end > bytes.len() as u64 || start >= end {
-            return None;
-        }
-        Some(bytes[start as usize..end as usize].to_vec())
     }
 }
 
