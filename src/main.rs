@@ -46,9 +46,30 @@ async fn main() -> anyhow::Result<()> {
             }),
         );
     }
+    let clock = Arc::new(SystemClock);
+    let mut slots = HashMap::new();
+    for u in &cfg.upstreams {
+        let backend: Arc<dyn StorageBackend> = match u.backend_type.as_str() {
+            "openlist" => Arc::new(
+                OpenListBackend::from_config(u).map_err(|e| anyhow::anyhow!(e))?,
+            ),
+            other => anyhow::bail!("upstream {}: unknown type {other:?} (v1 supports \"openlist\")", u.id),
+        };
+        slots.insert(
+            u.id.clone(),
+            Arc::new(BackendSlot {
+                backend,
+                gate: Arc::new(Semaphore::new(cfg.concurrency_per_upstream)),
+            }),
+        );
+    }
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), clock, BackendRegistry::new(slots)));
     cache.load_and_start().await;
     let app_state = origin_cache::business::AppState { cache, config: Arc::clone(&cfg) };
+
+    if cfg.prewarm_shared_secret_env.is_none() {
+        warn!("prewarm endpoint is open (no prewarm_shared_secret_env set) — fine behind EdgeOne, risky if directly exposed");
+    }
 
     let business_addr = cfg.listen_addr;
     let front_addr = cfg.front_listen;

@@ -1170,4 +1170,31 @@ mod tests {
         assert_eq!(cov.get("f.bin").unwrap().etag.as_deref(), Some("v2"));
         assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
     }
+
+    #[tokio::test]
+    async fn prewarm_secret_gate_blocks_anonymous() {
+        // Endpoint is open when prewarm_shared_secret_env is unset, but
+        // when set and wrong token sent, it must 401.
+        let fx = fixture(b"0123456789", None, vec![], false);
+        std::env::set_var("TEST_PW_SECRET", "right-token");
+        let mut cfg = fx.state.config.as_ref().clone();
+        cfg.prewarm_shared_secret_env = Some("TEST_PW_SECRET".into());
+        let state = AppState {
+            cache: fx.state.cache.clone(),
+            config: Arc::new(cfg),
+        };
+        // Wrong token: rejected.
+        let resp = prewarm(State(state.clone()), Path("w.bin".into()), headers(&[("x-prewarm-token", "wrong")]))
+            .await
+            .into_response();
+        let (status, _, _) = body_text(resp).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // Right token: proceeds.
+        let resp = prewarm(State(state.clone()), Path("w.bin".into()), headers(&[("x-prewarm-token", "right-token")]))
+            .await
+            .into_response();
+        let (status, _, _) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        std::env::remove_var("TEST_PW_SECRET");
+    }
 }
