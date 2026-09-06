@@ -41,10 +41,14 @@ allowed_download_suffixes = []
 [[upstreams]]
 id = "media"
 type = "openlist"
-base_url = "http://127.0.0.1:5244/dav"   # loopback — OpenList runs beside us
+base_url = "http://127.0.0.1:5244/dav"   # loopback — OpenList runs beside us.
+# Remote OpenList instances MUST use https (plain http is rejected for
+# non-loopback hosts — WebDAV credentials ride on this connection).
 root_path = "media"                       # optional subfolder in the mount
 username_env = "OPENLIST_USERNAME"
 password_env = "OPENLIST_PASSWORD"
+# accept_invalid_certs = false            # self-signed TLS escape hatch
+                                          # (dev/self-hosted only, default false)
 
 # Multi-OpenList: add more instances and route key prefixes to them.
 # [[upstreams]]

@@ -22,6 +22,7 @@ fn upstream(base: String) -> UpstreamConfig {
         root_path: None,
         username_env: "OPENLIST_USERNAME".into(),
         password_env: "OPENLIST_PASSWORD".into(),
+        accept_invalid_certs: false,
     }
 }
 
@@ -172,6 +173,7 @@ async fn unknown_type_is_rejected() {
         root_path: None,
         username_env: "OPENLIST_USERNAME".into(),
         password_env: "OPENLIST_PASSWORD".into(),
+        accept_invalid_certs: false,
     };
     assert!(origin_cache::backend::OpenListBackend::from_config(&cfg).is_err());
 }

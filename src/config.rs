@@ -11,8 +11,10 @@ pub struct UpstreamConfig {
     /// OpenList instance — hundreds of cloud drives behind one folder tree).
     #[serde(rename = "type", default = "default_backend_type")]
     pub backend_type: String,
-    /// WebDAV base URL of the OpenList instance, e.g. "http://127.0.0.1:5244/dav".
-    /// Loopback-only in the reference deployment (OpenList runs beside us).
+    /// WebDAV base URL of the OpenList instance. Loopback deployments may
+    /// use plain http (e.g. "http://127.0.0.1:5244/dav"); any non-loopback
+    /// host MUST be https (enforced in validation — credentials travel on
+    /// this connection).
     pub base_url: String,
     /// Optional subfolder inside the WebDAV mount this upstream serves,
     /// e.g. "music" for /dav/music/<key>. Empty = mount root.
@@ -22,10 +24,46 @@ pub struct UpstreamConfig {
     pub username_env: String,
     /// OpenList web-UI password — env reference (spec §2).
     pub password_env: String,
+    /// Accept self-signed/invalid TLS certificates on the upstream
+    /// connection. Dev/self-hosted escape hatch only — never enable for
+    /// third-party hosts. Default false.
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
 }
 
 fn default_backend_type() -> String {
     "openlist".into()
+}
+
+/// Loopback/localhost hosts are allowed to speak plain http to us (the
+/// reference deployment runs OpenList beside the cache); everything else
+/// must be https because WebDAV credentials ride on it.
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    h == "localhost" || h.starts_with("localhost.") || h.starts_with("127.") || h == "::1"
+}
+
+fn upstream_url_policy(base_url: &str, upstream_id: &str) -> anyhow::Result<()> {
+    let (scheme, rest) = base_url
+        .split_once("://")
+        .ok_or_else(|| anyhow::anyhow!("upstream {upstream_id}: base_url must be an absolute http(s) URL"))?;
+    let authority = rest.split('/').next().unwrap_or("");
+    // Strip an optional port, honoring bracketed IPv6 literals.
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    match scheme {
+        "https" => Ok(()),
+        "http" if is_loopback_host(host) => Ok(()),
+        "http" => Err(anyhow::anyhow!(
+            "upstream {upstream_id}: base_url is http on a non-loopback host ({host}) — credentials would travel in cleartext; use https"
+        )),
+        _ => Err(anyhow::anyhow!(
+            "upstream {upstream_id}: base_url scheme must be http (loopback only) or https"
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -135,6 +173,10 @@ impl Config {
         if raw.routes.is_empty() {
             anyhow::bail!("at least one [[routes]] required");
         }
+        // Upstream URL policy: https everywhere except loopback http.
+        for u in &raw.upstreams {
+            upstream_url_policy(&u.base_url, &u.id)?;
+        }
         // Validate routes reference known upstreams.
         let ids: std::collections::HashSet<&str> = raw.upstreams.iter().map(|u| u.id.as_str()).collect();
         for r in &raw.routes {
@@ -193,6 +235,7 @@ impl Default for Config {
                 root_path: None,
                 username_env: "OPENLIST_USERNAME".into(),
                 password_env: "OPENLIST_PASSWORD".into(),
+                accept_invalid_certs: false,
             }],
             routes: RouteTable::new(vec![RouteRule { prefix: "".into(), upstream: "primary".into() }]),
         }
@@ -224,6 +267,41 @@ mod tests {
             upstream = "missing"
         "#;
         assert!(Config::from_toml_str(toml).is_err());
+    }
+
+    fn upstream_toml(base_url: &str) -> String {
+        format!(
+            r#"
+            [[upstreams]]
+            id = "a"
+            type = "openlist"
+            base_url = "{base_url}"
+            username_env = "A_USER"
+            password_env = "A_PASS"
+            [[routes]]
+            prefix = ""
+            upstream = "a"
+        "#
+        )
+    }
+
+    #[test]
+    fn loopback_http_allowed() {
+        assert!(Config::from_toml_str(&upstream_toml("http://127.0.0.1:5244/dav")).is_ok());
+        assert!(Config::from_toml_str(&upstream_toml("http://localhost:5244/dav")).is_ok());
+        assert!(Config::from_toml_str(&upstream_toml("http://[::1]:5244/dav")).is_ok());
+    }
+
+    #[test]
+    fn remote_http_rejected_https_required() {
+        assert!(Config::from_toml_str(&upstream_toml("http://media.example.com/dav")).is_err());
+        assert!(Config::from_toml_str(&upstream_toml("https://media.example.com/dav")).is_ok());
+    }
+
+    #[test]
+    fn non_absolute_base_url_rejected() {
+        assert!(Config::from_toml_str(&upstream_toml("127.0.0.1:5244/dav")).is_err());
+        assert!(Config::from_toml_str(&upstream_toml("ftp://127.0.0.1/dav")).is_err());
     }
 
     #[test]

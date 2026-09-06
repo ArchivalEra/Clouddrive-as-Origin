@@ -44,7 +44,9 @@ pub struct OpenListBackend {
     root_path: Option<String>,
     username: String,
     password: String,
-    /// Own raw client for ranged streaming GETs.
+    /// Shared TLS-configured client: used directly for ranged streaming
+    /// GETs and injected into reqwest_dav for PROPFIND (set_agent), so
+    /// both paths share identical TLS policy.
     http: reqwest::Client,
 }
 
@@ -58,17 +60,20 @@ impl OpenListBackend {
         let password = std::env::var(&cfg.password_env)
             .map_err(|_| format!("upstream {}: env {} not set", cfg.id, cfg.password_env))?;
         let base_url = cfg.base_url.trim_end_matches('/').to_string();
+        let mut builder = reqwest::Client::builder()
+            // OpenList may be remote; generous timeout for large media.
+            .connect_timeout(Duration::from_secs(5));
+        if cfg.accept_invalid_certs {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        let http = builder.build().map_err(|e| format!("upstream {}: http client: {e}", cfg.id))?;
         Ok(Self {
             id: cfg.id.clone(),
             base_url,
             root_path: cfg.root_path.clone(),
             username,
             password,
-            http: reqwest::Client::builder()
-                // OpenList is loopback; generous timeout for large media.
-                .connect_timeout(Duration::from_secs(5))
-                .build()
-                .map_err(|e| format!("upstream {}: http client: {e}", cfg.id))?,
+            http,
         })
     }
 
@@ -93,6 +98,7 @@ impl StorageBackend for OpenListBackend {
     /// a content hash per driver), getcontentlength, getlastmodified.
     async fn stat(&self, key: &Key) -> Result<ObjectMeta, BackendError> {
         let dav = reqwest_dav::ClientBuilder::new()
+            .set_agent(self.http.clone())
             .set_host(self.base_url.clone())
             .set_auth(reqwest_dav::types::Auth::Basic(
                 self.username.clone(),
@@ -162,6 +168,7 @@ impl StorageBackend for OpenListBackend {
         // OpenList owns provider credential rotation; WebDAV basic auth has
         // no token lifecycle on our side. Health probe = cheap PROPFIND.
         let dav = reqwest_dav::ClientBuilder::new()
+            .set_agent(self.http.clone())
             .set_host(self.base_url.clone())
             .set_auth(reqwest_dav::types::Auth::Basic(
                 self.username.clone(),
