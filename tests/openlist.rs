@@ -6,8 +6,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 
 use origin_cache::{
-    backend::{BackendError, ByteRange, Key, ObjectMeta, StreamSource, StorageBackend},
-    config::UpstreamConfig,
+    backend::{BackendError, ByteRange, DirectUrl, Key, ObjectMeta, StreamSource, StorageBackend},
+    config::{ColdMiss, UpstreamConfig},
     mime,
 };
 
@@ -23,12 +23,15 @@ fn upstream(base: String) -> UpstreamConfig {
         username_env: "OPENLIST_USERNAME".into(),
         password_env: "OPENLIST_PASSWORD".into(),
         accept_invalid_certs: false,
+        cold_miss: ColdMiss::Proxy,
+        link_api_token_env: Some("OPENLIST_LINK_TOKEN".into()),
     }
 }
 
 fn backend_for(base: String) -> origin_cache::backend::OpenListBackend {
     std::env::set_var("OPENLIST_USERNAME", "test-user");
     std::env::set_var("OPENLIST_PASSWORD", "test-pass");
+    std::env::set_var("OPENLIST_LINK_TOKEN", "test-token");
     origin_cache::backend::OpenListBackend::from_config(&upstream(base)).unwrap()
 }
 
@@ -174,6 +177,126 @@ async fn unknown_type_is_rejected() {
         username_env: "OPENLIST_USERNAME".into(),
         password_env: "OPENLIST_PASSWORD".into(),
         accept_invalid_certs: false,
+        cold_miss: ColdMiss::Proxy,
+        link_api_token_env: None,
     };
     assert!(origin_cache::backend::OpenListBackend::from_config(&cfg).is_err());
+}
+
+/// Mount a link mock returning `link_url` for POST /api/fs/link.
+async fn mock_link(server: &MockServer, link_url: &str) {
+    Mock::given(method("POST"))
+        .and(path("/api/fs/link"))
+        .and(header("authorization", "test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"code":200,"message":"success","data":{{"url":{link_url:?},"header":{{}}}}}}"#
+        )))
+        .mount(server)
+        .await;
+}
+
+/// Second mock server playing the foreign CDN: 206 answer to the 1-byte
+/// probe (loopback http is allowed; foreign https in production).
+async fn mock_cdn_206(cdn: &MockServer, body: &[u8]) {
+    Mock::given(method("GET"))
+        .and(path("/f.bin"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 0-0/10")
+                .set_body_bytes(body.to_vec()),
+        )
+        .mount(cdn)
+        .await;
+}
+
+#[tokio::test]
+async fn direct_url_tier1_link_probed_ok() {
+    let server = MockServer::start().await;
+    let cdn = MockServer::start().await;
+    mock_link(&server, &format!("{}/f.bin?sign=x", cdn.uri())).await;
+    mock_cdn_206(&cdn, b"x").await;
+    let b = backend_for(server.uri());
+    let got: DirectUrl =
+        b.direct_url(&Key::from_validated("f.bin".into()), Some("test-agent/1.0")).await.unwrap();
+    assert_eq!(got.url, format!("{}/f.bin?sign=x", cdn.uri()));
+}
+
+#[tokio::test]
+async fn direct_url_follows_probe_redirect_to_final() {
+    let server = MockServer::start().await;
+    let cdn = MockServer::start().await;
+    mock_link(&server, &format!("{}/hop.bin", cdn.uri())).await;
+    // Intermediate redirector: one hop, then the real 206.
+    Mock::given(method("GET"))
+        .and(path("/hop.bin"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/real.bin"))
+        .mount(&cdn)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/real.bin"))
+        .and(header("range", "bytes=0-0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 0-0/10")
+                .set_body_bytes(b"x".to_vec()),
+        )
+        .mount(&cdn)
+        .await;
+    let b = backend_for(server.uri());
+    let got: DirectUrl = b.direct_url(&Key::from_validated("f.bin".into()), None).await.unwrap();
+    assert_eq!(got.url, format!("{}/real.bin", cdn.uri()));
+}
+
+#[tokio::test]
+async fn direct_url_tier3_self_referential_falls_back() {
+    let server = MockServer::start().await;
+    // Proxy-backed storages answer with our own /p URL — not redirectable.
+    mock_link(&server, &format!("{}/p/f.bin?d&sign=s", server.uri())).await;
+    let b = backend_for(server.uri());
+    let err = b.direct_url(&Key::from_validated("f.bin".into()), None).await.unwrap_err();
+    assert!(matches!(err, BackendError::Other(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn direct_url_tier3_link_error_falls_back() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/fs/link"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"code":500,"message":"failed link: storage not found","data":null}"#,
+        ))
+        .mount(&server)
+        .await;
+    let b = backend_for(server.uri());
+    let err = b.direct_url(&Key::from_validated("f.bin".into()), None).await.unwrap_err();
+    assert!(matches!(err, BackendError::Other(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn direct_url_tier3_probe_without_range_falls_back() {
+    let server = MockServer::start().await;
+    let cdn = MockServer::start().await;
+    mock_link(&server, &format!("{}/f.bin", cdn.uri())).await;
+    // 200 to a Range probe = Range ignored → unusable for seeking viewers.
+    Mock::given(method("GET"))
+        .and(path("/f.bin"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"0123456789".to_vec()))
+        .mount(&cdn)
+        .await;
+    let b = backend_for(server.uri());
+    let err = b.direct_url(&Key::from_validated("f.bin".into()), None).await.unwrap_err();
+    assert!(matches!(err, BackendError::Other(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn direct_url_without_token_is_unavailable() {
+    let server = MockServer::start().await;
+    std::env::set_var("OPENLIST_USERNAME", "u");
+    std::env::set_var("OPENLIST_PASSWORD", "p");
+    let mut cfg = upstream(server.uri());
+    cfg.link_api_token_env = None;
+    let b = origin_cache::backend::OpenListBackend::from_config(&cfg).unwrap();
+    let err = b.direct_url(&Key::from_validated("f.bin".into()), None).await.unwrap_err();
+    assert!(matches!(err, BackendError::Other(_)), "got {err:?}");
 }

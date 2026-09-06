@@ -49,6 +49,14 @@ username_env = "OPENLIST_USERNAME"
 password_env = "OPENLIST_PASSWORD"
 # accept_invalid_certs = false            # self-signed TLS escape hatch
                                           # (dev/self-hosted only, default false)
+# A relief valve (P1): cold-miss strategy per upstream.
+#   "proxy" (default) — water-pipe bytes through us, always works.
+#   "redirect" — 307 the viewer to an OpenList-issued direct link
+#     (single handshake, cloud bandwidth), background fill, silent
+#     proxy fallback. Requires link_api_token_env; hits never redirect.
+# cold_miss = "proxy"
+# link_api_token_env = "OPENLIST_LINK_TOKEN"  # OpenList static admin token
+                                              # (Settings → Other → Token)
 
 # Multi-OpenList: add more instances and route key prefixes to them.
 # [[upstreams]]

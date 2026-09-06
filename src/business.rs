@@ -13,16 +13,16 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::{
-    backend::{BackendError, ByteRange},
+    backend::{BackendError, ByteRange, Key},
     cache::cache::{Cache, CacheHit, CacheOutcome, HitMeta},
     clock::Clock,
-    config::Config,
+    config::{ColdMiss, Config},
     key::validate_key,
 };
 
@@ -281,6 +281,77 @@ async fn head_lookup<C: Clock + Clone>(
     }
 }
 
+/// A relief valve (P1): cold + redirect-capable upstream → 307 to the
+/// upstream-issued direct link, bytes filled in background. Returns
+/// `Some(response)` only on the 307 path; `None` means "serve from cache
+/// / proxy as usual". Hit-first: a fresh memory entry never redirects.
+/// Every failure (disabled, unresolvable, unsupported, rejected target,
+/// slow link) silently falls through to the water-pipe — the valve can
+/// only save bandwidth, never break a fetch.
+async fn try_relief_valve<C: Clock + Clone>(
+    state: &AppState<C>,
+    full: &str,
+    pinned: &Option<(String, String)>,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let (backend_path, upstream_id) = match pinned {
+        Some((rest, bucket)) => (rest.clone(), bucket.clone()),
+        None => {
+            let (_, u) = state.cache.resolve_upstream(full).ok()?;
+            (full.to_string(), u)
+        }
+    };
+    let redirect = state
+        .config
+        .upstream(&upstream_id)
+        .map(|u| u.cold_miss == ColdMiss::Redirect)
+        .unwrap_or(false);
+    if !redirect {
+        return None;
+    }
+    if state.cache.memory_hit_fresh(full).await {
+        return None;
+    }
+    // Backend identity must validate; if it doesn't, the B path below
+    // reports the 400 properly — the valve stays out of the way.
+    let bkey = validate_key(&backend_path).ok()?;
+    let slot = state.cache.backends.get(&upstream_id)?;
+    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    // Bound the link round-trips: a slow link source must not stall the
+    // viewer before the proxy fallback engages.
+    let link = tokio::time::timeout(
+        Duration::from_secs(8),
+        slot.backend.direct_url(&Key::from_validated(bkey), ua),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !crate::backend::redirect_target_allowed(&link.url) {
+        return None;
+    }
+    // Fill in background; the viewer leaves now.
+    let cache = Arc::clone(&state.cache);
+    let f = full.to_string();
+    let p = pinned.clone();
+    tokio::spawn(async move {
+        let _ = cache.prefetch(f, p).await;
+    });
+    let (req_id, host_id) = request_ids();
+    let location: axum::http::HeaderValue = link.url.parse().ok()?;
+    Some(
+        Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header("location", location)
+            // The 307 itself must never be edge-cached: the signed target
+            // expires while the URL stays the same.
+            .header("cache-control", "no-store")
+            .header("x-amz-request-id", req_id)
+            .header("x-amz-id-2", host_id)
+            .body(Body::empty())
+            .unwrap(),
+    )
+}
+
 async fn get_key<C>(State(state): State<AppState<C>>, Path(path_key): Path<String>, headers: HeaderMap) -> Response
 where
     C: Clock + Clone,
@@ -288,20 +359,26 @@ where
     let (req_id, host_id) = request_ids();
     let (key, pinned) = resolve_target(&state, &path_key);
 
+    // AWS error precedence: malformed/multi Ranges 416 before anything else.
+    let parsed = match parse_client_range(&headers) {
+        Err(()) | Ok(ClientRange::Multi) => {
+            let hint = state.cache.memory_size(&key).await;
+            return error_response(BackendError::RangeNotSatisfiable, &key, &req_id, &host_id, false, hint);
+        }
+        Ok(r) => r,
+    };
+    // A relief valve: cold + redirect-capable upstreams leave via 307
+    // (hits never redirect — checked inside). Falls through to proxy.
+    if let Some(redirect) = try_relief_valve(&state, &key, &pinned, &headers).await {
+        return redirect;
+    }
     // Suffix ranges need the object size up front: one lightweight stat
     // (memory or single PROPFIND — never a flight).
-    let range = match parse_client_range(&headers) {
-        Err(()) => {
-            let hint = state.cache.memory_size(&key).await;
-            return error_response(BackendError::RangeNotSatisfiable, &key, &req_id, &host_id, false, hint);
-        }
-        Ok(ClientRange::Multi) => {
-            let hint = state.cache.memory_size(&key).await;
-            return error_response(BackendError::RangeNotSatisfiable, &key, &req_id, &host_id, false, hint);
-        }
-        Ok(ClientRange::Absent) => None,
-        Ok(ClientRange::Single(r)) => Some(r),
-        Ok(ClientRange::Suffix(n)) => {
+    let range = match parsed {
+        ClientRange::Absent => None,
+        ClientRange::Multi => unreachable!("rejected above"),
+        ClientRange::Single(r) => Some(r),
+        ClientRange::Suffix(n) => {
             let size = match head_lookup(&state, &key, &pinned).await {
                 Ok(m) => m.size,
                 Err(e) => {
@@ -447,21 +524,17 @@ where
     if already {
         return (StatusCode::OK, Json(json!({"status": "hit"}))).into_response();
     }
-    match state.cache.get(&key, None).await {
-        Ok(mut hit) => {
-            // Prewarm fetches without streaming to a client: drain the body.
-            match crate::cache::flight::drain(&mut hit.body).await {
-                Ok(_) => (StatusCode::OK, Json(json!({"status": "fetched"}))).into_response(),
-                Err(e) => {
-                    warn!(key = %key, error = %e, "prewarm drain failed");
-                    (StatusCode::BAD_GATEWAY, Json(json!({"error": "upstream error"}))).into_response()
-                }
-            }
-        }
+    // Same primitive as the relief valve's background fill: full fetch, no
+    // client attached.
+    match state.cache.prefetch(key.clone(), None).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"status": "fetched"}))).into_response(),
         Err(BackendError::NotFound) => {
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
         }
-        Err(_) => (StatusCode::BAD_GATEWAY, Json(json!({"error": "upstream error"}))).into_response(),
+        Err(e) => {
+            warn!(key = %key, error = %e, "prewarm fetch failed");
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": "upstream error"}))).into_response()
+        }
     }
 }
 
@@ -505,7 +578,7 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use crate::{
-        backend::{BackendRegistry, BackendSlot, Key, ObjectMeta, StreamSource, StorageBackend},
+        backend::{BackendRegistry, BackendSlot, DirectUrl, Key, ObjectMeta, StreamSource, StorageBackend},
         clock::MockClock,
     };
 
@@ -516,8 +589,10 @@ mod tests {
         bytes: Vec<u8>,
         etag: Option<String>,
         always_missing: bool,
+        direct: Option<String>,
         stat_calls: Arc<AtomicUsize>,
         open_calls: Arc<AtomicUsize>,
+        direct_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -566,6 +641,14 @@ mod tests {
             Ok(())
         }
 
+        async fn direct_url(&self, _key: &Key, _viewer_ua: Option<&str>) -> Result<DirectUrl, BackendError> {
+            self.direct_calls.fetch_add(1, Ordering::SeqCst);
+            self.direct
+                .clone()
+                .map(|url| DirectUrl { url })
+                .ok_or_else(|| BackendError::Other("no link".into()))
+        }
+
         fn id(&self) -> &str {
             &self.id
         }
@@ -576,23 +659,44 @@ mod tests {
         state: AppState<MockClock>,
         stat_calls: Arc<AtomicUsize>,
         open_calls: Arc<AtomicUsize>,
+        direct_calls: Arc<AtomicUsize>,
     }
 
     /// Single-upstream ("primary") fixture. `extra` adds more upstreams
     /// (used for the bucket-alias test). `missing` makes every key absent.
     fn fixture(bytes: &[u8], etag: Option<&str>, extra: Vec<(&str, Vec<u8>)>, missing: bool) -> Fixture {
+        fixture_full(bytes, etag, extra, missing, None, false)
+    }
+
+    /// Full fixture: `direct` is the Tier 1 link the backend offers
+    /// (None = Tier 3 fallback); `redirect` flips primary to
+    /// `cold_miss = "redirect"`.
+    fn fixture_full(
+        bytes: &[u8],
+        etag: Option<&str>,
+        extra: Vec<(&str, Vec<u8>)>,
+        missing: bool,
+        direct: Option<&str>,
+        redirect: bool,
+    ) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+        let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+        if redirect {
+            cfg.upstreams[0].cold_miss = ColdMiss::Redirect;
+        }
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let open_calls = Arc::new(AtomicUsize::new(0));
+        let direct_calls = Arc::new(AtomicUsize::new(0));
         let mut slots = HashMap::new();
         let mk = |id: &str, b: Vec<u8>| ProbeBackend {
             id: id.into(),
             bytes: b,
             etag: etag.map(|s| s.into()),
             always_missing: missing,
+            direct: direct.map(|s| s.into()),
             stat_calls: Arc::clone(&stat_calls),
             open_calls: Arc::clone(&open_calls),
+            direct_calls: Arc::clone(&direct_calls),
         };
         slots.insert(
             "primary".to_string(),
@@ -616,6 +720,7 @@ mod tests {
             state: AppState { cache, config: Arc::new(cfg) },
             stat_calls,
             open_calls,
+            direct_calls,
         }
     }
 
@@ -640,6 +745,18 @@ mod tests {
         let resp = get_key(State(fx.state.clone()), Path(key.to_string()), headers(&[])).await;
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
+        wait_installed(fx, key).await;
+    }
+
+    /// Prime below the business plane (bypasses the relief valve): for
+    /// redirect-enabled fixtures where GET would 307 instead of filling.
+    async fn prime_cache(fx: &Fixture, key: &str) {
+        let mut hit = fx.state.cache.get(key, None).await.unwrap();
+        crate::cache::flight::drain(&mut hit.body).await.unwrap();
+        wait_installed(fx, key).await;
+    }
+
+    async fn wait_installed(fx: &Fixture, key: &str) {
         for _ in 0..200 {
             if fx.state.cache.state.read().await.entries.contains_key(key) {
                 return;
@@ -873,5 +990,80 @@ mod tests {
         let resp = get_key(State(fx.state.clone()), Path("archive/f.bin".into()), headers(&[])).await;
         let (_, _, body) = body_text(resp).await;
         assert_eq!(body, "BBB");
+    }
+
+    #[tokio::test]
+    async fn redirect_cold_307_and_background_fill() {
+        let fx = fixture_full(b"0123456789", None, vec![], false, Some("https://cdn.example.com/f?sign=x"), true);
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[])).await;
+        let (status, h, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(h.get("location").unwrap(), "https://cdn.example.com/f?sign=x");
+        assert_eq!(h.get("cache-control").unwrap(), "no-store");
+        assert!(body.is_empty());
+        assert!(h.get("x-amz-request-id").is_some());
+        assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 1);
+        // Background fill installs the entry without any viewer attached.
+        for _ in 0..200 {
+            if fx.state.cache.state.read().await.entries.contains_key("new.bin") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(fx.state.cache.state.read().await.entries.contains_key("new.bin"));
+    }
+
+    #[tokio::test]
+    async fn redirect_hit_serves_cache_never_redirects() {
+        let fx = fixture_full(b"0123456789", None, vec![], false, Some("https://cdn.example.com/f"), true);
+        prime_cache(&fx, "a.bin").await;
+        reset(&fx);
+        // fresh hit → 200 from cache even though redirect is enabled.
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[])).await;
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "0123456789");
+        assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn redirect_unavailable_silently_proxies() {
+        // Tier 3 (no link): normal water-pipe, viewer unaffected.
+        let fx = fixture_full(b"0123456789", None, vec![], false, None, true);
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[])).await;
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "0123456789");
+        assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn redirect_rejected_target_silently_proxies() {
+        // Foreign http is not an allowed redirect target → proxy.
+        let fx = fixture_full(b"0123456789", None, vec![], false, Some("http://cdn.example.com/f"), true);
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[])).await;
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "0123456789");
+    }
+
+    #[tokio::test]
+    async fn redirect_disabled_never_consults_backend() {
+        // Default proxy mode: direct_url untouched even when offered.
+        let fx = fixture_full(b"0123456789", None, vec![], false, Some("https://cdn.example.com/f"), false);
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[])).await;
+        let (status, _, _) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn prewarm_fetches_via_prefetch() {
+        let fx = fixture(b"0123456789", None, vec![], false);
+        let resp = prewarm(State(fx.state.clone()), Path("w.bin".into()), headers(&[])).await.into_response();
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("fetched"), "{body}");
+        assert!(fx.state.cache.state.read().await.entries.contains_key("w.bin"));
     }
 }

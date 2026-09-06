@@ -154,6 +154,8 @@ async fn two_upstream_routing_by_prefix() {
         username_env: "ARCHIVE_USER".into(),
         password_env: "ARCHIVE_PASS".into(),
         accept_invalid_certs: false,
+        cold_miss: origin_cache::config::ColdMiss::Proxy,
+        link_api_token_env: None,
     });
     cfg.routes = RouteTable::new(vec![
         RouteRule { prefix: "archive/".into(), upstream: "archive".into() },

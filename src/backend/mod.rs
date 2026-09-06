@@ -67,12 +67,51 @@ pub struct ObjectMeta {
     pub mime_hint: Option<String>,
 }
 
+/// A viewer-facing direct download URL issued by the upstream (A relief
+/// valve). The business plane 307s cold viewers here instead of proxying
+/// bytes; any failure silently falls back to the water-pipe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectUrl {
+    pub url: String,
+}
+
 /// A readable byte stream with a known-or-unknown total length.
 /// `total_len` is `Some` when the provider returned it (stat or
 /// Content-Range total); the water-pipe uses it for `Content-Length`.
 pub struct StreamSource {
     pub stream: Box<dyn AsyncRead + Send + Unpin>,
     pub total_len: Option<u64>,
+}
+
+/// Whether a URL may be handed to a viewer as a redirect target (A relief
+/// valve choke point). Rules: absolute http(s) only, no userinfo
+/// credentials (`user:pass@` must never reach a `Location` header), https
+/// everywhere except loopback http (same trust argument as the upstream
+/// URL policy — loopback plaintext is fine). Relative URLs fail.
+pub fn redirect_target_allowed(url: &str) -> bool {
+    let (scheme, rest) = match url.split_once("://") {
+        Some(p) => p,
+        None => return false,
+    };
+    let https = scheme.eq_ignore_ascii_case("https");
+    let http = scheme.eq_ignore_ascii_case("http");
+    if !https && !http {
+        return false;
+    }
+    let auth = rest.split('/').next().unwrap_or("");
+    if auth.is_empty() || auth.contains('@') {
+        return false;
+    }
+    if https {
+        return true;
+    }
+    let host = if let Some(s) = auth.strip_prefix('[') {
+        s.split(']').next().unwrap_or("")
+    } else {
+        auth.split(':').next().unwrap_or("")
+    }
+    .to_ascii_lowercase();
+    host == "localhost" || host.starts_with("localhost.") || host.starts_with("127.") || host == "::1"
 }
 
 /// Unified backend error taxonomy — cache semantics (negative cache,
@@ -120,6 +159,16 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Credential rotation + health probe (OAuth refresh, quota check).
     async fn refresh_if_needed(&self) -> Result<(), BackendError>;
 
+    /// Resolve a viewer-facing direct URL for `key` (Tier 1 link-first:
+    /// issue, normalize, and 1-byte-probe the upstream's direct link).
+    /// Any `Err` — unsupported, self-referential, unprobed — means
+    /// "proxy instead" (Tier 3); the caller never surfaces it.
+    /// `viewer_ua` mimics the viewer on server-side probes. Default:
+    /// unsupported (zero changes for existing backends).
+    async fn direct_url(&self, _key: &Key, _viewer_ua: Option<&str>) -> Result<DirectUrl, BackendError> {
+        Err(BackendError::Other("direct links not supported".into()))
+    }
+
     /// Upstream id this backend serves (for logs and redb records).
     fn id(&self) -> &str;
 }
@@ -133,6 +182,25 @@ mod tests {
         assert_eq!(ByteRange::from_offset(0).http_header_value(), "bytes=0-");
         assert_eq!(ByteRange::from_offset(100).http_header_value(), "bytes=100-");
         assert_eq!(ByteRange::bounded(100, 50).http_header_value(), "bytes=100-149");
+    }
+
+    #[test]
+    fn redirect_target_policy() {
+        // Foreign https: always fine.
+        assert!(redirect_target_allowed("https://cdn.example.com/f.bin?sign=x"));
+        // Credentials in URL: never (must not reach Location).
+        assert!(!redirect_target_allowed("https://user:pass@cdn.example.com/f"));
+        assert!(!redirect_target_allowed("https://user@cdn.example.com/f"));
+        // Relative / non-http: never.
+        assert!(!redirect_target_allowed("/p/f?d&sign=s"));
+        assert!(!redirect_target_allowed("ftp://cdn.example.com/f"));
+        assert!(!redirect_target_allowed("https://"));
+        // Remote http: never (credentials and signatures in cleartext).
+        assert!(!redirect_target_allowed("http://cdn.example.com/f"));
+        // Loopback http: fine (same trust argument as upstream policy).
+        assert!(redirect_target_allowed("http://127.0.0.1:8080/f"));
+        assert!(redirect_target_allowed("http://localhost:5244/f"));
+        assert!(redirect_target_allowed("http://[::1]:8080/f"));
     }
 
     #[tokio::test]

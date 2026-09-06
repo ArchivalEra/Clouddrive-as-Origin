@@ -29,6 +29,28 @@ pub struct UpstreamConfig {
     /// third-party hosts. Default false.
     #[serde(default)]
     pub accept_invalid_certs: bool,
+    /// Cold-miss strategy. `proxy` (default) water-pipes bytes through us;
+    /// `redirect` 307s the viewer to an upstream-issued direct link (A
+    /// relief valve) with a background fill, silently falling back to
+    /// proxy whenever no link is available. v1 supports redirect on
+    /// openlist upstreams only, and requires `link_api_token_env`.
+    #[serde(default)]
+    pub cold_miss: ColdMiss,
+    /// OpenList static admin token (Settings → Other → Token) for the
+    /// `/api/fs/link` direct-link endpoint — env reference. Only read
+    /// when `cold_miss = "redirect"`. Never expires, unlike 48h JWTs.
+    #[serde(default)]
+    pub link_api_token_env: Option<String>,
+}
+
+/// Cold-miss strategy per upstream (A relief valve is opt-in per
+/// upstream; default proxy = zero behavior change).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ColdMiss {
+    #[default]
+    Proxy,
+    Redirect,
 }
 
 fn default_backend_type() -> String {
@@ -149,8 +171,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
-        let raw: RawConfig = toml::from_str(s).context("parse TOML config")?;
+    pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {        let raw: RawConfig = toml::from_str(s).context("parse TOML config")?;
         Self::from_raw(raw)
     }
 
@@ -166,6 +187,12 @@ impl Config {
         }
     }
 
+    /// Look up a validated upstream by id (for per-upstream behavior
+    /// switches such as `cold_miss`).
+    pub fn upstream(&self, id: &str) -> Option<&UpstreamConfig> {
+        self.upstreams.iter().find(|u| u.id == id)
+    }
+
     fn from_raw(raw: RawConfig) -> anyhow::Result<Self> {
         if raw.upstreams.is_empty() {
             anyhow::bail!("at least one [[upstreams]] required");
@@ -176,6 +203,23 @@ impl Config {
         // Upstream URL policy: https everywhere except loopback http.
         for u in &raw.upstreams {
             upstream_url_policy(&u.base_url, &u.id)?;
+            // A relief valve needs a link source: v1 implements it for
+            // openlist only, authenticated by static token. Fail fast at
+            // boot instead of silently never redirecting.
+            if u.cold_miss == ColdMiss::Redirect {
+                if u.backend_type != "openlist" {
+                    anyhow::bail!(
+                        "upstream {}: cold_miss = \"redirect\" is only supported for openlist upstreams (v1)",
+                        u.id
+                    );
+                }
+                if u.link_api_token_env.is_none() {
+                    anyhow::bail!(
+                        "upstream {}: cold_miss = \"redirect\" requires link_api_token_env",
+                        u.id
+                    );
+                }
+            }
         }
         // Validate routes reference known upstreams.
         let ids: std::collections::HashSet<&str> = raw.upstreams.iter().map(|u| u.id.as_str()).collect();
@@ -236,6 +280,8 @@ impl Default for Config {
                 username_env: "OPENLIST_USERNAME".into(),
                 password_env: "OPENLIST_PASSWORD".into(),
                 accept_invalid_certs: false,
+                cold_miss: ColdMiss::Proxy,
+                link_api_token_env: None,
             }],
             routes: RouteTable::new(vec![RouteRule { prefix: "".into(), upstream: "primary".into() }]),
         }
@@ -302,6 +348,35 @@ mod tests {
     fn non_absolute_base_url_rejected() {
         assert!(Config::from_toml_str(&upstream_toml("127.0.0.1:5244/dav")).is_err());
         assert!(Config::from_toml_str(&upstream_toml("ftp://127.0.0.1/dav")).is_err());
+    }
+
+    fn redirect_toml(extra: &str) -> String {
+        format!(
+            r#"
+            [[upstreams]]
+            id = "a"
+            type = "openlist"
+            base_url = "http://127.0.0.1:5244/dav"
+            username_env = "A_USER"
+            password_env = "A_PASS"
+            cold_miss = "redirect"
+            {extra}
+            [[routes]]
+            prefix = ""
+            upstream = "a"
+        "#
+        )
+    }
+
+    #[test]
+    fn redirect_requires_link_token() {
+        assert!(Config::from_toml_str(&redirect_toml("")).is_err());
+        assert!(Config::from_toml_str(&redirect_toml("link_api_token_env = \"A_TOKEN\"")).is_ok());
+    }
+
+    #[test]
+    fn proxy_is_default_no_token_needed() {
+        assert!(Config::from_toml_str(&upstream_toml("http://127.0.0.1:5244/dav")).is_ok());
     }
 
     #[test]
