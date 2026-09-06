@@ -88,14 +88,31 @@ pub struct CacheHit {
     pub body: BodyStream,
 }
 
+/// C-path response (efficientcache passthrough): origin bytes with the
+/// staged-segment coordinates attached. No outcome: this never touches
+/// entries, flights, or revalidation.
+pub struct PassthroughHit {
+    pub meta: HitMeta,
+    pub etag: Option<String>,
+    pub total: u64,
+    pub content_range: Option<ContentRange>,
+    pub content_length: Option<u64>,
+    pub body: BodyStream,
+}
+
 pub struct CacheState {
     pub entries: HashMap<String, EntryMeta>,
     pub total_bytes: u64,
+    /// Bytes staged as `.seg` sidecars (efficientcache): served but not
+    /// yet promoted. Swept by age, never evicted by LRU (separate counter
+    /// so entry eviction math stays exact).
+    pub segment_bytes: u64,
+    pub segment_sweep_at_millis: u64,
 }
 
 impl Default for CacheState {
     fn default() -> Self {
-        Self { entries: HashMap::new(), total_bytes: 0 }
+        Self { entries: HashMap::new(), total_bytes: 0, segment_bytes: 0, segment_sweep_at_millis: 0 }
     }
 }
 
@@ -114,6 +131,10 @@ pub struct Cache<C: Clock> {
     /// synchronously before any await so every concurrent caller attaches
     /// to the same flight (no TOCTOU stampede window).
     pub flights: Arc<Mutex<HashMap<String, Arc<FlightShared>>>>,
+    /// Coverage ledger (efficientcache): staged byte intervals per cache
+    /// key. Segment files on disk are the source of truth; this map is
+    /// the working view, rebuilt by scan on startup.
+    pub coverage: Arc<Mutex<HashMap<String, store::Coverage>>>,
     pub reval_inflight: Inflight<StatData, BackendError>,
     pub routes: RouteTable,
 }
@@ -136,6 +157,7 @@ impl<C: Clock + Clone> Cache<C> {
             meta,
             dirty_access,
             flights: Arc::new(Mutex::new(HashMap::new())),
+            coverage: Arc::new(Mutex::new(HashMap::new())),
             reval_inflight: Inflight::new(),
             routes,
         }
@@ -147,8 +169,14 @@ impl<C: Clock + Clone> Cache<C> {
         // Startup self-heal (spec §3.10): temp files from crashed downloads.
         let _ = store::cleanup_tmps(&self.config.cache_dir);
 
+        // Coverage rebuild (P2-a): staged segments regroup into the ledger
+        // (segment files authoritative; orphans already swept by scan).
+        let (ledger, staged) = store::scan_segments(&self.config.cache_dir, self.clock.now_millis());
+        *self.coverage.lock().await = ledger;
+
         let persisted = self.meta.load_all().await.unwrap_or_default();
         let mut state = self.state.write().await;
+        state.segment_bytes = staged;
         for m in persisted {
             let path = store::file_path(&self.config.cache_dir, &m.key);
             if tokio::fs::metadata(&path).await.is_ok() {
@@ -282,6 +310,121 @@ impl<C: Clock + Clone> Cache<C> {
         let mut hit = self.get_resolved(rk, None).await?;
         flight::drain(&mut hit.body).await?;
         Ok(())
+    }
+
+    /// C-path response (efficientcache): origin bytes streamed straight to
+    /// the viewer with zero cache machinery — no flight, no tmp/seal, no
+    /// entry, no revalidation. The served interval is staged as a sidecar
+    /// segment so coverage-triggered promotion (P2-b) can reuse it; the
+    /// ledger merge happens only on successful exhaustion (aborts leave
+    /// `.segpart` orphans for the sweeper). Small files (`size <
+    /// min_file_size`) and every failure fall back to the B path in the
+    /// caller — this method never serves from disk.
+    pub async fn serve_passthrough(
+        &self,
+        rk: &ResolvedKey,
+        range: Option<crate::backend::ByteRange>,
+        min_file_size: u64,
+    ) -> Result<PassthroughHit, BackendError> {
+        let slot = self
+            .backends
+            .get(&rk.upstream_id)
+            .ok_or_else(|| BackendError::Other(format!("unknown upstream {}", rk.upstream_id)))?;
+        // Negative tombstones bind the C path too (no origin hammering).
+        {
+            let s = self.state.read().await;
+            if let Some(m) = s.entries.get(&rk.cache_key) {
+                if m.is_negative(self.clock.now_millis()) {
+                    return Err(BackendError::NotFound);
+                }
+            }
+        }
+        let _permit = slot.gate.acquire().await;
+        let bkey = Key::from_validated(rk.backend_key.clone());
+        let meta = match slot.backend.stat(&bkey).await {
+            Ok(m) => m,
+            Err(BackendError::NotFound) => {
+                self.install_negative(&rk.cache_key, &rk.upstream_id).await;
+                return Err(BackendError::NotFound);
+            }
+            Err(e) => return Err(e),
+        };
+        if meta.size_bytes < min_file_size {
+            return Err(BackendError::Other("below min_file_size".into()));
+        }
+        let (start, end) = match range {
+            None => (0, meta.size_bytes),
+            Some(r) => {
+                if r.offset >= meta.size_bytes {
+                    return Err(BackendError::RangeNotSatisfiable);
+                }
+                (r.offset, r.length.map_or(meta.size_bytes, |l| (r.offset + l).min(meta.size_bytes)))
+            }
+        };
+        let src = match slot.backend.open(&bkey, range).await {
+            Ok(s) => s,
+            Err(BackendError::NotFound) => {
+                self.install_negative(&rk.cache_key, &rk.upstream_id).await;
+                return Err(BackendError::NotFound);
+            }
+            Err(e) => return Err(e),
+        };
+        let total = meta.size_bytes;
+        let etag = meta.etag.clone();
+        let meta_out = hit_meta_remote(&rk.cache_key, &meta);
+        let content_range = range.map(|_| ContentRange { first: start, last: end.saturating_sub(1), total });
+        let content_length = Some(end.saturating_sub(start));
+
+        // Staged streaming: chunk → segpart file → viewer. Ledger merge +
+        // seal rename happen only on exhaustion, so aborts are sweep-safe.
+        let coverage = Arc::clone(&self.coverage);
+        let state = Arc::clone(&self.state);
+        let clock = Arc::clone(&self.clock);
+        let cache_dir = self.config.cache_dir.clone();
+        let cache_key = rk.cache_key.clone();
+        let segpart = store::segpart_path(&cache_dir, &cache_key, start, end);
+        let mut src_stream = src.stream;
+        let body: BodyStream = Box::pin(async_stream::try_stream! {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut file: Option<tokio::fs::File> = None;
+            let mut written: u64 = 0;
+            loop {
+                let n = src_stream.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                if file.is_none() {
+                    if let Some(parent) = segpart.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    file = Some(tokio::fs::File::create(&segpart).await?);
+                }
+                file.as_mut().unwrap().write_all(&buf[..n]).await?;
+                written += n as u64;
+                yield bytes::Bytes::copy_from_slice(&buf[..n]);
+            }
+            if written > 0 {
+                drop(file);
+                let seg = store::seg_path(&cache_dir, &cache_key, start, start + written);
+                let _ = tokio::fs::rename(&segpart, &seg).await;
+                let now = clock.now_millis();
+                let span = FinalizedSpan {
+                    cache_dir: cache_dir.clone(),
+                    key: cache_key.clone(),
+                    etag,
+                    total,
+                    start,
+                    end: start + written,
+                    bytes: written,
+                    now_millis: now,
+                };
+                finalize_coverage(&coverage, &state, span).await;
+            } else if file.is_some() {
+                let _ = tokio::fs::remove_file(&segpart).await;
+            }
+        });
+        Ok(PassthroughHit { meta: meta_out, etag: meta.etag, total, content_range, content_length, body })
     }
 
     /// Main entry: `GET /<key>` — streaming response. Cold misses attach
@@ -653,16 +796,125 @@ impl<C: Clock + Clone> Cache<C> {
     }
 
     /// Drive both reapers: inactive expiry + max_size LRU. Called by `tick()`.
+    /// Lock discipline: the state guard and the coverage mutex are never
+    /// held together (finalize takes them coverage→state; inverting here
+    /// would deadlock).
     pub async fn tick(&self) {
         let now = self.clock.now_millis();
-        let mut s = self.state.write().await;
-        reap(&mut s, &self.config, &self.meta, now).await;
+        let ttl_ms = self.config.inactive_ttl_secs * 1000;
+        // 1. Decide expiry under each lock separately.
+        let do_sweep = {
+            let s = self.state.read().await;
+            now.saturating_sub(s.segment_sweep_at_millis) >= ttl_ms
+        };
+        let expired: Vec<String> = if do_sweep {
+            let cov = self.coverage.lock().await;
+            cov.iter()
+                .filter(|(_, c)| now.saturating_sub(c.last_touch_millis) >= ttl_ms)
+                .map(|(k, _)| k.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // 2. Filesystem deletes hold no locks.
+        let mut freed: u64 = 0;
+        for key in &expired {
+            for path in store::key_segment_files(&self.config.cache_dir, key) {
+                freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let _ = std::fs::remove_file(&path);
+            }
+            let _ = std::fs::remove_file(store::segmeta_path(&self.config.cache_dir, key));
+        }
+        if do_sweep {
+            store::sweep_segparts(&self.config.cache_dir, ttl_ms, now);
+            store::sweep_orphan_metas(&self.config.cache_dir);
+        }
+        // 3. State mutation (entries reaper + accounting + sweep stamp).
+        {
+            let mut s = self.state.write().await;
+            reap(&mut s, &self.config, &self.meta, now).await;
+            if do_sweep {
+                s.segment_sweep_at_millis = now;
+                s.segment_bytes = s.segment_bytes.saturating_sub(freed);
+            }
+        }
+        // 4. Ledger removal (coverage only).
+        if do_sweep {
+            let mut cov = self.coverage.lock().await;
+            for key in &expired {
+                cov.remove(key);
+            }
+        }
     }
 }
 
 fn flights_none() -> Arc<Mutex<HashMap<String, Arc<FlightShared>>>> {
     // Forced refetches run on a private flight: no map registration needed.
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Merge one completed staged interval into the coverage ledger (the only
+/// writer besides the startup scan). Etag-locked: a version change with
+/// history present resets (drops staged files + ledger) so promotion can
+/// never assemble a mixed-version file. Unknown etags adopt; totals adopt
+/// when known. Best-effort fs ops — the scan heals any gap.
+struct FinalizedSpan {
+    cache_dir: std::path::PathBuf,
+    key: String,
+    etag: Option<String>,
+    total: u64,
+    start: u64,
+    end: u64,
+    bytes: u64,
+    now_millis: u64,
+}
+
+async fn finalize_coverage(
+    coverage: &Arc<Mutex<HashMap<String, store::Coverage>>>,
+    state: &Arc<RwLock<CacheState>>,
+    span: FinalizedSpan,
+) {
+    {
+        let mut cov = coverage.lock().await;
+        let entry = cov.entry(span.key.clone()).or_default();
+        let version_changed = match (&entry.etag, &span.etag) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        };
+        if version_changed {
+            remove_key_segments(&span.cache_dir, &span.key);
+            *entry = store::Coverage::default();
+        }
+        if span.etag.is_some() {
+            entry.etag = span.etag.clone();
+        }
+        if span.total != 0 {
+            entry.total = span.total;
+        }
+        entry.add_interval(span.start, span.end);
+        entry.last_touch_millis = span.now_millis;
+    }
+    let meta = store::SegMeta { etag: span.etag.clone(), total: span.total };
+    if let Ok(b) = serde_json::to_vec(&meta) {
+        let _ = tokio::fs::write(store::segmeta_path(&span.cache_dir, &span.key), b).await;
+    }
+    state.write().await.segment_bytes += span.bytes;
+}
+
+/// Drop a key's completed segments + version marker (etag reset path).
+/// In-flight `.segpart.*` files are left alone (concurrent transfers).
+fn remove_key_segments(cache_dir: &std::path::Path, key: &str) {
+    let esc = store::escape_key(key);
+    let prefix = format!(".seg.{esc}.");
+    if let Ok(rd) = std::fs::read_dir(cache_dir) {
+        for entry in rd.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_file(store::segmeta_path(cache_dir, key));
 }
 
 /// One cold-miss download driver: gate → stat → publish Meta → pump to

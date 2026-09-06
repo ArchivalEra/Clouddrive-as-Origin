@@ -187,6 +187,10 @@ where
         }
     };
 
+    if let Some(passthrough) = try_passthrough(&state, &rk, range, &req_id, &host_id).await {
+        return passthrough;
+    }
+
     match state.cache.get_resolved(&rk, range).await {
         Ok(hit) => {
             let status =
@@ -213,6 +217,37 @@ where
             error_response(e, key, &req_id, &host_id, false, hint)
         }
     }
+}
+
+/// Efficient profile (P2-a): ranged misses passthrough origin straight to
+/// the viewer while staging the served interval (no flight, no full fill).
+/// Fresh entries serve from disk via the B path below; every failure here
+/// falls through to it (stale-if-error included).
+async fn try_passthrough<C: Clock + Clone>(
+    state: &AppState<C>,
+    rk: &ResolvedKey,
+    range: Option<ByteRange>,
+    req_id: &str,
+    host_id: &str,
+) -> Option<Response> {
+    let prof = state.config.cache_profile(&rk.upstream_id);
+    if !prof.efficient || range.is_none() {
+        return None;
+    }
+    if state.cache.memory_hit_fresh(&rk.cache_key).await {
+        return None;
+    }
+    let hit = state.cache.serve_passthrough(rk, range, prof.min_file_size).await.ok()?;
+    info!(key = %rk.cache_key, size = hit.meta.size, "passthrough response");
+    let mut builder = Response::builder().status(StatusCode::PARTIAL_CONTENT);
+    if let Some(cr) = &hit.content_range {
+        builder = builder.header("content-range", cr.header_value());
+    }
+    if let Some(len) = hit.content_length {
+        builder = builder.header("content-length", len);
+    }
+    builder = s3_meta_headers(builder, &hit.meta, req_id, host_id);
+    Some(builder.body(Body::from_stream(hit.body)).unwrap())
 }
 
 /// HEAD: headers identical to GET, always 200 on success (even when ranged),
@@ -289,9 +324,9 @@ async fn healthz<C>(State(state): State<AppState<C>>) -> impl IntoResponse
 where
     C: Clock + Clone,
 {
-    let (count, bytes) = {
+    let (count, bytes, segment_bytes) = {
         let s = state.cache.state.read().await;
-        (s.entries.len(), s.total_bytes)
+        (s.entries.len(), s.total_bytes, s.segment_bytes)
     };
     (
         StatusCode::OK,
@@ -301,6 +336,7 @@ where
             "version": env!("CARGO_PKG_VERSION"),
             "entries": count,
             "bytes": bytes,
+            "segment_bytes": segment_bytes,
         })),
     )
 }
@@ -533,6 +569,59 @@ mod tests {
             open_calls,
             direct_calls,
         }
+    }
+
+    /// Efficient-profile fixture: primary serves `cache_profile =
+    /// "efficient"` with the given threshold/min_file_size.
+    fn fixture_efficient(bytes: &[u8], threshold: f64, min_file_size: u64) -> Fixture {
+        use crate::config::CacheProfile;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+        cfg.upstreams[0].cache_profile = "efficient".into();
+        cfg.cache_profiles.insert("efficient".into(), CacheProfile { coverage_threshold: threshold, min_file_size });
+        let stat_calls = Arc::new(AtomicUsize::new(0));
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let direct_calls = Arc::new(AtomicUsize::new(0));
+        let backend = ProbeBackend {
+            id: "primary".into(),
+            bytes: bytes.to_vec(),
+            etag: Some("v1".into()),
+            always_missing: false,
+            direct: None,
+            stat_calls: Arc::clone(&stat_calls),
+            open_calls: Arc::clone(&open_calls),
+            direct_calls: Arc::clone(&direct_calls),
+        };
+        let mut slots = HashMap::new();
+        slots.insert(
+            "primary".to_string(),
+            Arc::new(BackendSlot { backend: Arc::new(backend), gate: Arc::new(Semaphore::new(3)) }),
+        );
+        let cache = Arc::new(Cache::new(Arc::new(cfg.clone()), Arc::new(MockClock::new(0)), BackendRegistry::new(slots)));
+        Fixture {
+            _dir: dir,
+            state: AppState { cache, config: Arc::new(cfg) },
+            stat_calls,
+            open_calls,
+            direct_calls,
+        }
+    }
+
+    /// Segment sidecars currently staged for `key` (test introspection).
+    fn staged_segments(fx: &Fixture, key: &str) -> Vec<(u64, u64)> {
+        let prefix = format!(".seg.{}.", crate::cache::store::escape_key(key));
+        let mut out = Vec::new();
+        let rd = std::fs::read_dir(&fx.state.config.cache_dir).unwrap();
+        for entry in rd.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) {
+                let range = name[prefix.len()..].to_string();
+                let (s, e) = range.split_once('-').unwrap();
+                out.push((s.parse().unwrap(), e.parse().unwrap()));
+            }
+        }
+        out.sort();
+        out
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -859,5 +948,125 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("fetched"), "{body}");
         assert!(fx.state.cache.state.read().await.entries.contains_key("w.bin"));
+    }
+
+    #[tokio::test]
+    async fn efficient_ranged_miss_passthrough_and_stages() {
+        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=2-5")]),
+        )
+        .await;
+        let (status, h, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, "2345");
+        assert_eq!(h.get("content-range").unwrap(), "bytes 2-5/10");
+        // No flight, no entry: pure passthrough.
+        assert!(!fx.state.cache.state.read().await.entries.contains_key("a.bin"));
+        assert_eq!(fx.open_calls.load(Ordering::SeqCst), 1);
+        // Served bytes staged as one sidecar; ledger merged.
+        assert_eq!(staged_segments(&fx, "a.bin"), vec![(2, 6)]);
+        let cov = fx.state.cache.coverage.lock().await;
+        let c = cov.get("a.bin").unwrap();
+        assert_eq!(c.intervals, vec![(2, 6)]);
+        assert_eq!(c.total, 10);
+        assert_eq!(c.etag.as_deref(), Some("v1"));
+        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 4);
+    }
+
+    #[tokio::test]
+    async fn efficient_second_pull_merges_ledger() {
+        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        for range in ["bytes=0-1", "bytes=4-5"] {
+            let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", range)])).await;
+            let (status, _, _) = body_text(resp).await;
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        }
+        assert_eq!(staged_segments(&fx, "a.bin"), vec![(0, 2), (4, 6)]);
+        let cov = fx.state.cache.coverage.lock().await;
+        assert_eq!(cov.get("a.bin").unwrap().intervals, vec![(0, 2), (4, 6)]);
+        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 4);
+        // Still no cache entry: staging is not filling.
+        assert!(!fx.state.cache.state.read().await.entries.contains_key("a.bin"));
+    }
+
+    #[tokio::test]
+    async fn efficient_full_get_still_waterpipes() {
+        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[])).await;
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "0123456789");
+        // Full GETs fill normally (a whole file needs no promotion dance).
+        wait_installed(&fx, "a.bin").await;
+        assert!(staged_segments(&fx, "a.bin").is_empty());
+    }
+
+    #[tokio::test]
+    async fn efficient_min_size_bypass_goes_waterpipe() {
+        let fx = fixture_efficient(b"0123456789", 0.8, 64);
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=2-5")]),
+        )
+        .await;
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, "2345");
+        // Bypass: B path installs the entry, stages nothing.
+        wait_installed(&fx, "a.bin").await;
+        assert!(staged_segments(&fx, "a.bin").is_empty());
+    }
+
+    #[tokio::test]
+    async fn standard_ranged_miss_waterpipes() {
+        let fx = fixture(b"0123456789", None, vec![], false);
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=2-5")]),
+        )
+        .await;
+        let (status, _, _) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        wait_installed(&fx, "a.bin").await;
+        assert!(staged_segments(&fx, "a.bin").is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_sweeps_old_segments() {
+        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=2-5")]),
+        )
+        .await;
+        let (status, _, _) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(staged_segments(&fx, "a.bin"), vec![(2, 6)]);
+        // Age past inactive_ttl: tick sweeps segments, zeroes accounting.
+        fx.state.cache.clock.advance(1_201_000);
+        fx.state.cache.tick().await;
+        assert!(staged_segments(&fx, "a.bin").is_empty());
+        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_segment_bytes() {
+        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=2-5")]),
+        )
+        .await;
+        body_text(resp).await;
+        let resp = healthz(State(fx.state.clone())).await.into_response();
+        let (_, _, body) = body_text(resp).await;
+        assert!(body.contains("\"segment_bytes\":4"), "{body}");
     }
 }

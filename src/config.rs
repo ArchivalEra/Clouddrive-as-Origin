@@ -1,6 +1,6 @@
 use anyhow::Context;
 use serde::Deserialize;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use crate::routing::{RouteRule, RouteTable};
 
@@ -36,6 +36,13 @@ pub struct UpstreamConfig {
     /// openlist upstreams only, and requires `link_api_token_env`.
     #[serde(default)]
     pub cold_miss: ColdMiss,
+    /// Fill-policy profile name (P2 efficientcache). `"standard"` (default)
+    /// = legacy behavior: every miss water-pipes a full file into cache.
+    /// Any other name must have a `[cache_profiles.<name>]` table, which
+    /// switches this upstream to ranged-passthrough + segment staging +
+    /// coverage-triggered promotion.
+    #[serde(default = "default_cache_profile")]
+    pub cache_profile: String,
     /// OpenList static admin token (Settings → Other → Token) for the
     /// `/api/fs/link` direct-link endpoint — env reference. Only read
     /// when `cold_miss = "redirect"`. Never expires, unlike 48h JWTs.
@@ -51,6 +58,52 @@ pub enum ColdMiss {
     #[default]
     Proxy,
     Redirect,
+}
+
+fn default_cache_profile() -> String {
+    "standard".into()
+}
+
+fn default_coverage_threshold() -> f64 {
+    0.8
+}
+
+fn default_min_file_size() -> u64 {
+    64 * 1024 * 1024
+}
+
+/// Fill-policy profile (P2 efficientcache): when ranged misses stage
+/// segments instead of full-filing, and what staged coverage promotes a
+/// key to a full cache entry. `threshold` ∈ (0, 1]; 1.0 = promote only
+/// once every byte has been served.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RawCacheProfile {
+    #[serde(default = "default_coverage_threshold")]
+    pub coverage_threshold: f64,
+    #[serde(default = "default_min_file_size")]
+    pub min_file_size: u64,
+}
+
+/// Validated fill-policy profile.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheProfile {
+    pub coverage_threshold: f64,
+    pub min_file_size: u64,
+}
+
+/// Resolved per-upstream fill behavior: `efficient == false` is legacy
+/// standard (full-file water-pipe on every miss).
+#[derive(Debug, Clone, Copy)]
+pub struct EffectiveProfile {
+    pub efficient: bool,
+    pub coverage_threshold: f64,
+    pub min_file_size: u64,
+}
+
+impl EffectiveProfile {
+    pub fn standard() -> Self {
+        Self { efficient: false, coverage_threshold: default_coverage_threshold(), min_file_size: default_min_file_size() }
+    }
 }
 
 fn default_backend_type() -> String {
@@ -127,6 +180,10 @@ pub struct RawConfig {
     pub upstreams: Vec<UpstreamConfig>,
     #[serde(default)]
     pub routes: Vec<RouteRule>,
+    /// Named fill-policy profiles (`[cache_profiles.<name>]`). Upstreams
+    /// opt in via `cache_profile = "<name>"`; `"standard"` is built-in.
+    #[serde(default)]
+    pub cache_profiles: HashMap<String, RawCacheProfile>,
 }
 
 fn default_front_listen() -> SocketAddr { "127.0.0.1:8443".parse().unwrap() }
@@ -168,6 +225,7 @@ pub struct Config {
     pub allowed_download_suffixes: Vec<String>,
     pub upstreams: Vec<UpstreamConfig>,
     pub routes: RouteTable,
+    pub cache_profiles: HashMap<String, CacheProfile>,
 }
 
 impl Config {
@@ -191,6 +249,24 @@ impl Config {
     /// switches such as `cold_miss`).
     pub fn upstream(&self, id: &str) -> Option<&UpstreamConfig> {
         self.upstreams.iter().find(|u| u.id == id)
+    }
+
+    /// Resolve an upstream's fill behavior. Unknown upstreams and
+    /// `"standard"` both yield the legacy profile (defensive: boot
+    /// validation already rejects dangling references).
+    pub fn cache_profile(&self, upstream_id: &str) -> EffectiveProfile {
+        let name = self.upstream(upstream_id).map(|u| u.cache_profile.as_str()).unwrap_or("standard");
+        if name == "standard" {
+            return EffectiveProfile::standard();
+        }
+        match self.cache_profiles.get(name) {
+            Some(p) => EffectiveProfile {
+                efficient: true,
+                coverage_threshold: p.coverage_threshold,
+                min_file_size: p.min_file_size,
+            },
+            None => EffectiveProfile::standard(),
+        }
     }
 
     fn from_raw(raw: RawConfig) -> anyhow::Result<Self> {
@@ -221,7 +297,33 @@ impl Config {
                 }
             }
         }
-        // Validate routes reference known upstreams.
+        // Fill-policy profiles: threshold sanity + every non-standard
+        // reference resolves. Fail fast at boot, not on first miss.
+        let mut profiles = HashMap::new();
+        for (name, raw) in &raw.cache_profiles {
+            if !(raw.coverage_threshold > 0.0 && raw.coverage_threshold <= 1.0) {
+                anyhow::bail!(
+                    "cache_profiles.{name}: coverage_threshold must be in (0, 1], got {}",
+                    raw.coverage_threshold
+                );
+            }
+            profiles.insert(
+                name.clone(),
+                CacheProfile {
+                    coverage_threshold: raw.coverage_threshold,
+                    min_file_size: raw.min_file_size,
+                },
+            );
+        }
+        for u in &raw.upstreams {
+            if u.cache_profile != "standard" && !profiles.contains_key(&u.cache_profile) {
+                anyhow::bail!(
+                    "upstream {}: cache_profile {:?} has no [cache_profiles.<name>] table",
+                    u.id,
+                    u.cache_profile
+                );
+            }
+        }
         let ids: std::collections::HashSet<&str> = raw.upstreams.iter().map(|u| u.id.as_str()).collect();
         for r in &raw.routes {
             if !ids.contains(r.upstream.as_str()) {
@@ -250,6 +352,7 @@ impl Config {
             allowed_download_suffixes: raw.allowed_download_suffixes,
             upstreams: raw.upstreams,
             routes: RouteTable::new(raw.routes),
+            cache_profiles: profiles,
         })
     }
 }
@@ -282,8 +385,10 @@ impl Default for Config {
                 accept_invalid_certs: false,
                 cold_miss: ColdMiss::Proxy,
                 link_api_token_env: None,
+                cache_profile: default_cache_profile(),
             }],
             routes: RouteTable::new(vec![RouteRule { prefix: "".into(), upstream: "primary".into() }]),
+            cache_profiles: HashMap::new(),
         }
     }
 }
@@ -377,6 +482,51 @@ mod tests {
     #[test]
     fn proxy_is_default_no_token_needed() {
         assert!(Config::from_toml_str(&upstream_toml("http://127.0.0.1:5244/dav")).is_ok());
+    }
+
+    fn profile_toml(profile_section: &str, profile_ref: &str) -> String {
+        format!(
+            r#"
+            [[upstreams]]
+            id = "a"
+            type = "openlist"
+            base_url = "http://127.0.0.1:5244/dav"
+            username_env = "A_USER"
+            password_env = "A_PASS"
+            {profile_ref}
+            {profile_section}
+            [[routes]]
+            prefix = ""
+            upstream = "a"
+        "#
+        )
+    }
+
+    #[test]
+    fn efficient_profile_validates() {
+        let ok = profile_toml("[cache_profiles.efficient]\ncoverage_threshold = 0.8", "cache_profile = \"efficient\"");
+        let cfg = Config::from_toml_str(&ok).unwrap();
+        let p = cfg.cache_profile("a");
+        assert!(p.efficient);
+        assert_eq!(p.coverage_threshold, 0.8);
+        // Standard is the default everywhere.
+        assert!(!Config::from_toml_str(&upstream_toml("http://127.0.0.1:5244/dav")).unwrap().cache_profile("a").efficient);
+    }
+
+    #[test]
+    fn profile_threshold_and_reference_validated() {
+        let bad_threshold = profile_toml(
+            "[cache_profiles.efficient]\ncoverage_threshold = 1.5",
+            "cache_profile = \"efficient\"",
+        );
+        assert!(Config::from_toml_str(&bad_threshold).is_err());
+        let zero_threshold = profile_toml(
+            "[cache_profiles.efficient]\ncoverage_threshold = 0.0",
+            "cache_profile = \"efficient\"",
+        );
+        assert!(Config::from_toml_str(&zero_threshold).is_err());
+        let dangling = profile_toml("", "cache_profile = \"ghost\"");
+        assert!(Config::from_toml_str(&dangling).is_err());
     }
 
     #[test]

@@ -58,6 +58,17 @@ password_env = "OPENLIST_PASSWORD"
 # link_api_token_env = "OPENLIST_LINK_TOKEN"  # OpenList static admin token
                                               # (Settings → Other → Token)
 
+# Fill-policy profiles (P2 efficientcache): orthogonal to cold_miss
+# (serve behavior). Upstreams opt in with `cache_profile = "<name>"`;
+# "standard" (default) = legacy full-file water-pipe on every miss.
+# An efficient profile serves ranged misses straight through (C path,
+# exact Range, no full fill) while staging served intervals as sidecars;
+# once staged coverage >= threshold the key promotes to a full entry (P2-b).
+# cache_profile = "efficient"
+# [cache_profiles.efficient]
+# coverage_threshold = 0.8   # (0, 1]; 1.0 = promote only when fully served
+# min_file_size = 67108864   # below this, miss goes B (small files fill cheap)
+
 # Multi-OpenList: add more instances and route key prefixes to them.
 # [[upstreams]]
 # id = "archive"
