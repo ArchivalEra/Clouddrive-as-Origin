@@ -7,10 +7,25 @@ use crate::routing::{RouteRule, RouteTable};
 #[derive(Debug, Deserialize, Clone)]
 pub struct UpstreamConfig {
     pub id: String,
-    pub drive_root_path: String,
-    pub client_id_env: String,
-    pub client_secret_env: String,
-    pub refresh_token_env: String,
+    /// Upstream kind. v1 ships "openlist" (WebDAV native-proxy against an
+    /// OpenList instance — hundreds of cloud drives behind one folder tree).
+    #[serde(rename = "type", default = "default_backend_type")]
+    pub backend_type: String,
+    /// WebDAV base URL of the OpenList instance, e.g. "http://127.0.0.1:5244/dav".
+    /// Loopback-only in the reference deployment (OpenList runs beside us).
+    pub base_url: String,
+    /// Optional subfolder inside the WebDAV mount this upstream serves,
+    /// e.g. "music" for /dav/music/<key>. Empty = mount root.
+    #[serde(default)]
+    pub root_path: Option<String>,
+    /// OpenList web-UI username — env reference (spec §2).
+    pub username_env: String,
+    /// OpenList web-UI password — env reference (spec §2).
+    pub password_env: String,
+}
+
+fn default_backend_type() -> String {
+    "openlist".into()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -173,10 +188,11 @@ impl Default for Config {
             allowed_download_suffixes: default_allowed_suffixes(),
             upstreams: vec![UpstreamConfig {
                 id: "primary".into(),
-                drive_root_path: "/drive/root:/assets".into(),
-                client_id_env: "ONEDRIVE_PRIMARY_CLIENT_ID".into(),
-                client_secret_env: "ONEDRIVE_PRIMARY_CLIENT_SECRET".into(),
-                refresh_token_env: "ONEDRIVE_PRIMARY_REFRESH_TOKEN".into(),
+                backend_type: "openlist".into(),
+                base_url: "http://127.0.0.1:5244/dav".into(),
+                root_path: None,
+                username_env: "OPENLIST_USERNAME".into(),
+                password_env: "OPENLIST_PASSWORD".into(),
             }],
             routes: RouteTable::new(vec![RouteRule { prefix: "".into(), upstream: "primary".into() }]),
         }
@@ -191,7 +207,7 @@ mod tests {
     fn parses_example() {
         let raw = std::fs::read_to_string("config.example.toml").unwrap();
         let cfg = Config::from_toml_str(&raw).unwrap();
-        assert_eq!(cfg.routes.resolve("2026/08/a.png"), "primary");
+        assert_eq!(cfg.routes.resolve("2026/08/a.png"), "media");
     }
 
     #[test]
