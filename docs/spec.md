@@ -181,6 +181,30 @@ repo** — it is injected at runtime via an environment variable (e.g.
     process restart. Partial-download temp files are always removed on
     startup.
 
+11. **Outbound modes (A/B/C):** hits serve S3-shaped bytes from disk.
+    Cold misses leave by one of three paths, chosen per upstream config:
+    - **A (307 relief valve):** `cold_miss = "redirect"` + upstream-issued
+      direct link available → `307 Temporary Redirect` to the link
+      (`Cache-Control: no-store`, never edge-cached), bytes filled in
+      background. Hits never redirect; every failure silently proxies.
+    - **B (water-pipe, default):** stream + full-file fill simultaneously.
+    - **C (passthrough):** `cache_profile != "standard"` + ranged miss →
+      exact-Range origin bytes streamed straight through (no flight, no
+      full fill). Full GETs and small files still water-pipe; all
+      failures fall back to B (stale-if-error included).
+
+12. **efficientcache fill policy (per-upstream `cache_profile`):**
+    orthogonal to §3.11's serve modes. Under a non-`"standard"` profile,
+    ranged misses stage exactly the served bytes as `.seg` sidecars and
+    merge them into a per-key **coverage ledger** (etag-locked). When
+    staged coverage ≥ `coverage_threshold` (default 0.8, ∈ (0,1]),
+    a single-flight background task re-verifies the version by fresh
+    stat (any drift drops history, never a mixed-version file), fetches
+    only the missing gaps by exact Range, seals, installs, and cleans
+    staged history. Files below `min_file_size` (default 64 MiB) fill
+    whole via B. Segments count separately (`segment_bytes` in
+    healthz), age-sweep with `inactive_ttl`, rebuild from disk on restart.
+
 ## 4. Upstream details (OpenList WebDAV)
 
 - Each OpenList instance exposes WebDAV at `http://<host>:5244/dav` with
@@ -317,6 +341,8 @@ repo never contains `${ORIGIN_HOST}`'s real value.
 - Per-minute self-check log: entry count, cached bytes, per-category
   counts for the last minute.
 - `/healthz` exposes the same counters plus per-upstream token state.
+- `/_internal/healthz` additionally reports `segment_bytes` (staged,
+  unpromoted efficientcache sidecars).
 
 ## 9. Non-goals (v1 explicitly out of scope)
 

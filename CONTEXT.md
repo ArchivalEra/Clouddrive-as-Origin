@@ -19,9 +19,9 @@ Pull-through origin cache for OneDrive. EdgeOne CDN origin-pulls `GET /<key>` ov
 **Eligible-at**: `last_access + inactive_ttl`, the timestamp at which an entry becomes eligible for expiry eviction. LRU/max_size eviction walks entries in ascending eligible-at order.
 
 **Negative cache**: A cached 404 tombstone for a key whose upstream confirmed absence; served without an upstream call until `negative_ttl` expires.
-
 **Stale-if-error**: On upstream `5xx` or network error, serving the last cached copy with a `Warning` header when available, otherwise `502`.
-
 **Front plane**: The Pingora process that terminates TLS/H2 and reverse-proxies to the business plane on `127.0.0.1`. Owns no cache semantics.
 
 **Business plane**: The axum service on `127.0.0.1` that owns all cache semantics (single-flight, water-pipe, redb, eviction). Single `redb::Database` handle, single writer via async mutex.
+**Coverage ledger**: Per-key transfer history under an efficientcache profile — which byte intervals have been served and staged as sidecars, under which object version. Files on disk are authoritative; memory is a rebuildable view.
+**Coverage-triggered promotion**: Background assembly of a full cache entry once staged coverage ≥ threshold: version re-verified by fresh stat, gaps fetched by exact Range, sealed, installed, staged history cleaned. Never a mixed-version file.
