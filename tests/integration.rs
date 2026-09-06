@@ -471,3 +471,53 @@ async fn mime_fallback_overrides_octet_stream() {
     read_body(&mut hit.body).await;
     assert_eq!(hit.meta.content_type.as_deref(), Some("audio/flac"));
 }
+
+#[tokio::test]
+async fn cache_entries_and_access_clock_survive_restart() {
+    // Spec §10: entries and last-access survive a restart. Simulate by
+    // building a cache, filling it, dropping it, then reopening the same
+    // cache_dir with a never-seen-the-data backend.
+    let dir = tempdir().unwrap();
+    let cfg = test_config(dir.path().to_path_buf());
+    let clock = Arc::new(MockClock::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = CountingBackend {
+        bytes: b"persisted".to_vec(),
+        etag: Some("v1".into()),
+        calls: Arc::clone(&calls),
+        fail: None,
+    };
+    let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend)));
+    cache.load_and_start().await;
+    let mut hit = cache.get("a.png", None).await.unwrap();
+    assert_eq!(read_body(&mut hit.body).await, b"persisted");
+    wait_installed(&cache, "a.png").await;
+    clock.advance(5000); // last_access moved; eviction order must persist too
+    // flush the coalesced access-clock bump to redb
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    // "Restart": new Cache instance, fresh clock, backend that would 500 if
+    // ever contacted (proving the restart hit is served from disk+redb).
+    drop(cache);
+    let calls2 = Arc::new(AtomicUsize::new(0));
+    let backend2 = CountingBackend {
+        bytes: vec![],
+        etag: None,
+        calls: Arc::clone(&calls2),
+        fail: Some(BackendError::ServerError("must not be contacted".into())),
+    };
+    let clock2 = Arc::new(MockClock::new(5000));
+    let cache2 = Cache::new(
+        test_config(dir.path().to_path_buf()),
+        Arc::clone(&clock2),
+        registry_with(Arc::new(backend2)),
+    );
+    cache2.load_and_start().await;
+
+    // Entry reloaded from redb: fresh clock (now=5000) vs last_access —
+    // still within revalidate ttl, so a plain disk hit with zero upstream.
+    let mut hit2 = cache2.get("a.png", None).await.unwrap();
+    assert_eq!(hit2.outcome, CacheOutcome::Hit);
+    assert_eq!(read_body(&mut hit2.body).await, b"persisted");
+    assert_eq!(calls2.load(Ordering::SeqCst), 0, "restart hit must not touch upstream");
+}
