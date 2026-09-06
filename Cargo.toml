@@ -33,10 +33,14 @@ async-stream = "0.3"
 futures = "0.3"
 http-range-header = "0.4"
 mime_guess = "2"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+tokio-util = { version = "0.7", features = ["io"] }
+reqwest_dav = "0.3"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"
+wiremock = "0.6"
 
 [profile.release]
 lto = "thin"

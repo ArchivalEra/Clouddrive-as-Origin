@@ -148,10 +148,11 @@ async fn two_upstream_routing_by_prefix() {
     cfg.cache_dir = dir.path().to_path_buf();
     cfg.upstreams.push(origin_cache::config::UpstreamConfig {
         id: "archive".into(),
-        drive_root_path: "/drive/root:/archive".into(),
-        client_id_env: "ARCHIVE_ID".into(),
-        client_secret_env: "ARCHIVE_SECRET".into(),
-        refresh_token_env: "ARCHIVE_TOKEN".into(),
+        backend_type: "openlist".into(),
+        base_url: "http://127.0.0.1:5245/dav".into(),
+        root_path: None,
+        username_env: "ARCHIVE_USER".into(),
+        password_env: "ARCHIVE_PASS".into(),
     });
     cfg.routes = RouteTable::new(vec![
         RouteRule { prefix: "archive/".into(), upstream: "archive".into() },

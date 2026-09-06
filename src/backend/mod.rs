@@ -1,5 +1,9 @@
+pub mod openlist;
+
 use async_trait::async_trait;
 use tokio::io::AsyncRead;
+
+pub use openlist::OpenListBackend;
 
 /// A validated cache key (produced only by `crate::key::validate_key`).
 /// Wrapping prevents backends from receiving raw, unvalidated paths.

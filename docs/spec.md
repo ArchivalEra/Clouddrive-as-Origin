@@ -10,25 +10,26 @@
 > H2, connection management, reverse-proxy to localhost — plus
 > **axum / hyper / tokio as business plane** on `127.0.0.1` which owns
 > **all** cache semantics. Metadata store: **redb** (pure-Rust,
-> embedded, ACID). Upstream storage is abstracted behind a
-> **StorageBackend** trait (§5.1): v1 ships real **GoogleDrive** (first,
-> OAuth refresh-token flow) and **OneDrive** (Graph) providers behind
-> one flat key namespace. Acceptance criteria are framework-agnostic.
+> embedded, ACID). Upstream storage: **OpenList** instances on loopback
+> expose hundreds of cloud drives as WebDAV (native-proxy policy); this
+> service is the pull-through disk cache in front of them via the
+> StorageBackend trait (§5.1). Acceptance criteria are framework-agnostic.
 
 ## 1. Goal
 
 A pull-through origin for `GET /<key>` (and `HEAD`): on hit, serve
-from local disk; on cold miss, fetch from OneDrive via Microsoft
-Graph and **stream to the client while writing to disk** (water-pipe).
+from local disk; on cold miss, fetch from the owning upstream
+(OpenList/WebDAV) and **stream to the client while writing to disk**
+(water-pipe).
 Entries expire **20 minutes after last access**. Disk usage is bounded;
 when `max_size` is exceeded the entries closest to expiry are evicted
-first (LRU). No garbage is left on disk. OneDrive is the durable
-source of truth; the VPS is a discardable hot cache.
+first (LRU). No garbage is left on disk. The cloud drives behind OpenList are
+the durable source of truth; the VPS is a discardable hot cache.
 
 The service is **multi-upstream from day one**: the config declares an
-`upstreams` list (≥ 2 real accounts in v1, a dozen or more later). All
-cache state lives in a single global pool; each entry records its
-owning upstream.
+`upstreams` list — one per OpenList instance (or per WebDAV mount on
+one instance). All cache state lives in a single global pool; each
+entry records its owning upstream.
 
 The origin hostname that EdgeOne pulls from is **never stored in this
 repo** — it is injected at runtime via an environment variable (e.g.
@@ -47,32 +48,35 @@ repo** — it is injected at runtime via an environment variable (e.g.
 
   ```toml
   [[upstreams]]
-  id = "od-music"
-  type = "onedrive"
-  drive_root_path = "/Music"
-  client_id_env = "OD_MUSIC_CLIENT_ID"
-  client_secret_env = "OD_MUSIC_CLIENT_SECRET"
-  refresh_token_env = "OD_MUSIC_REFRESH_TOKEN"
+  id = "media"
+  type = "openlist"
+  base_url = "http://127.0.0.1:5244/dav"
+  root_path = "music"
+  username_env = "OPENLIST_USERNAME"
+  password_env = "OPENLIST_PASSWORD"
 
   [[upstreams]]
-  id = "gd-albums"
-  type = "googledrive"
-  folder_id = "1A2B3C..."
-  client_id_env = "GD_CLIENT_ID"
-  client_secret_env = "GD_CLIENT_SECRET"
-  refresh_token_env = "GD_REFRESH_TOKEN"
+  id = "archive"
+  type = "openlist"
+  base_url = "http://127.0.0.1:5245/dav"
+  username_env = "OPENLIST2_USERNAME"
+  password_env = "OPENLIST2_PASSWORD"
 
   [[routes]]
-  prefix = "music/"     # -> od-music
-  upstream = "od-music"
+  prefix = "music/"     # -> media (OpenList #1)
+  upstream = "media"
   [[routes]]
-  prefix = "albums/"    # -> gd-albums
-  upstream = "gd-albums"
+  prefix = "albums/"    # -> archive (OpenList #2)
+  upstream = "archive"
   [[routes]]
   prefix = ""           # default (catch-all)
-  upstream = "od-music"
+  upstream = "media"
   ```
 
+  At request time the service resolves `key → upstream` (longest
+  prefix first), then talks WebDAV to that OpenList: `PROPFIND
+  Depth:0` for metadata and `GET` (with Range) for bytes. The business
+  plane never knows which cloud drive sits behind the mount.
   At request time the service resolves `key → upstream` (longest
   prefix first), then calls the upstream's **StorageBackend** (§5.1)
   `stat` for metadata and `open` for bytes. The business plane never
@@ -177,23 +181,32 @@ repo** — it is injected at runtime via an environment variable (e.g.
     process restart. Partial-download temp files are always removed on
     startup.
 
-## 4. Upstream details (Graph)
+## 4. Upstream details (OpenList WebDAV)
 
-- Personal OneDrive requires **delegated auth** — a one-time device-code
-  flow obtains a refresh token; thereafter the service refreshes it
-  internally. Refresh is globally single-flight per upstream (concurrent
-  `401`s trigger exactly one refresh). Proactive renewal 5 minutes
-  before expiry.
-- `downloadUrl` is short-lived and may redirect. Re-fetch metadata on
-  every origin pull; never cache `downloadUrl` long-term. Requests to
-  `downloadUrl` still pass the §2 host allow-check.
-- `429` / throttling is normal, not exceptional. Per-upstream Graph
-  concurrency ≤ 3 (configurable).
+- Each OpenList instance exposes WebDAV at `http://<host>:5244/dav` with
+  the web-UI credentials (basic auth, env-injected). The WebDAV policy on
+  every mounted drive must be **native proxy** so byte streams flow
+  through the instance with Range support (302 mode is not usable here).
+- `stat` = `PROPFIND Depth:0` (via the `reqwest_dav` crate): maps
+  `getcontentlength` → size, `getetag` → etag, `getlastmodified` →
+  last-modified, `getcontenttype` → mime hint.
+- `open` = `GET` with `Range` through our own streaming client
+  (reqwest, `bytes_stream`): 200/206 accepted; full length parsed from
+  the `Content-Range` total or `Content-Length`.
+- Error mapping: 404 → `NotFound`, 401/403 → `AuthRequired` (surfaced
+  in healthz), 429 → `RateLimited` (no Retry-After — jittered backoff),
+  5xx → `ServerError` (stale-if-error applies).
+- OpenList owns all provider credential rotation and per-drive quirks;
+  our per-upstream concurrency gate (≤3) still applies to every
+  PROPFIND/GET we issue.
+- ETag semantics: OpenList reports per-driver etags; where a driver
+  yields an unstable etag, `getlastmodified` is the revalidation
+  fallback (stat-compare either field).
 
 Per-upstream persisted state (all `0600`, under the data directory):
 
-- `tokens/<upstream-id>.json` — refreshed token material
-- redb database — entry metadata (see §3.10)
+- redb database — entry metadata (see §3.10); OpenList credentials are
+  env-only, nothing to persist.
 
 ## 5. Multi-upstream routing
 
@@ -229,12 +242,13 @@ pub trait StorageBackend: Send + Sync {
 - `BackendError` is a unified enum (NotFound / RateLimited / ServerError
   / Auth / Other) so cache semantics (negative cache, stale-if-error,
   backoff) are provider-agnostic.
-- v1 providers: `src/backend/googledrive.rs` (first — OAuth refresh
-  token is available now) and `src/backend/onedrive.rs` (Graph port).
-  The former whole-object `Fetcher` trait is deleted; the cache core
-  becomes stream-based.
-- Adding MinIO/S3 later is a new `impl StorageBackend` plus a config
-  block — zero changes to the business plane.
+- v1 provider: `src/backend/openlist.rs` — WebDAV against OpenList
+  instances (native-proxy policy). The former hand-written cloud
+  providers (GoogleDrive direct, OneDrive Graph) were dropped when the
+  project pivoted to OpenList adaptation (2026-09-06); OpenList fronts
+  hundreds of cloud drives, so per-provider code is unnecessary.
+- Adding a non-OpenList source later is a new `impl StorageBackend`
+  plus a config block — zero changes to the business plane.
 
 ## 6. Deployment & TLS
 
@@ -307,7 +321,7 @@ repo never contains `${ORIGIN_HOST}`'s real value.
 ## 9. Non-goals (v1 explicitly out of scope)
 
 - Upload (handled by a separate upload service / PicGo pipeline).
-- OneDrive writes (prewarm is read-only).
+- Upstream writes (prewarm is read-only).
 - HTML / page caching (only image-class static assets).
 - EdgeOne site provisioning and `${ORIGIN_HOST}` DNS creation (operator
   task, tracked separately).
@@ -343,7 +357,7 @@ repo never contains `${ORIGIN_HOST}`'s real value.
 - [ ] `prewarm` returns `202` immediately; the background fetch passes
       single-flight (concurrent prewarm + visitor = one upstream fetch)
       and `healthz` reports the prewarm queue depth.
-- [ ] GoogleDrive backend: refresh-token flow, folder-indexed key
-      resolution, `Range` passthrough — wiremock-tested end to end.
+- [ ] OpenList backend: PROPFIND stat mapping, ranged streaming GET,
+      error taxonomy (404/401/429) — wiremock-tested end to end.
 - [ ] Restart survival holds with redb (already in §3.10) for BOTH
       provider types.

@@ -19,7 +19,7 @@ inactive_ttl_secs = 1200          # 20 min (spec §3.3)
 revalidate_ttl_secs = 60          # spec §3.5
 negative_ttl_secs = 60            # spec §3.6
 
-# --- per-upstream Graph throttling ---
+# --- per-upstream throttling ---
 concurrency_per_upstream = 3
 retry_max_attempts = 4
 retry_base_ms = 200
@@ -27,38 +27,40 @@ retry_max_ms = 30000
 
 # --- observability & internal ---
 prewarm_shared_secret_env = "ORIGIN_PREWARM_SECRET"
-allowed_download_suffixes = [
-  ".files.1drv.com",
-  ".sharepoint.com",
-  "storage.live.com",
-]
+# Host allow-check applies to any redirect targets we follow (OpenList is
+# loopback; direct 302 mode is not used, so this rarely fires).
+allowed_download_suffixes = []
 
 # --- upstreams ---
-# Each upstream = one OneDrive account = one Entra app client + one delegated
-# refresh token. Secrets live in env, never in this file.
-# drive_root_path is the Graph root prefix for this upstream.
+# One upstream = one OpenList instance (or one WebDAV mount on it).
+# OpenList fronts hundreds of cloud drives behind one folder tree; we cache
+# over its WebDAV interface (native-proxy policy, Range-capable).
+# OpenList credentials are web-UI credentials, injected via env — never
+# written here.
 
 [[upstreams]]
-id = "primary"
-drive_root_path = "/drive/root:/assets"
-client_id_env = "ONEDRIVE_PRIMARY_CLIENT_ID"
-client_secret_env = "ONEDRIVE_PRIMARY_CLIENT_SECRET"
-refresh_token_env = "ONEDRIVE_PRIMARY_REFRESH_TOKEN"
+id = "media"
+type = "openlist"
+base_url = "http://127.0.0.1:5244/dav"   # loopback — OpenList runs beside us
+root_path = "media"                       # optional subfolder in the mount
+username_env = "OPENLIST_USERNAME"
+password_env = "OPENLIST_PASSWORD"
 
-# Example second upstream (v1 will wire ≥2 real accounts):
+# Multi-OpenList: add more instances and route key prefixes to them.
 # [[upstreams]]
 # id = "archive"
-# drive_root_path = "/drive/root:/archive"
-# client_id_env = "ONEDRIVE_ARCHIVE_CLIENT_ID"
-# client_secret_env = "ONEDRIVE_ARCHIVE_CLIENT_SECRET"
-# refresh_token_env = "ONEDRIVE_ARCHIVE_REFRESH_TOKEN"
+# type = "openlist"
+# base_url = "http://127.0.0.1:5245/dav"
+# root_path = ""
+# username_env = "OPENLIST2_USERNAME"
+# password_env = "OPENLIST2_PASSWORD"
 
 # --- routes ---
 # First-match prefix → upstream. Sorted longest-prefix first at load time;
 # "" is the default (catch-all). Adding an upstream is a config-only change.
 [[routes]]
 prefix = ""
-upstream = "primary"
+upstream = "media"
 
 # Example prefix route to a second upstream:
 # [[routes]]

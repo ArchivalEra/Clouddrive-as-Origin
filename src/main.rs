@@ -7,34 +7,11 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use origin_cache::{
-    backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, Key, ObjectMeta, StorageBackend},
+    backend::{BackendRegistry, BackendSlot, OpenListBackend, StorageBackend},
     cache::cache::Cache,
     clock::SystemClock,
     config,
 };
-
-/// Placeholder backend until the real GoogleDrive/OneDrive providers land:
-/// every key is not-found, so the cache serves the negative path.
-struct NullBackend;
-
-#[async_trait::async_trait]
-impl StorageBackend for NullBackend {
-    async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
-        Err(BackendError::NotFound)
-    }
-
-    async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<origin_cache::backend::StreamSource, BackendError> {
-        Err(BackendError::NotFound)
-    }
-
-    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
-        Ok(())
-    }
-
-    fn id(&self) -> &str {
-        "null"
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -57,10 +34,16 @@ async fn main() -> anyhow::Result<()> {
     let clock = Arc::new(SystemClock);
     let mut slots = HashMap::new();
     for u in &cfg.upstreams {
+        let backend: Arc<dyn StorageBackend> = match u.backend_type.as_str() {
+            "openlist" => Arc::new(
+                OpenListBackend::from_config(u).map_err(|e| anyhow::anyhow!(e))?,
+            ),
+            other => anyhow::bail!("upstream {}: unknown type {other:?} (v1 supports \"openlist\")", u.id),
+        };
         slots.insert(
             u.id.clone(),
             Arc::new(BackendSlot {
-                backend: Arc::new(NullBackend),
+                backend,
                 gate: Arc::new(Semaphore::new(cfg.concurrency_per_upstream)),
             }),
         );
