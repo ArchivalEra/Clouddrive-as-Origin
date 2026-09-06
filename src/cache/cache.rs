@@ -77,11 +77,14 @@ fn hit_meta_entry(key: &str, m: &EntryMeta) -> HitMeta {
 /// A cache response: headers' worth of metadata plus a streaming body
 /// (water-pipe — the body may still be downloading from the backend).
 /// `content_range` is Some for 206 responses (cached-file slices and
-/// cold-miss Range passthrough per §3.8).
+/// cold-miss Range passthrough per §3.8). `content_length` is the exact
+/// byte count the body will deliver when known up front (S3 shape: the
+/// business plane renders it as `Content-Length` instead of chunked).
 pub struct CacheHit {
     pub outcome: CacheOutcome,
     pub meta: HitMeta,
     pub content_range: Option<String>,
+    pub content_length: Option<u64>,
     pub body: BodyStream,
 }
 
@@ -184,6 +187,82 @@ impl<C: Clock + Clone> Cache<C> {
         Ok((key, upstream))
     }
 
+    /// HEAD-grade metadata lookup: memory entry when fresh, else a single
+    /// upstream `stat` (a HEAD must be current — stale rows still cost one
+    /// stat, but bytes never move: no flights, no file reads, no file-row
+    /// installs; a confirmed absence installs a negative tombstone so
+    /// HEAD 404s share the negative-cache window with GET).
+    pub async fn head_meta(&self, raw_key: &str) -> Result<HitMeta, BackendError> {
+        let (key, upstream_id) =
+            self.resolve_upstream(raw_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+        self.head_meta_pinned(key.clone(), key, upstream_id).await
+    }
+
+    /// Same as [`Cache::head_meta`] with the upstream pre-pinned (S3
+    /// bucket alias + suffix-range size resolution). Same two-namespace
+    /// split as [`Cache::get_pinned`]: `cache_key` for memory rows,
+    /// `backend_key` for the upstream stat.
+    pub async fn head_meta_pinned(
+        &self,
+        cache_key: String,
+        backend_key: String,
+        upstream_id: String,
+    ) -> Result<HitMeta, BackendError> {
+        let key = validate_key(&cache_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+        let backend_key = validate_key(&backend_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+        let now = self.clock.now_millis();
+        {
+            let s = self.state.read().await;
+            if let Some(meta) = s.entries.get(&key) {
+                if meta.is_negative(now) {
+                    return Err(BackendError::NotFound);
+                }
+                if meta.negative_until_millis.is_none() {
+                    // Fresh enough to serve from memory: a HEAD must be
+                    // current, so a stale row still costs one stat (bytes
+                    // never move — flights and file reads stay untouched).
+                    let age = now.saturating_sub(meta.last_revalidated_millis.unwrap_or(meta.created_at_millis));
+                    if age <= self.config.revalidate_ttl_secs * 1000 {
+                        let hit = hit_meta_entry(&key, meta);
+                        drop(s);
+                        self.bump_last_access(&key).await;
+                        return Ok(hit);
+                    }
+                }
+                // Stale row or expired tombstone: fall through to stat.
+            }
+        }
+        let slot = self
+            .backends
+            .get(&upstream_id)
+            .ok_or_else(|| BackendError::Other(format!("unknown upstream {upstream_id}")))?;
+        let _permit = slot.gate.acquire().await;
+        match slot.backend.stat(&Key::from_validated(backend_key)).await {
+            Ok(m) => {
+                self.bump_last_access(&key).await;
+                Ok(hit_meta_remote(&key, &m))
+            }
+            Err(BackendError::NotFound) => {
+                self.install_negative(&key, &upstream_id).await;
+                Err(BackendError::NotFound)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Pure memory peek at a cached entry's size: no upstream call, no
+    /// state mutation. Used only for best-effort `Content-Range: bytes
+    /// */size` hints on 416 responses (SHOULD-level per R1).
+    pub(crate) async fn memory_size(&self, raw_key: &str) -> Option<u64> {
+        let key = validate_key(raw_key).ok()?;
+        let s = self.state.read().await;
+        let m = s.entries.get(&key)?;
+        if m.negative_until_millis.is_some() {
+            return None;
+        }
+        Some(m.size_bytes)
+    }
+
     /// Main entry: `GET /<key>` — streaming response. Cold misses attach
     /// to a shared download flight; hits stream the cached file; revalidation
     /// stats the upstream (no bytes) and compares etags. A Range request on
@@ -197,6 +276,29 @@ impl<C: Clock + Clone> Cache<C> {
     ) -> Result<CacheHit, BackendError> {
         let (key, upstream_id) =
             self.resolve_upstream(raw_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+        self.get_pinned(key.clone(), key, upstream_id, range).await
+    }
+
+    /// Same as [`Cache::get`] but with the upstream pre-pinned: skips route
+    /// resolution. Used by the S3 path-style `/{bucket}/{key}` alias, where
+    /// the bucket names the upstream directly (bucket namespace = upstream
+    /// ids, zero new config).
+    ///
+    /// Two key namespaces: `key` is the cache identity (full request path,
+    /// bucket included — state rows, flights, store paths, reval labels);
+    /// `backend_key` is the provider-side object path (bucket stripped).
+    /// They coincide for legacy routing; they differ only for the alias.
+    /// Sharing one namespace would collide flights and entries across
+    /// upstreams, so the split is load-bearing, not cosmetic.
+    pub async fn get_pinned(
+        &self,
+        key: String,
+        backend_key: String,
+        upstream_id: String,
+        range: Option<crate::backend::ByteRange>,
+    ) -> Result<CacheHit, BackendError> {
+        let key = validate_key(&key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+        let backend_key = validate_key(&backend_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
         let slot = self
             .backends
             .get(&upstream_id)
@@ -247,7 +349,7 @@ impl<C: Clock + Clone> Cache<C> {
                 .reval_inflight
                 .run(format!("reval:{key}"), || {
                     let slot = Arc::clone(&slot);
-                    let k = Key::from_validated(key.clone());
+                    let k = Key::from_validated(backend_key.clone());
                     async move {
                         let _permit = slot.gate.acquire().await;
                         slot.backend.stat(&k).await.map(|meta| StatData { meta })
@@ -265,7 +367,7 @@ impl<C: Clock + Clone> Cache<C> {
                 Ok(_) => {
                     // Modified (or etag vanished): forced refetch below; the
                     // old file keeps serving other readers until the rename.
-                    return self.forced_fetch(slot, key, upstream_id, range).await;
+                    return self.forced_fetch(slot, key, backend_key, upstream_id, range).await;
                 }
                 Err(BackendError::NotFound) => {
                     self.install_negative(&key, &upstream_id).await;
@@ -281,8 +383,11 @@ impl<C: Clock + Clone> Cache<C> {
         }
 
         // Cold miss: attach-or-create the shared download flight.
-        let flight = self.attach_or_start(&key, &upstream_id, Arc::clone(&slot)).await;
-        self.await_flight(flight, &key, &upstream_id, CacheOutcome::Miss, slot, range).await
+        // The flight is namespaced by cache key; the driver fetches the
+        // provider-side object path.
+        let backend_key = Key::from_validated(backend_key);
+        let flight = self.attach_or_start(&key, backend_key.clone(), &upstream_id, Arc::clone(&slot)).await;
+        self.await_flight(flight, &key, backend_key.as_str(), &upstream_id, slot, range).await
     }
 
     /// Serve a complete cached file from disk, if both file and meta exist.
@@ -320,15 +425,19 @@ impl<C: Clock + Clone> Cache<C> {
             outcome,
             meta: hit_meta_entry(key, &m),
             content_range,
+            content_length: Some(len),
             body: flight::file_body(path, offset, len),
         }))
     }
 
     /// Attach to an existing flight for this key, or create one and spawn
     /// its driver. Map insertion happens before any await.
+    /// `key` namespaces the flight/map entry and store paths;
+    /// `backend_key` is what the driver stats/opens upstream.
     async fn attach_or_start(
         &self,
         key: &str,
+        backend_key: Key,
         upstream_id: &str,
         slot: Arc<BackendSlot>,
     ) -> Arc<FlightShared> {
@@ -346,15 +455,15 @@ impl<C: Clock + Clone> Cache<C> {
         // affecting the download other readers are attached to.
         let driver_f = f.clone();
         let driver_slot = Arc::clone(&slot);
-        let driver_key = Key::from_validated(key.to_string());
         let driver_up = upstream_id.to_string();
+        let entry_key = key.to_string();
         let cfg = Arc::clone(&self.config);
         let state = Arc::clone(&self.state);
         let meta_store = Arc::clone(&self.meta);
         let flights = Arc::clone(&self.flights);
         let clock = Arc::clone(&self.clock);
         tokio::spawn(async move {
-            drive_flight(driver_f, driver_slot, driver_key, driver_up, cfg, state, meta_store, flights, clock).await;
+            drive_flight(driver_f, driver_slot, backend_key, entry_key, driver_up, cfg, state, meta_store, flights, clock).await;
         });
         f
     }
@@ -368,8 +477,8 @@ impl<C: Clock + Clone> Cache<C> {
         &self,
         flight: Arc<FlightShared>,
         key: &str,
+        backend_key: &str,
         upstream_id: &str,
-        outcome: CacheOutcome,
         slot: Arc<BackendSlot>,
         range: Option<crate::backend::ByteRange>,
     ) -> Result<CacheHit, BackendError> {
@@ -383,9 +492,10 @@ impl<C: Clock + Clone> Cache<C> {
                     match range {
                         None => {
                             return Ok(CacheHit {
-                                outcome,
+                                outcome: CacheOutcome::Miss,
                                 meta: meta_out,
                                 content_range: None,
+                                content_length: Some(meta.size_bytes),
                                 body: flight::growing_reader(flight),
                             });
                         }
@@ -393,9 +503,10 @@ impl<C: Clock + Clone> Cache<C> {
                             // The growing reader already streams from byte 0.
                             let last = meta.size_bytes.saturating_sub(1);
                             return Ok(CacheHit {
-                                outcome,
+                                outcome: CacheOutcome::Miss,
                                 meta: meta_out,
                                 content_range: Some(format!("bytes 0-{last}/{}", meta.size_bytes)),
+                                content_length: Some(meta.size_bytes),
                                 body: flight::growing_reader(flight),
                             });
                         }
@@ -406,14 +517,15 @@ impl<C: Clock + Clone> Cache<C> {
                                 return Err(BackendError::RangeNotSatisfiable);
                             }
                             let _permit = slot.gate.acquire().await;
-                            let src = slot.backend.open(&Key::from_validated(key.to_string()), Some(r)).await?;
+                            let src = slot.backend.open(&Key::from_validated(backend_key.to_string()), Some(r)).await?;
                             let end = r
                                 .length
                                 .map_or(meta.size_bytes.saturating_sub(1), |l| (r.offset + l - 1).min(meta.size_bytes - 1));
                             return Ok(CacheHit {
-                                outcome,
+                                outcome: CacheOutcome::Miss,
                                 meta: meta_out,
                                 content_range: Some(format!("bytes {}-{}/{}", r.offset, end, meta.size_bytes)),
+                                content_length: Some(end.saturating_sub(r.offset).saturating_add(1)),
                                 body: flight::passthrough_body(src),
                             });
                         }
@@ -423,7 +535,7 @@ impl<C: Clock + Clone> Cache<C> {
                     // Late attacher: the whole flight finished before we
                     // subscribed (watch keeps only the latest value). The
                     // file is sealed and its meta installed — serve disk.
-                    if let Some(hit) = self.serve_from_disk(key, outcome, range).await? {
+                    if let Some(hit) = self.serve_from_disk(key, CacheOutcome::Miss, range).await? {
                         return Ok(hit);
                     }
                     return Err(BackendError::Other("flight done but entry missing".into()));
@@ -454,6 +566,7 @@ impl<C: Clock + Clone> Cache<C> {
         &self,
         slot: Arc<BackendSlot>,
         key: String,
+        backend_key: String,
         upstream_id: String,
         range: Option<crate::backend::ByteRange>,
     ) -> Result<CacheHit, BackendError> {
@@ -463,16 +576,18 @@ impl<C: Clock + Clone> Cache<C> {
         ));
         let driver_f = flight.clone();
         let driver_slot = Arc::clone(&slot);
-        let driver_key = Key::from_validated(key.clone());
         let driver_up = upstream_id.clone();
+        let backend_key = Key::from_validated(backend_key);
+        let entry_key = key.clone();
+        let driver_backend_key = backend_key.clone();
         let cfg = Arc::clone(&self.config);
         let state = Arc::clone(&self.state);
         let meta_store = Arc::clone(&self.meta);
         let clock = Arc::clone(&self.clock);
         tokio::spawn(async move {
-            drive_flight(driver_f, driver_slot, driver_key, driver_up, cfg, state, meta_store, flights_none(), clock).await;
+            drive_flight(driver_f, driver_slot, driver_backend_key, entry_key, driver_up, cfg, state, meta_store, flights_none(), clock).await;
         });
-        self.await_flight(flight, &key, &upstream_id, CacheOutcome::Miss, slot, range).await
+        self.await_flight(flight, &key, backend_key.as_str(), &upstream_id, slot, range).await
     }
 
     async fn try_serve_cached(&self, key: &str) -> Option<Vec<u8>> {
@@ -548,7 +663,8 @@ fn flights_none() -> Arc<Mutex<HashMap<String, Arc<FlightShared>>>> {
 async fn drive_flight<C: Clock>(
     flight: Arc<FlightShared>,
     slot: Arc<BackendSlot>,
-    k: Key,
+    backend_key: Key,
+    entry_key: String,
     upstream_id: String,
     config: Arc<Config>,
     state: Arc<RwLock<CacheState>>,
@@ -558,9 +674,9 @@ async fn drive_flight<C: Clock>(
 ) {
     let outcome = async {
         let _permit = slot.gate.acquire().await;
-        let meta = slot.backend.stat(&k).await?;
+        let meta = slot.backend.stat(&backend_key).await?;
         let _ = flight.progress_tx.send(FlightProgress::Meta(meta.clone()));
-        let src = slot.backend.open(&k, None).await?;
+        let src = slot.backend.open(&backend_key, None).await?;
         flight::pump_and_seal(src, &flight.tmp_path, &flight.final_path, &flight.progress_tx).await?;
         Ok::<ObjectMeta, BackendError>(meta)
     }
@@ -568,14 +684,14 @@ async fn drive_flight<C: Clock>(
 
     match outcome {
         Ok(meta) => {
-            insert_meta(&state, &config, &meta_store, k.as_str(), &upstream_id, &meta, clock.now_millis()).await;
+            insert_meta(&state, &config, &meta_store, &entry_key, &upstream_id, &meta, clock.now_millis()).await;
             let _ = flight.progress_tx.send(FlightProgress::Done);
         }
         Err(e) => {
             let _ = flight.progress_tx.send(FlightProgress::Failed(e));
         }
     }
-    flights.lock().await.remove(k.as_str());
+    flights.lock().await.remove(entry_key.as_str());
 }
 
 async fn insert_meta(
