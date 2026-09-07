@@ -3,15 +3,14 @@
 //! AuthRequired), and the OpenList server-side quirks we depend on.
 
 use bytes::Bytes;
-use futures::StreamExt;
 
 use origin_cache::{
-    backend::{BackendError, ByteRange, DirectUrl, Key, ObjectMeta, StreamSource, StorageBackend},
+    backend::{BackendError, ByteRange, DirectUrl, Key, StreamSource, StorageBackend},
     config::{ColdMiss, UpstreamConfig},
     mime,
 };
 
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn upstream(base: String) -> UpstreamConfig {
@@ -119,7 +118,6 @@ async fn stat_bad_credentials_map_to_auth_required() {
 #[tokio::test]
 async fn open_passes_range_header_and_streams() {
     let server = MockServer::start().await;
-    let payload = b"0123456789".to_vec();
     Mock::given(method("GET"))
         .and(path("/media/big.bin"))
         .and(header("range", "bytes=3-"))

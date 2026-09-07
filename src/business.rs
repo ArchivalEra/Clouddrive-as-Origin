@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -130,11 +130,23 @@ async fn try_relief_valve<C: Clock + Clone>(
     )
 }
 
-async fn get_key<C>(State(state): State<AppState<C>>, Path(path_key): Path<String>, headers: HeaderMap) -> Response
+async fn get_key<C>(
+    State(state): State<AppState<C>>,
+    Path(path_key): Path<String>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response
 where
     C: Clock + Clone,
 {
     let (req_id, host_id) = request_ids();
+    // List dispatch (map #24): S3 list operations live on the same path
+    // space as objects but bypass the cache entirely (metadata path).
+    if let Some(resp) =
+        crate::list::try_list(&state, &path_key, query.as_deref(), &req_id, &host_id).await
+    {
+        return resp;
+    }
     // Single resolution seam (C2): routing + bucket alias + validation,
     // once. Everything below takes `rk` — no re-resolution, no re-validation.
     let rk = match state.cache.resolve(&path_key) {
@@ -662,7 +674,7 @@ mod tests {
 
     /// Prime the cache via GET miss + full drain, then wait for install.
     async fn prime(fx: &Fixture, key: &str) {
-        let resp = get_key(State(fx.state.clone()), Path(key.to_string()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path(key.to_string()), headers(&[]), RawQuery(None)).await;
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         wait_installed(fx, key).await;
@@ -715,7 +727,7 @@ mod tests {
     async fn get_hit_s3_shape() {
         let fx = fixture(b"0123456789", Some("abc123"), vec![], false);
         prime(&fx, "a.bin").await;
-        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None)).await;
         let (status, h, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "0123456789");
@@ -732,8 +744,8 @@ mod tests {
     async fn request_ids_unique_per_response() {
         let fx = fixture(b"0123456789", None, vec![], false);
         prime(&fx, "a.bin").await;
-        let r1 = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[])).await;
-        let r2 = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[])).await;
+        let r1 = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None)).await;
+        let r2 = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None)).await;
         assert_ne!(
             r1.headers().get("x-amz-request-id").unwrap(),
             r2.headers().get("x-amz-request-id").unwrap()
@@ -744,7 +756,7 @@ mod tests {
     async fn get_missing_is_nosuchkey_xml() {
         let fx = fixture(b"0123456789", None, vec![], true);
         // Missing on a fresh cache: stat the backend once to confirm absence.
-        let resp = get_key(State(fx.state.clone()), Path("nope.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("nope.bin".into()), headers(&[]), RawQuery(None)).await;
         let (status, h, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(h.get("content-type").unwrap(), "application/xml");
@@ -762,6 +774,7 @@ mod tests {
             State(fx.state.clone()),
             Path("a.bin".into()),
             headers(&[("range", "bytes=20-30")]),
+            RawQuery(None),
         )
         .await;
         let (status, h, body) = body_text(resp).await;
@@ -778,6 +791,7 @@ mod tests {
             State(fx.state.clone()),
             Path("a.bin".into()),
             headers(&[("range", "bytes=0-1,3-4")]),
+            RawQuery(None),
         )
         .await;
         let (status, _, body) = body_text(resp).await;
@@ -794,6 +808,7 @@ mod tests {
             State(fx.state.clone()),
             Path("a.bin".into()),
             headers(&[("range", "bytes=-3")]),
+            RawQuery(None),
         )
         .await;
         let (status, h, body) = body_text(resp).await;
@@ -805,6 +820,7 @@ mod tests {
             State(fx.state.clone()),
             Path("a.bin".into()),
             headers(&[("range", "bytes=-100")]),
+            RawQuery(None),
         )
         .await;
         let (status, h, body) = body_text(resp).await;
@@ -886,11 +902,11 @@ mod tests {
     async fn bucket_alias_pins_upstream() {
         let fx = fixture(b"AAA", None, vec![("archive", b"BBB".to_vec())], false);
         // Legacy path routes "" → primary.
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None)).await;
         let (_, _, body) = body_text(resp).await;
         assert_eq!(body, "AAA");
         // Bucket alias pins the archive upstream regardless of routes.
-        let resp = get_key(State(fx.state.clone()), Path("archive/f.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("archive/f.bin".into()), headers(&[]), RawQuery(None)).await;
         let (_, _, body) = body_text(resp).await;
         assert_eq!(body, "BBB");
     }
@@ -898,7 +914,7 @@ mod tests {
     #[tokio::test]
     async fn redirect_cold_307_and_background_fill() {
         let fx = fixture_full(b"0123456789", None, vec![], false, Some("https://cdn.example.com/f?sign=x"), true);
-        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None)).await;
         let (status, h, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(h.get("location").unwrap(), "https://cdn.example.com/f?sign=x");
@@ -922,7 +938,7 @@ mod tests {
         prime_cache(&fx, "a.bin").await;
         reset(&fx);
         // fresh hit → 200 from cache even though redirect is enabled.
-        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None)).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "0123456789");
@@ -933,7 +949,7 @@ mod tests {
     async fn redirect_unavailable_silently_proxies() {
         // Tier 3 (no link): normal water-pipe, viewer unaffected.
         let fx = fixture_full(b"0123456789", None, vec![], false, None, true);
-        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None)).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "0123456789");
@@ -944,7 +960,7 @@ mod tests {
     async fn redirect_rejected_target_silently_proxies() {
         // Foreign http is not an allowed redirect target → proxy.
         let fx = fixture_full(b"0123456789", None, vec![], false, Some("http://cdn.example.com/f"), true);
-        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None)).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "0123456789");
@@ -954,7 +970,7 @@ mod tests {
     async fn redirect_disabled_never_consults_backend() {
         // Default proxy mode: direct_url untouched even when offered.
         let fx = fixture_full(b"0123456789", None, vec![], false, Some("https://cdn.example.com/f"), false);
-        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None)).await;
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 0);
@@ -977,6 +993,7 @@ mod tests {
             State(fx.state.clone()),
             Path("a.bin".into()),
             headers(&[("range", "bytes=2-5")]),
+            RawQuery(None),
         )
         .await;
         let (status, h, body) = body_text(resp).await;
@@ -1000,7 +1017,7 @@ mod tests {
     async fn efficient_second_pull_merges_ledger() {
         let fx = fixture_efficient(b"0123456789", 0.8, 4);
         for range in ["bytes=0-1", "bytes=4-5"] {
-            let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", range)])).await;
+            let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", range)]), RawQuery(None)).await;
             let (status, _, _) = body_text(resp).await;
             assert_eq!(status, StatusCode::PARTIAL_CONTENT);
         }
@@ -1015,7 +1032,7 @@ mod tests {
     #[tokio::test]
     async fn efficient_full_get_still_waterpipes() {
         let fx = fixture_efficient(b"0123456789", 0.8, 4);
-        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None)).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "0123456789");
@@ -1031,6 +1048,7 @@ mod tests {
             State(fx.state.clone()),
             Path("a.bin".into()),
             headers(&[("range", "bytes=2-5")]),
+            RawQuery(None),
         )
         .await;
         let (status, _, body) = body_text(resp).await;
@@ -1048,6 +1066,7 @@ mod tests {
             State(fx.state.clone()),
             Path("a.bin".into()),
             headers(&[("range", "bytes=2-5")]),
+            RawQuery(None),
         )
         .await;
         let (status, _, _) = body_text(resp).await;
@@ -1063,6 +1082,7 @@ mod tests {
             State(fx.state.clone()),
             Path("a.bin".into()),
             headers(&[("range", "bytes=2-5")]),
+            RawQuery(None),
         )
         .await;
         let (status, _, _) = body_text(resp).await;
@@ -1082,6 +1102,7 @@ mod tests {
             State(fx.state.clone()),
             Path("a.bin".into()),
             headers(&[("range", "bytes=2-5")]),
+            RawQuery(None),
         )
         .await;
         body_text(resp).await;
@@ -1098,7 +1119,7 @@ mod tests {
         let bytes: Vec<u8> = (0..100u8).collect();
         let fx = fixture_efficient(&bytes, 0.75, 4);
         for range in ["bytes=0-49", "bytes=50-79"] {
-            let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", range)])).await;
+            let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", range)]), RawQuery(None)).await;
             let (status, _, _) = body_text(resp).await;
             assert_eq!(status, StatusCode::PARTIAL_CONTENT);
         }
@@ -1109,7 +1130,7 @@ mod tests {
         assert!(opens.contains(&(80, Some(20))), "{opens:?}");
         assert!(!opens.iter().any(|(o, l)| *o == 0 && l.is_none()), "{opens:?}");
         // Assembled bytes are exact: sidecar copies + fetched gap.
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None)).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.as_bytes(), bytes.as_slice());
@@ -1124,16 +1145,16 @@ mod tests {
     async fn promotion_at_full_coverage_needs_no_gap_fetch() {
         let bytes: Vec<u8> = (0..100u8).collect();
         let fx = fixture_efficient(&bytes, 1.0, 4);
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")])).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None)).await;
         body_text(resp).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-99")])).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-99")]), RawQuery(None)).await;
         body_text(resp).await;
         wait_installed(&fx, "f.bin").await;
         // Only the two viewer pulls opened the backend — no gap fetch.
         assert_eq!(fx.opens.lock().unwrap().len(), 2);
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[])).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None)).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.as_bytes(), bytes.as_slice());
@@ -1144,7 +1165,7 @@ mod tests {
     async fn below_threshold_stays_staged() {
         let bytes: Vec<u8> = (0..100u8).collect();
         let fx = fixture_efficient(&bytes, 0.9, 4);
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")])).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None)).await;
         body_text(resp).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
@@ -1157,12 +1178,12 @@ mod tests {
     async fn etag_flip_resets_staged_history() {
         let bytes: Vec<u8> = (0..100u8).collect();
         let fx = fixture_efficient(&bytes, 0.75, 4);
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")])).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None)).await;
         body_text(resp).await;
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
         // Object replaced upstream: next transfer restarts history.
         *fx.etag.lock().unwrap() = Some("v2".into());
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-79")])).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-79")]), RawQuery(None)).await;
         body_text(resp).await;
         // Old segments dropped, ledger re-anchored on v2, no entry yet.
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(50, 80)]);
