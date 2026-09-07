@@ -287,6 +287,9 @@ where
         }
     };
 
+    if let Some(passthrough) = try_nocache(&state, &rk, range, &req_id, &host_id).await {
+        return passthrough;
+    }
     if let Some(passthrough) = try_passthrough(&state, &rk, range, &req_id, &host_id).await {
         return passthrough;
     }
@@ -317,6 +320,36 @@ where
             error_response(e, key, &req_id, &host_id, false, hint)
         }
     }
+}
+
+/// Nocache profile (small-footprint nodes): every GET water-pipes
+/// origin-to-viewer with zero disk writes — no entries, no flights, no
+/// segments, no tombstones. Range or not, cold or not: everything goes
+/// through; only header metadata is stat'd. Every failure surfaces via
+/// the standard error mapping (no stale-if-error: there is no disk copy).
+async fn try_nocache<C: Clock + Clone>(
+    state: &AppState<C>,
+    rk: &ResolvedKey,
+    range: Option<ByteRange>,
+    req_id: &str,
+    host_id: &str,
+) -> Option<Response> {
+    let prof = state.config.cache_profile(&rk.upstream_id);
+    if !prof.nocache {
+        return None;
+    }
+    let hit = state.cache.serve_nocache(rk, range).await.ok()?;
+    info!(key = %rk.cache_key, size = hit.meta.size, "nocache passthrough response");
+    let status = if hit.content_range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
+    let mut builder = Response::builder().status(status);
+    if let Some(cr) = &hit.content_range {
+        builder = builder.header("content-range", cr.header_value());
+    }
+    if let Some(len) = hit.content_length {
+        builder = builder.header("content-length", len);
+    }
+    builder = s3_meta_headers(builder, &hit.meta, req_id, host_id);
+    Some(builder.body(Body::from_stream(hit.body)).unwrap())
 }
 
 /// Efficient profile (P2-a): ranged misses passthrough origin straight to
@@ -713,6 +746,45 @@ mod tests {
         let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
         cfg.upstreams[0].cache_profile = "efficient".into();
         cfg.cache_profiles.insert("efficient".into(), CacheProfile { coverage_threshold: threshold, min_file_size });
+        let stat_calls = Arc::new(AtomicUsize::new(0));
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let direct_calls = Arc::new(AtomicUsize::new(0));
+        let etag = Arc::new(std::sync::Mutex::new(Some("v1".into())));
+        let opens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = ProbeBackend {
+            id: "primary".into(),
+            bytes: bytes.to_vec(),
+            etag: Arc::clone(&etag),
+            always_missing: false,
+            direct: None,
+            stat_calls: Arc::clone(&stat_calls),
+            open_calls: Arc::clone(&open_calls),
+            direct_calls: Arc::clone(&direct_calls),
+            opens: Arc::clone(&opens),
+        };
+        let mut slots = HashMap::new();
+        slots.insert(
+            "primary".to_string(),
+            Arc::new(BackendSlot { backend: Arc::new(backend), gate: Arc::new(Semaphore::new(3)) }),
+        );
+        let cache = Arc::new(Cache::new(Arc::new(cfg.clone()), Arc::new(MockClock::new(0)), BackendRegistry::new(slots)));
+        Fixture {
+            _dir: dir,
+            state: AppState { cache, config: Arc::new(cfg), sigv4_config: None },
+            stat_calls,
+            open_calls,
+            direct_calls,
+            etag,
+            opens,
+        }
+    }
+
+    /// Nocache-profile fixture: primary serves `cache_profile = "nocache"`
+    /// (built-in pure water-pipe, zero disk writes).
+    fn fixture_nocache(bytes: &[u8]) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+        cfg.upstreams[0].cache_profile = "nocache".into();
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let open_calls = Arc::new(AtomicUsize::new(0));
         let direct_calls = Arc::new(AtomicUsize::new(0));
@@ -1387,5 +1459,79 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body = String::from_utf8_lossy(&body).into_owned();
         assert!(body.contains("<Code>AccessDenied</Code>"), "{body}");
+    }
+
+    /// Cache directory contents minus the redb metadata database (which
+    /// exists by design even on nocache nodes — only cache OBJECT writes
+    /// are forbidden).
+    fn stray_cache_files(fx: &Fixture) -> usize {
+        std::fs::read_dir(fx.state.config.cache_dir.clone())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy() != "redb.db")
+            .count()
+    }
+
+    /// Nocache full GET: correct bytes, exact stat+open calls, and the
+    /// cache directory stays EMPTY (no entry, no segment, no tmp).
+    #[tokio::test]
+    async fn nocache_full_get_zero_disk() {
+        let fx = fixture_nocache(b"0123456789");
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        let (status, h, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "0123456789");
+        assert_eq!(h.get("content-length").unwrap(), "10");
+        assert_eq!(h.get("etag").unwrap(), "\"v1\"");
+        // One stat (headers) + one open (bytes). No flight machinery.
+        assert_eq!(fx.stat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fx.open_calls.load(Ordering::SeqCst), 1);
+        // Zero disk: no entries, no segment bytes, no stray cache files.
+        assert!(!fx.state.cache.state.read().await.entries.contains_key("a.bin"));
+        assert_eq!(fx.state.cache.state.read().await.total_bytes, 0);
+        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 0);
+        assert_eq!(stray_cache_files(&fx), 0);
+    }
+
+    /// Nocache ranged GET: exact slice, 206, still zero disk.
+    #[tokio::test]
+    async fn nocache_ranged_get_slices_and_zero_disk() {
+        let fx = fixture_nocache(b"0123456789");
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", "bytes=2-5")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        let (status, h, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, "2345");
+        assert_eq!(h.get("content-range").unwrap(), "bytes 2-5/10");
+        assert_eq!(stray_cache_files(&fx), 0);
+        assert_eq!(fx.state.cache.state.read().await.total_bytes, 0);
+        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 0);
+    }
+
+    /// Nocache HEAD: one stat, no open, no disk state.
+    #[tokio::test]
+    async fn nocache_head_is_pure_stat() {
+        let fx = fixture_nocache(b"0123456789");
+        let resp = head_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        let (status, h, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+        assert_eq!(h.get("content-length").unwrap(), "10");
+        assert_eq!(fx.stat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
+        // HEAD on a nocache upstream writes nothing (no tombstones either).
+        assert_eq!(stray_cache_files(&fx), 0);
+    }
+
+    /// Nocache prewarm: a no-op fetch (nothing to fill) that still reports
+    /// success; never opens the backend for bytes.
+    #[tokio::test]
+    async fn nocache_prewarm_is_noop() {
+        let fx = fixture_nocache(b"0123456789");
+        let resp = prewarm(State(fx.state.clone()), Path("w.bin".into()), headers(&[])).await.into_response();
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("fetched"), "{body}");
+        assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
+        assert!(!fx.state.cache.state.read().await.entries.contains_key("w.bin"));
     }
 }
