@@ -293,6 +293,49 @@ pub trait StorageBackend: Send + Sync {
   origin-pull ranges (plus operator SSH). `/_internal/*` is still
   gated by its shared secret even though the listener is `0.0.0.0`.
 
+### 6.1 S3-compatible inbound (ListObjectsV2 + SigV4)
+
+The outbound speaks AWS S3 shapes (R/#26 recon, contract in map #24).
+Two add-on surfaces ride the same listener; both are additive to the
+plain `GET /<key>` contract above.
+
+- **ListObjectsV2** (`GET /?list-type=2...` or `GET /{bucket}?list-type=2`):
+  S3-compatible listing backed by a live upstream PROPFIND — metadata
+  only, never touches the object cache. Path-style bucket alias maps
+  `/{bucket}` to the upstream id (virtual-host style unsupported).
+  Full parameter contract, wire shapes, and measured edge cases per
+  ticket #26 (Contents-then-CommonPrefixes block order, form-urlencoded
+  encoding set, `max-keys=0` -> empty non-truncated page). Responses
+  carry `Cache-Control: private, max-age=5` so directory browsing also
+  rides the CDN.
+
+- **SigV4 inbound verification** (optional verify-if-present): a request
+  bearing `Authorization: AWS4-HMAC-SHA256 ...` or presigned query
+  params (`X-Amz-Signature`) is verified against the credentials in
+  `SIGV4_ACCESS_KEY_ID` / `SIGV4_SECRET_ACCESS_KEY`; unsigned requests
+  pass through (D1 anonymous-first). Header form and presigned form
+  share one verifier (s3s-derived): +-900 s clock skew, credential
+  scope date consistency, X-Amz-Expires <= 604800, constant-time
+  compare, raw-path retry. Failures are `403 AccessDenied` XML with
+  `cache-control: no-store`. Both env vars unset = layer disabled.
+  SigV4a (ECDSA-P256) is deferred — no Rust verifier crate exists.
+
+- **EdgeOne compatibility (R/#27, operator requirement: edge caching
+  must survive)**: EdgeOne forwards all client headers (Authorization
+  included) and the full query string on origin-pull, and its cache
+  key is the client URL + query — it does NOT include the
+  Authorization header, so signed and anonymous requests share one
+  cache entry. Two operator-side requirements:
+  1. Do NOT add Authorization or signature params to the cache key
+     (default behavior is already correct).
+  2. If presigned URLs are used, configure the EdgeOne cache key to
+     IGNORE the entire query string — origin-pull still carries the
+     full query, so verification keeps working while every presigned
+     request hits the same cache entry.
+  3. Do NOT enable origin-pull URL rewriting / query stripping /
+     Host rewriting rules on routes serving signed traffic — any of
+     them breaks the signature.
+
 ## 7. Configuration (single TOML file)
 
 All timeouts / limits have defaults. Secrets and hostnames are **env
