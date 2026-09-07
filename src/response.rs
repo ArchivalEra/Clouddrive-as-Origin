@@ -63,9 +63,26 @@ pub(crate) fn quote_etag(etag: &str) -> String {
 }
 
 pub(crate) fn s3_error_xml(code: &str, message: &str, resource: &str, req_id: &str, host_id: &str) -> String {
+    s3_error_xml_ex(code, message, resource, req_id, host_id, &[])
+}
+
+/// Extended envelope with AWS-style extra elements (`ArgumentName`,
+/// `BucketName`) placed after `Message` per the measured S3 error shape.
+pub(crate) fn s3_error_xml_ex(
+    code: &str,
+    message: &str,
+    resource: &str,
+    req_id: &str,
+    host_id: &str,
+    extra: &[(&str, &str)],
+) -> String {
+    let mut extras = String::new();
+    for (k, v) in extra {
+        extras.push_str(&format!("<{k}>{v}</{k}>"));
+    }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-         <Error><Code>{code}</Code><Message>{message}</Message>\
+         <Error><Code>{code}</Code><Message>{message}</Message>{extras}\
          <Resource>{resource}</Resource><RequestId>{req_id}</RequestId>\
          <HostId>{host_id}</HostId></Error>"
     )

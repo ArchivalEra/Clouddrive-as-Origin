@@ -337,11 +337,15 @@ mod tests {
             Ok(self
                 .listing
                 .iter()
-                .filter(|e| {
-                    let Some(rest) = e.key.strip_prefix(folder) else { return false };
-                    recursive || !rest.trim_end_matches('/').contains('/')
+                .filter_map(|e| {
+                    let rest = e.key.strip_prefix(folder)?;
+                    // The folder itself is the PROPFIND self entity, never
+                    // a child.
+                    if rest.is_empty() {
+                        return None;
+                    }
+                    (recursive || !rest.trim_end_matches('/').contains('/')).then(|| e.clone())
                 })
-                .cloned()
                 .collect())
         }
 
