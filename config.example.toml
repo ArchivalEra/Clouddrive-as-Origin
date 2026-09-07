@@ -31,6 +31,17 @@ prewarm_shared_secret_env = "ORIGIN_PREWARM_SECRET"
 # loopback; direct 302 mode is not used, so this rarely fires).
 allowed_download_suffixes = []
 
+# --- S3-compatible inbound (spec §6.1) ---
+# SigV4 verification of inbound requests (header auth + presigned URLs).
+# OPTIONAL verify-if-present: unsigned requests pass through; set BOTH
+# env vars to enable, leave both unset to disable the layer entirely.
+# SIGV4_ACCESS_KEY_ID = "SIGV4_ACCESS_KEY_ID"
+# SIGV4_SECRET_ACCESS_KEY = "SIGV4_SECRET_ACCESS_KEY"
+# EdgeOne note (spec §6.1): the cache key must NOT include the
+# Authorization header (default), and presigned traffic requires the
+# cache key configured to ignore the entire query string. Never enable
+# origin-pull URL rewriting or query stripping on signed routes.
+
 # --- upstreams ---
 # One upstream = one OpenList instance (or one WebDAV mount on it).
 # OpenList fronts hundreds of cloud drives behind one folder tree; we cache
