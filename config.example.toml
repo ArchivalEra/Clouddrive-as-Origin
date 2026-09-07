@@ -80,6 +80,13 @@ password_env = "OPENLIST_PASSWORD"
 # coverage_threshold = 0.8   # (0, 1]; 1.0 = promote only when fully served
 # min_file_size = 67108864   # below this, miss goes B (small files fill cheap)
 
+# "nocache" is a built-in profile for small-footprint nodes: pure
+# water-pipe, zero cache-object disk writes (no entries, no segments,
+# no tombstones; prewarm is a no-op; HEAD is a pure stat). Only the
+# redb metadata file exists on disk. Use it for nodes with tiny disks
+# that just stream bytes:
+# cache_profile = "nocache"
+
 # Multi-OpenList: add more instances and route key prefixes to them.
 # [[upstreams]]
 # id = "archive"

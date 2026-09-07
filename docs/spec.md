@@ -320,6 +320,18 @@ plain `GET /<key>` contract above.
   `cache-control: no-store`. Both env vars unset = layer disabled.
   SigV4a (ECDSA-P256) is deferred — no Rust verifier crate exists.
 
+- **Nocache profile** (built-in `cache_profile = "nocache"`): for
+  small-footprint nodes (hundreds-of-MB RAM, GB-scale eMMC) that
+  water-pipe without caching. Every GET/HEAD is stat + ranged open +
+  stream-to-viewer; the cache directory receives **zero cache-object
+  writes** — no entries, no segments, no negative tombstones, no
+  coverage ledger, no access-clock writes; prewarm and the relief
+  valve's background fill are no-ops. Only the redb metadata file
+  exists on disk. Consequences: no stale-if-error (nothing to fall
+  back to), no hit acceleration (every request walks the upstream), and
+  `healthz` stays at zero entries — the CDN edge (EdgeOne) is expected
+  to carry the caching duty for these nodes.
+
 - **EdgeOne compatibility (R/#27, operator requirement: edge caching
   must survive)**: EdgeOne forwards all client headers (Authorization
   included) and the full query string on origin-pull, and its cache

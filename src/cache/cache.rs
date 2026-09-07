@@ -88,9 +88,9 @@ pub struct CacheHit {
     pub body: BodyStream,
 }
 
-/// C-path response (efficientcache passthrough): origin bytes with the
-/// staged-segment coordinates attached. No outcome: this never touches
-/// entries, flights, or revalidation.
+/// C-path / nocache response: origin bytes with the streaming
+/// coordinates attached. No outcome: these paths never touch entries,
+/// flights, or revalidation.
 pub struct PassthroughHit {
     pub meta: HitMeta,
     pub etag: Option<String>,
@@ -236,6 +236,17 @@ impl<C: Clock + Clone> Cache<C> {
         let backend_key = rk.backend_key.clone();
         let upstream_id = rk.upstream_id.clone();
         let now = self.clock.now_millis();
+        // Nocache profile: pure stat, zero cache state (no memory rows, no
+        // tombstones, no access-clock bumps).
+        if self.config.cache_profile(&upstream_id).nocache {
+            let slot = self
+                .backends
+                .get(&upstream_id)
+                .ok_or_else(|| BackendError::Other(format!("unknown upstream {upstream_id}")))?;
+            let _permit = slot.gate.acquire().await;
+            let m = slot.backend.stat(&Key::from_validated(backend_key)).await?;
+            return Ok(hit_meta_remote(&key, &m));
+        }
         {
             let s = self.state.read().await;
             if let Some(meta) = s.entries.get(&key) {
@@ -309,11 +320,67 @@ impl<C: Clock + Clone> Cache<C> {
 
     /// Background fill: full fetch + drain, no client attached. Powers the
     /// A relief valve (307 now, bytes later) and shares the prewarm path —
-    /// one primitive, two callers.
+    /// one primitive, two callers. Nocache upstreams have nothing to fill
+    /// (zero-disk contract), so prefetch is a no-op there.
     pub async fn prefetch(&self, rk: &ResolvedKey) -> Result<(), BackendError> {
+        if self.config.cache_profile(&rk.upstream_id).nocache {
+            return Ok(());
+        }
         let mut hit = self.get_resolved(rk, None).await?;
         flight::drain(&mut hit.body).await?;
         Ok(())
+    }
+
+    /// Nocache profile (small-footprint nodes): pure water-pipe — stat for
+    /// headers, ranged open, bytes stream origin-to-viewer with **zero
+    /// disk writes**: no entries, no segments, no redb rows, no negative
+    /// tombstones, no coverage ledger. Every failure is the caller's
+    /// fallback problem, exactly like `serve_passthrough`.
+    pub async fn serve_nocache(
+        &self,
+        rk: &ResolvedKey,
+        range: Option<crate::backend::ByteRange>,
+    ) -> Result<PassthroughHit, BackendError> {
+        let slot = self
+            .backends
+            .get(&rk.upstream_id)
+            .ok_or_else(|| BackendError::Other(format!("unknown upstream {}", rk.upstream_id)))?;
+        let _permit = slot.gate.acquire().await;
+        let bkey = Key::from_validated(rk.backend_key.clone());
+        let meta = slot.backend.stat(&bkey).await?;
+        let total = meta.size_bytes;
+        let (start, end) = match range {
+            None => (0, total),
+            Some(r) => {
+                if r.offset >= total {
+                    return Err(BackendError::RangeNotSatisfiable);
+                }
+                (r.offset, r.length.map_or(total, |l| (r.offset + l).min(total)))
+            }
+        };
+        let src = slot.backend.open(&bkey, range).await?;
+        let content_range = range.map(|_| ContentRange { first: start, last: end.saturating_sub(1), total });
+        let content_length = Some(end.saturating_sub(start));
+        let mut src_stream = src.stream;
+        let body: BodyStream = Box::pin(async_stream::try_stream! {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                let n = src_stream.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                yield bytes::Bytes::copy_from_slice(&buf[..n]);
+            }
+        });
+        Ok(PassthroughHit {
+            meta: hit_meta_remote(&rk.cache_key, &meta),
+            etag: meta.etag,
+            total,
+            content_range,
+            content_length,
+            body,
+        })
     }
 
     /// C-path response (efficientcache): origin bytes streamed straight to

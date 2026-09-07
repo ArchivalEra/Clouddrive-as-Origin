@@ -91,18 +91,27 @@ pub struct CacheProfile {
     pub min_file_size: u64,
 }
 
-/// Resolved per-upstream fill behavior: `efficient == false` is legacy
-/// standard (full-file water-pipe on every miss).
+/// Resolved per-upstream fill behavior. `standard` = legacy full-file
+/// water-pipe into cache; `efficient` = ranged passthrough + staging +
+/// coverage promotion; `nocache` = pure water-pipe, zero disk writes
+/// (small-footprint nodes: bytes stream through, metadata stat still
+/// happens so ETag/Size/Last-Modified headers render, nothing persists —
+/// no entries, no segments, no redb writes, no negative tombstones).
 #[derive(Debug, Clone, Copy)]
 pub struct EffectiveProfile {
     pub efficient: bool,
+    pub nocache: bool,
     pub coverage_threshold: f64,
     pub min_file_size: u64,
 }
 
 impl EffectiveProfile {
     pub fn standard() -> Self {
-        Self { efficient: false, coverage_threshold: default_coverage_threshold(), min_file_size: default_min_file_size() }
+        Self { efficient: false, nocache: false, coverage_threshold: default_coverage_threshold(), min_file_size: default_min_file_size() }
+    }
+
+    pub fn nocache() -> Self {
+        Self { efficient: false, nocache: true, coverage_threshold: 0.0, min_file_size: 0 }
     }
 }
 
@@ -252,20 +261,24 @@ impl Config {
     }
 
     /// Resolve an upstream's fill behavior. Unknown upstreams and
-    /// `"standard"` both yield the legacy profile (defensive: boot
+    /// `"standard"` both yield the legacy profile; `"nocache"` is a
+    /// built-in no-disk profile (pure water-pipe). Any other name must
+    /// have a `[cache_profiles.<name>]` table (defensive: boot
     /// validation already rejects dangling references).
     pub fn cache_profile(&self, upstream_id: &str) -> EffectiveProfile {
         let name = self.upstream(upstream_id).map(|u| u.cache_profile.as_str()).unwrap_or("standard");
-        if name == "standard" {
-            return EffectiveProfile::standard();
-        }
-        match self.cache_profiles.get(name) {
-            Some(p) => EffectiveProfile {
-                efficient: true,
-                coverage_threshold: p.coverage_threshold,
-                min_file_size: p.min_file_size,
+        match name {
+            "standard" => EffectiveProfile::standard(),
+            "nocache" => EffectiveProfile::nocache(),
+            other => match self.cache_profiles.get(other) {
+                Some(p) => EffectiveProfile {
+                    efficient: true,
+                    nocache: false,
+                    coverage_threshold: p.coverage_threshold,
+                    min_file_size: p.min_file_size,
+                },
+                None => EffectiveProfile::standard(),
             },
-            None => EffectiveProfile::standard(),
         }
     }
 
