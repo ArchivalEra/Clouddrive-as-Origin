@@ -48,7 +48,11 @@ async fn main() -> anyhow::Result<()> {
     }
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), clock, BackendRegistry::new(slots)));
     cache.load_and_start().await;
-    let app_state = origin_cache::business::AppState { cache, config: Arc::clone(&cfg) };
+    let app_state = origin_cache::business::AppState {
+        cache,
+        config: Arc::clone(&cfg),
+        sigv4_config: origin_cache::sigv4::SigV4Config::from_env(),
+    };
 
     if cfg.prewarm_shared_secret_env.is_none() {
         warn!("prewarm endpoint is open (no prewarm_shared_secret_env set) — fine behind EdgeOne, risky if directly exposed");

@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, RawQuery, State},
+    extract::{OriginalUri, Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -22,12 +22,84 @@ use crate::{
     config::{ColdMiss, Config},
     key::ResolvedKey,
     response::{error_response, request_ids, s3_meta_headers},
+    sigv4,
 };
+
+/// Inbound SigV4 gate (#28): optional verify-if-present. Reads the
+/// verifier's input from the raw request line + headers; a request with
+/// SigV4 material is verified (403 XML on failure), anything else
+/// passes through (D1 anonymous-first). Config comes from named env
+/// vars once at boot; `None` disables the layer entirely.
+fn sigv4_gate(
+    cfg: Option<&sigv4::SigV4Config>,
+    method: &str,
+    raw_uri_path: &str,
+    query: Option<&str>,
+    headers: &HeaderMap,
+    req_id: &str,
+    host_id: &str,
+    now_unix: i64,
+) -> Option<Response> {
+    let decoded_path = raw_uri_path.percent_decoded();
+    let pairs: Vec<(String, String)> = query
+        .map(|q| form_urlencoded::parse(q.as_bytes()).map(|(k, v)| (k.into_owned(), v.into_owned())).collect())
+        .unwrap_or_default();
+    let header_pairs: Vec<(String, String)> = headers
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_ascii_lowercase(), v.to_string())))
+        .collect();
+    let input = sigv4::VerifyInput {
+        method,
+        uri_path: &decoded_path,
+        raw_uri_path,
+        query_pairs: pairs.into_iter().map(|(k, v)| (k, v)).collect(),
+        headers: header_pairs,
+        authorization: headers.get("authorization").and_then(|v| v.to_str().ok()),
+    };
+    match sigv4::verify_optional(cfg, &input, now_unix) {
+        sigv4::VerifyOutcome::Anonymous | sigv4::VerifyOutcome::Verified(_) => None,
+        // The reason string stays out of the response body: AWS-compatible
+        // clients only need the code; the detail lives in the log.
+        sigv4::VerifyOutcome::Failed(reason) => {
+            tracing::warn!(reason, "sigv4 verification failed");
+            let xml = crate::response::s3_error_xml(
+                "AccessDenied",
+                "Access Denied",
+                &format!("/{raw_uri_path}"),
+                req_id,
+                host_id,
+            );
+            Some(
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "application/xml")
+                    .header("cache-control", "no-store")
+                    .header("x-amz-request-id", req_id)
+                    .header("x-amz-id-2", host_id)
+                    .body(Body::from(xml))
+                    .unwrap(),
+            )
+        }
+    }
+}
+
+trait PercentDecodePath {
+    fn percent_decoded(&self) -> String;
+}
+
+impl PercentDecodePath for str {
+    fn percent_decoded(&self) -> String {
+        percent_encoding::percent_decode_str(self).decode_utf8_lossy().into_owned()
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState<C: Clock + Clone> {
     pub cache: Arc<Cache<C>>,
     pub config: Arc<Config>,
+    /// Inbound SigV4 credentials (named env vars, read once at boot).
+    /// `None` = anonymous-first everywhere (the #28 default).
+    pub sigv4_config: Option<sigv4::SigV4Config>,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,11 +207,27 @@ async fn get_key<C>(
     Path(path_key): Path<String>,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
+    OriginalUri(original): OriginalUri,
 ) -> Response
 where
     C: Clock + Clone,
 {
     let (req_id, host_id) = request_ids();
+    // Inbound SigV4 gate (#28): optional verify-if-present. The raw URI
+    // path is exactly what the client signed; the business path may be
+    // percent-decoded.
+    if let Some(resp) = sigv4_gate(
+        state.sigv4_config.as_ref(),
+        "GET",
+        original.path(),
+        query.as_deref(),
+        &headers,
+        &req_id,
+        &host_id,
+        sigv4::SigV4Config::now_unix(),
+    ) {
+        return resp;
+    }
     // List dispatch (map #24): S3 list operations live on the same path
     // space as objects but bypass the cache entirely (metadata path).
     if let Some(resp) =
@@ -265,11 +353,30 @@ async fn try_passthrough<C: Clock + Clone>(
 /// HEAD: headers identical to GET, always 200 on success (even when ranged),
 /// always an empty body. Served from memory meta or a single stat — never a
 /// flight, never file bytes.
-async fn head_key<C>(State(state): State<AppState<C>>, Path(path_key): Path<String>, headers: HeaderMap) -> Response
+async fn head_key<C>(
+    State(state): State<AppState<C>>,
+    Path(path_key): Path<String>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    OriginalUri(original): OriginalUri,
+) -> Response
 where
     C: Clock + Clone,
 {
     let (req_id, host_id) = request_ids();
+    // Same SigV4 gate as GET (presigned/head-signed requests).
+    if let Some(resp) = sigv4_gate(
+        state.sigv4_config.as_ref(),
+        "HEAD",
+        original.path(),
+        query.as_deref(),
+        &headers,
+        &req_id,
+        &host_id,
+        sigv4::SigV4Config::now_unix(),
+    ) {
+        return resp;
+    }
     let rk = match state.cache.resolve(&path_key) {
         Ok(rk) => rk,
         Err(e) => {
@@ -589,7 +696,7 @@ mod tests {
         let cache = Arc::new(Cache::new(Arc::new(cfg.clone()), Arc::new(MockClock::new(0)), BackendRegistry::new(slots)));
         Fixture {
             _dir: dir,
-            state: AppState { cache, config: Arc::new(cfg) },
+            state: AppState { cache, config: Arc::new(cfg), sigv4_config: None },
             stat_calls,
             open_calls,
             direct_calls,
@@ -630,7 +737,7 @@ mod tests {
         let cache = Arc::new(Cache::new(Arc::new(cfg.clone()), Arc::new(MockClock::new(0)), BackendRegistry::new(slots)));
         Fixture {
             _dir: dir,
-            state: AppState { cache, config: Arc::new(cfg) },
+            state: AppState { cache, config: Arc::new(cfg), sigv4_config: None },
             stat_calls,
             open_calls,
             direct_calls,
@@ -665,6 +772,11 @@ mod tests {
         h
     }
 
+    /// Test OriginalUri: a plain absolute path (no percent encoding) so
+    /// the sigv4 gate decodes it unchanged.
+    static DEFAULT_TEST_URI: std::sync::LazyLock<axum::http::Uri> =
+        std::sync::LazyLock::new(|| "/a.bin".parse().unwrap());
+
     async fn body_text(resp: Response) -> (StatusCode, HeaderMap, String) {
         let (mut parts, body) = resp.into_parts();
         let bytes = axum::body::to_bytes(body, 64 * 1024 * 1024).await.unwrap();
@@ -674,7 +786,7 @@ mod tests {
 
     /// Prime the cache via GET miss + full drain, then wait for install.
     async fn prime(fx: &Fixture, key: &str) {
-        let resp = get_key(State(fx.state.clone()), Path(key.to_string()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path(key.to_string()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         wait_installed(fx, key).await;
@@ -727,7 +839,7 @@ mod tests {
     async fn get_hit_s3_shape() {
         let fx = fixture(b"0123456789", Some("abc123"), vec![], false);
         prime(&fx, "a.bin").await;
-        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, h, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "0123456789");
@@ -744,8 +856,8 @@ mod tests {
     async fn request_ids_unique_per_response() {
         let fx = fixture(b"0123456789", None, vec![], false);
         prime(&fx, "a.bin").await;
-        let r1 = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None)).await;
-        let r2 = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None)).await;
+        let r1 = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        let r2 = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         assert_ne!(
             r1.headers().get("x-amz-request-id").unwrap(),
             r2.headers().get("x-amz-request-id").unwrap()
@@ -756,7 +868,7 @@ mod tests {
     async fn get_missing_is_nosuchkey_xml() {
         let fx = fixture(b"0123456789", None, vec![], true);
         // Missing on a fresh cache: stat the backend once to confirm absence.
-        let resp = get_key(State(fx.state.clone()), Path("nope.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("nope.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, h, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(h.get("content-type").unwrap(), "application/xml");
@@ -775,6 +887,7 @@ mod tests {
             Path("a.bin".into()),
             headers(&[("range", "bytes=20-30")]),
             RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
         let (status, h, body) = body_text(resp).await;
@@ -792,6 +905,7 @@ mod tests {
             Path("a.bin".into()),
             headers(&[("range", "bytes=0-1,3-4")]),
             RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
         let (status, _, body) = body_text(resp).await;
@@ -809,6 +923,7 @@ mod tests {
             Path("a.bin".into()),
             headers(&[("range", "bytes=-3")]),
             RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
         let (status, h, body) = body_text(resp).await;
@@ -821,6 +936,7 @@ mod tests {
             Path("a.bin".into()),
             headers(&[("range", "bytes=-100")]),
             RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
         let (status, h, body) = body_text(resp).await;
@@ -834,7 +950,8 @@ mod tests {
         let fx = fixture(b"0123456789", Some("v1"), vec![], false);
         prime(&fx, "a.bin").await;
         reset(&fx);
-        let resp = head_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[])).await;
+        let resp = head_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone()))
+            .await;
         let (status, h, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.is_empty());
@@ -855,6 +972,8 @@ mod tests {
             State(fx.state.clone()),
             Path("a.bin".into()),
             headers(&[("range", "bytes=2-5")]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
         let (status, h, body) = body_text(resp).await;
@@ -869,13 +988,15 @@ mod tests {
     #[tokio::test]
     async fn head_missing_404_empty_shares_negative_cache() {
         let fx = fixture(b"0123456789", None, vec![], true);
-        let resp = head_key(State(fx.state.clone()), Path("gone.bin".into()), headers(&[])).await;
+        let resp = head_key(State(fx.state.clone()), Path("gone.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone()))
+            .await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.is_empty());
         assert_eq!(fx.stat_calls.load(Ordering::SeqCst), 1);
         // Second HEAD: negative tombstone, no second stat.
-        let resp = head_key(State(fx.state.clone()), Path("gone.bin".into()), headers(&[])).await;
+        let resp = head_key(State(fx.state.clone()), Path("gone.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone()))
+            .await;
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(fx.stat_calls.load(Ordering::SeqCst), 1);
@@ -889,7 +1010,8 @@ mod tests {
         // but still never opens a flight or reads bytes.
         fx.state.cache.clock.advance(61_000);
         reset(&fx);
-        let resp = head_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[])).await;
+        let resp = head_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone()))
+            .await;
         let (status, h, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.is_empty());
@@ -902,11 +1024,11 @@ mod tests {
     async fn bucket_alias_pins_upstream() {
         let fx = fixture(b"AAA", None, vec![("archive", b"BBB".to_vec())], false);
         // Legacy path routes "" → primary.
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (_, _, body) = body_text(resp).await;
         assert_eq!(body, "AAA");
         // Bucket alias pins the archive upstream regardless of routes.
-        let resp = get_key(State(fx.state.clone()), Path("archive/f.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("archive/f.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (_, _, body) = body_text(resp).await;
         assert_eq!(body, "BBB");
     }
@@ -914,7 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn redirect_cold_307_and_background_fill() {
         let fx = fixture_full(b"0123456789", None, vec![], false, Some("https://cdn.example.com/f?sign=x"), true);
-        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, h, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(h.get("location").unwrap(), "https://cdn.example.com/f?sign=x");
@@ -938,7 +1060,7 @@ mod tests {
         prime_cache(&fx, "a.bin").await;
         reset(&fx);
         // fresh hit → 200 from cache even though redirect is enabled.
-        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "0123456789");
@@ -949,7 +1071,7 @@ mod tests {
     async fn redirect_unavailable_silently_proxies() {
         // Tier 3 (no link): normal water-pipe, viewer unaffected.
         let fx = fixture_full(b"0123456789", None, vec![], false, None, true);
-        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "0123456789");
@@ -960,7 +1082,7 @@ mod tests {
     async fn redirect_rejected_target_silently_proxies() {
         // Foreign http is not an allowed redirect target → proxy.
         let fx = fixture_full(b"0123456789", None, vec![], false, Some("http://cdn.example.com/f"), true);
-        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "0123456789");
@@ -970,7 +1092,7 @@ mod tests {
     async fn redirect_disabled_never_consults_backend() {
         // Default proxy mode: direct_url untouched even when offered.
         let fx = fixture_full(b"0123456789", None, vec![], false, Some("https://cdn.example.com/f"), false);
-        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 0);
@@ -994,6 +1116,7 @@ mod tests {
             Path("a.bin".into()),
             headers(&[("range", "bytes=2-5")]),
             RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
         let (status, h, body) = body_text(resp).await;
@@ -1017,7 +1140,7 @@ mod tests {
     async fn efficient_second_pull_merges_ledger() {
         let fx = fixture_efficient(b"0123456789", 0.8, 4);
         for range in ["bytes=0-1", "bytes=4-5"] {
-            let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", range)]), RawQuery(None)).await;
+            let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", range)]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
             let (status, _, _) = body_text(resp).await;
             assert_eq!(status, StatusCode::PARTIAL_CONTENT);
         }
@@ -1032,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn efficient_full_get_still_waterpipes() {
         let fx = fixture_efficient(b"0123456789", 0.8, 4);
-        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "0123456789");
@@ -1049,6 +1172,7 @@ mod tests {
             Path("a.bin".into()),
             headers(&[("range", "bytes=2-5")]),
             RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
         let (status, _, body) = body_text(resp).await;
@@ -1067,6 +1191,7 @@ mod tests {
             Path("a.bin".into()),
             headers(&[("range", "bytes=2-5")]),
             RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
         let (status, _, _) = body_text(resp).await;
@@ -1083,6 +1208,7 @@ mod tests {
             Path("a.bin".into()),
             headers(&[("range", "bytes=2-5")]),
             RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
         let (status, _, _) = body_text(resp).await;
@@ -1103,6 +1229,7 @@ mod tests {
             Path("a.bin".into()),
             headers(&[("range", "bytes=2-5")]),
             RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
         body_text(resp).await;
@@ -1119,7 +1246,7 @@ mod tests {
         let bytes: Vec<u8> = (0..100u8).collect();
         let fx = fixture_efficient(&bytes, 0.75, 4);
         for range in ["bytes=0-49", "bytes=50-79"] {
-            let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", range)]), RawQuery(None)).await;
+            let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", range)]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
             let (status, _, _) = body_text(resp).await;
             assert_eq!(status, StatusCode::PARTIAL_CONTENT);
         }
@@ -1130,7 +1257,7 @@ mod tests {
         assert!(opens.contains(&(80, Some(20))), "{opens:?}");
         assert!(!opens.iter().any(|(o, l)| *o == 0 && l.is_none()), "{opens:?}");
         // Assembled bytes are exact: sidecar copies + fetched gap.
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.as_bytes(), bytes.as_slice());
@@ -1145,16 +1272,16 @@ mod tests {
     async fn promotion_at_full_coverage_needs_no_gap_fetch() {
         let bytes: Vec<u8> = (0..100u8).collect();
         let fx = fixture_efficient(&bytes, 1.0, 4);
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         body_text(resp).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-99")]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-99")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         body_text(resp).await;
         wait_installed(&fx, "f.bin").await;
         // Only the two viewer pulls opened the backend — no gap fetch.
         assert_eq!(fx.opens.lock().unwrap().len(), 2);
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.as_bytes(), bytes.as_slice());
@@ -1165,7 +1292,7 @@ mod tests {
     async fn below_threshold_stays_staged() {
         let bytes: Vec<u8> = (0..100u8).collect();
         let fx = fixture_efficient(&bytes, 0.9, 4);
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         body_text(resp).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
@@ -1178,12 +1305,12 @@ mod tests {
     async fn etag_flip_resets_staged_history() {
         let bytes: Vec<u8> = (0..100u8).collect();
         let fx = fixture_efficient(&bytes, 0.75, 4);
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         body_text(resp).await;
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
         // Object replaced upstream: next transfer restarts history.
         *fx.etag.lock().unwrap() = Some("v2".into());
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-79")]), RawQuery(None)).await;
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-79")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         body_text(resp).await;
         // Old segments dropped, ledger re-anchored on v2, no entry yet.
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(50, 80)]);
@@ -1203,6 +1330,7 @@ mod tests {
         let state = AppState {
             cache: fx.state.cache.clone(),
             config: Arc::new(cfg),
+            sigv4_config: None,
         };
         // Wrong token: rejected.
         let resp = prewarm(State(state.clone()), Path("w.bin".into()), headers(&[("x-prewarm-token", "wrong")]))
@@ -1217,5 +1345,47 @@ mod tests {
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         std::env::remove_var("TEST_PW_SECRET");
+    }
+
+    /// SigV4 gate end-to-end at the business seam: anonymous passes, a
+    /// correctly-signed request passes, a tampered signature 403s with a
+    /// no-store XML error.
+    #[tokio::test]
+    async fn sigv4_gate_anonymous_passes_and_bad_signature_403s() {
+        let fx = fixture(b"0123456789", None, vec![], false);
+        let cfg = crate::sigv4::SigV4Config {
+            access_key_id: "AKIDEXAMPLE".into(),
+            secret_access_key: "s3cr3t".into(),
+        };
+        let mut state = fx.state.clone();
+        state.sigv4_config = Some(cfg.clone());
+
+        // Anonymous request: no gate response (proceeds to the cache).
+        let gate = sigv4_gate(Some(&cfg), "GET", "/a.bin", None, &headers(&[]), "r", "h", 0);
+        assert!(gate.is_none());
+
+        // Tampered signature: 403 AccessDenied XML, no-store.
+        let amz_date = "20130524T000000Z";
+        let bad_sig = "0".repeat(64);
+        let auth = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20130524/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+             Signature={bad_sig}"
+        );
+        let h = headers(&[
+            ("host", "origin.example.com"),
+            ("x-amz-date", amz_date),
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("authorization", auth.as_str()),
+        ]);
+        // Skewed-clock check fires first; to reach the signature mismatch
+        // we set "now" to the request's own time (2013-05-24T00:00:00Z).
+        let now: i64 = 1_369_353_600;
+        let resp = sigv4_gate(Some(&cfg), "GET", "/a.bin", None, &h, "r", "h", now).unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert!(body.contains("<Code>AccessDenied</Code>"), "{body}");
     }
 }
