@@ -574,8 +574,11 @@ where
 {
     Router::new()
         .route("/_internal/healthz", get(healthz::<C>))
-        .route("/_internal/prewarm/{key}", post(prewarm::<C>))
-        .route("/{*key}", get(get_key::<C>).head(head_key::<C>))
+        // axum 0.7 (matchit 0.7) syntax: named params are `:key`, catch-all
+        // is `*key`. The 0.8 brace syntax (`{key}` / `{*key}`) panics at
+        // Router construction — caught by the oracle deploy smoke test.
+        .route("/_internal/prewarm/:key", post(prewarm::<C>))
+        .route("/*key", get(get_key::<C>).head(head_key::<C>))
         .fallback(not_found)
         .with_state(state)
 }
@@ -1577,5 +1580,16 @@ mod tests {
         assert!(body.contains("fetched"), "{body}");
         assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
         assert!(!fx.state.cache.state.read().await.entries.contains_key("w.bin"));
+    }
+
+    /// Router construction smoke test: every route path must survive
+    /// matchit's pattern compiler at runtime. The oracle deploy panicked
+    /// here because the integration suite calls handlers directly and
+    /// never built the Router — a blind spot that shipped 0.8 route
+    /// syntax into an axum 0.7 binary.
+    #[tokio::test]
+    async fn router_constructs_without_panic() {
+        let fx = fixture(b"0123456789", None, vec![], false);
+        let _app = router(fx.state.clone());
     }
 }
