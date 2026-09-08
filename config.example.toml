@@ -5,6 +5,9 @@
 
 # --- planes ---
 # Pingora front plane (TLS termination, H2, reverse-proxy to business plane)
+# Dual-stack tip: "0.0.0.0:8443" is IPv4-only; "[::]:8443" binds both stacks
+# (Linux default net.ipv6.bindv6only=0) — required when CDN origin-pull
+# arrives over IPv6 (EdgeOne → IPv6-only hosts).
 front_listen = "0.0.0.0:8443"
 tls_cert_env = "ORIGIN_TLS_CERT_PATH"
 tls_key_env = "ORIGIN_TLS_KEY_PATH"
