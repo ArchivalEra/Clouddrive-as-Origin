@@ -480,6 +480,28 @@ where
         let s = state.cache.state.read().await;
         (s.entries.len(), s.total_bytes, s.segment_bytes)
     };
+    // Live-machinery depths (spec §8: the queue-ish counters operators
+    // watch when a node misbehaves): active cold-miss flights, promotion
+    // assemblies in flight, and pending access-clock flushes.
+    let flights = state.cache.flights.lock().await.len();
+    let promotions = state.cache.promotions.lock().await.len();
+    let dirty_access = state.cache.dirty_access.lock().await.len();
+    // Per-upstream view: profile + gate depth, so a saturated or
+    // misconfigured upstream is visible without reading logs.
+    let upstreams: Vec<serde_json::Value> = state
+        .config
+        .upstreams
+        .iter()
+        .map(|u| {
+            let prof = state.config.cache_profile(&u.id);
+            json!({
+                "id": u.id,
+                "profile": if prof.nocache { "nocache" } else if prof.efficient { "efficient" } else { "standard" },
+                "cold_miss": format!("{:?}", u.cold_miss).to_lowercase(),
+                "sigv4_layer": state.sigv4_config.is_some(),
+            })
+        })
+        .collect();
     (
         StatusCode::OK,
         Json(json!({
@@ -489,6 +511,11 @@ where
             "entries": count,
             "bytes": bytes,
             "segment_bytes": segment_bytes,
+            "flights_active": flights,
+            "promotions_active": promotions,
+            "dirty_access_flushes": dirty_access,
+            "sigv4_enabled": state.sigv4_config.is_some(),
+            "upstreams": upstreams,
         })),
     )
 }
@@ -1308,6 +1335,23 @@ mod tests {
         let resp = healthz(State(fx.state.clone())).await.into_response();
         let (_, _, body) = body_text(resp).await;
         assert!(body.contains("\"segment_bytes\":4"), "{body}");
+        assert!(body.contains("\"flights_active\":"), "{body}");
+        assert!(body.contains("\"promotions_active\":"), "{body}");
+        assert!(body.contains("\"dirty_access_flushes\":"), "{body}");
+        assert!(body.contains("\"sigv4_enabled\":false"), "{body}");
+        assert!(body.contains("\"profile\":\"efficient\""), "{body}");
+        assert!(body.contains("\"id\":\"primary\""), "{body}");
+    }
+
+    /// healthz on a nocache upstream reports the profile so an operator
+    /// can spot a node misconfigured into zero-disk mode.
+    #[tokio::test]
+    async fn healthz_reports_nocache_profile() {
+        let fx = fixture_nocache(b"0123456789");
+        let resp = healthz(State(fx.state.clone())).await.into_response();
+        let (_, _, body) = body_text(resp).await;
+        assert!(body.contains("\"profile\":\"nocache\""), "{body}");
+        assert!(body.contains("\"entries\":0"), "{body}");
     }
 
     /// Pull two disjoint halves (union 80% >= 0.75): promotion assembles
