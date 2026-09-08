@@ -577,7 +577,7 @@ where
         // axum 0.7 (matchit 0.7) syntax: named params are `:key`, catch-all
         // is `*key`. The 0.8 brace syntax (`{key}` / `{*key}`) panics at
         // Router construction — caught by the oracle deploy smoke test.
-        .route("/_internal/prewarm/:key", post(prewarm::<C>))
+        .route("/_internal/prewarm/*key", post(prewarm::<C>))
         .route("/*key", get(get_key::<C>).head(head_key::<C>))
         .fallback(not_found)
         .with_state(state)
