@@ -306,6 +306,11 @@ pub(crate) async fn try_list<C: Clock + Clone>(
     };
     let recursive = params.delimiter.is_none();
 
+    // The listing is a metadata path but still hits the upstream — it must
+    // respect the per-upstream concurrency gate (a large-directory list
+    // walks many PROPFINDs; without the gate, concurrent listers would
+    // hammer OpenList unboundedly).
+    let _permit = slot.gate.acquire().await;
     let entries = match slot.backend.list(folder, recursive).await {
         Ok(e) => e,
         // A missing folder is an empty listing: S3 prefixes are string
