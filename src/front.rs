@@ -120,8 +120,19 @@ where
     }
     let mut outbound = TcpStream::connect(business).await?;
     outbound.write_all(&buf[..n]).await?;
-    tokio::io::copy_bidirectional(inbound, &mut outbound).await?;
-    Ok(())
+    // Bound the bidirectional copy: a stalled viewer must not hold the
+    // connection (and its upstream socket) open forever. 60s of total
+    // inactivity on either direction tears the proxy down.
+    let idle = std::time::Duration::from_secs(60);
+    let copy = tokio::io::copy_bidirectional(inbound, &mut outbound);
+    match tokio::time::timeout(idle, copy).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            warn!("proxy connection idle for {idle:?}; tearing down");
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
