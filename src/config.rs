@@ -329,7 +329,10 @@ impl Config {
             );
         }
         for u in &raw.upstreams {
-            if u.cache_profile != "standard" && !profiles.contains_key(&u.cache_profile) {
+            // Built-in profile names need no [cache_profiles] table;
+            // anything else must resolve to a declared table.
+            let builtin = u.cache_profile == "standard" || u.cache_profile == "nocache";
+            if !builtin && !profiles.contains_key(&u.cache_profile) {
                 anyhow::bail!(
                     "upstream {}: cache_profile {:?} has no [cache_profiles.<name>] table",
                     u.id,
@@ -540,6 +543,31 @@ mod tests {
         assert!(Config::from_toml_str(&zero_threshold).is_err());
         let dangling = profile_toml("", "cache_profile = \"ghost\"");
         assert!(Config::from_toml_str(&dangling).is_err());
+    }
+
+    #[test]
+    fn nocache_is_builtin_profile() {
+        // The built-in nocache profile needs no [cache_profiles] table
+        // (real bug caught by the CDN-LAB dry-run: boot rejected
+        // cache_profile = "nocache" with a dangling-table error).
+        let toml = format!(
+            r#"
+            [[upstreams]]
+            id = "a"
+            type = "openlist"
+            base_url = "http://127.0.0.1:5244/dav"
+            username_env = "A_USER"
+            password_env = "A_PASS"
+            cache_profile = "nocache"
+            [[routes]]
+            prefix = ""
+            upstream = "a"
+        "#
+        );
+        let cfg = Config::from_toml_str(&toml).unwrap();
+        let p = cfg.cache_profile("a");
+        assert!(p.nocache);
+        assert!(!p.efficient);
     }
 
     #[test]
