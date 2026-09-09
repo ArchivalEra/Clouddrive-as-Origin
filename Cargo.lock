@@ -1865,8 +1865,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "http",
  "pingora",
  "pingora-error",
+ "prometheus",
  "tracing",
 ]
 

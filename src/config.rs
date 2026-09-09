@@ -171,6 +171,11 @@ pub struct RawConfig {
     pub tls_cert_env: Option<String>,
     #[serde(default)]
     pub tls_key_env: Option<String>,
+    /// Prometheus metrics listener for the front plane (e.g.
+    /// "127.0.0.1:9090"). Absent = metrics endpoint disabled. Per-process
+    /// ports must differ when several instances share a node.
+    #[serde(default)]
+    pub front_metrics_listen: Option<String>,
     #[serde(default = "default_cache_dir")]
     pub cache_dir: PathBuf,
 
@@ -232,6 +237,7 @@ pub struct Config {
     pub listen_addr: SocketAddr,
     pub tls_cert_env: Option<String>,
     pub tls_key_env: Option<String>,
+    pub front_metrics_listen: Option<String>,
     pub cache_dir: PathBuf,
     pub max_size_bytes: u64,
     pub inactive_ttl_secs: u64,
@@ -368,6 +374,7 @@ impl Config {
             listen_addr: raw.listen_addr,
             tls_cert_env: raw.tls_cert_env,
             tls_key_env: raw.tls_key_env,
+            front_metrics_listen: raw.front_metrics_listen,
             cache_dir: raw.cache_dir,
             max_size_bytes: raw.max_size_bytes,
             inactive_ttl_secs: raw.inactive_ttl_secs,
@@ -393,6 +400,7 @@ impl Default for Config {
             listen_addr: default_listen_addr(),
             tls_cert_env: None,
             tls_key_env: None,
+            front_metrics_listen: None,
             cache_dir: default_cache_dir(),
             max_size_bytes: default_max_size(),
             inactive_ttl_secs: default_inactive_ttl(),

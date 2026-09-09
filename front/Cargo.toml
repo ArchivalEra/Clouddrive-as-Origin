@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+http = "1"
 pingora = { version = "0.8", features = ["any_tls", "proxy", "rustls"] }
 pingora-error = "0.8"
+prometheus = "0.13"
 tracing = "0.1"
