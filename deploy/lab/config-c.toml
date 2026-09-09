@@ -2,6 +2,7 @@
 # coverage window (5s) so the window-decay acceptance test can observe
 # expiry in real time (map #30 T2).
 front_listen = "127.0.0.1:7779"
+front_metrics_listen = "127.0.0.1:9092"
 listen_addr = "127.0.0.1:8082"
 cache_dir = "/mnt/hdd/CDN-LAB/cache-c"
 max_size_bytes = 10737418240
