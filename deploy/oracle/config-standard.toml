@@ -1,0 +1,24 @@
+# Clouddrive-as-Origin — oracle node, standard profile (node B: overseas drive)
+# Dual-stack front: EdgeOne origin-pull arrives over IPv6 (apple.dib.l.cd
+# is IPv6-only), so bind [::] not 0.0.0.0.
+front_listen = "[::]:7777"
+listen_addr = "127.0.0.1:8080"
+cache_dir = "/opt/origin-cache/cache-standard"
+max_size_bytes = 10737418240
+inactive_ttl_secs = 1200
+revalidate_ttl_secs = 60
+negative_ttl_secs = 60
+concurrency_per_upstream = 3
+prewarm_shared_secret_env = "ORIGIN_PREWARM_SECRET"
+
+[[upstreams]]
+id = "media"
+type = "openlist"
+base_url = "http://127.0.0.1:5244/dav"
+root_path = "googledrive1"
+username_env = "OPENLIST_USERNAME"
+password_env = "OPENLIST_PASSWORD"
+
+[[routes]]
+prefix = ""
+upstream = "media"
