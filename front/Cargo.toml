@@ -1,0 +1,13 @@
+[package]
+name = "origin-front"
+version = "0.1.0"
+edition = "2021"
+description = "Pingora TLS/H2 reverse proxy front for Clouddrive-as-Origin — pure byte movement, no cache semantics"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+pingora = { version = "0.8", features = ["any_tls", "proxy", "rustls"] }
+pingora-error = "0.8"
+tracing = "0.1"
