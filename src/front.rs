@@ -86,11 +86,12 @@ pub fn run_front(
     let mut service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
     match &tls {
         Some((cert, key)) => {
-            // add_tls enables HTTP/2 via ALPN (h2 + http/1.1) by default
-            // in Pingora 0.8.
-            service
-                .add_tls(&front.to_string(), cert, key)
-                .with_context(|| format!("add tls listener on {front}"))?;
+            // add_tls_with_settings + enable_h2: ALPN advertises h2 +
+            // http/1.1 so EdgeOne origin-pull negotiates HTTP/2.
+            let mut tls_settings = pingora::listeners::tls::TlsSettings::intermediate(cert, key)
+                .with_context(|| format!("load tls material {cert} / {key}"))?;
+            tls_settings.enable_h2();
+            service.add_tls_with_settings(&front.to_string(), None, tls_settings);
         }
         None => {
             service.add_tcp(&front.to_string());
