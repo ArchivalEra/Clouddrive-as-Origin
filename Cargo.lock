@@ -562,9 +562,8 @@ dependencies = [
  "hmac",
  "http-range-header",
  "mime_guess",
+ "origin-front",
  "percent-encoding",
- "pingora",
- "pingora-error",
  "rcgen",
  "redb",
  "reqwest",
@@ -1859,6 +1858,17 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
+
+[[package]]
+name = "origin-front"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "pingora",
+ "pingora-error",
+ "tracing",
+]
 
 [[package]]
 name = "ouroboros"
