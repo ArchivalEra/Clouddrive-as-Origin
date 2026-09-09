@@ -1,4 +1,4 @@
-//! Inbound AWS SigV4 verification (map #24, tickets #25 + #28).
+//! Inbound AWS SigV4 verification.
 //!
 //! Canonical-request / string-to-sign / key-derivation logic is ported
 //! from s3s 0.15.0's `sig_v4` module (Apache-2.0, SPDX headers permit

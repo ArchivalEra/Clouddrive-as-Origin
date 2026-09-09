@@ -77,7 +77,7 @@ pub struct Coverage {
     pub etag: Option<String>,
     pub total: u64,
     /// Merged, sorted, non-overlapping `[start, end)` intervals, each with
-    /// the clock-domain time it was last read (window decay, map #30).
+    /// the clock-domain time it was last read (window decay).
     pub intervals: Vec<(u64, u64, u64)>,
     /// Clock-domain last touch (stage or rebuild time): drives age sweep
     /// in MockClock-testable time, unlike fs mtime.
@@ -93,7 +93,7 @@ impl Coverage {
     /// time. Overlapping intervals merge and keep the max timestamp;
     /// adjacent (touching) intervals stay separate so each keeps its own
     /// read time — a stale interval must not be "revived" by a fresh
-    /// neighbor (map #30 window decay).
+    /// neighbor (window decay semantics).
     pub fn add_interval(&mut self, start: u64, end: u64, now_millis: u64) {
         if start >= end {
             return;
@@ -116,7 +116,7 @@ impl Coverage {
 
     /// Drop intervals whose last read is older than `window_millis` ago.
     /// Window expiry only removes ledger counts — the disk sidecars stay
-    /// for the natural sweep (map #30 Q16c/Q18b).
+    /// for the natural sweep.
     pub fn decay(&mut self, now_millis: u64, window_millis: u64) {
         if window_millis == 0 {
             return;

@@ -80,7 +80,7 @@ fn default_coverage_window_secs() -> u64 {
 /// segments instead of full-filing, and what staged coverage promotes a
 /// key to a full cache entry. `threshold` ∈ (0, 1]; 1.0 = promote only
 /// once every byte has been served. `coverage_window_secs` bounds how
-/// long a staged interval counts toward coverage (map #30): intervals
+/// long a staged interval counts toward coverage: intervals
 /// whose last read is older than the window decay out of the ledger, so
 /// stale partial reads never accumulate into a promotion.
 #[derive(Debug, Deserialize, Clone)]

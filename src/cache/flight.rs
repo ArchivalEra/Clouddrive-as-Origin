@@ -196,11 +196,11 @@ pub async fn pump_and_seal(
     Ok(())
 }
 
-/// Parallel segmented pull (map #31 H2 optimization): the edge serves
-/// 10MB Range segments far faster than full responses, so large cold
-/// misses are fetched as N parallel segments (bounded by the upstream
-/// gate) and written in order. Each segment is buffered in memory
-/// (10MB x concurrency), then appended to the tmp file in order.
+/// Parallel segmented pull: the edge serves 5MB Range segments far
+/// faster than full responses, so large cold misses are fetched as N
+/// parallel segments (bounded by the upstream gate) and written in
+/// order. Each segment is buffered in memory (5MB x concurrency), then
+/// appended to the tmp file in order.
 pub async fn pump_and_seal_parallel(
     slot: &crate::backend::BackendSlot,
     backend_key: &crate::backend::Key,

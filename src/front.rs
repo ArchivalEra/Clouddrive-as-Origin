@@ -6,7 +6,7 @@
 //!
 //! Pingora (Cloudflare's proxy framework) provides native HTTP/2
 //! multiplexing, TLS termination, and graceful shutdown — replacing the
-//! hand-rolled rustls byte proxy (map #31 H2 optimization).
+//! hand-rolled rustls byte proxy.
 
 use std::net::SocketAddr;
 
