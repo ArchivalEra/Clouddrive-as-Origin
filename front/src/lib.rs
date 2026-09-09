@@ -147,13 +147,13 @@ impl ProxyHttp for BusinessProxy {
     }
 
     /// Guaranteed final per-request hook (runs even on failures) — the
-    /// only place it is safe to decrement the connection gauge and count
-    /// the request outcome.
+    /// only place it is safe to decrement the connection gauge, count
+    /// the request outcome, and emit the one-line access log.
     async fn logging(
         &self,
         session: &mut Session,
-        _e: Option<&pingora::Error>,
-        _ctx: &mut Self::CTX,
+        e: Option<&pingora::Error>,
+        ctx: &mut Self::CTX,
     ) where
         Self::CTX: Send + Sync,
     {
@@ -161,6 +161,23 @@ impl ProxyHttp for BusinessProxy {
             .with_label_values(&[proto_of(session), session.req_header().method.as_str(), &status_of(session)])
             .inc();
         CONNECTIONS_ACTIVE.dec();
+        let xff = session
+            .req_header()
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        tracing::info!(
+            method = %session.req_header().method,
+            path = %session.req_header().uri.path(),
+            status = status_of(session),
+            bytes = session.body_bytes_sent(),
+            duration_ms = ctx.start.elapsed().as_millis(),
+            proto = proto_of(session),
+            xff = %xff,
+            err = ?e.as_ref().map(|e| e.to_string()),
+            "front access",
+        );
     }
 }
 
