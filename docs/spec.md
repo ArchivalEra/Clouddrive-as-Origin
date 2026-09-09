@@ -205,6 +205,30 @@ repo** — it is injected at runtime via an environment variable (e.g.
     whole via B. Segments count separately (`segment_bytes` in
     healthz), age-sweep with `inactive_ttl`, rebuild from disk on restart.
 
+    **Coverage window (map #30):** each staged interval carries its read
+    timestamp; intervals older than `coverage_window_secs` (default
+    3600, per-profile) decay out of the ledger — stale partial reads
+    never accumulate into a promotion, so only recently-active content
+    promotes (the capacity-dimension complement to the threshold).
+    Window expiry removes ledger counts only; disk sidecars stay for
+    the natural sweep. Promotion tasks already running are not aborted.
+
+    **Viewer-disconnect sealing (map #30 T2):** segmented downloads are
+    separate connections; when the viewer disconnects, axum drops the
+    body stream, so a detached watcher polls each `.segpart` and seals
+    it once it stops growing (3 × 100 ms stable), finalizing coverage
+    and running the promotion check. The in-stream seal path stays for
+    full-consumption transfers. The read loop is bounded by the Range
+    length — upstream 206 streams may not signal EOF at Content-Length
+    (e.g. rclone serve webdav).
+
+    **Live-verified 2026-09-09 (oracle node, 3 GiB file, 300 s window):**
+    5 × 600 MB ranged reads (93% coverage) → promoted (entries=1) →
+    full GET served from disk at **1.07 GB/s** vs 56 MB/s cold pull
+    (~19×). With a 30 s window the same 5 reads spanning 34 s decayed
+    the first segment and correctly did NOT promote (window semantics
+    confirmed in real traffic).
+
 ## 4. Upstream details (OpenList WebDAV)
 
 - Each OpenList instance exposes WebDAV at `http://<host>:5244/dav` with
