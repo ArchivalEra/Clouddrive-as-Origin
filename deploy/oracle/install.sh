@@ -59,7 +59,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=$APP
-Restart=on-failure
+Restart=always
 RestartSec=3
 
 [Install]
@@ -84,7 +84,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=$APP
-Restart=on-failure
+Restart=always
 RestartSec=3
 
 [Install]
@@ -102,7 +102,7 @@ Type=simple
 # Root: binds privileged port 80.
 ExecStart=/usr/bin/python3 $APP/port80.py
 WorkingDirectory=$APP
-Restart=on-failure
+Restart=always
 RestartSec=3
 
 [Install]
