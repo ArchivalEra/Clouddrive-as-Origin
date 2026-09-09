@@ -1,4 +1,4 @@
-//! ListObjectsV2 endpoint (map #24: tickets #26 contract, #29 contract).
+//! ListObjectsV2 endpoint.
 //!
 //! AWS-authoritative semantics measured against real S3 buckets by R:
 //! - `list-type=2` exact match selects V2; anything else silently

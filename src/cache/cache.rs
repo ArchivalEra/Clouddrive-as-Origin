@@ -410,7 +410,7 @@ impl<C: Clock + Clone> Cache<C> {
                 }
             }
         }
-        // Stat single-flight (map #31 T2): concurrent cold passthroughs for
+        // Stat single-flight: concurrent cold passthroughs for
         // the same key must coalesce to ONE upstream stat. The flight runs
         // OUTSIDE the gate: the gate (concurrency 3) would otherwise
         // serialize the stat calls and the flight cell would be removed
@@ -497,8 +497,8 @@ impl<C: Clock + Clone> Cache<C> {
         // Viewer disconnect drops the whole body stream (axum drops the
         // async block), so the seal code below never runs on abort. A
         // detached watcher polls the segpart and seals it once it stops
-        // growing — the served bytes still count toward coverage (map #30
-        // T2: segmented downloads are separate connections).
+        // growing — the served bytes still count toward coverage
+        // (segmented downloads are separate connections).
         let watcher = {
             let segpart = segpart.clone();
             let seg = store::seg_path(&cache_dir, &cache_key, start, end);
@@ -1060,7 +1060,7 @@ fn flights_none() -> Arc<Mutex<HashMap<String, Arc<FlightShared>>>> {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Coverage window in millis for an upstream (map #30): 0 = no decay.
+/// Coverage window in millis for an upstream: 0 = no decay.
 fn window_millis_for(config: &Config, upstream_id: &str) -> u64 {
     config.cache_profile(upstream_id).coverage_window_secs * 1000
 }
@@ -1116,7 +1116,7 @@ async fn finalize_coverage(
         }
         entry.add_interval(span.start, span.end, span.now_millis);
         entry.last_touch_millis = span.now_millis;
-        // Window decay (map #30 Q17a): drop intervals whose last read is
+        // Window decay: drop intervals whose last read is
         // older than the coverage window, so stale staged bytes stop
         // counting toward promotion. Disk sidecars stay for the sweep.
         if window_millis > 0 {
@@ -1199,7 +1199,7 @@ async fn maybe_promote(
     }
     let ready = {
         let mut cov = coverage.lock().await;
-        // Window decay backstop (map #30 Q17a): a key with no recent
+        // Window decay backstop: a key with no recent
         // writes must not promote on stale intervals.
         if let Some(entry) = cov.get_mut(key) {
             let window_ms = prof.coverage_window_secs * 1000;
@@ -1429,7 +1429,7 @@ async fn drive_flight<C: Clock>(
         let _permit = slot.gate.acquire().await;
         let meta = slot.backend.stat(&backend_key).await?;
         let _ = flight.progress_tx.send(FlightProgress::Meta(meta.clone()));
-        // Parallel segmented pull (map #31 H2 optimization): the edge
+        // Parallel segmented pull: the edge
         // (EdgeOne) serves 5MB Range segments ~9x faster than 10MB ones
         // (live-measured: 20x5MB = 16.4MB/s vs 10x10MB = 1.7MB/s on the
         // same direct link), so large cold misses are fetched as N

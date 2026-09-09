@@ -218,7 +218,7 @@ where
 /// Root-path handler: `GET /?list-type=2` (S3 list at the bucket root).
 /// The root route cannot extract a `Path<String>` (no key segment), so
 /// the key is the empty string — the list dispatch resolves the default
-/// upstream (map #31: browser test caught the Path panic).
+/// upstream.
 async fn get_key_root<C>(
     State(state): State<AppState<C>>,
     headers: HeaderMap,
@@ -257,7 +257,7 @@ where
     ) {
         return resp;
     }
-    // List dispatch (map #24): S3 list operations live on the same path
+    // List dispatch: S3 list operations live on the same path
     // space as objects but bypass the cache entirely (metadata path).
     if let Some(resp) =
         crate::list::try_list(&state, &path_key, query.as_deref(), &req_id, &host_id).await
@@ -429,7 +429,7 @@ where
 }
 
 /// Root-path HEAD (S3 list at the bucket root): no key segment, so the
-/// key is the empty string (map #31: root route must not extract Path).
+/// key is the empty string.
 async fn head_key_root<C>(
     State(state): State<AppState<C>>,
     headers: HeaderMap,
@@ -1479,7 +1479,7 @@ mod tests {
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
     }
 
-    /// Window decay (map #30): staged intervals older than the coverage
+    /// Window decay: staged intervals older than the coverage
     /// window stop counting — a 60% read, a window expiry, then a 20% read
     /// must NOT promote (coverage decayed to 20%).
     #[tokio::test]
@@ -1541,7 +1541,7 @@ mod tests {
         body_text(resp).await;
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
         // Object replaced upstream: next transfer restarts history. Wait
-        // out the stat single-flight cooldown (map #31 T2) so the flip is
+        // out the stat single-flight cooldown so the flip is
         // observed on a fresh stat.
         *fx.etag.lock().unwrap() = Some("v2".into());
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -1699,10 +1699,9 @@ mod tests {
     }
 
     /// Router construction smoke test: every route path must survive
-    /// matchit's pattern compiler at runtime. The oracle deploy panicked
-    /// here because the integration suite calls handlers directly and
-    /// never built the Router — a blind spot that shipped 0.8 route
-    /// syntax into an axum 0.7 binary.
+    /// matchit's pattern compiler at runtime. The integration suite
+    /// calls handlers directly and never builds the Router — a blind
+    /// spot that let route-syntax panics surface only at deploy boot.
     #[tokio::test]
     async fn router_constructs_without_panic() {
         let fx = fixture(b"0123456789", None, vec![], false);

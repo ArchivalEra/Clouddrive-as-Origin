@@ -26,7 +26,7 @@ impl<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Infligh
     /// cooldown so callers that arrive slightly staggered (process spawn
     /// skew, network jitter) still share the flight — removing it
     /// immediately on the first completion would re-execute for every
-    /// straggler (map #31 T2: 50 concurrent cold passthroughs statted the
+    /// straggler (measured: 50 concurrent cold passthroughs statted the
     /// upstream 50 times).
     pub async fn run<F, Fut>(&self, key: String, f: F) -> Result<V, E>
     where
@@ -158,7 +158,7 @@ mod tests {
             .unwrap();
         let c2 = Arc::clone(&c);
         // Wait out the cooldown: a call within 200ms shares the previous
-        // result (map #31 T2 semantics); after the cooldown it re-executes.
+        // result (cooldown semantics); after the cooldown it re-executes.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         inflight
             .run("k".into(), || {

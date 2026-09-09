@@ -205,7 +205,7 @@ repo** — it is injected at runtime via an environment variable (e.g.
     whole via B. Segments count separately (`segment_bytes` in
     healthz), age-sweep with `inactive_ttl`, rebuild from disk on restart.
 
-    **Coverage window (map #30):** each staged interval carries its read
+    **Coverage window:** each staged interval carries its read
     timestamp; intervals older than `coverage_window_secs` (default
     3600, per-profile) decay out of the ledger — stale partial reads
     never accumulate into a promotion, so only recently-active content
@@ -213,7 +213,7 @@ repo** — it is injected at runtime via an environment variable (e.g.
     Window expiry removes ledger counts only; disk sidecars stay for
     the natural sweep. Promotion tasks already running are not aborted.
 
-    **Viewer-disconnect sealing (map #30 T2):** segmented downloads are
+    **Viewer-disconnect sealing:** segmented downloads are
     separate connections; when the viewer disconnects, axum drops the
     body stream, so a detached watcher polls each `.segpart` and seals
     it once it stops growing (3 × 100 ms stable), finalizing coverage
@@ -229,7 +229,7 @@ repo** — it is injected at runtime via an environment variable (e.g.
     the first segment and correctly did NOT promote (window semantics
     confirmed in real traffic).
 
-    **Parallel segmented cold pull (map #31 H2 optimization):** large
+    **Parallel segmented cold pull:** large
     cold misses (> 10 MB) are fetched as N parallel 5 MB Range segments
     (bounded by the upstream gate, 3 concurrent) and written in order —
     the edge serves 5 MB segments ~9× faster than 10 MB ones on the same
@@ -340,7 +340,7 @@ pub trait StorageBackend: Send + Sync {
 
 ### 6.1 S3-compatible inbound (ListObjectsV2 + SigV4)
 
-The outbound speaks AWS S3 shapes (R/#26 recon, contract in map #24).
+The outbound speaks AWS S3 shapes.
 Two add-on surfaces ride the same listener; both are additive to the
 plain `GET /<key>` contract above.
 
@@ -348,14 +348,13 @@ plain `GET /<key>` contract above.
   S3-compatible listing backed by a live upstream PROPFIND — metadata
   only, never touches the object cache. Path-style bucket alias maps
   `/{bucket}` to the upstream id (virtual-host style unsupported).
-  Full parameter contract, wire shapes, and measured edge cases per
-  ticket #26 (Contents-then-CommonPrefixes block order, form-urlencoded
+  Full parameter contract, wire shapes, and measured edge cases are in
+  this section (Contents-then-CommonPrefixes block order, form-urlencoded
   encoding set, `max-keys=0` -> empty non-truncated page). Responses
   carry `Cache-Control: private, max-age=5` so directory browsing also
   rides the CDN. The root path `/` is routed to the object handler via
-  dedicated root handlers (matchit 0.7's `/*key` does not match `/`,
-  and the `Path` extractor panics with no key segment — caught by the
-  live browser test, map #31).
+  dedicated root handlers (matchit does not match `/` for the wildcard
+  segment, and the `Path` extractor panics with no key segment).
 
 - **SigV4 inbound verification** (optional verify-if-present): a request
   bearing `Authorization: AWS4-HMAC-SHA256 ...` or presigned query
@@ -380,7 +379,7 @@ plain `GET /<key>` contract above.
   `healthz` stays at zero entries — the CDN edge (EdgeOne) is expected
   to carry the caching duty for these nodes.
 
-- **EdgeOne compatibility (R/#27, operator requirement: edge caching
+- **EdgeOne compatibility (operator requirement: edge caching
   must survive)**: EdgeOne forwards all client headers (Authorization
   included) and the full query string on origin-pull, and its cache
   key is the client URL + query — it does NOT include the

@@ -86,7 +86,7 @@ pub struct ContentRange {
     pub total: u64,
 }
 
-/// One entry from a backend listing (ListObjectsV2 support, map #24).
+/// One entry from a backend listing (ListObjectsV2 support).
 /// `key` is the full key path relative to the upstream root: no leading
 /// slash, never percent-encoded. Directory entries end with `/` and carry
 /// `is_dir = true`, `size = 0`; file entries never end with `/`.
