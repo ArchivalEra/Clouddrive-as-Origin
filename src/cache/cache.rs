@@ -511,7 +511,7 @@ impl<C: Clock + Clone> Cache<C> {
                     bytes: written,
                     now_millis: now,
                 };
-                finalize_coverage(&coverage, &state, span).await;
+                finalize_coverage(&coverage, &state, span, window_millis_for(&config, &upstream_id)).await;
                 // Coverage-triggered promotion (P2-b): threshold met →
                 // background assemble + seal. Fire-and-forget by design.
                 maybe_promote(
@@ -960,6 +960,11 @@ fn flights_none() -> Arc<Mutex<HashMap<String, Arc<FlightShared>>>> {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Coverage window in millis for an upstream (map #30): 0 = no decay.
+fn window_millis_for(config: &Config, upstream_id: &str) -> u64 {
+    config.cache_profile(upstream_id).coverage_window_secs * 1000
+}
+
 /// Merge one completed staged interval into the coverage ledger (the only
 /// writer besides the startup scan). Etag-locked: a version change with
 /// history present resets (drops staged files + ledger) so promotion can
@@ -982,6 +987,7 @@ async fn finalize_coverage(
     coverage: &Arc<Mutex<HashMap<String, store::Coverage>>>,
     state: &Arc<RwLock<CacheState>>,
     span: FinalizedSpan,
+    window_millis: u64,
 ) {
     {
         let mut cov = coverage.lock().await;
@@ -1008,8 +1014,14 @@ async fn finalize_coverage(
         if !span.upstream_id.is_empty() {
             entry.upstream_id = span.upstream_id.clone();
         }
-        entry.add_interval(span.start, span.end);
+        entry.add_interval(span.start, span.end, span.now_millis);
         entry.last_touch_millis = span.now_millis;
+        // Window decay (map #30 Q17a): drop intervals whose last read is
+        // older than the coverage window, so stale staged bytes stop
+        // counting toward promotion. Disk sidecars stay for the sweep.
+        if window_millis > 0 {
+            entry.decay(span.now_millis, window_millis);
+        }
     }
     let meta = store::SegMeta {
         etag: span.etag.clone(),
@@ -1086,7 +1098,15 @@ async fn maybe_promote(
         return;
     }
     let ready = {
-        let cov = coverage.lock().await;
+        let mut cov = coverage.lock().await;
+        // Window decay backstop (map #30 Q17a): a key with no recent
+        // writes must not promote on stale intervals.
+        if let Some(entry) = cov.get_mut(key) {
+            let window_ms = prof.coverage_window_secs * 1000;
+            if window_ms > 0 {
+                entry.decay(now_millis, window_ms);
+            }
+        }
         cov.get(key).and_then(|c| c.ratio()).is_some_and(|r| r >= prof.coverage_threshold)
     };
     if !ready {
@@ -1198,7 +1218,7 @@ async fn assemble_file(
     };
     let mut buf = vec![0u8; 256 * 1024];
     let mut pos = 0u64;
-    for &(s, e) in cov.intervals.iter() {
+    for &(s, e, _) in cov.intervals.iter() {
         if pos < s && !fetch_gap(slot, bkey, &mut out, &mut buf, pos, s).await {
             return false;
         }

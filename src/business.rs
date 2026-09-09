@@ -775,7 +775,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
         cfg.upstreams[0].cache_profile = "efficient".into();
-        cfg.cache_profiles.insert("efficient".into(), CacheProfile { coverage_threshold: threshold, min_file_size });
+        cfg.cache_profiles.insert("efficient".into(), CacheProfile { coverage_threshold: threshold, min_file_size, coverage_window_secs: 3600 });
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let open_calls = Arc::new(AtomicUsize::new(0));
         let direct_calls = Arc::new(AtomicUsize::new(0));
@@ -1232,7 +1232,8 @@ mod tests {
         assert_eq!(staged_segments(&fx, "a.bin"), vec![(2, 6)]);
         let cov = fx.state.cache.coverage.lock().await;
         let c = cov.get("a.bin").unwrap();
-        assert_eq!(c.intervals, vec![(2, 6)]);
+        assert_eq!(c.intervals.len(), 1);
+        assert_eq!((c.intervals[0].0, c.intervals[0].1), (2, 6));
         assert_eq!(c.total, 10);
         assert_eq!(c.etag.as_deref(), Some("v1"));
         assert_eq!(fx.state.cache.state.read().await.segment_bytes, 4);
@@ -1248,7 +1249,10 @@ mod tests {
         }
         assert_eq!(staged_segments(&fx, "a.bin"), vec![(0, 2), (4, 6)]);
         let cov = fx.state.cache.coverage.lock().await;
-        assert_eq!(cov.get("a.bin").unwrap().intervals, vec![(0, 2), (4, 6)]);
+        let iv = &cov.get("a.bin").unwrap().intervals;
+        assert_eq!(iv.len(), 2);
+        assert_eq!((iv[0].0, iv[0].1), (0, 2));
+        assert_eq!((iv[1].0, iv[1].1), (4, 6));
         assert_eq!(fx.state.cache.state.read().await.segment_bytes, 4);
         // Still no cache entry: staging is not filling.
         assert!(!fx.state.cache.state.read().await.entries.contains_key("a.bin"));
@@ -1416,6 +1420,58 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
+    }
+
+    /// Window decay (map #30): staged intervals older than the coverage
+    /// window stop counting — a 60% read, a window expiry, then a 20% read
+    /// must NOT promote (coverage decayed to 20%).
+    #[tokio::test]
+    async fn coverage_window_expiry_blocks_promotion() {
+        let bytes: Vec<u8> = (0..100u8).collect();
+        let fx = fixture_efficient(&bytes, 0.8, 4);
+        // 60% staged at t=0.
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-59")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        body_text(resp).await;
+        assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 60)]);
+        // Advance past the 3600s window: intervals decay out of the ledger.
+        fx.state.cache.clock.advance(3_601_000);
+        // 20% more read at t=3601s: coverage is now 20%, not 80%.
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=60-79")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        body_text(resp).await;
+        // No promotion: entry must not exist.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
+        // Ledger holds only the fresh interval.
+        let cov = fx.state.cache.coverage.lock().await;
+        let c = cov.get("f.bin").unwrap();
+        assert_eq!(c.intervals.len(), 1);
+        assert_eq!((c.intervals[0].0, c.intervals[0].1), (60, 80));
+    }
+
+    /// Window decay backstop: a key with no recent writes must not promote
+    /// on stale intervals even if the threshold was met long ago. The
+    /// promotion task races the clock, so this asserts the deterministic
+    /// half: the ledger decays when the window passes (the expiry test
+    /// covers the promotion-blocking half).
+    #[tokio::test]
+    async fn coverage_window_backstop_blocks_stale_promotion() {
+        let bytes: Vec<u8> = (0..100u8).collect();
+        let fx = fixture_efficient(&bytes, 0.8, 4);
+        // 80% staged at t=0 — threshold met, promotion task may spawn.
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-79")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        body_text(resp).await;
+        // Advance past the window: the ledger must decay regardless of
+        // what the promotion task does (it may have already installed a
+        // valid entry — that is fine; stale intervals must not survive).
+        fx.state.cache.clock.advance(3_601_000);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let cov = fx.state.cache.coverage.lock().await;
+        match cov.get("f.bin") {
+            // Promotion cleaned up: nothing left to decay — acceptable.
+            None => {}
+            // Ledger still present: every interval must be decayed away.
+            Some(c) => assert!(c.intervals.is_empty(), "stale intervals must decay: {:?}", c.intervals),
+        }
     }
 
     /// Version flip between staging and promotion: history resets, no

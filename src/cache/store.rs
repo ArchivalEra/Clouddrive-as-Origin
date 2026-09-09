@@ -76,8 +76,9 @@ pub fn prune_empty_parents(cache_dir: &Path, file: &Path) {
 pub struct Coverage {
     pub etag: Option<String>,
     pub total: u64,
-    /// Merged, sorted, non-overlapping `[start, end)` intervals.
-    pub intervals: Vec<(u64, u64)>,
+    /// Merged, sorted, non-overlapping `[start, end)` intervals, each with
+    /// the clock-domain time it was last read (window decay, map #30).
+    pub intervals: Vec<(u64, u64, u64)>,
     /// Clock-domain last touch (stage or rebuild time): drives age sweep
     /// in MockClock-testable time, unlike fs mtime.
     pub last_touch_millis: u64,
@@ -88,28 +89,44 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// Merge `[start, end)` (empty ranges ignored).
-    pub fn add_interval(&mut self, start: u64, end: u64) {
+    /// Merge `[start, end)` (empty ranges ignored), stamped with the read
+    /// time. Overlapping intervals merge and keep the max timestamp;
+    /// adjacent (touching) intervals stay separate so each keeps its own
+    /// read time — a stale interval must not be "revived" by a fresh
+    /// neighbor (map #30 window decay).
+    pub fn add_interval(&mut self, start: u64, end: u64, now_millis: u64) {
         if start >= end {
             return;
         }
-        self.intervals.push((start, end));
+        self.intervals.push((start, end, now_millis));
         self.intervals.sort();
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.intervals.len());
-        for (s, e) in self.intervals.drain(..) {
+        let mut merged: Vec<(u64, u64, u64)> = Vec::with_capacity(self.intervals.len());
+        for (s, e, t) in self.intervals.drain(..) {
             if let Some(last) = merged.last_mut() {
-                if s <= last.1 {
+                if s < last.1 {
                     last.1 = last.1.max(e);
+                    last.2 = last.2.max(t);
                     continue;
                 }
             }
-            merged.push((s, e));
+            merged.push((s, e, t));
         }
         self.intervals = merged;
     }
 
+    /// Drop intervals whose last read is older than `window_millis` ago.
+    /// Window expiry only removes ledger counts — the disk sidecars stay
+    /// for the natural sweep (map #30 Q16c/Q18b).
+    pub fn decay(&mut self, now_millis: u64, window_millis: u64) {
+        if window_millis == 0 {
+            return;
+        }
+        let cutoff = now_millis.saturating_sub(window_millis);
+        self.intervals.retain(|(_, _, t)| *t >= cutoff);
+    }
+
     pub fn covered_bytes(&self) -> u64 {
-        self.intervals.iter().map(|(s, e)| e - s).sum()
+        self.intervals.iter().map(|(s, e, _)| e - s).sum()
     }
 
     /// Staged fraction of the object, or `None` while the total is unknown
@@ -253,7 +270,7 @@ pub fn scan_segments(cache_dir: &Path, now_millis: u64) -> (std::collections::Ha
             backend_key: meta.backend_key.clone(),
             upstream_id: meta.upstream_id.clone(),
         });
-        cov.add_interval(start, end.min(start.saturating_add(len)));
+        cov.add_interval(start, end.min(start.saturating_add(len)), now_millis);
         staged_bytes += len;
     }
     (ledger, staged_bytes)
@@ -392,17 +409,37 @@ mod tests {
         let mut c = Coverage::default();
         assert_eq!(c.ratio(), None); // total unknown → never promotes
         c.total = 100;
-        c.add_interval(0, 30);
-        c.add_interval(50, 80);
+        c.add_interval(0, 30, 1000);
+        c.add_interval(50, 80, 2000);
         assert_eq!(c.covered_bytes(), 60);
         assert!((c.ratio().unwrap() - 0.6).abs() < 1e-9);
-        c.add_interval(20, 60); // bridges the gap
-        assert_eq!(c.intervals, vec![(0, 80)]);
-        c.add_interval(80, 100); // adjacent merges
-        assert_eq!(c.intervals, vec![(0, 100)]);
+        c.add_interval(20, 60, 3000); // bridges the gap (overlap)
+        assert_eq!(c.intervals, vec![(0, 80, 3000)]);
+        c.add_interval(80, 100, 4000); // adjacent: stays separate (own ts)
+        assert_eq!(c.intervals, vec![(0, 80, 3000), (80, 100, 4000)]);
         assert!((c.ratio().unwrap() - 1.0).abs() < 1e-9);
-        c.add_interval(200, 200); // empty ignored
-        assert_eq!(c.intervals, vec![(0, 100)]);
+        c.add_interval(200, 200, 5000); // empty ignored
+        assert_eq!(c.intervals, vec![(0, 80, 3000), (80, 100, 4000)]);
+    }
+
+    #[test]
+    fn coverage_window_decay_drops_stale_intervals() {
+        let mut c = Coverage::default();
+        c.total = 100;
+        c.add_interval(0, 30, 1000);
+        c.add_interval(50, 80, 2000);
+        // Window 1000ms, now=2500: interval [0,30) read at 1000 is stale.
+        c.decay(2500, 1000);
+        assert_eq!(c.intervals, vec![(50, 80, 2000)]);
+        assert_eq!(c.covered_bytes(), 30);
+        // Everything stale: ledger empties, ratio 0.
+        c.decay(5000, 1000);
+        assert!(c.intervals.is_empty());
+        assert_eq!(c.covered_bytes(), 0);
+        // Zero window = no decay.
+        c.add_interval(0, 10, 100);
+        c.decay(999999, 0);
+        assert_eq!(c.intervals.len(), 1);
     }
 
     #[test]
@@ -423,7 +460,9 @@ mod tests {
         let cov = ledger.get("v/f.bin").unwrap();
         assert_eq!(cov.etag.as_deref(), Some("e1"));
         assert_eq!(cov.total, 100);
-        assert_eq!(cov.intervals, vec![(0, 30), (50, 80)]);
+        assert_eq!(cov.intervals.len(), 2);
+        assert_eq!((cov.intervals[0].0, cov.intervals[0].1), (0, 30));
+        assert_eq!((cov.intervals[1].0, cov.intervals[1].1), (50, 80));
         assert!(!segpart_path(dir.path(), "v/f.bin", 80, 100).exists());
         assert!(!dir.path().join(".seg.garbage").exists());
     }
