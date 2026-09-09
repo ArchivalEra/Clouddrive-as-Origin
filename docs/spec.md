@@ -230,26 +230,25 @@ repo** — it is injected at runtime via an environment variable (e.g.
     confirmed in real traffic).
 
     **Parallel segmented cold pull (map #31 H2 optimization):** large
-    cold misses (> 20 MB) are fetched as N parallel 10 MB Range segments
+    cold misses (> 10 MB) are fetched as N parallel 5 MB Range segments
     (bounded by the upstream gate, 3 concurrent) and written in order —
-    the edge serves 10 MB segments ~18× faster than full responses.
-    Small files keep the single-stream path. Live numbers: cold pull of
-    100 MB from GDrive 16.6 MB/s (vs ~7 MB/s single-connection).
+    the edge serves 5 MB segments ~9× faster than 10 MB ones on the same
+    direct link (live-measured: 20×5 MB = 16.4 MB/s vs 10×10 MB =
+    1.7 MB/s). Small files keep the single-stream path. Live numbers:
+    cold pull of 100 MB from GDrive 16.6 MB/s (vs ~7 MB/s
+    single-connection).
 
     **EdgeOne edge behavior (live-measured 2026-09-09):** the edge
-    serves 10 MB Range segments at full speed (9-12 MB/s) but degrades
-    sharply for larger single responses — 50 MB segments stall at
-    ~700 KB/s and full 100 MB responses truncate around 70 MB. This is
-    an edge-side platform behavior (verified from the origin node
-    itself, ruling out client links). Segment size 5 MB vs 10 MB shows
-    no throughput difference on a stable link (~11 MB/s for both at 10-20
-    concurrent lanes); the bottleneck is the edge's cold-cache
-    origin-pull, not the segment size. Real-world consumers (video
-    seeking, resumable downloads, database clients) use Range requests
-    natively; the 10 MB segment size aligns with the edge's sweet spot.
-    EdgeOne sharded origin-pull is enabled for
-    `cdn-oracle.isui.ren/*` so the edge only origin-pulls missing
-    shards.
+    serves 5 MB Range segments at full speed (16 MB/s aggregate) but
+    degrades sharply for larger single responses — 10 MB segments drop
+    to ~1.7 MB/s, 50 MB segments stall at ~700 KB/s and full 100 MB
+    responses truncate around 70 MB. This is an edge-side platform
+    behavior (verified from the origin node itself, ruling out client
+    links). Real-world consumers (video seeking, resumable downloads,
+    database clients) use Range requests natively; the 5 MB segment
+    size aligns with the edge's sweet spot. EdgeOne sharded origin-pull
+    is enabled for `cdn-oracle.isui.ren/*` so the edge only
+    origin-pulls missing shards.
 
 ## 4. Upstream details (OpenList WebDAV)
 

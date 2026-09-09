@@ -1430,12 +1430,13 @@ async fn drive_flight<C: Clock>(
         let meta = slot.backend.stat(&backend_key).await?;
         let _ = flight.progress_tx.send(FlightProgress::Meta(meta.clone()));
         // Parallel segmented pull (map #31 H2 optimization): the edge
-        // (EdgeOne) serves 10MB Range segments ~18x faster than full
-        // responses, so large cold misses are fetched as N parallel
-        // segments and written in order. Small files (< 2 segments)
-        // fall back to the single-stream path.
+        // (EdgeOne) serves 5MB Range segments ~9x faster than 10MB ones
+        // (live-measured: 20x5MB = 16.4MB/s vs 10x10MB = 1.7MB/s on the
+        // same direct link), so large cold misses are fetched as N
+        // parallel segments and written in order. Small files (< 2
+        // segments) fall back to the single-stream path.
         let total = meta.size_bytes;
-        const SEG: u64 = 10 * 1024 * 1024;
+        const SEG: u64 = 5 * 1024 * 1024;
         if total > SEG * 2 {
             flight::pump_and_seal_parallel(
                 &slot,
