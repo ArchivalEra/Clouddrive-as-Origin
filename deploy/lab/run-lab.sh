@@ -84,10 +84,11 @@ note "1. cold small-file GET (standard)"
 code=$(H -o /dev/null -w "%{http_code}" http://127.0.0.1:7777/media/hello.txt)
 [ "$code" = 200 ] && ok "cold GET 200" || bad "cold GET got $code"
 
-note "2. second hit faster than first (disk)"
-t1=$(H -o /dev/null -w "%{time_total}" "http://127.0.0.1:7777/media/hello.txt")
-H -o /dev/null "http://127.0.0.1:7777/media/hello.txt"
-t2=$(H -o /dev/null -w "%{time_total}" "http://127.0.0.1:7777/media/hello.txt")
+note "2. second hit faster than first (disk, 1MB file)"
+# 1MB file: cold pull from rclone + disk write, hit is pure disk read.
+t1=$(H -o /dev/null -w "%{time_total}" "http://127.0.0.1:7777/media/big1mb.bin")
+H -o /dev/null "http://127.0.0.1:7777/media/big1mb.bin"
+t2=$(H -o /dev/null -w "%{time_total}" "http://127.0.0.1:7777/media/big1mb.bin")
 awk -v a="$t1" -v b="$t2" 'BEGIN { exit !(b <= a + 0.05) }' && ok "hit t=$t2 <= cold t=$t1" || bad "hit $t2 > cold $t1"
 
 note "2. Range slices 206 + Content-Range (1MB file)"
@@ -186,11 +187,12 @@ case "$code$cc" in 403*no-store*) ok "sigv4 bad sig 403 no-store" ;; *) bad "sig
 
 # --- 4b. coverage window (map #30 T2): efficient profile on 7779 ---------------
 note "9. coverage promotion: 80% staged -> promoted (efficient)"
-# 1MB file, 5 x 200KB ranges = 100% coverage; threshold 0.8 -> promote at 80%.
-for off in 0 200000 400000 600000; do
+# 1MB file, 5 x 200KB ranges = 100% coverage; threshold 0.8 -> promote
+# at 80% (4 segments = 76.3% is below the threshold — 5 needed).
+for off in 0 200000 400000 600000 800000; do
   H -o /dev/null -H "Range: bytes=$off-$((off+199999))" "http://127.0.0.1:7779/media/big1mb.bin"
 done
-# 4 x 200KB = 800KB = 80% -> promotion task should install the entry.
+# 5 x 200KB = 100% -> promotion task should install the entry.
 promoted=0
 for i in $(seq 1 40); do
   if curl -s -m 2 http://127.0.0.1:7779/_internal/healthz | grep -q '"entries":1'; then
@@ -211,6 +213,24 @@ if curl -s -m 2 http://127.0.0.1:7779/_internal/healthz | grep -q '"entries":2';
 else
   ok "window expiry: stale coverage did not promote"
 fi
+
+# --- 4c. concurrency stampede (map #31 T2): 50 concurrent cold key ------------
+note "11. single-flight: 50 concurrent cold key -> one upstream fetch"
+# Fresh key (never requested): 50 parallel GETs must coalesce to one fetch.
+# Count upstream PROPFINDs in the dav log before/after.
+BEFORE=$(grep -c "PROPFIND" "$LAB/dav.log" 2>/dev/null || echo 0)
+pids=""
+for i in $(seq 1 50); do
+  curl -s -m 30 -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:7777/media/stampede.bin" >> "$LAB/stampede-codes.txt" &
+  pids="$pids $!"
+done
+for p in $pids; do wait "$p" 2>/dev/null; done
+AFTER=$(grep -c "PROPFIND" "$LAB/dav.log" 2>/dev/null || echo 0)
+codes=$(sort -u "$LAB/stampede-codes.txt" | tr -d ' \n')
+rm -f "$LAB/stampede-codes.txt"
+# 50 responses all 200, and the upstream saw exactly ONE stat for the key.
+[ "$codes" = "200" ] && ok "stampede: all 50 responses 200" || bad "stampede codes: $codes"
+[ $((AFTER - BEFORE)) -le 2 ] && ok "stampede: upstream PROPFIND delta=$((AFTER-BEFORE)) (<=2)" || bad "stampede: PROPFIND delta=$((AFTER-BEFORE))"
 
 # --- 5. summary ---------------------------------------------------------------
 echo "======================================"
