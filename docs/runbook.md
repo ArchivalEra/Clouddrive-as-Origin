@@ -58,16 +58,27 @@ sudo systemctl start origin-cache-standard
 
 ### Certificate expiry / renewal
 
-acme.sh auto-renews (next: 2026-11-08). After renewal the unit must be
-restarted to load the new cert:
-
-```sh
-sudo systemctl restart origin-cache-standard
-```
+acme.sh auto-renews (next: 2026-11-07). A deploy hook
+(`~/.acme.sh/deploy/origin-cache.sh`, registered as `Le_DeployHook` in
+the domain conf) installs the new cert to `/etc/ssl/dib.l.cd/cdn-oracle/`
+and restarts `origin-cache-standard` automatically — no manual step.
 
 Verify: `sudo openssl x509 -in /etc/ssl/dib.l.cd/cdn-oracle/cert.pem -noout -dates`.
 If renewal failed: `sudo ~/.acme.sh/acme.sh --renew -d cdn-oracle.isui.ren --dns dns_dp`
 (needs `DP_Id`/`DP_Key` from `~/dnspod`).
+
+### Log rotation
+
+`/etc/logrotate.d/origin-cache` rotates `port80.log` + `watchdog.log`
+(daily, 7 copies, compressed). journald capped at 500M
+(`/etc/systemd/journald.conf.d/origin-cache.conf`).
+
+### Test artifacts (kept for regression)
+
+- `origin-cache-efficient.service` (port 7780): coverage test instance,
+  keep for T2/T3 regression.
+- `coverage-test-3g.bin` in googledrive1 + `/tmp/coverage-test-3g.bin`:
+  3 GiB coverage test file. Delete via WebDAV when no longer needed.
 
 ### Disk full
 
