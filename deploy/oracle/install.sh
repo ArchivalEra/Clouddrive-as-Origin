@@ -4,15 +4,19 @@
 #   - writes the 3 systemd units (standard / nocache / port80)
 #   - enables and starts them
 #
-# Usage:  sudo bash deploy/oracle/install.sh <path-to-release-binary>
+# Usage:  sudo bash deploy/oracle/install.sh <path-to-release-binary> [--keep-env]
+#   --keep-env: do not overwrite an existing origin-cache.env (preserves
+#               real secrets across reinstalls).
 set -euo pipefail
 
 SRC_BIN="${1:-}"
+KEEP_ENV=0
+[ "${2:-}" = "--keep-env" ] && KEEP_ENV=1
 APP=/opt/origin-cache
 REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 USER=opc
 
-[ -n "$SRC_BIN" ] && [ -x "$SRC_BIN" ] || { echo "usage: $0 /path/to/origin-cache"; exit 1; }
+[ -n "$SRC_BIN" ] && [ -x "$SRC_BIN" ] || { echo "usage: $0 /path/to/origin-cache [--keep-env]"; exit 1; }
 
 mkdir -p "$APP/cache-standard" "$APP/cache-nocache" "$APP/acme-webroot"
 install -m 0755 "$SRC_BIN" "$APP/origin-cache"
@@ -23,15 +27,19 @@ chown -R "$USER:$USER" "$APP"
 
 # Environment file: contains real secrets at runtime, written by the
 # operator (never committed). Template printed for reference.
-cat > "$APP/origin-cache.env" <<'ENV'
+if [ "$KEEP_ENV" = 1 ] && [ -f "$APP/origin-cache.env" ]; then
+  echo "keeping existing $APP/origin-cache.env"
+else
+  cat > "$APP/origin-cache.env" <<'ENV'
 OPENLIST_USERNAME=REPLACE_ME
 OPENLIST_PASSWORD=REPLACE_ME
 ORIGIN_PREWARM_SECRET=REPLACE_ME
 ORIGIN_TLS_CERT_PATH=/etc/ssl/dib.l.cd/cdn-oracle/cert.pem
 ORIGIN_TLS_KEY_PATH=/etc/ssl/dib.l.cd/cdn-oracle/key.pem
 ENV
-chown "$USER:$USER" "$APP/origin-cache.env"
-chmod 600 "$APP/origin-cache.env"
+  chown "$USER:$USER" "$APP/origin-cache.env"
+  chmod 600 "$APP/origin-cache.env"
+fi
 
 cat > /etc/systemd/system/origin-cache-standard.service <<UNIT
 [Unit]
