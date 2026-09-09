@@ -474,12 +474,96 @@ impl<C: Clock + Clone> Cache<C> {
         let upstream_id = rk.upstream_id.clone();
         let segpart = store::segpart_path(&cache_dir, &cache_key, start, end);
         let mut src_stream = src.stream;
+        // The upstream 206 stream may not signal EOF at the Content-Length
+        // boundary (keep-alive reuse, e.g. rclone serve webdav): read at
+        // most `end - start` bytes, then seal. Waiting for EOF would hang
+        // the staging loop and leave the segpart unsealed forever.
+        let want = end.saturating_sub(start);
+        // Viewer disconnect drops the whole body stream (axum drops the
+        // async block), so the seal code below never runs on abort. A
+        // detached watcher polls the segpart and seals it once it stops
+        // growing — the served bytes still count toward coverage (map #30
+        // T2: segmented downloads are separate connections).
+        let watcher = {
+            let segpart = segpart.clone();
+            let seg = store::seg_path(&cache_dir, &cache_key, start, end);
+            let coverage = Arc::clone(&coverage);
+            let state = Arc::clone(&state);
+            let clock = Arc::clone(&clock);
+            let config = Arc::clone(&config);
+            let backends = backends.clone();
+            let meta_store = Arc::clone(&meta_store);
+            let promotions = Arc::clone(&promotions);
+            let cache_dir = cache_dir.clone();
+            let cache_key = cache_key.clone();
+            let backend_key = backend_key.clone();
+            let upstream_id = upstream_id.clone();
+            let etag = etag.clone();
+            let total = total;
+            let start = start;
+            let end = end;
+            tokio::spawn(async move {
+                // Wait for the segpart to appear and stop growing (viewer
+                // gone or transfer done), then seal it.
+                let mut last = 0u64;
+                let mut stable = 0u32;
+                for _ in 0..600 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let size = tokio::fs::metadata(&segpart).await.map(|m| m.len()).unwrap_or(0);
+                    if size == 0 {
+                        continue; // not started yet
+                    }
+                    if size == last {
+                        stable += 1;
+                        if stable >= 3 {
+                            // Sealed by the stream itself already?
+                            if tokio::fs::metadata(&seg).await.is_ok() {
+                                return;
+                            }
+                            // Seal it here.
+                            let _ = tokio::fs::rename(&segpart, &seg).await;
+                            let now = clock.now_millis();
+                            let span = FinalizedSpan {
+                                cache_dir: cache_dir.clone(),
+                                key: cache_key.clone(),
+                                backend_key: backend_key.clone(),
+                                upstream_id: upstream_id.clone(),
+                                etag: etag.clone(),
+                                total,
+                                start,
+                                end: start + size,
+                                bytes: size,
+                                now_millis: now,
+                            };
+                            finalize_coverage(&coverage, &state, span, window_millis_for(&config, &upstream_id)).await;
+                            maybe_promote(
+                                &coverage,
+                                &config,
+                                &backends,
+                                &meta_store,
+                                &promotions,
+                                &state,
+                                &cache_dir,
+                                &cache_key,
+                                &upstream_id,
+                                now,
+                            )
+                            .await;
+                            return;
+                        }
+                    } else {
+                        stable = 0;
+                    }
+                    last = size;
+                }
+            })
+        };
         let body: BodyStream = Box::pin(async_stream::try_stream! {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = vec![0u8; 256 * 1024];
             let mut file: Option<tokio::fs::File> = None;
             let mut written: u64 = 0;
-            loop {
+            while written < want {
                 let n = src_stream.read(&mut buf).await?;
                 if n == 0 {
                     break;
@@ -531,6 +615,7 @@ impl<C: Clock + Clone> Cache<C> {
                 let _ = tokio::fs::remove_file(&segpart).await;
             }
         });
+        let _ = watcher;
         Ok(PassthroughHit { meta: meta_out, etag: meta.etag, total, content_range, content_length, body })
     }
 
