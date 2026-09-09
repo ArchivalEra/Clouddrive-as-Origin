@@ -72,16 +72,25 @@ fn default_min_file_size() -> u64 {
     64 * 1024 * 1024
 }
 
+fn default_coverage_window_secs() -> u64 {
+    3600
+}
+
 /// Fill-policy profile (P2 efficientcache): when ranged misses stage
 /// segments instead of full-filing, and what staged coverage promotes a
 /// key to a full cache entry. `threshold` ∈ (0, 1]; 1.0 = promote only
-/// once every byte has been served.
+/// once every byte has been served. `coverage_window_secs` bounds how
+/// long a staged interval counts toward coverage (map #30): intervals
+/// whose last read is older than the window decay out of the ledger, so
+/// stale partial reads never accumulate into a promotion.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RawCacheProfile {
     #[serde(default = "default_coverage_threshold")]
     pub coverage_threshold: f64,
     #[serde(default = "default_min_file_size")]
     pub min_file_size: u64,
+    #[serde(default = "default_coverage_window_secs")]
+    pub coverage_window_secs: u64,
 }
 
 /// Validated fill-policy profile.
@@ -89,6 +98,7 @@ pub struct RawCacheProfile {
 pub struct CacheProfile {
     pub coverage_threshold: f64,
     pub min_file_size: u64,
+    pub coverage_window_secs: u64,
 }
 
 /// Resolved per-upstream fill behavior. `standard` = legacy full-file
@@ -103,15 +113,16 @@ pub struct EffectiveProfile {
     pub nocache: bool,
     pub coverage_threshold: f64,
     pub min_file_size: u64,
+    pub coverage_window_secs: u64,
 }
 
 impl EffectiveProfile {
     pub fn standard() -> Self {
-        Self { efficient: false, nocache: false, coverage_threshold: default_coverage_threshold(), min_file_size: default_min_file_size() }
+        Self { efficient: false, nocache: false, coverage_threshold: default_coverage_threshold(), min_file_size: default_min_file_size(), coverage_window_secs: default_coverage_window_secs() }
     }
 
     pub fn nocache() -> Self {
-        Self { efficient: false, nocache: true, coverage_threshold: 0.0, min_file_size: 0 }
+        Self { efficient: false, nocache: true, coverage_threshold: 0.0, min_file_size: 0, coverage_window_secs: 0 }
     }
 }
 
@@ -276,6 +287,7 @@ impl Config {
                     nocache: false,
                     coverage_threshold: p.coverage_threshold,
                     min_file_size: p.min_file_size,
+                    coverage_window_secs: p.coverage_window_secs,
                 },
                 None => EffectiveProfile::standard(),
             },
@@ -325,6 +337,7 @@ impl Config {
                 CacheProfile {
                     coverage_threshold: raw.coverage_threshold,
                     min_file_size: raw.min_file_size,
+                    coverage_window_secs: raw.coverage_window_secs,
                 },
             );
         }
