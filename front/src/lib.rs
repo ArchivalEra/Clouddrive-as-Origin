@@ -116,17 +116,29 @@ impl ProxyHttp for BusinessProxy {
         }
     }
 
-    /// Forward to the business plane (loopback, plain HTTP).
+    /// Forward to the business plane (loopback, plain HTTP). Timeouts
+    /// are idle-semantic (interval between adjacent reads/writes), never
+    /// total-transfer bounds — a multi-GB cold pull takes minutes and
+    /// any overall deadline would kill it.
     async fn upstream_peer(
         &self,
         _session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> ProxyResult<Box<HttpPeer>> {
-        Ok(Box::new(HttpPeer::new(
+        let mut peer = Box::new(HttpPeer::new(
             self.business.to_string(),
             false,
             String::new(),
-        )))
+        ));
+        if let Some(opts) = peer.get_mut_peer_options() {
+            opts.connection_timeout = Some(std::time::Duration::from_secs(3)); // loopback, generous
+            opts.read_timeout = Some(std::time::Duration::from_secs(10)); // idle semantics
+            opts.write_timeout = Some(std::time::Duration::from_secs(10)); // idle semantics
+            opts.idle_timeout = Some(std::time::Duration::from_secs(60)); // pool keepalive
+            // total_connection_timeout deliberately unset — total-time
+            // bound is forbidden (3GB/3min cold pull).
+        }
+        Ok(peer)
     }
 
     /// Connection accounting: new vs reused upstream connections.
