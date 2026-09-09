@@ -20,7 +20,7 @@ DAV_USER=labuser
 DAV_PASS=labpass
 PREWARM_SECRET=labsecret
 SIGV4_AK=AKLLABTESTKEY
-SIGV4_SK=labsk-demo
+SIGV4_SK=labsk_demo
 PID_DAV= PID_A= PID_B=
 PASS=0; FAIL=0
 
