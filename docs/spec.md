@@ -229,6 +229,25 @@ repo** — it is injected at runtime via an environment variable (e.g.
     the first segment and correctly did NOT promote (window semantics
     confirmed in real traffic).
 
+    **Parallel segmented cold pull (map #31 H2 optimization):** large
+    cold misses (> 20 MB) are fetched as N parallel 10 MB Range segments
+    (bounded by the upstream gate, 3 concurrent) and written in order —
+    the edge serves 10 MB segments ~18× faster than full responses.
+    Small files keep the single-stream path. Live numbers: cold pull of
+    100 MB from GDrive 16.6 MB/s (vs ~7 MB/s single-connection).
+
+    **EdgeOne edge behavior (live-measured 2026-09-09):** the edge
+    serves 10 MB Range segments at full speed (9-12 MB/s) but degrades
+    sharply for larger single responses — 50 MB segments stall at
+    ~700 KB/s and full 100 MB responses truncate around 70 MB. This is
+    an edge-side platform behavior (verified from the origin node
+    itself, ruling out client links). Real-world consumers (video
+    seeking, resumable downloads, database clients) use Range requests
+    natively; the 10 MB segment size aligns with the edge's sweet spot.
+    EdgeOne sharded origin-pull is enabled for
+    `cdn-oracle.isui.ren/*` so the edge only origin-pulls missing
+    shards.
+
 ## 4. Upstream details (OpenList WebDAV)
 
 - Each OpenList instance exposes WebDAV at `http://<host>:5244/dav` with
