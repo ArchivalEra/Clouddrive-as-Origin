@@ -241,7 +241,10 @@ repo** — it is injected at runtime via an environment variable (e.g.
     sharply for larger single responses — 50 MB segments stall at
     ~700 KB/s and full 100 MB responses truncate around 70 MB. This is
     an edge-side platform behavior (verified from the origin node
-    itself, ruling out client links). Real-world consumers (video
+    itself, ruling out client links). Segment size 5 MB vs 10 MB shows
+    no throughput difference on a stable link (~11 MB/s for both at 10-20
+    concurrent lanes); the bottleneck is the edge's cold-cache
+    origin-pull, not the segment size. Real-world consumers (video
     seeking, resumable downloads, database clients) use Range requests
     natively; the 10 MB segment size aligns with the edge's sweet spot.
     EdgeOne sharded origin-pull is enabled for
