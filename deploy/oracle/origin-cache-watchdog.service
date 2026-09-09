@@ -1,0 +1,7 @@
+[Unit]
+Description=Clouddrive-as-Origin node watchdog (map #30 T4)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/origin-cache/watchdog.sh
