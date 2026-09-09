@@ -212,6 +212,35 @@ async fn get_key<C>(
 where
     C: Clock + Clone,
 {
+    get_key_inner(state, &path_key, headers, query, original).await
+}
+
+/// Root-path handler: `GET /?list-type=2` (S3 list at the bucket root).
+/// The root route cannot extract a `Path<String>` (no key segment), so
+/// the key is the empty string — the list dispatch resolves the default
+/// upstream (map #31: browser test caught the Path panic).
+async fn get_key_root<C>(
+    State(state): State<AppState<C>>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    OriginalUri(original): OriginalUri,
+) -> Response
+where
+    C: Clock + Clone,
+{
+    get_key_inner(state, "", headers, query, original).await
+}
+
+async fn get_key_inner<C>(
+    state: AppState<C>,
+    path_key: &str,
+    headers: HeaderMap,
+    query: Option<String>,
+    original: axum::http::Uri,
+) -> Response
+where
+    C: Clock + Clone,
+{
     let (req_id, host_id) = request_ids();
     // Inbound SigV4 gate (#28): optional verify-if-present. The raw URI
     // path is exactly what the client signed; the business path may be
@@ -392,6 +421,33 @@ async fn head_key<C>(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
     OriginalUri(original): OriginalUri,
+) -> Response
+where
+    C: Clock + Clone,
+{
+    head_key_inner(state, &path_key, headers, query, original).await
+}
+
+/// Root-path HEAD (S3 list at the bucket root): no key segment, so the
+/// key is the empty string (map #31: root route must not extract Path).
+async fn head_key_root<C>(
+    State(state): State<AppState<C>>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    OriginalUri(original): OriginalUri,
+) -> Response
+where
+    C: Clock + Clone,
+{
+    head_key_inner(state, "", headers, query, original).await
+}
+
+async fn head_key_inner<C>(
+    state: AppState<C>,
+    path_key: &str,
+    headers: HeaderMap,
+    query: Option<String>,
+    original: axum::http::Uri,
 ) -> Response
 where
     C: Clock + Clone,
@@ -582,7 +638,7 @@ where
         // the root must reach the object handler too — `/*key` does not
         // match `/` in matchit 0.7 (map #31: browser test caught 404 on
         // the root list endpoint).
-        .route("/", get(get_key::<C>).head(head_key::<C>))
+        .route("/", get(get_key_root::<C>).head(head_key_root::<C>))
         .route("/*key", get(get_key::<C>).head(head_key::<C>))
         .fallback(not_found)
         .with_state(state)
