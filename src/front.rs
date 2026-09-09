@@ -69,13 +69,15 @@ impl ProxyHttp for BusinessProxy {
 }
 
 /// Run the Pingora front plane. `tls` is `Some((cert, key))` for TLS
-/// termination, `None` for plaintext. `shutdown` is a future that
-/// resolves when the process should stop.
-pub async fn run_front(
+/// termination, `None` for plaintext. Synchronous: Pingora manages its
+/// own runtime and signal handling (SIGTERM/SIGINT graceful shutdown) —
+/// must NOT be called from inside a tokio runtime (run_forever panics
+/// with "Cannot start a runtime from within a runtime"). Call from a
+/// dedicated std::thread.
+pub fn run_front(
     front: SocketAddr,
     business: SocketAddr,
     tls: Option<(String, String)>,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let mut server = Server::new(None).context("create pingora server")?;
     server.bootstrap();
@@ -95,9 +97,6 @@ pub async fn run_front(
         }
     }
     server.add_service(service);
-
-    // Graceful shutdown: when the future resolves, Pingora drains.
-    let _ = shutdown;
     server.run_forever();
     Ok(())
 }

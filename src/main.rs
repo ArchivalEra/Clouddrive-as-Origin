@@ -78,24 +78,19 @@ async fn main() -> anyhow::Result<()> {
 
     let tls = front::acceptor_from_env(cfg.tls_cert_env.as_deref(), cfg.tls_key_env.as_deref())
         .context("load front TLS material")?;
-    let front_handle = tokio::spawn({
-        let mut rx = shutdown_rx.clone();
-        async move {
-            if let Err(e) = front::run_front(front_addr, business_addr, tls, async move {
-                rx.changed().await.ok();
-            })
-            .await
-            {
-                warn!(error = %e, "front plane exited with error");
-            }
+    // Pingora manages its own runtime + signal handling; run it on a
+    // dedicated thread (run_forever panics inside a tokio runtime).
+    let front_thread = std::thread::spawn(move || {
+        if let Err(e) = front::run_front(front_addr, business_addr, tls) {
+            warn!(error = %e, "front plane exited with error");
         }
     });
 
     wait_shutdown().await;
     let _ = shutdown_tx.send(true);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    front_handle.abort();
     let _ = business_handle.await;
+    let _ = front_thread.join();
     info!("origin-cache shut down cleanly");
     Ok(())
 }
