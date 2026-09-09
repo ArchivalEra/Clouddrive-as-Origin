@@ -21,7 +21,7 @@ DAV_PASS=labpass
 PREWARM_SECRET=labsecret
 SIGV4_AK=AKLLABTESTKEY
 SIGV4_SK=labsk_demo
-PID_DAV= PID_A= PID_B=
+PID_DAV= PID_A= PID_B= PID_C=
 PASS=0; FAIL=0
 
 ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
@@ -29,7 +29,7 @@ bad()  { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 note() { echo "---- $1"; }
 
 cleanup() {
-  for pid in "$PID_A" "$PID_B" "$PID_DAV"; do
+  for pid in "$PID_A" "$PID_B" "$PID_C" "$PID_DAV"; do
     [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null
   done
   wait 2>/dev/null
@@ -66,14 +66,16 @@ for i in $(seq 1 20); do
 done
 [ "$dav_ok" = 1 ] || { echo "FAIL: dav not reachable"; tail -3 "$LAB/dav.log"; exit 1; }
 
-# --- 3. start both profiles ---------------------------------------------------
+# --- 3. start all profiles ---------------------------------------------------
 export CDN_LAB_DAV_USER=$DAV_USER CDN_LAB_DAV_PASS=labpass CDN_LAB_PREWARM_SECRET=$PREWARM_SECRET
 cd "$REPO"
 "$BIN" "$REPO/deploy/lab/config-a.toml" > "$LAB/cache-a/serve.log" 2>&1 & PID_A=$!
 "$BIN" "$REPO/deploy/lab/config-b.toml" > "$LAB/cache-b/serve.log" 2>&1 & PID_B=$!
+"$BIN" "$REPO/deploy/lab/config-c.toml" > "$LAB/cache-c/serve.log" 2>&1 & PID_C=$!
 sleep 2
 curl -s -m 5 http://127.0.0.1:7777/_internal/healthz > /dev/null 2>&1 || { echo "FAIL: standard not up"; exit 1; }
 curl -s -m 5 http://127.0.0.1:7778/_internal/healthz > /dev/null 2>&1 || { echo "FAIL: nocache not up"; exit 1; }
+curl -s -m 5 http://127.0.0.1:7779/_internal/healthz > /dev/null 2>&1 || { echo "FAIL: efficient not up"; exit 1; }
 
 H() { curl -s "$@"; }
 
@@ -181,6 +183,34 @@ H -sD /tmp/lab-badsig-hdr.txt -o /dev/null \
 code=$(head -1 /tmp/lab-badsig-hdr.txt | grep -oE "[0-9]{3}")
 cc=$(grep -i "^cache-control:" /tmp/lab-badsig-hdr.txt | tr -d "\r")
 case "$code$cc" in 403*no-store*) ok "sigv4 bad sig 403 no-store" ;; *) bad "sigv4 bad sig: code=$code cc=$cc" ;; esac
+
+# --- 4b. coverage window (map #30 T2): efficient profile on 7779 ---------------
+note "9. coverage promotion: 80% staged -> promoted (efficient)"
+# 1MB file, 5 x 200KB ranges = 100% coverage; threshold 0.8 -> promote at 80%.
+for off in 0 200000 400000 600000; do
+  H -o /dev/null -H "Range: bytes=$off-$((off+199999))" "http://127.0.0.1:7779/media/big1mb.bin"
+done
+# 4 x 200KB = 800KB = 80% -> promotion task should install the entry.
+promoted=0
+for i in $(seq 1 40); do
+  if curl -s -m 2 http://127.0.0.1:7779/_internal/healthz | grep -q '"entries":1'; then
+    promoted=1; break
+  fi
+  sleep 0.5
+done
+[ "$promoted" = 1 ] && ok "coverage 80% promoted" || bad "coverage 80% not promoted"
+
+note "10. coverage window expiry blocks promotion (5s window)"
+# Fresh key: 60% staged, wait 6s (window 5s), then 20% more -> decayed, no promote.
+H -o /dev/null -H "Range: bytes=0-599999" "http://127.0.0.1:7779/media/big1mb.bin"
+sleep 6
+H -o /dev/null -H "Range: bytes=600000-799999" "http://127.0.0.1:7779/media/big1mb.bin"
+sleep 1
+if curl -s -m 2 http://127.0.0.1:7779/_internal/healthz | grep -q '"entries":2'; then
+  bad "window expiry: stale coverage promoted"
+else
+  ok "window expiry: stale coverage did not promote"
+fi
 
 # --- 5. summary ---------------------------------------------------------------
 echo "======================================"
