@@ -348,6 +348,14 @@ plain `GET /<key>` contract above.
      Host rewriting rules on routes serving signed traffic — any of
      them breaks the signature.
 
+  **Live-verified 2026-09-09 (oracle node, EdgeOne → apple.dib.l.cd:7777)**:
+  | Behavior | Test | Result |
+  |---|---|---|
+  | Authorization forwarded to origin | SigV4-signed GET via EdgeOne domain | 200 (origin verified the signature — header arrived intact) |
+  | Cache key excludes Authorization | Signed GET then anonymous GET, same URL | both `eo-cache-status: HIT` on the same entry (age identical) |
+  | 403 not edge-cached | Bad-signature GET on a cold URL, twice | both 403 + `cache-control: no-store` + `eo-cache-status: MISS` (each hit the origin) |
+  | Edge-cached URL + bad signature | Bad-signature GET on a warm URL | 200 HIT (edge serves without re-verifying — expected: auth is origin-side) |
+
 ## 7. Configuration (single TOML file)
 
 All timeouts / limits have defaults. Secrets and hostnames are **env
