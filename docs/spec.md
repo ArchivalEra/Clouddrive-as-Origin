@@ -331,7 +331,10 @@ plain `GET /<key>` contract above.
   ticket #26 (Contents-then-CommonPrefixes block order, form-urlencoded
   encoding set, `max-keys=0` -> empty non-truncated page). Responses
   carry `Cache-Control: private, max-age=5` so directory browsing also
-  rides the CDN.
+  rides the CDN. The root path `/` is routed to the object handler via
+  dedicated root handlers (matchit 0.7's `/*key` does not match `/`,
+  and the `Path` extractor panics with no key segment — caught by the
+  live browser test, map #31).
 
 - **SigV4 inbound verification** (optional verify-if-present): a request
   bearing `Authorization: AWS4-HMAC-SHA256 ...` or presigned query
