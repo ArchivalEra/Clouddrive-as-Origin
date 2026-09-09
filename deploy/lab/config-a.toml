@@ -1,6 +1,7 @@
 # CDN-LAB config A: standard profile against a local rclone webdav
 # (simulated OpenList). Plain http loopback upstream is allowed.
 front_listen = "127.0.0.1:7777"
+front_metrics_listen = "127.0.0.1:9090"
 listen_addr = "127.0.0.1:8080"
 cache_dir = "/mnt/hdd/CDN-LAB/cache-a"
 max_size_bytes = 10737418240
