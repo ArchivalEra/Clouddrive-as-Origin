@@ -8,8 +8,8 @@ use origin_cache::{
     cache::cache::Cache,
     clock::SystemClock,
     config,
-    front,
 };
+use origin_front as front;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

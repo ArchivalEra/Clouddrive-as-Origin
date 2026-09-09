@@ -3,7 +3,6 @@ pub mod business;
 pub mod cache;
 pub mod clock;
 pub mod config;
-pub mod front;
 pub mod inflight;
 pub mod key;
 pub mod list;
