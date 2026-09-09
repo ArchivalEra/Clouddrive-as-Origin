@@ -41,6 +41,17 @@ note "build release (may reuse cache)"
 (cd "$REPO" && cargo build --release 2>&1 | tail -1) || { echo "FAIL: build"; exit 1; }
 [ -x "$BIN" ] || { echo "FAIL: no binary"; exit 1; }
 
+# pre-flight: stale instances from previous runs hold redb locks and ports —
+# fresh starts then panic at boot while the stale binary keeps serving, so
+# every assertion silently runs against the wrong process. Clear them first.
+pkill -f "target/release/origin-cache" 2>/dev/null
+for port in 7777 7778 7779; do
+  for _ in $(seq 1 20); do
+    ss -tln 2>/dev/null | grep -q ":$port " || break
+    sleep 0.5
+  done
+done
+
 # --- 1. test data -------------------------------------------------------------
 mkdir -p "$LAB/dav-data/media/2026/08" "$LAB/dav-data/archive" "$LAB/cache-a" "$LAB/cache-b"
 echo "hello-origin" > "$LAB/dav-data/media/hello.txt"
@@ -76,6 +87,11 @@ sleep 2
 curl -s -m 5 http://127.0.0.1:7777/_internal/healthz > /dev/null 2>&1 || { echo "FAIL: standard not up"; exit 1; }
 curl -s -m 5 http://127.0.0.1:7778/_internal/healthz > /dev/null 2>&1 || { echo "FAIL: nocache not up"; exit 1; }
 curl -s -m 5 http://127.0.0.1:7779/_internal/healthz > /dev/null 2>&1 || { echo "FAIL: efficient not up"; exit 1; }
+# healthz may have been answered by a stale leftover instance — assert the
+# fresh processes are actually alive (boot panic = redb/port conflict).
+kill -0 "$PID_A" 2>/dev/null || { echo "FAIL: standard process died at boot"; tail -5 "$LAB/cache-a/serve.log"; exit 1; }
+kill -0 "$PID_B" 2>/dev/null || { echo "FAIL: nocache process died at boot"; tail -5 "$LAB/cache-b/serve.log"; exit 1; }
+kill -0 "$PID_C" 2>/dev/null || { echo "FAIL: efficient process died at boot"; tail -5 "$LAB/cache-c/serve.log"; exit 1; }
 
 H() { curl -s "$@"; }
 
@@ -119,9 +135,9 @@ code=${out%% *}; t=${out##* }
 [ "$code" = 200 ] && ok "restart survival 200 t=${t}s" || bad "restart: $code"
 
 note "4. upstream NOT touched after restart (dav log count)"
-c1=$(grep -c "PROPFIND" "$LAB/dav.log" 2>/dev/null || echo 0)
+c1=$(grep -c "PROPFIND" "$LAB/dav.log" 2>/dev/null | head -1); c1=${c1:-0}
 H -o /dev/null "http://127.0.0.1:7777/media/big1mb.bin"
-c2=$(grep -c "PROPFIND" "$LAB/dav.log" 2>/dev/null || echo 0)
+c2=$(grep -c "PROPFIND" "$LAB/dav.log" 2>/dev/null | head -1); c2=${c2:-0}
 [ "$c1" = "$c2" ] && ok "no PROPFIND on hit" || bad "PROPFIND delta $c1->$c2"
 
 note "5. nocache zero-disk"
@@ -151,6 +167,7 @@ export CDN_LAB_SIGV4_ID=$SIGV4_AK CDN_LAB_SIGV4_SK=$SIGV4_SK
 SIGV4_ACCESS_KEY_ID=$SIGV4_AK SIGV4_SECRET_ACCESS_KEY=$SIGV4_SK \
   "$BIN" "$REPO/deploy/lab/config-a.toml" >> "$LAB/cache-a/serve.log" 2>&1 & PID_A=$!
 sleep 2
+kill -0 "$PID_A" 2>/dev/null || { echo "FAIL: sigv4 instance died at boot"; tail -5 "$LAB/cache-a/serve.log"; exit 1; }
 # state 2: correct signature passes (sign with the same creds)
 lines=$(python3 - "$SIGV4_SK" "http://127.0.0.1:7777/media/hello.txt" "$SIGV4_AK" <<'PY' 2>/dev/null
 import hashlib, hmac, sys, datetime
@@ -218,14 +235,14 @@ fi
 note "11. single-flight: 50 concurrent cold key -> one upstream fetch"
 # Fresh key (never requested): 50 parallel GETs must coalesce to one fetch.
 # Count upstream PROPFINDs in the dav log before/after.
-BEFORE=$(grep -c "PROPFIND" "$LAB/dav.log" 2>/dev/null || echo 0)
+BEFORE=$(grep -c "PROPFIND" "$LAB/dav.log" 2>/dev/null | head -1); BEFORE=${BEFORE:-0}
 pids=""
 for i in $(seq 1 50); do
   curl -s -m 30 -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:7777/media/stampede.bin" >> "$LAB/stampede-codes.txt" &
   pids="$pids $!"
 done
 for p in $pids; do wait "$p" 2>/dev/null; done
-AFTER=$(grep -c "PROPFIND" "$LAB/dav.log" 2>/dev/null || echo 0)
+AFTER=$(grep -c "PROPFIND" "$LAB/dav.log" 2>/dev/null | head -1); AFTER=${AFTER:-0}
 codes=$(sort -u "$LAB/stampede-codes.txt" | tr -d ' \n')
 rm -f "$LAB/stampede-codes.txt"
 # 50 responses all 200, and the upstream saw exactly ONE stat for the key.
