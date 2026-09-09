@@ -78,10 +78,11 @@ async fn main() -> anyhow::Result<()> {
 
     let tls = front::acceptor_from_env(cfg.tls_cert_env.as_deref(), cfg.tls_key_env.as_deref())
         .context("load front TLS material")?;
+    let cfg_front_metrics = cfg.front_metrics_listen.clone();
     // Pingora manages its own runtime + signal handling; run it on a
     // dedicated thread (run_forever panics inside a tokio runtime).
     let front_thread = std::thread::spawn(move || {
-        if let Err(e) = front::run_front(front_addr, business_addr, tls) {
+        if let Err(e) = front::run_front(front_addr, business_addr, tls, cfg_front_metrics) {
             warn!(error = %e, "front plane exited with error");
         }
     });
