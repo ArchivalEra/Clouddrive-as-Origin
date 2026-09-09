@@ -11,7 +11,9 @@ concurrency_per_upstream = 3
 prewarm_shared_secret_env = "ORIGIN_PREWARM_SECRET"
 
 [[upstreams]]
-id = "media"
+# Upstream id MUST equal the first URL path segment (bucket-alias
+# semantics) — see config-standard.toml for the double-prefix trap.
+id = "googledrive1"
 type = "openlist"
 base_url = "http://127.0.0.1:5244/dav"
 root_path = "googledrive1"
@@ -21,4 +23,4 @@ cache_profile = "nocache"
 
 [[routes]]
 prefix = ""
-upstream = "media"
+upstream = "googledrive1"
