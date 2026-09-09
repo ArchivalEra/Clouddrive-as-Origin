@@ -46,6 +46,8 @@ getrandom = "0.2"
 hmac = "0.12"
 sha2 = "0.10"
 chrono = "0.4"
+pingora = { version = "0.8", features = ["any_tls", "proxy"] }
+pingora-error = "0.8"
 
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["json"] }
