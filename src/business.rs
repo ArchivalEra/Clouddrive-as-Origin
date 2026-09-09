@@ -630,16 +630,12 @@ where
 {
     Router::new()
         .route("/_internal/healthz", get(healthz::<C>))
-        // axum 0.7 (matchit 0.7) syntax: named params are `:key`, catch-all
-        // is `*key`. The 0.8 brace syntax (`{key}` / `{*key}`) panics at
-        // Router construction — caught by the oracle deploy smoke test.
-        .route("/_internal/prewarm/*key", post(prewarm::<C>))
+        // axum 0.8 (matchit 0.8) brace syntax: `{key}` / `{*key}`.
+        .route("/_internal/prewarm/{*key}", post(prewarm::<C>))
         // Root path: ListObjectsV2 lives at `/?list-type=2` (S3 API), so
-        // the root must reach the object handler too — `/*key` does not
-        // match `/` in matchit 0.7 (map #31: browser test caught 404 on
-        // the root list endpoint).
+        // the root must reach the object handler too.
         .route("/", get(get_key_root::<C>).head(head_key_root::<C>))
-        .route("/*key", get(get_key::<C>).head(head_key::<C>))
+        .route("/{*key}", get(get_key::<C>).head(head_key::<C>))
         .fallback(not_found)
         .with_state(state)
 }

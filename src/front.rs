@@ -36,12 +36,17 @@ pub fn load_acceptor(cert_file: &Path, key_file: &Path) -> anyhow::Result<TlsAcc
     .context("parse tls key")?
     .ok_or_else(|| anyhow::anyhow!("tls key {} holds no private key", key_file.display()))?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let config = rustls::ServerConfig::builder_with_provider(provider)
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .context("tls protocol versions")?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("tls single cert")?;
+    // Advertise h2 + http/1.1 via ALPN: EdgeOne origin-pull may
+    // negotiate HTTP/2 (map #31 H2 optimization). The byte proxy
+    // passes frames through; the business plane (axum 0.8 + http2
+    // feature) terminates the protocol.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
