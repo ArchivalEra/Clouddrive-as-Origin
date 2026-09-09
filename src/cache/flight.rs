@@ -196,6 +196,78 @@ pub async fn pump_and_seal(
     Ok(())
 }
 
+/// Parallel segmented pull (map #31 H2 optimization): the edge serves
+/// 10MB Range segments far faster than full responses, so large cold
+/// misses are fetched as N parallel segments (bounded by the upstream
+/// gate) and written in order. Each segment is buffered in memory
+/// (10MB x concurrency), then appended to the tmp file in order.
+pub async fn pump_and_seal_parallel(
+    slot: &crate::backend::BackendSlot,
+    backend_key: &crate::backend::Key,
+    total: u64,
+    seg: u64,
+    tmp_path: &std::path::Path,
+    final_path: &std::path::Path,
+    tx: &watch::Sender<FlightProgress>,
+) -> Result<(), BackendError> {
+    use futures::stream::{self, StreamExt};
+    use tokio::io::AsyncWriteExt;
+
+    let n_segs = total.div_ceil(seg);
+    // Fetch all segments in parallel (bounded by the gate), each into
+    // memory. Order is preserved by collecting into a Vec indexed by
+    // segment number.
+    let segs: Vec<Result<Vec<u8>, BackendError>> = stream::iter(0..n_segs)
+        .map(|i| {
+            let slot = slot.clone();
+            let key = backend_key.clone();
+            async move {
+                let start = i * seg;
+                let len = seg.min(total - start);
+                let _permit = slot.gate.acquire().await;
+                let mut src = slot.backend.open(&key, Some(crate::backend::ByteRange::bounded(start, len))).await?;
+                let mut buf = Vec::with_capacity(len as usize);
+                use tokio::io::AsyncReadExt;
+                src.stream.read_to_end(&mut buf).await.map_err(|e| {
+                    crate::backend::BackendError::ServerError(format!("read seg {i}: {e}"))
+                })?;
+                Ok(buf)
+            }
+        })
+        .buffer_unordered(3)
+        .collect()
+        .await;
+
+    let mut out = tokio::fs::File::create(tmp_path)
+        .await
+        .map_err(|e| crate::backend::BackendError::Other(format!("create tmp: {e}")))?;
+    let mut written: u64 = 0;
+    for (i, r) in segs.into_iter().enumerate() {
+        let buf = r?;
+        if buf.len() as u64 != seg.min(total - i as u64 * seg) {
+            return Err(crate::backend::BackendError::ServerError(format!(
+                "seg {i} short: {} vs {}",
+                buf.len(),
+                seg.min(total - i as u64 * seg)
+            )));
+        }
+        out.write_all(&buf)
+            .await
+            .map_err(|e| crate::backend::BackendError::Other(format!("write tmp: {e}")))?;
+        written += buf.len() as u64;
+        let _ = tx.send(FlightProgress::Growing(written));
+    }
+    out.flush()
+        .await
+        .map_err(|e| crate::backend::BackendError::Other(format!("flush tmp: {e}")))?;
+    out.sync_all()
+        .await
+        .map_err(|e| crate::backend::BackendError::Other(format!("fsync tmp: {e}")))?;
+    drop(out);
+    store::install_tmp(tmp_path, final_path).map_err(|e| crate::backend::BackendError::Other(e.to_string()))?;
+    Ok(())
+}
+
 /// Drain a body to nothing (prewarm / internal fetches).
 pub async fn drain(body: &mut BodyStream) -> Result<u64, BackendError> {
     use futures::StreamExt;
