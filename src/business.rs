@@ -1483,8 +1483,11 @@ mod tests {
         let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         body_text(resp).await;
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
-        // Object replaced upstream: next transfer restarts history.
+        // Object replaced upstream: next transfer restarts history. Wait
+        // out the stat single-flight cooldown (map #31 T2) so the flip is
+        // observed on a fresh stat.
         *fx.etag.lock().unwrap() = Some("v2".into());
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-79")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         body_text(resp).await;
         // Old segments dropped, ledger re-anchored on v2, no entry yet.

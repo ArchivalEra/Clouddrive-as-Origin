@@ -7,12 +7,12 @@ use tokio::sync::{OnceCell, Mutex};
 /// share the same outcome; the cell is removed after the first batch
 /// completes so later calls re-execute.
 pub struct Inflight<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> {
-    cells: Mutex<HashMap<String, Arc<OnceCell<Result<V, E>>>>>,
+    cells: Arc<Mutex<HashMap<String, Arc<OnceCell<Result<V, E>>>>>>,
 }
 
 impl<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Default for Inflight<V, E> {
     fn default() -> Self {
-        Self { cells: Mutex::new(HashMap::new()) }
+        Self { cells: Arc::new(Mutex::new(HashMap::new())) }
     }
 }
 
@@ -22,8 +22,12 @@ impl<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Infligh
     }
 
     /// Run `f` once per `key` — concurrent callers await the same result.
-    /// The result (Ok or Err) is shared; the cell is removed after completion
-    /// so a later call re-executes.
+    /// The result (Ok or Err) is shared; the cell is removed after a short
+    /// cooldown so callers that arrive slightly staggered (process spawn
+    /// skew, network jitter) still share the flight — removing it
+    /// immediately on the first completion would re-execute for every
+    /// straggler (map #31 T2: 50 concurrent cold passthroughs statted the
+    /// upstream 50 times).
     pub async fn run<F, Fut>(&self, key: String, f: F) -> Result<V, E>
     where
         F: FnOnce() -> Fut,
@@ -38,7 +42,20 @@ impl<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Infligh
             let mut guard = self.cells.lock().await;
             if let Some(c) = guard.get(&key) {
                 if Arc::ptr_eq(c, &cell) {
-                    guard.remove(&key);
+                    // Cooldown: keep the cell alive briefly so staggered
+                    // callers share this result instead of re-executing.
+                    let cells = Arc::clone(&self.cells);
+                    let key = key.clone();
+                    let cell = Arc::clone(&cell);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        let mut guard = cells.lock().await;
+                        if let Some(c) = guard.get(&key) {
+                            if Arc::ptr_eq(c, &cell) {
+                                guard.remove(&key);
+                            }
+                        }
+                    });
                 }
             }
         }
@@ -140,6 +157,9 @@ mod tests {
             .await
             .unwrap();
         let c2 = Arc::clone(&c);
+        // Wait out the cooldown: a call within 200ms shares the previous
+        // result (map #31 T2 semantics); after the cooldown it re-executes.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         inflight
             .run("k".into(), || {
                 let c2 = Arc::clone(&c2);

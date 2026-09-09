@@ -410,16 +410,31 @@ impl<C: Clock + Clone> Cache<C> {
                 }
             }
         }
-        let _permit = slot.gate.acquire().await;
+        // Stat single-flight (map #31 T2): concurrent cold passthroughs for
+        // the same key must coalesce to ONE upstream stat. The flight runs
+        // OUTSIDE the gate: the gate (concurrency 3) would otherwise
+        // serialize the stat calls and the flight cell would be removed
+        // between permits — 50 concurrent requests would stat 50 times.
         let bkey = Key::from_validated(rk.backend_key.clone());
-        let meta = match slot.backend.stat(&bkey).await {
-            Ok(m) => m,
+        let meta = match self
+            .reval_inflight
+            .run(format!("stat:{}", rk.cache_key), || {
+                let slot = Arc::clone(&slot);
+                let k = bkey.clone();
+                async move {
+                    slot.backend.stat(&k).await.map(|meta| StatData { meta })
+                }
+            })
+            .await
+        {
+            Ok(s) => s.meta,
             Err(BackendError::NotFound) => {
                 self.install_negative(&rk.cache_key, &rk.upstream_id).await;
                 return Err(BackendError::NotFound);
             }
             Err(e) => return Err(e),
         };
+        let _permit = slot.gate.acquire().await;
         // Version gate: a flipped object restarts staged history BEFORE
         // serving, so new bytes land on a clean ledger (finalize keeps a
         // same-file backstop for races).
