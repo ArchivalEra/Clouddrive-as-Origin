@@ -20,19 +20,26 @@ use anyhow::Context;
 use pingora::{
     proxy::{ProxyHttp, Session},
     server::Server,
-    upstreams::peer::HttpPeer,
+    upstreams::peer::{HttpPeer, Peer},
 };
-use pingora_error::Result as ProxyResult;
+use pingora_error::{Error, ErrorType, Result as ProxyResult};
 use prometheus::{
     register_int_counter_vec, register_int_gauge, IntCounterVec, IntGauge,
 };
 use tracing::{info, warn};
 
+/// Prewarm is a tiny authenticated POST; anything materially larger at
+/// the front is abuse and gets rejected before reaching the business
+/// plane (whose token check stays authoritative).
+pub const PREWARM_MAX_BODY: usize = 64 * 1024;
+
 /// Per-request front state. `start` exists for the access-log duration
 /// (map ticket 00); the connection gauge lives on `new_ctx`/`logging`
-/// bookends which are both guaranteed to run.
+/// bookends which are both guaranteed to run. `prewarm_body_bytes`
+/// backs the chunked-body cap (content-length lies are caught here).
 pub struct FrontCtx {
     pub start: Instant,
+    prewarm_body_bytes: usize,
 }
 
 // Static metrics land in the global default registry — the same registry
@@ -113,7 +120,53 @@ impl ProxyHttp for BusinessProxy {
         CONNECTIONS_ACTIVE.inc();
         FrontCtx {
             start: Instant::now(),
+            prewarm_body_bytes: 0,
         }
+    }
+
+    /// Prewarm body-size gate, declared-length path: an over-cap
+    /// content-length is rejected before reading a single body byte.
+    /// Uses the error path (not the Ok(true) short-circuit) so that
+    /// `logging` still runs — the connection gauge stays paired and the
+    /// 413 shows up in metrics and the access log.
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> ProxyResult<bool> {
+        if session.req_header().uri.path().starts_with("/_internal/prewarm/") {
+            let declared = session
+                .req_header()
+                .headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<usize>().ok());
+            if declared.is_some_and(|v| v > PREWARM_MAX_BODY) {
+                return Err(Error::new(ErrorType::HTTPStatus(413)));
+            }
+        }
+        Ok(false)
+    }
+
+    /// Prewarm body-size gate, chunked backstop: content-length can lie
+    /// or be absent, so accumulate actual bytes seen. The error bubbles
+    /// to fail_to_proxy, which writes the 413.
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> ProxyResult<()> {
+        if session.req_header().uri.path().starts_with("/_internal/prewarm/") {
+            if let Some(b) = body {
+                ctx.prewarm_body_bytes = ctx.prewarm_body_bytes.saturating_add(b.len());
+            }
+            if ctx.prewarm_body_bytes > PREWARM_MAX_BODY {
+                return Err(Error::new(ErrorType::HTTPStatus(413)));
+            }
+        }
+        Ok(())
     }
 
     /// Forward to the business plane (loopback, plain HTTP). Timeouts
