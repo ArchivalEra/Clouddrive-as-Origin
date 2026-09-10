@@ -118,8 +118,12 @@ impl RateGate {
         if self.exempt.iter().any(|n| n.contains(&std_addr.ip())) {
             return false;
         }
+        // rps == 0 means rate limiting is disabled — never gate.
         // `observe` counts this request in the 1s window and returns the
         // running count; strictly over the ceiling means refuse.
+        if self.rps == 0 {
+            return false;
+        }
         self.rate.observe(&std_addr.ip().to_string(), 1) > self.rps as isize
     }
 }
