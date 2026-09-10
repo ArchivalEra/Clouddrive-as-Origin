@@ -3,6 +3,12 @@
 # is IPv6-only), so bind [::] not 0.0.0.0.
 front_listen = "[::]:7777"
 front_metrics_listen = "127.0.0.1:9090"
+# Client CIDRs refused at connection time (before TLS handshake).
+front_ip_block = []
+# Client CIDRs exempt from per-IP rate limiting (ops path is never throttled).
+front_ip_allow = []
+# Per-client-IP requests/sec ceiling; Omit = disabled (threshold lands later).
+front_rate_rps = 0
 tls_cert_env = "ORIGIN_TLS_CERT_PATH"
 tls_key_env = "ORIGIN_TLS_KEY_PATH"
 listen_addr = "127.0.0.1:8080"
