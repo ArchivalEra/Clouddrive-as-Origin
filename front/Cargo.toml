@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+bytes = "1"
 async-trait = "0.1"
 http = "1"
 pingora = { version = "0.8", features = ["any_tls", "proxy", "rustls"] }
