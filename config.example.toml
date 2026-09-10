@@ -11,6 +11,16 @@
 front_listen = "0.0.0.0:8443"
 tls_cert_env = "ORIGIN_TLS_CERT_PATH"
 tls_key_env = "ORIGIN_TLS_KEY_PATH"
+# Prometheus metrics listener (loopback only). Distinct port per instance.
+front_metrics_listen = "127.0.0.1:9090"
+# Client CIDRs refused at connection time (before TLS handshake).
+# Bare IP = single host. Example: front_ip_block = ["203.0.113.0/24"]
+front_ip_block = []
+# Client CIDRs exempt from per-IP rate limiting (ops path is never throttled).
+front_ip_allow = []
+# Per-client-IP requests/sec ceiling on the front. Omit = disabled;
+# threshold lands after the real-traffic baseline (wayfinder #45).
+# front_rate_rps = 500
 
 # Business plane (axum on loopback — never exposed directly)
 listen_addr = "127.0.0.1:8080"
