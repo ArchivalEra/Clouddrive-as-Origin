@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use anyhow::Context;
+use ipnet::IpNet;
 use pingora::{
     proxy::{ProxyHttp, Session},
     server::Server,
@@ -32,6 +33,96 @@ use tracing::{info, warn};
 /// the front is abuse and gets rejected before reaching the business
 /// plane (whose token check stays authoritative).
 pub const PREWARM_MAX_BODY: usize = 64 * 1024;
+
+/// Everything the front plane needs at boot. CIDR lists are plain
+/// strings here; parsing (and its errors) happen in this crate so the
+/// config layer stays serializable.
+pub struct FrontOptions {
+    pub front: SocketAddr,
+    pub business: SocketAddr,
+    /// Some((cert, key)) = TLS termination + h2 ALPN; None = plaintext.
+    pub tls: Option<(String, String)>,
+    /// Prometheus listener (loopback); None disables the endpoint.
+    pub metrics: Option<String>,
+    /// Client CIDRs refused at connection time (before TLS handshake).
+    pub ip_block: Vec<String>,
+    /// Client CIDRs exempt from per-IP rate limiting (ops path is never throttled).
+    pub ip_allow: Vec<String>,
+    /// Per-client-IP requests/sec ceiling; None disables rate limiting
+    /// (threshold lands with the real-traffic baseline, map ticket 45).
+    pub rate_rps: Option<u32>,
+}
+
+/// Parse a CIDR allow/block entry; a bare IP is treated as /32 (or /128).
+fn parse_cidr(s: &str) -> anyhow::Result<IpNet> {
+    if s.contains('/') {
+        s.parse::<IpNet>()
+            .with_context(|| format!("parse CIDR {s:?}"))
+    } else {
+        let ip: std::net::IpAddr = s
+            .parse()
+            .with_context(|| format!("parse IP {s:?}"))?;
+        Ok(IpNet::from(ip))
+    }
+}
+
+fn parse_cidrs(list: &[String]) -> anyhow::Result<Vec<IpNet>> {
+    list.iter().map(|s| parse_cidr(s)).collect()
+}
+
+/// Connection-time gate: refused CIDRs never reach the TLS handshake.
+/// The allow list plays no role here — it only exempts from rate
+/// limiting — so an allow entry can never accidentally widen access.
+#[derive(Debug)]
+struct IpFilter {
+    block: Vec<IpNet>,
+}
+
+impl IpFilter {
+    fn accepts(&self, addr: &SocketAddr) -> bool {
+        !self.block.iter().any(|n| n.contains(&addr.ip()))
+    }
+}
+
+#[async_trait::async_trait]
+impl pingora::listeners::ConnectionFilter for IpFilter {
+    async fn should_accept(&self, addr: Option<&SocketAddr>) -> bool {
+        match addr {
+            Some(a) => {
+                let accept = self.accepts(a);
+                if !accept {
+                    warn!(peer = %a, "connection refused by ip blocklist");
+                }
+                accept
+            }
+            // No peer address available — do not guess-block.
+            None => true,
+        }
+    }
+}
+
+/// Per-client-IP rate limiter (sliding window from pingora-limits).
+/// `exempt` CIDRs (the ops path) bypass it entirely.
+struct RateGate {
+    rate: pingora_limits::rate::Rate,
+    rps: u32,
+    exempt: Vec<IpNet>,
+}
+
+impl RateGate {
+    fn exceeds(&self, addr: &pingora::protocols::l4::socket::SocketAddr) -> bool {
+        // UDS peers have no IP to rate-limit; only inet sockets gate.
+        let Some(std_addr) = addr.as_inet() else {
+            return false;
+        };
+        if self.exempt.iter().any(|n| n.contains(&std_addr.ip())) {
+            return false;
+        }
+        // `observe` counts this request in the 1s window and returns the
+        // running count; strictly over the ceiling means refuse.
+        self.rate.observe(&std_addr.ip().to_string(), 1) > self.rps as isize
+    }
+}
 
 /// Per-request front state. `start` exists for the access-log duration
 /// (map ticket 00); the connection gauge lives on `new_ctx`/`logging`
@@ -110,6 +201,7 @@ pub fn acceptor_from_env(
 /// loopback. No cache semantics here — pure byte movement.
 pub struct BusinessProxy {
     pub business: SocketAddr,
+    rate: Option<std::sync::Arc<RateGate>>,
 }
 
 #[async_trait::async_trait]
@@ -128,12 +220,20 @@ impl ProxyHttp for BusinessProxy {
     /// content-length is rejected before reading a single body byte.
     /// Uses the error path (not the Ok(true) short-circuit) so that
     /// `logging` still runs — the connection gauge stays paired and the
-    /// 413 shows up in metrics and the access log.
+    /// 413 shows up in metrics and the access log. The per-IP rate gate
+    /// shares this error-path discipline (429s must be observable).
     async fn request_filter(
         &self,
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> ProxyResult<bool> {
+        if let Some(gate) = self.rate.as_ref() {
+            if let Some(addr) = session.client_addr() {
+                if gate.exceeds(addr) {
+                    return Err(Error::new(ErrorType::HTTPStatus(429)));
+                }
+            }
+        }
         if session.req_header().uri.path().starts_with("/_internal/prewarm/") {
             let declared = session
                 .req_header()
@@ -246,43 +346,58 @@ impl ProxyHttp for BusinessProxy {
     }
 }
 
-/// Run the Pingora front plane. `tls` is `Some((cert, key))` for TLS
-/// termination, `None` for plaintext. `metrics` is the Prometheus
-/// listener address (loopback), `None` disables the endpoint.
-/// Synchronous: Pingora manages its own runtime and signal handling
-/// (SIGTERM/SIGINT graceful shutdown) — must NOT be called from inside a
-/// tokio runtime (run_forever panics with "Cannot start a runtime from
-/// within a runtime"). Call from a dedicated std::thread.
-pub fn run_front(
-    front: SocketAddr,
-    business: SocketAddr,
-    tls: Option<(String, String)>,
-    metrics: Option<String>,
-) -> anyhow::Result<()> {
+/// Run the Pingora front plane (see [`FrontOptions`]). Synchronous:
+/// Pingora manages its own runtime and signal handling (SIGTERM/SIGINT
+/// graceful shutdown) — must NOT be called from inside a tokio runtime
+/// (run_forever panics with "Cannot start a runtime from within a
+/// runtime"). Call from a dedicated std::thread.
+pub fn run_front(opts: FrontOptions) -> anyhow::Result<()> {
     let mut server = Server::new(None).context("create pingora server")?;
     server.bootstrap();
 
-    let proxy = BusinessProxy { business };
+    let ip_allow = parse_cidrs(&opts.ip_allow)?;
+    let rate = opts.rate_rps.map(|rps| {
+        std::sync::Arc::new(RateGate {
+            rate: pingora_limits::rate::Rate::new(std::time::Duration::from_secs(1)),
+            rps,
+            exempt: ip_allow,
+        })
+    });
+
+    let proxy = BusinessProxy {
+        business: opts.business,
+        rate,
+    };
     let mut service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
-    match &tls {
+    if !opts.ip_block.is_empty() {
+        let filter = std::sync::Arc::new(IpFilter {
+            block: parse_cidrs(&opts.ip_block)?,
+        });
+        service.set_connection_filter(filter);
+        info!(count = opts.ip_block.len(), "front ip blocklist active");
+    }
+    if let Some(rps) = opts.rate_rps {
+        info!(rps, "front per-ip rate limit active (allow-exempt)");
+    }
+    match &opts.tls {
         Some((cert, key)) => {
             // add_tls_with_settings + enable_h2: ALPN advertises h2 +
             // http/1.1 so EdgeOne origin-pull negotiates HTTP/2.
             let mut tls_settings = pingora::listeners::tls::TlsSettings::intermediate(cert, key)
                 .with_context(|| format!("load tls material {cert} / {key}"))?;
             tls_settings.enable_h2();
-            service.add_tls_with_settings(&front.to_string(), None, tls_settings);
+            service.add_tls_with_settings(&opts.front.to_string(), None, tls_settings);
         }
         None => {
-            service.add_tcp(&front.to_string());
+            service.add_tcp(&opts.front.to_string());
         }
     }
     server.add_service(service);
 
-    if let Some(metrics_addr) = metrics {
+    if let Some(metrics_addr) = &opts.metrics {
         let mut metrics_service =
             pingora::services::listening::Service::prometheus_http_service();
-        metrics_service.add_tcp(&metrics_addr);
+        metrics_service.add_tcp(metrics_addr);
         server.add_service(metrics_service);
         info!(metrics = %metrics_addr, "front plane metrics enabled");
     }
@@ -294,8 +409,58 @@ pub fn run_front(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn cidr_parsing_and_matching() {
+        let net = parse_cidr("10.1.2.0/24").unwrap();
+        assert!(net.contains(&addr("10.1.2.99:1").ip()));
+        assert!(!net.contains(&addr("10.1.3.1:1").ip()));
+        // bare IP = single-host net
+        let host = parse_cidr("192.0.2.7").unwrap();
+        assert!(host.contains(&addr("192.0.2.7:9").ip()));
+        assert!(!host.contains(&addr("192.0.2.8:9").ip()));
+        // v6
+        let v6 = parse_cidr("2001:db8::/32").unwrap();
+        assert!(v6.contains(&addr("[2001:db8::1]:80").ip()));
+        assert!(parse_cidr("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn ip_filter_blocks_only_listed() {
+        let f = IpFilter {
+            block: vec![parse_cidr("203.0.113.0/24").unwrap()],
+        };
+        assert!(!f.accepts(&addr("203.0.113.5:1")));
+        assert!(f.accepts(&addr("198.51.100.5:1")));
+    }
+
+    #[test]
+    fn rate_gate_exempts_allowlist() {
+        use pingora::protocols::l4::socket::SocketAddr as PSockAddr;
+        let g = RateGate {
+            rate: pingora_limits::rate::Rate::new(std::time::Duration::from_secs(1)),
+            rps: 1,
+            exempt: vec![parse_cidr("127.0.0.0/8").unwrap()],
+        };
+        let loopback = PSockAddr::Inet(addr("127.0.0.1:1"));
+        for _ in 0..10 {
+            assert!(!g.exceeds(&loopback), "exempt ip must never exceed");
+        }
+        // a non-exempt ip exceeds on the 2nd event within the window
+        // (observe counts the current event: 1st = 1 <= rps, 2nd = 2 > rps)
+        let other = PSockAddr::Inet(addr("192.0.2.1:1"));
+        assert!(!g.exceeds(&other));
+        assert!(g.exceeds(&other));
+    }
 
     fn rendered() -> String {
+        use std::io::Write;
+        use prometheus::Encoder as _;
         let families = prometheus::gather();
         let mut buf = vec![];
         prometheus::TextEncoder::new()

@@ -10,7 +10,9 @@ anyhow = "1"
 bytes = "1"
 async-trait = "0.1"
 http = "1"
-pingora = { version = "0.8", features = ["any_tls", "proxy", "rustls"] }
+ipnet = "2"
+pingora = { version = "0.8", features = ["any_tls", "proxy", "rustls", "connection_filter"] }
 pingora-error = "0.8"
+pingora-limits = "0.8"
 prometheus = "0.13"
 tracing = "0.1"

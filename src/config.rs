@@ -176,6 +176,17 @@ pub struct RawConfig {
     /// ports must differ when several instances share a node.
     #[serde(default)]
     pub front_metrics_listen: Option<String>,
+    /// Client CIDRs refused at connection time (before the TLS
+    /// handshake). A bare IP means a single host.
+    #[serde(default)]
+    pub front_ip_block: Vec<String>,
+    /// Client CIDRs exempt from per-IP rate limiting (ops path is never throttled).
+    #[serde(default)]
+    pub front_ip_allow: Vec<String>,
+    /// Per-client-IP requests/sec ceiling on the front. Absent =
+    /// disabled (threshold set after the real-traffic baseline).
+    #[serde(default)]
+    pub front_rate_rps: Option<u32>,
     #[serde(default = "default_cache_dir")]
     pub cache_dir: PathBuf,
 
@@ -238,6 +249,9 @@ pub struct Config {
     pub tls_cert_env: Option<String>,
     pub tls_key_env: Option<String>,
     pub front_metrics_listen: Option<String>,
+    pub front_ip_block: Vec<String>,
+    pub front_ip_allow: Vec<String>,
+    pub front_rate_rps: Option<u32>,
     pub cache_dir: PathBuf,
     pub max_size_bytes: u64,
     pub inactive_ttl_secs: u64,
@@ -375,6 +389,9 @@ impl Config {
             tls_cert_env: raw.tls_cert_env,
             tls_key_env: raw.tls_key_env,
             front_metrics_listen: raw.front_metrics_listen,
+            front_ip_block: raw.front_ip_block,
+            front_ip_allow: raw.front_ip_allow,
+            front_rate_rps: raw.front_rate_rps,
             cache_dir: raw.cache_dir,
             max_size_bytes: raw.max_size_bytes,
             inactive_ttl_secs: raw.inactive_ttl_secs,
@@ -401,6 +418,9 @@ impl Default for Config {
             tls_cert_env: None,
             tls_key_env: None,
             front_metrics_listen: None,
+            front_ip_block: Vec::new(),
+            front_ip_allow: Vec::new(),
+            front_rate_rps: None,
             cache_dir: default_cache_dir(),
             max_size_bytes: default_max_size(),
             inactive_ttl_secs: default_inactive_ttl(),
