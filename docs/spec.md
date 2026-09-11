@@ -229,14 +229,29 @@ repo** — it is injected at runtime via an environment variable (e.g.
     the first segment and correctly did NOT promote (window semantics
     confirmed in real traffic).
 
-    **Parallel segmented cold pull:** large
-    cold misses (> 10 MB) are fetched as N parallel 5 MB Range segments
-    (bounded by the upstream gate, 3 concurrent) and written in order —
-    the edge serves 5 MB segments ~9× faster than 10 MB ones on the same
-    direct link (live-measured: 20×5 MB = 16.4 MB/s vs 10×10 MB =
-    1.7 MB/s). Small files keep the single-stream path. Live numbers:
-    cold pull of 100 MB from GDrive 16.6 MB/s (vs ~7 MB/s
-    single-connection).
+    **Upstream fetch is a single stream (corrected 2026-09-11):** cold
+    misses open ONE upstream stream and pump it to disk while the client
+    reads the growing file. Measured on the real upstream (OpenList →
+    Google Drive, 3.1 GB file, raw curl bypassing this service):
+
+    | upstream fetch | time | throughput |
+    |---|---|---|
+    | single stream | 71 s | 43.8 MB/s |
+    | 100 MB segments × 31, conc 3 | 256 s | 11 MB/s |
+    | 5 MB segments × 614, conc 3 | 292 s | 11 MB/s |
+
+    Every segmented variant is ~4× slower: each upstream request pays a
+    **~800 ms fixed stream-open cost** (a 1 KB Range request also takes
+    ~820 ms — the cost is size-independent), and concurrency saturates
+    near 15 MB/s. One stream pays that cost once.
+
+    **Two hops, opposite optima — do not share one segment size.** An
+    earlier revision fetched upstream in parallel 5 MB segments, applying
+    a measurement taken on the **EdgeOne edge** (client → edge, where
+    large single responses do degrade — see below) to the **upstream hop**,
+    where the opposite holds. The edge still benefits from client-side
+    Range requests; the upstream must not be segmented. Local lab after
+    the fix: 3 GB cold pull 119 s → 52.5 s (27 → 61 MB/s).
 
     **EdgeOne edge behavior (live-measured 2026-09-09):** the edge
     serves 5 MB Range segments at full speed (16 MB/s aggregate) but
@@ -245,10 +260,10 @@ repo** — it is injected at runtime via an environment variable (e.g.
     responses truncate around 70 MB. This is an edge-side platform
     behavior (verified from the origin node itself, ruling out client
     links). Real-world consumers (video seeking, resumable downloads,
-    database clients) use Range requests natively; the 5 MB segment
-    size aligns with the edge's sweet spot. EdgeOne sharded origin-pull
-    is enabled for `cdn-oracle.isui.ren/*` so the edge only
-    origin-pulls missing shards.
+    database clients) use Range requests natively. EdgeOne sharded
+    origin-pull is enabled for `cdn-oracle.isui.ren/*` so the edge only
+    origin-pulls missing shards. **This section governs the client↔edge
+    hop only** — it does not describe the upstream hop above.
 
 ## 4. Upstream details (OpenList WebDAV)
 
