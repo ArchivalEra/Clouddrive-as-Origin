@@ -38,6 +38,9 @@ async fn main() -> anyhow::Result<()> {
             ),
             other => anyhow::bail!("upstream {}: unknown type {other:?} (v1 supports \"openlist\")", u.id),
         };
+        // Timing decorator: every backend call is measured (map #47 T2).
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(origin_cache::backend::TimedBackend::new(backend));
         slots.insert(
             u.id.clone(),
             Arc::new(BackendSlot {

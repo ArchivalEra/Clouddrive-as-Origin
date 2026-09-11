@@ -6,6 +6,7 @@ pub mod config;
 pub mod inflight;
 pub mod key;
 pub mod list;
+pub mod metrics;
 pub mod mime;
 pub mod response;
 pub mod routing;

@@ -220,6 +220,46 @@ pub trait StorageBackend: Send + Sync + 'static {
     fn id(&self) -> &str;
 }
 
+/// Timing decorator (map #47 T2): wraps any `StorageBackend` and records
+/// each call's duration into `backend_call_duration_seconds{op}`. Wired
+/// once at construction so all 14 call sites stay untouched.
+pub struct TimedBackend {
+    inner: std::sync::Arc<dyn StorageBackend>,
+}
+
+impl TimedBackend {
+    pub fn new(inner: std::sync::Arc<dyn StorageBackend>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl StorageBackend for TimedBackend {
+    async fn stat(&self, key: &Key) -> Result<ObjectMeta, BackendError> {
+        crate::metrics::observe_backend("stat", || self.inner.stat(key)).await
+    }
+
+    async fn open(&self, key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
+        crate::metrics::observe_backend("open", || self.inner.open(key, range)).await
+    }
+
+    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
+        crate::metrics::observe_backend("refresh", || self.inner.refresh_if_needed()).await
+    }
+
+    async fn direct_url(&self, key: &Key, viewer_ua: Option<&str>) -> Result<DirectUrl, BackendError> {
+        crate::metrics::observe_backend("direct_url", || self.inner.direct_url(key, viewer_ua)).await
+    }
+
+    async fn list(&self, folder: &str, recursive: bool) -> Result<Vec<ListEntry>, BackendError> {
+        crate::metrics::observe_backend("list", || self.inner.list(folder, recursive)).await
+    }
+
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
