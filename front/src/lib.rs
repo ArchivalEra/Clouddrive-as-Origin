@@ -25,7 +25,8 @@ use pingora::{
 };
 use pingora_error::{Error, ErrorType, Result as ProxyResult};
 use prometheus::{
-    register_int_counter_vec, register_int_gauge, IntCounterVec, IntGauge,
+    register_histogram_vec, register_int_counter_vec, register_int_gauge, HistogramVec,
+    IntCounterVec, IntGauge,
 };
 use tracing::{info, warn};
 
@@ -132,10 +133,24 @@ impl RateGate {
 /// (map ticket 00); the connection gauge lives on `new_ctx`/`logging`
 /// bookends which are both guaranteed to run. `prewarm_body_bytes`
 /// backs the chunked-body cap (content-length lies are caught here).
+///
+/// Latency attribution (map #47): `connected_at` is stamped once the
+/// upstream connection is established, `upstream_ttfb_at` when the
+/// upstream response header arrives — the gaps between these three
+/// instants are what `front_upstream_connect_seconds` and
+/// `front_upstream_ttfb_seconds` report.
 pub struct FrontCtx {
     pub start: Instant,
+    connected_at: Option<Instant>,
+    upstream_ttfb_at: Option<Instant>,
     prewarm_body_bytes: usize,
 }
+
+/// Latency histogram buckets, milliseconds through minutes: the edge
+/// path spans µs (loopback) to minutes (cold multi-GB pull).
+const LATENCY_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 180.0,
+];
 
 // Static metrics land in the global default registry — the same registry
 // PrometheusHttpApp serves (prometheus 0.13, same version pingora uses).
@@ -160,6 +175,33 @@ pub static UPSTREAM_REUSED_TOTAL: std::sync::LazyLock<IntCounterVec> =
         )
         .expect("register front_upstream_reused_total")
     });
+pub static REQUEST_DURATION: std::sync::LazyLock<HistogramVec> = std::sync::LazyLock::new(|| {
+    register_histogram_vec!(
+        "front_request_duration_seconds",
+        "total front request duration",
+        &["proto", "method", "status"],
+        LATENCY_BUCKETS.to_vec()
+    )
+    .expect("register front_request_duration_seconds")
+});
+pub static UPSTREAM_CONNECT: std::sync::LazyLock<HistogramVec> = std::sync::LazyLock::new(|| {
+    register_histogram_vec!(
+        "front_upstream_connect_seconds",
+        "time from request start to upstream connection established",
+        &["proto"],
+        LATENCY_BUCKETS.to_vec()
+    )
+    .expect("register front_upstream_connect_seconds")
+});
+pub static UPSTREAM_TTFB: std::sync::LazyLock<HistogramVec> = std::sync::LazyLock::new(|| {
+    register_histogram_vec!(
+        "front_upstream_ttfb_seconds",
+        "time from request start to upstream response header",
+        &["proto"],
+        LATENCY_BUCKETS.to_vec()
+    )
+    .expect("register front_upstream_ttfb_seconds")
+});
 
 fn proto_of(session: &Session) -> &'static str {
     // RequestHeader derefs to http::request::Parts, which carries the
@@ -216,6 +258,8 @@ impl ProxyHttp for BusinessProxy {
         CONNECTIONS_ACTIVE.inc();
         FrontCtx {
             start: Instant::now(),
+            connected_at: None,
+            upstream_ttfb_at: None,
             prewarm_body_bytes: 0,
         }
     }
@@ -298,20 +342,45 @@ impl ProxyHttp for BusinessProxy {
         Ok(peer)
     }
 
-    /// Connection accounting: new vs reused upstream connections.
+    /// Connection accounting: new vs reused upstream connections, plus
+    /// the connect latency stamp (request start → connection up).
     async fn connected_to_upstream(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         reused: bool,
         _peer: &HttpPeer,
         #[cfg(unix)] _fd: std::os::unix::io::RawFd,
         #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
         _digest: Option<&pingora::protocols::Digest>,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> ProxyResult<()> {
         UPSTREAM_REUSED_TOTAL
             .with_label_values(&[if reused { "true" } else { "false" }])
             .inc();
+        let now = Instant::now();
+        ctx.connected_at = Some(now);
+        UPSTREAM_CONNECT
+            .with_label_values(&[proto_of(session)])
+            .observe((now - ctx.start).as_secs_f64());
+        Ok(())
+    }
+
+    /// Upstream response header arrived (phase #13, before caching) —
+    /// stamp the TTFB point: request start → first upstream byte of
+    /// header. This is the core attribution metric: if it is large while
+    /// the business plane's own serve time is small, the upstream (cloud
+    /// drive) is the bottleneck.
+    async fn upstream_response_filter(
+        &self,
+        session: &mut Session,
+        _upstream_response: &mut pingora::http::ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> ProxyResult<()> {
+        let now = Instant::now();
+        ctx.upstream_ttfb_at = Some(now);
+        UPSTREAM_TTFB
+            .with_label_values(&[proto_of(session)])
+            .observe((now - ctx.start).as_secs_f64());
         Ok(())
     }
 
@@ -329,6 +398,13 @@ impl ProxyHttp for BusinessProxy {
         REQUESTS_TOTAL
             .with_label_values(&[proto_of(session), session.req_header().method.as_str(), &status_of(session)])
             .inc();
+        REQUEST_DURATION
+            .with_label_values(&[
+                proto_of(session),
+                session.req_header().method.as_str(),
+                &status_of(session),
+            ])
+            .observe(ctx.start.elapsed().as_secs_f64());
         CONNECTIONS_ACTIVE.dec();
         let xff = session
             .req_header()
@@ -485,5 +561,49 @@ mod tests {
         assert!(text.contains(r#"front_requests_total{method="GET",proto="h1",status="200"}"#));
         assert!(text.contains(r#"front_upstream_reused_total{reused="true"}"#));
         assert!(text.contains("front_connections_active"));
+    }
+
+    /// T1: the three latency histograms are registered in the same
+    /// process-global registry and expose _bucket/_sum/_count lines.
+    #[test]
+    fn latency_histograms_exposed() {
+        REQUEST_DURATION
+            .with_label_values(&["h2", "GET", "200"])
+            .observe(0.042);
+        UPSTREAM_CONNECT.with_label_values(&["h2"]).observe(0.0003);
+        UPSTREAM_TTFB.with_label_values(&["h2"]).observe(0.85);
+        let text = rendered();
+        for name in [
+            "front_request_duration_seconds",
+            "front_upstream_connect_seconds",
+            "front_upstream_ttfb_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("{name}_bucket")),
+                "{name} missing _bucket"
+            );
+            assert!(text.contains(&format!("{name}_sum")), "{name} missing _sum");
+            assert!(
+                text.contains(&format!("{name}_count")),
+                "{name} missing _count"
+            );
+        }
+        // the observed TTFB sample must be counted
+        assert!(text.contains(r#"front_upstream_ttfb_seconds_count{proto="h2"} 1"#));
+    }
+
+    /// T3 guard: latency label sets are bounded — no path/key/ip labels
+    /// anywhere in the front metrics (high-cardinality = series explosion).
+    #[test]
+    fn latency_labels_are_bounded() {
+        let text = rendered();
+        for line in text.lines().filter(|l| l.starts_with("front_")) {
+            for forbidden in ["path=", "key=", "ip=", "addr="] {
+                assert!(
+                    !line.contains(forbidden),
+                    "high-cardinality label {forbidden} in: {line}"
+                );
+            }
+        }
     }
 }
