@@ -91,13 +91,35 @@ pub fn file_body(path: std::path::PathBuf, offset: u64, len: u64) -> BodyStream 
 /// Stream a file while its driver writes it. Retries `File::open` until
 /// the driver creates the temp file, follows the growing length, and
 /// terminates on Done (EOF) or Failed.
-pub fn growing_reader(flight: std::sync::Arc<FlightShared>) -> BodyStream {
+/// Follow the flight's growing temp file from `start`, yielding at most
+/// `len` bytes (None = to end). This is the single reader for BOTH
+/// whole-file and ranged cold misses: a ranged request waits for the
+/// writer to reach its offset instead of opening a second upstream
+/// connection.
+///
+/// Why converge instead of passing ranged reads through: every upstream
+/// open pays a ~800 ms fixed stream-open cost, so N concurrent Range
+/// requests used to mean N upstream connections (measured: 5 concurrent
+/// ranges -> 5 opens). EdgeOne's sharded origin-pull delivers shards in
+/// ascending offset order, so a shard's offset is normally already
+/// written by the time it is requested — the wait is near-zero in
+/// practice, and a genuine cold seek costs only the full pull it would
+/// have needed anyway.
+pub fn growing_reader_from(
+    flight: std::sync::Arc<FlightShared>,
+    start: u64,
+    len: Option<u64>,
+) -> BodyStream {
     Box::pin(async_stream::try_stream! {
         let mut rx = flight.subscribe();
-        let mut pos: u64 = 0;
+        let mut pos: u64 = start;
+        let mut remaining: Option<u64> = len;
         let mut buf = vec![0u8; 256 * 1024];
         let mut file: Option<tokio::fs::File> = None;
         loop {
+            if remaining == Some(0) {
+                break; // range satisfied
+            }
             // Ensure the temp file exists (driver creates it right after
             // publishing Meta). After the seal-rename, late openers fall
             // back to the final path.
@@ -129,9 +151,16 @@ pub fn growing_reader(flight: std::sync::Arc<FlightShared>) -> BodyStream {
             let f = file.as_mut().unwrap();
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             f.seek(std::io::SeekFrom::Start(pos)).await?;
-            let n = f.read(&mut buf).await?;
+            let want = match remaining {
+                Some(r) => buf.len().min(r as usize),
+                None => buf.len(),
+            };
+            let n = f.read(&mut buf[..want]).await?;
             if n > 0 {
                 pos += n as u64;
+                if let Some(r) = remaining.as_mut() {
+                    *r -= n as u64;
+                }
                 yield Bytes::copy_from_slice(&buf[..n]);
                 continue;
             }
@@ -150,6 +179,11 @@ pub fn growing_reader(flight: std::sync::Arc<FlightShared>) -> BodyStream {
             }
         }
     })
+}
+
+/// Whole-file reader (start 0, no bound). Kept as the common case.
+pub fn growing_reader(flight: std::sync::Arc<FlightShared>) -> BodyStream {
+    growing_reader_from(flight, 0, None)
 }
 
 /// Pump a remote stream into the temp file, publishing progress; then

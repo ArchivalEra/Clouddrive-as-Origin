@@ -794,7 +794,7 @@ impl<C: Clock + Clone> Cache<C> {
         // provider-side object path.
         let backend_key = Key::from_validated(backend_key);
         let flight = self.attach_or_start(&key, backend_key.clone(), &upstream_id, Arc::clone(&slot)).await;
-        self.await_flight(flight, &key, backend_key.as_str(), &upstream_id, slot, range).await
+        self.await_flight(flight, &key, &upstream_id, range).await
     }
 
     /// Serve a complete cached file from disk, if both file and meta exist.
@@ -884,9 +884,7 @@ impl<C: Clock + Clone> Cache<C> {
         &self,
         flight: Arc<FlightShared>,
         key: &str,
-        backend_key: &str,
         upstream_id: &str,
-        slot: Arc<BackendSlot>,
         range: Option<crate::backend::ByteRange>,
     ) -> Result<CacheHit, BackendError> {
         let mut rx = flight.subscribe();
@@ -922,16 +920,21 @@ impl<C: Clock + Clone> Cache<C> {
                             });
                         }
                         Some(r) => {
-                            // Dual-channel: client stream passes through at
-                            // the offset; the flight keeps filling the cache.
+                            // Converge on the flight instead of opening a
+                            // second upstream connection. Each upstream open
+                            // costs ~800 ms and N concurrent ranges used to
+                            // mean N opens (measured: 5 -> 5). The reader
+                            // waits for the writer to reach this offset; a
+                            // cold seek costs only the full pull it needed
+                            // anyway, and EdgeOne delivers shards in
+                            // ascending order so the wait is normally zero.
                             if r.offset >= meta.size_bytes {
                                 return Err(BackendError::RangeNotSatisfiable);
                             }
-                            let _permit = slot.gate.acquire().await;
-                            let src = slot.backend.open(&Key::from_validated(backend_key.to_string()), Some(r)).await?;
                             let end = r
                                 .length
                                 .map_or(meta.size_bytes.saturating_sub(1), |l| (r.offset + l - 1).min(meta.size_bytes - 1));
+                            let want = end.saturating_sub(r.offset).saturating_add(1);
                             return Ok(CacheHit {
                                 outcome: CacheOutcome::Miss,
                                 meta: meta_out,
@@ -940,8 +943,8 @@ impl<C: Clock + Clone> Cache<C> {
                                     last: end,
                                     total: meta.size_bytes,
                                 }),
-                                content_length: Some(end.saturating_sub(r.offset).saturating_add(1)),
-                                body: flight::passthrough_body(src),
+                                content_length: Some(want),
+                                body: flight::growing_reader_from(flight, r.offset, Some(want)),
                             });
                         }
                     }
@@ -1002,7 +1005,7 @@ impl<C: Clock + Clone> Cache<C> {
         tokio::spawn(async move {
             drive_flight(driver_f, driver_slot, driver_backend_key, entry_key, driver_up, cfg, state, meta_store, flights_none(), clock).await;
         });
-        self.await_flight(flight, &key, backend_key.as_str(), &upstream_id, slot, range).await
+        self.await_flight(flight, &key, &upstream_id, range).await
     }
 
     async fn entry_meta(&self, key: &str) -> Option<EntryMeta> {
