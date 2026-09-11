@@ -564,6 +564,7 @@ dependencies = [
  "mime_guess",
  "origin-front",
  "percent-encoding",
+ "prometheus",
  "rcgen",
  "redb",
  "reqwest",

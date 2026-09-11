@@ -341,6 +341,17 @@ impl<C: Clock + Clone> Cache<C> {
         rk: &ResolvedKey,
         range: Option<crate::backend::ByteRange>,
     ) -> Result<PassthroughHit, BackendError> {
+        let start = std::time::Instant::now();
+        let out = self.serve_nocache_inner(rk, range).await;
+        crate::metrics::observe_serve(if out.is_ok() { "nocache" } else { "nocache_error" }, start);
+        out
+    }
+
+    async fn serve_nocache_inner(
+        &self,
+        rk: &ResolvedKey,
+        range: Option<crate::backend::ByteRange>,
+    ) -> Result<PassthroughHit, BackendError> {
         let slot = self
             .backends
             .get(&rk.upstream_id)
@@ -392,6 +403,21 @@ impl<C: Clock + Clone> Cache<C> {
     /// min_file_size`) and every failure fall back to the B path in the
     /// caller — this method never serves from disk.
     pub async fn serve_passthrough(
+        &self,
+        rk: &ResolvedKey,
+        range: Option<crate::backend::ByteRange>,
+        min_file_size: u64,
+    ) -> Result<PassthroughHit, BackendError> {
+        let start = std::time::Instant::now();
+        let out = self.serve_passthrough_inner(rk, range, min_file_size).await;
+        crate::metrics::observe_serve(
+            if out.is_ok() { "passthrough" } else { "passthrough_error" },
+            start,
+        );
+        out
+    }
+
+    async fn serve_passthrough_inner(
         &self,
         rk: &ResolvedKey,
         range: Option<crate::backend::ByteRange>,
@@ -658,6 +684,21 @@ impl<C: Clock + Clone> Cache<C> {
     /// Sharing one namespace would collide flights and entries across
     /// upstreams, so the split is load-bearing, not cosmetic.
     pub async fn get_resolved(
+        &self,
+        rk: &ResolvedKey,
+        range: Option<crate::backend::ByteRange>,
+    ) -> Result<CacheHit, BackendError> {
+        let start = std::time::Instant::now();
+        let out = self.get_resolved_inner(rk, range).await;
+        let label = match &out {
+            Ok(hit) => format!("{:?}", hit.outcome),
+            Err(_) => "error".to_string(),
+        };
+        crate::metrics::observe_serve(&label, start);
+        out
+    }
+
+    async fn get_resolved_inner(
         &self,
         rk: &ResolvedKey,
         range: Option<crate::backend::ByteRange>,

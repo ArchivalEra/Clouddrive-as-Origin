@@ -49,6 +49,9 @@ getrandom = "0.2"
 hmac = "0.12"
 sha2 = "0.10"
 chrono = "0.4"
+# Process-global metric registry — same crate/version the front plane
+# serves (map #47: one /metrics endpoint for both planes).
+prometheus = "0.13"
 origin-front = { path = "front" }
 
 [dev-dependencies]
