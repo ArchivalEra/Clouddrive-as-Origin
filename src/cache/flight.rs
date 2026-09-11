@@ -214,10 +214,14 @@ pub async fn pump_and_seal_parallel(
     use tokio::io::AsyncWriteExt;
 
     let n_segs = total.div_ceil(seg);
-    // Fetch all segments in parallel (bounded by the gate), each into
-    // memory. Order is preserved by collecting into a Vec indexed by
-    // segment number.
-    let segs: Vec<Result<Vec<u8>, BackendError>> = stream::iter(0..n_segs)
+    // Stream, don't collect: `buffered` runs up to `conc` segment fetches
+    // concurrently but yields them in order, so each segment is written
+    // (and announced via `Growing`) as soon as its predecessors have
+    // landed. Collecting first would hold the whole file in memory and
+    // leave the client silent until the last segment arrived — the two
+    // faults this fixes (map #47 review, candidates 1 and 2).
+    const CONC: usize = 3;
+    let mut segs = stream::iter(0..n_segs)
         .map(|i| {
             let slot = slot.clone();
             let key = backend_key.clone();
@@ -231,29 +235,39 @@ pub async fn pump_and_seal_parallel(
                 src.stream.read_to_end(&mut buf).await.map_err(|e| {
                     crate::backend::BackendError::ServerError(format!("read seg {i}: {e}"))
                 })?;
-                Ok(buf)
+                Ok::<(u64, Vec<u8>), BackendError>((start, buf))
             }
         })
-        .buffer_unordered(3)
-        .collect()
-        .await;
+        .buffered(CONC);
 
-    let mut out = tokio::fs::File::create(tmp_path)
-        .await
-        .map_err(|e| crate::backend::BackendError::Other(format!("create tmp: {e}")))?;
+    let mut out = match tokio::fs::File::create(tmp_path).await {
+        Ok(f) => f,
+        Err(e) => return Err(crate::backend::BackendError::Other(format!("create tmp: {e}"))),
+    };
     let mut written: u64 = 0;
-    for (i, r) in segs.into_iter().enumerate() {
-        let buf = r?;
-        if buf.len() as u64 != seg.min(total - i as u64 * seg) {
+    while let Some(r) = segs.next().await {
+        let (start, buf) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                // Partial write must not survive as a cache entry: drop
+                // the tmp so the startup sweep has nothing to find and a
+                // retry starts clean (map #47 review, Q2).
+                let _ = tokio::fs::remove_file(tmp_path).await;
+                return Err(e);
+            }
+        };
+        let expected = seg.min(total - start);
+        if buf.len() as u64 != expected {
+            let _ = tokio::fs::remove_file(tmp_path).await;
             return Err(crate::backend::BackendError::ServerError(format!(
-                "seg {i} short: {} vs {}",
-                buf.len(),
-                seg.min(total - i as u64 * seg)
+                "seg @{start} short: {} vs {expected}",
+                buf.len()
             )));
         }
-        out.write_all(&buf)
-            .await
-            .map_err(|e| crate::backend::BackendError::Other(format!("write tmp: {e}")))?;
+        if let Err(e) = out.write_all(&buf).await {
+            let _ = tokio::fs::remove_file(tmp_path).await;
+            return Err(crate::backend::BackendError::Other(format!("write tmp: {e}")));
+        }
         written += buf.len() as u64;
         let _ = tx.send(FlightProgress::Growing(written));
     }
@@ -352,5 +366,88 @@ mod tests {
         driver.await.unwrap();
         assert_eq!(out1, payload);
         assert_eq!(out2, payload);
+    }
+
+    /// The parallel pump must stream, not collect: a reader has to see
+    /// early bytes while later segments are still being fetched. This
+    /// guards the regression that made TTFB equal to the whole download
+    /// (map #47 review, candidate 1).
+    #[tokio::test]
+    async fn parallel_pump_streams_before_completion() {
+        use crate::backend::{BackendError, ByteRange, Key, ListEntry, ObjectMeta as M, StorageBackend, StreamSource};
+        use std::sync::Arc;
+
+        // Backend that serves `total` bytes, delaying the LAST segment so
+        // the first segments land well before completion.
+        struct SlowTail {
+            total: u64,
+        }
+        #[async_trait::async_trait]
+        impl StorageBackend for SlowTail {
+            async fn stat(&self, _k: &Key) -> Result<M, BackendError> {
+                Ok(M { size_bytes: self.total, etag: None, last_modified: None, mime_hint: None })
+            }
+            async fn open(&self, _k: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
+                let (start, len) = match range {
+                    Some(r) => (r.offset, r.length.unwrap_or(self.total - r.offset)),
+                    None => (0, self.total),
+                };
+                if start + len >= self.total {
+                    // last segment: stall so the earlier writes are observable
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                }
+                let data: Vec<u8> = (0..len).map(|i| ((start + i) % 251) as u8).collect();
+                Ok(StreamSource { stream: Box::new(std::io::Cursor::new(data)), total_len: Some(len) })
+            }
+            async fn refresh_if_needed(&self) -> Result<(), BackendError> { Ok(()) }
+            async fn list(&self, _f: &str, _r: bool) -> Result<Vec<ListEntry>, BackendError> { Ok(vec![]) }
+            fn id(&self) -> &str { "slowtail" }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".tmp.par");
+        let finalp = dir.path().join("par.bin");
+        let total = 15 * 1024 * 1024u64; // 3 segments of 5MB
+        let slot = crate::backend::BackendSlot {
+            backend: Arc::new(SlowTail { total }),
+            gate: Arc::new(tokio::sync::Semaphore::new(3)),
+        };
+        let flight = std::sync::Arc::new(FlightShared::new(tmp.clone(), finalp.clone()));
+
+        let driver = {
+            let flight = flight.clone();
+            tokio::spawn(async move {
+                pump_and_seal_parallel(
+                    &slot,
+                    &Key::from_validated("x".into()),
+                    total,
+                    5 * 1024 * 1024,
+                    &tmp,
+                    &finalp,
+                    &flight.progress_tx,
+                )
+                .await
+                .unwrap();
+                let _ = flight.progress_tx.send(FlightProgress::Done);
+            })
+        };
+
+        // Subscribe and assert bytes arrive BEFORE the driver finishes.
+        let mut body = growing_reader(flight.clone());
+        use futures::StreamExt;
+        let first = tokio::time::timeout(std::time::Duration::from_millis(250), body.next()).await;
+        assert!(
+            first.is_ok() && first.as_ref().unwrap().is_some(),
+            "no bytes before completion — pump collected instead of streaming"
+        );
+        assert!(!driver.is_finished(), "driver finished before first byte observed");
+
+        // Drain the rest and verify integrity.
+        let mut got = first.unwrap().unwrap().unwrap().len();
+        while let Some(c) = body.next().await {
+            got += c.unwrap().len();
+        }
+        driver.await.unwrap();
+        assert_eq!(got as u64, total);
     }
 }
