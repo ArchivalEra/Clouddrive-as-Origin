@@ -1470,29 +1470,23 @@ async fn drive_flight<C: Clock>(
         let _permit = slot.gate.acquire().await;
         let meta = slot.backend.stat(&backend_key).await?;
         let _ = flight.progress_tx.send(FlightProgress::Meta(meta.clone()));
-        // Parallel segmented pull: the edge
-        // (EdgeOne) serves 5MB Range segments ~9x faster than 10MB ones
-        // (live-measured: 20x5MB = 16.4MB/s vs 10x10MB = 1.7MB/s on the
-        // same direct link), so large cold misses are fetched as N
-        // parallel segments and written in order. Small files (< 2
-        // segments) fall back to the single-stream path.
-        let total = meta.size_bytes;
-        const SEG: u64 = 5 * 1024 * 1024;
-        if total > SEG * 2 {
-            flight::pump_and_seal_parallel(
-                &slot,
-                &backend_key,
-                total,
-                SEG,
-                &flight.tmp_path,
-                &flight.final_path,
-                &flight.progress_tx,
-            )
-            .await?;
-        } else {
-            let src = slot.backend.open(&backend_key, None).await?;
-            flight::pump_and_seal(src, &flight.tmp_path, &flight.final_path, &flight.progress_tx).await?;
-        }
+        // Upstream fetch is ALWAYS a single stream. Measured on the real
+        // upstream (OpenList -> Google Drive, 3.1 GB file):
+        //   single stream         71 s   43.8 MB/s
+        //   100 MB segments x31  256 s   11 MB/s
+        //   5 MB segments x614   292 s   11 MB/s
+        // Every segmented variant is ~4x slower because each upstream
+        // request pays a ~800 ms fixed stream-open cost (a 1 KB Range
+        // request also takes ~820 ms), and concurrency does not stack
+        // past ~15 MB/s. One stream pays that cost once.
+        //
+        // The earlier parallel pump applied a measurement taken on the
+        // EdgeOne edge (client -> edge, where large single responses do
+        // degrade) to this hop, where the opposite holds. The client
+        // still reads a growing stream; only the upstream fetch strategy
+        // changed.
+        let src = slot.backend.open(&backend_key, None).await?;
+        flight::pump_and_seal(src, &flight.tmp_path, &flight.final_path, &flight.progress_tx).await?;
         Ok::<ObjectMeta, BackendError>(meta)
     }
     .await;
