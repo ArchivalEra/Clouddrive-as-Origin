@@ -99,6 +99,47 @@ pub fn has_room_for(path: &Path, want: u64, reserve: u64) -> bool {
     }
 }
 
+/// Every durable cached object file under `cache_dir`, as (key, size) —
+/// the inverse of [`file_path`]. Only NESTED files are objects: every
+/// ephemeral artifact (`.tmp.*`, `.seg.*`, `.segpart.*`, `.segmeta.*`) is
+/// written flat into the top level, so a walk that skips dot-prefixed
+/// top-level names and recurses into directories sees exactly the object
+/// tree.
+///
+/// Why it exists: after metadata loss (corrupt redb, a manual `rm`), the
+/// entry rows are gone but the bytes are not. Without this, those files
+/// are neither served (`serve_from_disk` needs a row) nor reaped — they
+/// leak silently, which is what the runbook used to paper over.
+pub fn scan_object_files(cache_dir: &Path) -> Vec<(String, u64)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, u64)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Top-level dot-entries are ephemeral, never objects.
+            if dir == root && name.starts_with('.') {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => walk(&path, root, out),
+                Ok(t) if t.is_file() => {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        let key = rel.to_string_lossy().replace('\\', "/");
+                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        if !key.is_empty() {
+                            out.push((key, size));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(cache_dir, cache_dir, &mut out);
+    out
+}
+
 /// Remove `.tmp.*` files older than `ttl_ms` (P56). Startup sweeps every
 /// tmp; this periodic form must be age-guarded, because an in-flight cold
 /// pull's temp file is young and must not be deleted underneath its driver.

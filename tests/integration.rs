@@ -1184,3 +1184,72 @@ fn disk_room_check_respects_the_reserve() {
     // Unknown path must not block serving (None -> true).
     assert!(has_room_for(std::path::Path::new("/nonexistent/probe/path"), 1, 0));
 }
+
+// ---------------------------------------------------------------------------
+// #57: metadata loss must degrade, not crash-loop, and the bytes on disk
+// must not become orphans.
+// ---------------------------------------------------------------------------
+
+/// An unopenable metadata file must not kill the process: the store
+/// quarantines it and opens fresh (before this it propagated into a boot
+/// panic, and with Restart=always a crash loop).
+#[test]
+fn unopenable_metadata_is_quarantined_not_fatal() {
+    use origin_cache::cache::persist::MetaStore;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("redb.db");
+    // A directory where the db file belongs: redb cannot open it.
+    std::fs::create_dir_all(path.join("child")).unwrap();
+    let store = MetaStore::open(&path).expect("open must degrade, not error out");
+    drop(store);
+    assert!(path.is_file(), "a real db file must exist after the quarantine");
+    let stray: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("corrupt"))
+        .collect();
+    assert!(!stray.is_empty(), "the bad path should be moved aside, not silently dropped");
+}
+
+/// A corrupt-but-openable store yields no rows; a cache started on it must
+/// rebuild entry rows from the object files so the bytes stay served.
+#[tokio::test]
+async fn metadata_loss_rebuilds_rows_from_the_object_tree() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let cfg = test_config(dir.path().to_path_buf());
+    let backend = CountingBackend {
+        bytes: b"payload".to_vec(),
+        etag: Some("v1".into()),
+        calls: Arc::new(AtomicUsize::new(0)),
+        fail: None,
+    };
+
+    // First cache: store an object normally.
+    {
+        let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend.clone()))));
+        cache.load_and_start().await;
+        let mut hit = cache.get("kept.bin", None).await.unwrap();
+        assert_eq!(read_body(&mut hit.body).await, b"payload");
+        wait_installed(&cache, "kept.bin").await;
+    }
+
+    // Simulate metadata loss: wipe the store's rows by removing redb.db
+    // while leaving the object file in place (the runbook's recovery step).
+    std::fs::remove_file(cfg.cache_dir.join("redb.db")).unwrap();
+    assert!(cfg.cache_dir.join("kept.bin").exists(), "object file survived");
+
+    // Second cache: no rows exist, but the object does -- rebuild it.
+    let cache2 = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+    cache2.load_and_start().await;
+
+    {
+        let s = cache2.state.read().await;
+        assert!(
+            s.entries.contains_key("kept.bin"),
+            "the row must be rebuilt from the object tree (got {:?})",
+            s.entries.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(s.entries.get("kept.bin").unwrap().size_bytes, 7);
+    }
+}

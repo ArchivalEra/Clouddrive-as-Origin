@@ -310,7 +310,22 @@ impl<C: Clock + Clone> Cache<C> {
         let (ledger, staged) = store::scan_segments(&self.config.cache_dir, self.clock.now_millis());
         *self.coverage.lock().await = ledger;
 
-        let persisted = self.meta.load_all().await.unwrap_or_default();
+        // Metadata load failures used to be swallowed by
+        // `unwrap_or_default()` (ticket #57): a corrupt store started the
+        // node with ZERO entries while every cached file sat on disk as an
+        // orphan — served by nothing, reaped by nothing, and reported by
+        // nothing. Log it, then rebuild from the object tree below.
+        let persisted = match self.meta.load_all().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "metadata load failed; rebuilding entry rows from the object tree"
+                );
+                Vec::new()
+            }
+        };
+        let loaded = persisted.len();
         let mut state = self.state.write().await;
         state.segment_bytes = staged;
         for m in persisted {
@@ -321,6 +336,45 @@ impl<C: Clock + Clone> Cache<C> {
             } else {
                 // File lost while we were down — drop the row too.
                 let _ = self.meta.remove(&m.key).await;
+            }
+        }
+        // Rebuild path (ticket #57): rows missing but bytes present means
+        // metadata was lost (corrupt store, manual `rm redb.db`). Recreate
+        // an entry per surviving object file so the bytes stay served and
+        // reaped instead of leaking. ETag/mtime are unknown, so the rows
+        // carry none: the first access re-stats the upstream and installs
+        // the real metadata (the same revalidation path as any stale row).
+        let now = self.clock.now_millis();
+        let needs_rebuild = state.entries.is_empty();
+        // Release the state guard before touching redb (C3 lock discipline):
+        // the rebuild below persists rows.
+        drop(state);
+        if needs_rebuild {
+            let found = store::scan_object_files(&self.config.cache_dir);
+            if !found.is_empty() {
+                tracing::warn!(
+                    files = found.len(),
+                    "no metadata rows but object files exist; rebuilding entries from disk"
+                );
+                let mut rebuilt: Vec<EntryMeta> = Vec::with_capacity(found.len());
+                for (key, size) in found {
+                    let upstream_id = self.routes.resolve(&key).to_string();
+                    rebuilt.push(EntryMeta {
+                        version: 1,
+                        upstream_id,
+                        key,
+                        size_bytes: size,
+                        etag: None,
+                        last_modified: None,
+                        content_type: None,
+                        created_at_millis: now,
+                        last_access_millis: now,
+                        last_revalidated_millis: None,
+                        negative_until_millis: None,
+                    });
+                }
+                let meta_store = Arc::clone(&self.meta);
+                rebuild_entries(&meta_store, &self.state, rebuilt, loaded).await;
             }
         }
 
@@ -1876,6 +1930,31 @@ async fn insert_meta(
         evict_pick(&mut s, config)
     };
     remove_entries(config, meta_store, &evicted).await;
+}
+
+/// Persist rebuilt rows and install them into memory (ticket #57).
+/// Persist-guard-free-then-one-write-stretch, matching the C3 discipline
+/// used by `insert_meta`.
+async fn rebuild_entries(
+    meta_store: &crate::cache::persist::MetaStore,
+    state: &Arc<RwLock<CacheState>>,
+    rebuilt: Vec<EntryMeta>,
+    loaded: usize,
+) {
+    for entry in &rebuilt {
+        if let Err(e) = meta_store.insert(entry).await {
+            tracing::error!(key = %entry.key, error = %e, "rebuild: redb insert failed");
+        }
+    }
+    {
+        let mut s = state.write().await;
+        for entry in rebuilt {
+            s.total_bytes += entry.size_bytes;
+            s.entries.insert(entry.key.clone(), entry);
+        }
+    }
+    let n = state.read().await.entries.len();
+    tracing::info!(rows = n, loaded, "entry rows rebuilt");
 }
 
 /// Inactive-expiry collection — memory only. Persistence and file
