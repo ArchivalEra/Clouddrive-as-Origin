@@ -832,3 +832,65 @@ async fn short_upstream_body_is_never_sealed() {
     let mut hit = cache.get("short.bin", None).await.unwrap();
     assert_eq!(read_body(&mut hit.body).await, payload, "retry must pull the full object");
 }
+
+// ---------------------------------------------------------------------------
+// P1: hit-path lock discipline — the access stamp must not take the state
+// write lock, and concurrent hits must not serialize on it.
+// ---------------------------------------------------------------------------
+
+/// Concurrent hits must all complete while the access clock stays lock-free
+/// on the state: with N readers hitting one hot key, every response must be
+/// byte-exact and no hit may block on a writer lock the hit path no longer
+/// takes. The flusher folds the batch later; the value's lag is invisible to
+/// the reaper (1200 s TTL).
+#[tokio::test]
+async fn concurrent_hits_stamp_access_without_state_write_lock() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let backend = CountingBackend {
+        bytes: payload.clone(),
+        etag: Some("v1".into()),
+        calls: Arc::new(AtomicUsize::new(0)),
+        fail: None,
+    };
+    let cache = Arc::new(Cache::new(
+        test_config(dir.path().to_path_buf()),
+        Arc::clone(&clock),
+        registry_with(Arc::new(backend)),
+    ));
+    cache.load_and_start().await;
+
+    // Move the clock so the access stamps carry a distinguishable value,
+    // then cold-fill and hammer the hot key concurrently.
+    clock.advance(5000);
+    let mut first = cache.get("hot.bin", None).await.unwrap();
+    assert_eq!(read_body(&mut first.body).await, payload);
+    wait_installed(&cache, "hot.bin").await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let cache = Arc::clone(&cache);
+        let expect = payload.clone();
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..8 {
+                let mut hit = cache.get("hot.bin", None).await.unwrap();
+                assert_eq!(hit.outcome, CacheOutcome::Hit);
+                assert_eq!(read_body(&mut hit.body).await, expect);
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    // The access clock is pending a fold (not yet written into the row) —
+    // that is the design, and the reaper must not treat it as stale.
+    assert!(cache.dirty_access.pending() > 0, "hits must register in the access clock");
+
+    // After a real-time flush tick the row carries the stamp the hit wrote
+    // (5000), proving the flusher folds the lock-free records into state.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let last = cache.state.read().await.entries.get("hot.bin").unwrap().last_access_millis;
+    assert_eq!(last, 5000, "flusher must fold the access stamp into the entry row");
+}

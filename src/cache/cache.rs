@@ -65,7 +65,7 @@ fn hit_meta_remote(key: &str, m: &ObjectMeta) -> HitMeta {
     }
 }
 
-fn hit_meta_entry(key: &str, m: &EntryMeta) -> HitMeta {
+fn hit_meta_entry(key: &str, m: &EntryHeaders) -> HitMeta {
     HitMeta {
         size: m.size_bytes,
         etag: m.etag.clone(),
@@ -116,6 +116,75 @@ impl Default for CacheState {
     }
 }
 
+/// Lock-free access clock: the per-hit alternative to taking the state
+/// write lock to stamp `last_access_millis` (audit P1). Hits record into
+/// sharded maps without any exclusive lock; the one-second flusher folds
+/// the batch into `CacheState` (and redb) in a single write stretch.
+///
+/// Lag bound: a hit's timestamp is visible to the reaper/evictor within
+/// one flush tick (<= ~1 s). Both readers use the value only against a
+/// 1200 s TTL (reap) or for relative LRU ordering, so sub-second lag is
+/// invisible — verified in the audit (readers: `reap_collect`,
+/// `eligible_at`).
+#[derive(Debug, Default)]
+pub struct AccessClock {
+    shards: [Mutex<HashMap<String, u64>>; ACCESS_SHARDS],
+    pending: std::sync::atomic::AtomicUsize,
+}
+
+const ACCESS_SHARDS: usize = 16;
+
+fn shard_of(key: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    (h.finish() as usize) % ACCESS_SHARDS
+}
+
+impl AccessClock {
+    pub fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Record an access. Never takes the state lock; a key that is absent
+    /// from the entry map is harmless (the flusher's fold is a no-op).
+    pub async fn touch(&self, key: &str, now_millis: u64) {
+        let mut s = self.shards[shard_of(key)].lock().await;
+        s.insert(key.to_string(), now_millis);
+        self.pending.store(s.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drain every shard for the flusher; returns the batch and shrinks the
+    /// pending gauge.
+    pub async fn drain(&self) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let mut g = shard.lock().await;
+            out.extend(g.drain());
+        }
+        self.pending.store(0, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
+    pub fn pending(&self) -> usize {
+        self.pending.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The five entry fields the disk-hit path needs, copied out under one
+/// read guard (P1).
+#[derive(Debug, Clone)]
+struct EntryHeaders {
+    size_bytes: u64,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    content_type: Option<String>,
+    negative: bool,
+}
+
 /// Owned healthz view of the cache machinery (C4).
 #[derive(Debug, Clone)]
 pub struct CacheSnapshot {
@@ -142,9 +211,10 @@ pub struct Cache<C: Clock> {
     /// redb-backed metadata persistence (spec §3.10: entries + access clock
     /// + eviction order survive restarts).
     pub meta: Arc<crate::cache::persist::MetaStore>,
-    /// Access-clock bumps awaiting the coalesced flush (R1: per-hit fsync
-    /// would bottleneck; flush at most once per second).
-    pub dirty_access: Arc<Mutex<HashMap<String, u64>>>,
+    /// Access-clock bumps awaiting the coalesced fold (R1: per-hit fsync
+    /// would bottleneck; fold at most once per second). Lock-free on the
+    /// hit path — see [`AccessClock`].
+    pub dirty_access: Arc<AccessClock>,
     /// In-flight cold-miss downloads, keyed by cache key. The flight
     /// module owns joining, driver spawning, panic guarding and map
     /// hygiene; the Cache only supplies the driver policy.
@@ -169,7 +239,7 @@ impl<C: Clock + Clone> Cache<C> {
     pub fn new(config: Arc<Config>, clock: Arc<C>, backends: BackendRegistry) -> Self {
         let routes = config.routes.clone();
         let meta = Arc::new(crate::cache::persist::MetaStore::open(&config.cache_dir.join("redb.db")).expect("open redb metadata store"));
-        let dirty_access = Arc::new(Mutex::new(HashMap::new()));
+        let dirty_access = Arc::new(AccessClock::new());
         Self {
             config,
             clock,
@@ -223,14 +293,26 @@ impl<C: Clock + Clone> Cache<C> {
         // no matter the hit rate (R1: fsync is the bottleneck).
         let dirty = Arc::clone(&self.dirty_access);
         let meta = Arc::clone(&self.meta);
+        let state = Arc::clone(&self.state);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(1000));
             loop {
                 tick.tick().await;
-                let batch: Vec<(String, u64)> = {
-                    let mut d = dirty.lock().await;
-                    d.drain().collect()
-                };
+                let batch = dirty.drain().await;
+                if batch.is_empty() {
+                    continue;
+                }
+                // One write stretch folds the whole batch into memory
+                // (P1: the hit path no longer touches this lock) ...
+                {
+                    let mut s = state.write().await;
+                    for (key, ms) in &batch {
+                        if let Some(m) = s.entries.get_mut(key) {
+                            m.last_access_millis = *ms;
+                        }
+                    }
+                }
+                // ... then the per-key redb writes (batched separately: P5).
                 for (key, ms) in batch {
                     if let Err(e) = meta.bump_last_access(&key, ms).await {
                         tracing::warn!(key = %key, error = %e, "access-clock flush failed");
@@ -272,7 +354,7 @@ impl<C: Clock + Clone> Cache<C> {
             segment_bytes,
             flights_active: self.flights.active().await,
             promotions_active: self.promotions.lock().await.len(),
-            dirty_access_pending: self.dirty_access.lock().await.len(),
+            dirty_access_pending: self.dirty_access.pending(),
         }
     }
 
@@ -339,7 +421,14 @@ impl<C: Clock + Clone> Cache<C> {
                     // never move — flights and file reads stay untouched).
                     let age = now.saturating_sub(meta.last_revalidated_millis.unwrap_or(meta.created_at_millis));
                     if age <= self.config.revalidate_ttl_secs * 1000 {
-                        let hit = hit_meta_entry(&key, meta);
+                        let hdrs = EntryHeaders {
+                            size_bytes: meta.size_bytes,
+                            etag: meta.etag.clone(),
+                            last_modified: meta.last_modified.clone(),
+                            content_type: meta.content_type.clone(),
+                            negative: false,
+                        };
+                        let hit = hit_meta_entry(&key, &hdrs);
                         drop(s);
                         self.bump_last_access(&key).await;
                         return Ok(hit);
@@ -793,28 +882,25 @@ impl<C: Clock + Clone> Cache<C> {
             .ok_or_else(|| BackendError::Other(format!("unknown upstream {upstream_id}")))?;
         let now = self.clock.now_millis();
 
-        // Negative cache (cheap read, not single-flighted).
-        {
+        // One read pass answers all three questions the hit path asks
+        // (P1: negative tombstone? revalidate due? what etag is on file?)
+        // instead of taking the read lock three separate times.
+        let (needs_revalidate, cached_etag) = {
             let s = self.state.read().await;
-            if let Some(meta) = s.entries.get(&key) {
-                if meta.is_negative(now) {
-                    return Err(BackendError::NotFound);
+            match s.entries.get(&key) {
+                Some(meta) => {
+                    if meta.is_negative(now) {
+                        return Err(BackendError::NotFound);
+                    }
+                    if meta.negative_until_millis.is_some() {
+                        (false, None)
+                    } else {
+                        let age = now
+                            .saturating_sub(meta.last_revalidated_millis.unwrap_or(meta.created_at_millis));
+                        (age > self.config.revalidate_ttl_secs * 1000, meta.etag.clone())
+                    }
                 }
-            }
-        }
-
-        let needs_revalidate = {
-            let s = self.state.read().await;
-            if let Some(meta) = s.entries.get(&key) {
-                if meta.negative_until_millis.is_some() {
-                    false
-                } else {
-                    let age =
-                        now.saturating_sub(meta.last_revalidated_millis.unwrap_or(meta.created_at_millis));
-                    age > self.config.revalidate_ttl_secs * 1000
-                }
-            } else {
-                false
+                None => (false, None),
             }
         };
 
@@ -829,10 +915,6 @@ impl<C: Clock + Clone> Cache<C> {
         } else {
             // Revalidation = stat + etag compare (G2 #11: Drive has no 304;
             // stat-compare is provider-uniform and costs no bytes).
-            let cached_etag = {
-                let s = self.state.read().await;
-                s.entries.get(&key).and_then(|m| m.etag.clone())
-            };
             let stat = self
                 .reval_inflight
                 .run(format!("reval:{key}"), || {
@@ -887,7 +969,7 @@ impl<C: Clock + Clone> Cache<C> {
         range: Option<crate::backend::ByteRange>,
     ) -> Result<Option<CacheHit>, BackendError> {
         let m = match self.entry_meta(key).await {
-            Some(m) if m.negative_until_millis.is_none() => m,
+            Some(m) if !m.negative => m,
             _ => return Ok(None),
         };
         let path = store::file_path(&self.config.cache_dir, key);
@@ -1074,21 +1156,23 @@ impl<C: Clock + Clone> Cache<C> {
         self.await_flight(flight, &key, &upstream_id, range).await
     }
 
-    async fn entry_meta(&self, key: &str) -> Option<EntryMeta> {
-        self.state.read().await.entries.get(key).cloned()
+    /// Header-relevant slice of an entry row (P1): avoids cloning the long
+    /// `key`/`upstream_id` Strings on every disk hit.
+    async fn entry_meta(&self, key: &str) -> Option<EntryHeaders> {
+        self.state.read().await.entries.get(key).map(|m| EntryHeaders {
+            size_bytes: m.size_bytes,
+            etag: m.etag.clone(),
+            last_modified: m.last_modified.clone(),
+            content_type: m.content_type.clone(),
+            negative: m.negative_until_millis.is_some(),
+        })
     }
 
+    /// Stamp an access without taking the state write lock (P1): the hit
+    /// path only touches the sharded [`AccessClock`]; the flusher folds it
+    /// into memory and redb within one tick.
     async fn bump_last_access(&self, key: &str) {
-        let now = self.clock.now_millis();
-        {
-            let mut s = self.state.write().await;
-            if let Some(m) = s.entries.get_mut(key) {
-                m.last_access_millis = now;
-            }
-        }
-        // Coalesced redb flush (R1): mark dirty; the flusher writes at most
-        // once per second across all keys.
-        self.dirty_access.lock().await.insert(key.to_string(), now);
+        self.dirty_access.touch(key, self.clock.now_millis()).await;
     }
 
     async fn install_negative(&self, key: &str, upstream_id: &str) {
