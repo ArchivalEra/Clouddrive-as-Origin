@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::{
-    backend::{BackendError, ByteRange, ContentRange, Key},
+    backend::{BackendError, ByteRange, ContentRange},
     cache::cache::{Cache, CacheOutcome},
     clock::Clock,
     config::{ColdMiss, Config},
