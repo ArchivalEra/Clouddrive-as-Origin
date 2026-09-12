@@ -1031,3 +1031,47 @@ async fn listing_snapshot_is_reused_then_expires() {
     clock.advance(6_000);
     assert!(cache.list_snapshot("up", "a/", true).await.is_none(), "snapshot expired");
 }
+
+// ---------------------------------------------------------------------------
+// P10: entry-count eviction budget.
+// ---------------------------------------------------------------------------
+
+/// A byte-only budget lets many small objects exhaust RAM; the entry-count
+/// cap must evict the least-recently-used rows even when bytes are far
+/// under max_size_bytes.
+#[tokio::test]
+async fn entry_count_cap_evicts_lru_even_under_byte_budget() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config::default();
+    cfg.cache_dir = dir.path().to_path_buf();
+    cfg.max_size_bytes = 1 << 40; // huge: bytes never trigger
+    cfg.max_entries = 3; // the count cap is the only active budget
+    let cfg = Arc::new(cfg);
+
+    let backend = CountingBackend {
+        bytes: b"tiny".to_vec(),
+        etag: Some("v1".into()),
+        calls: Arc::new(AtomicUsize::new(0)),
+        fail: None,
+    };
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+
+    // Fill 5 distinct keys, advancing the clock so recency is ordered.
+    for (i, key) in ["k1", "k2", "k3", "k4", "k5"].iter().enumerate() {
+        clock.advance(1000);
+        let mut hit = cache.get(key, None).await.unwrap();
+        let _ = read_body(&mut hit.body).await;
+        wait_installed(&cache, key).await;
+        let _ = i;
+    }
+
+    let s = cache.state.read().await;
+    assert!(
+        s.entries.len() <= 3,
+        "entry-count cap must bound the map (got {} entries)",
+        s.entries.len()
+    );
+    assert!(s.entries.contains_key("k5"), "the most recent key must survive");
+    drop(s);
+}

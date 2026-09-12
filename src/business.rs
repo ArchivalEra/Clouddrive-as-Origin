@@ -547,6 +547,7 @@ where
     let flights = snap.flights_active;
     let promotions = snap.promotions_active;
     let dirty_access = snap.dirty_access_pending;
+    let (coverage_keys, coverage_intervals) = (snap.coverage_keys, snap.coverage_intervals);
     // Per-upstream view: profile + gate depth, so a saturated or
     // misconfigured upstream is visible without reading logs.
     let upstreams: Vec<serde_json::Value> = state
@@ -575,6 +576,8 @@ where
             "flights_active": flights,
             "promotions_active": promotions,
             "dirty_access_flushes": dirty_access,
+            "coverage_keys": coverage_keys,
+            "coverage_intervals": coverage_intervals,
             "sigv4_enabled": state.sigv4_config.is_some(),
             "upstreams": upstreams,
         })),

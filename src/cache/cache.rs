@@ -209,6 +209,11 @@ pub struct CacheSnapshot {
     pub flights_active: usize,
     pub promotions_active: usize,
     pub dirty_access_pending: usize,
+    /// Coverage-ledger rows and their total interval count (P10: the
+    /// ledger is the other structure that grows with distinct scrubbed
+    /// keys, so operators need to see it).
+    pub coverage_keys: usize,
+    pub coverage_intervals: usize,
 }
 
 /// The Cache is the only seam between the HTTP layer and the cache
@@ -367,6 +372,10 @@ impl<C: Clock + Clone> Cache<C> {
             let s = self.state.read().await;
             (s.entries.len(), s.total_bytes, s.segment_bytes)
         };
+        let (coverage_keys, coverage_intervals) = {
+            let cov = self.coverage.lock().await;
+            (cov.len(), cov.values().map(|c| c.intervals.len()).sum())
+        };
         CacheSnapshot {
             entries,
             total_bytes,
@@ -374,6 +383,8 @@ impl<C: Clock + Clone> Cache<C> {
             flights_active: self.flights.active().await,
             promotions_active: self.promotions.lock().await.len(),
             dirty_access_pending: self.dirty_access.pending(),
+            coverage_keys,
+            coverage_intervals,
         }
     }
 
@@ -1813,7 +1824,15 @@ fn reap_collect(state: &mut CacheState, ttl_ms: u64, now: u64) -> Vec<(String, u
 /// via [`remove_entries`] (C3 lock discipline).
 fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
     let mut out = Vec::new();
-    while state.total_bytes > config.max_size_bytes && !state.entries.is_empty() {
+    // Two independent budgets (P10): bytes AND entry count. Entry rows cost
+    // roughly 500 B of RAM each (key stored twice plus five Strings), and
+    // max_size_bytes alone let millions of small objects exhaust memory on
+    // a 10.9 GB node while sitting far under the byte cap.
+    let over_bytes = |s: &CacheState| s.total_bytes > config.max_size_bytes;
+    let over_entries = |s: &CacheState| {
+        config.max_entries > 0 && s.entries.len() > config.max_entries
+    };
+    while (over_bytes(state) || over_entries(state)) && !state.entries.is_empty() {
         let victim = state
             .entries
             .iter()

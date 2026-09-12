@@ -196,6 +196,11 @@ pub struct RawConfig {
 
     #[serde(default = "default_max_size")]
     pub max_size_bytes: u64,
+    /// Entry-count ceiling: the second eviction budget (P10). Entry rows
+    /// cost ~500 B of RAM each, so a byte-only cap lets many small objects
+    /// exhaust memory. 0 disables the count cap (bytes only).
+    #[serde(default = "default_max_entries")]
+    pub max_entries: usize,
     #[serde(default = "default_inactive_ttl")]
     pub inactive_ttl_secs: u64,
     #[serde(default = "default_revalidate_ttl")]
@@ -229,6 +234,10 @@ pub struct RawConfig {
 fn default_front_listen() -> SocketAddr { "127.0.0.1:8443".parse().unwrap() }
 fn default_listen_addr() -> SocketAddr { "127.0.0.1:8080".parse().unwrap() }
 fn default_cache_dir() -> PathBuf { "/var/lib/origin-cache".into() }
+fn default_max_entries() -> usize {
+    500_000
+}
+
 fn default_max_size() -> u64 { 107_374_182_400 }
 fn default_inactive_ttl() -> u64 { 1200 }
 fn default_revalidate_ttl() -> u64 { 60 }
@@ -259,6 +268,7 @@ pub struct Config {
     pub front_threads: Option<usize>,
     pub cache_dir: PathBuf,
     pub max_size_bytes: u64,
+    pub max_entries: usize,
     pub inactive_ttl_secs: u64,
     pub revalidate_ttl_secs: u64,
     pub negative_ttl_secs: u64,
@@ -400,6 +410,7 @@ impl Config {
             front_threads: raw.front_threads,
             cache_dir: raw.cache_dir,
             max_size_bytes: raw.max_size_bytes,
+            max_entries: raw.max_entries,
             inactive_ttl_secs: raw.inactive_ttl_secs,
             revalidate_ttl_secs: raw.revalidate_ttl_secs,
             negative_ttl_secs: raw.negative_ttl_secs,
@@ -430,6 +441,7 @@ impl Default for Config {
             front_threads: None,
             cache_dir: default_cache_dir(),
             max_size_bytes: default_max_size(),
+            max_entries: default_max_entries(),
             inactive_ttl_secs: default_inactive_ttl(),
             revalidate_ttl_secs: default_revalidate_ttl(),
             negative_ttl_secs: default_negative_ttl(),
