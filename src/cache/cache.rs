@@ -2,7 +2,7 @@ use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    backend::{BackendError, BackendRegistry, BackendSlot, ContentRange, DirectUrl, Key, ObjectMeta},
+    backend::{BackendError, BackendRegistry, BackendSlot, ContentRange, DirectUrl, Key, ListEntry, ObjectMeta},
     cache::{
         flight::{self, BodyStream, FlightProgress, FlightShared},
         meta::EntryMeta,
@@ -23,6 +23,9 @@ pub enum CacheOutcome {
     Stale,
     Revalidated,
 }
+
+/// How long a listing walk stays reusable for subsequent pages (P9).
+const LISTING_SNAPSHOT_TTL_MS: u64 = 5_000;
 
 /// Static metric label for an outcome (P7): keeps the hot path
 /// allocation-free.
@@ -238,6 +241,11 @@ pub struct Cache<C: Clock> {
     /// Keys with a promotion task in flight (P2-b single-flight: threshold
     /// re-hits while promoting attach to nothing — the task re-verifies).
     pub promotions: Arc<Mutex<HashSet<String>>>,
+    /// Short-TTL listing snapshots keyed by (upstream, folder, recursive):
+    /// S3 list paging slices one upstream walk instead of re-walking per
+    /// page (P9). Staleness is bounded by LISTING_SNAPSHOT_TTL and S3
+    /// listing consistency is eventual anyway.
+    pub listings: Arc<Mutex<HashMap<(String, String, bool), (u64, Arc<Vec<ListEntry>>)>>>,
     pub reval_inflight: Inflight<StatData, BackendError>,
     pub routes: RouteTable,
 }
@@ -262,6 +270,7 @@ impl<C: Clock + Clone> Cache<C> {
             flights: crate::cache::flight::Flights::new(crate::cache::flight::DEFAULT_STALL_BUDGET),
             coverage: Arc::new(Mutex::new(HashMap::new())),
             promotions: Arc::new(Mutex::new(HashSet::new())),
+            listings: Arc::new(Mutex::new(HashMap::new())),
             reval_inflight: Inflight::new(),
             routes,
         }
@@ -366,6 +375,27 @@ impl<C: Clock + Clone> Cache<C> {
             promotions_active: self.promotions.lock().await.len(),
             dirty_access_pending: self.dirty_access.pending(),
         }
+    }
+
+    /// A listing snapshot younger than [`LISTING_SNAPSHOT_TTL`], if any.
+    pub async fn list_snapshot(&self, upstream: &str, folder: &str, recursive: bool) -> Option<Vec<ListEntry>> {
+        let now = self.clock.now_millis();
+        let g = self.listings.lock().await;
+        g.get(&(upstream.to_string(), folder.to_string(), recursive))
+            .filter(|(at, _)| now.saturating_sub(*at) < LISTING_SNAPSHOT_TTL_MS)
+            .map(|(_, v)| v.as_ref().clone())
+    }
+
+    /// Record a fresh listing walk for paging reuse.
+    pub async fn store_list_snapshot(&self, upstream: &str, folder: &str, recursive: bool, entries: &[ListEntry]) {
+        let now = self.clock.now_millis();
+        let mut g = self.listings.lock().await;
+        // Bound the map: drop expired rows before inserting.
+        g.retain(|_, (at, _)| now.saturating_sub(*at) < LISTING_SNAPSHOT_TTL_MS);
+        g.insert(
+            (upstream.to_string(), folder.to_string(), recursive),
+            (now, Arc::new(entries.to_vec())),
+        );
     }
 
     /// Whether any entry row (positive or negative tombstone) exists.

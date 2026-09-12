@@ -5,7 +5,7 @@ use tokio::sync::Semaphore;
 use tempfile::tempdir;
 
 use origin_cache::{
-    backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, Key, ObjectMeta, StreamSource, StorageBackend},
+    backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, Key, ListEntry, ObjectMeta, StreamSource, StorageBackend},
     cache::cache::{Cache, CacheOutcome},
     cache::flight::BodyStream,
     clock::MockClock,
@@ -992,4 +992,42 @@ async fn head_not_starved_by_saturated_stream_gate() {
     );
 
     release.notify_waiters();
+}
+
+
+// ---------------------------------------------------------------------------
+// P9: listing snapshots let later pages reuse one upstream walk.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn listing_snapshot_is_reused_then_expires() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let cache = Arc::new(Cache::new(
+        test_config(dir.path().to_path_buf()),
+        Arc::clone(&clock),
+        registry_with(Arc::new(CountingBackend {
+            bytes: b"x".to_vec(),
+            etag: None,
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: None,
+        })),
+    ));
+
+    let entries = vec![
+        ListEntry { key: "a/1.bin".into(), size: 1, etag: None, last_modified: None, is_dir: false },
+        ListEntry { key: "a/2.bin".into(), size: 2, etag: None, last_modified: None, is_dir: false },
+    ];
+    assert!(cache.list_snapshot("up", "a/", true).await.is_none(), "cold snapshot is empty");
+    cache.store_list_snapshot("up", "a/", true, &entries).await;
+
+    let got = cache.list_snapshot("up", "a/", true).await.expect("snapshot present");
+    assert_eq!(got, entries, "the second page sees the same walk");
+
+    // Different selector = different snapshot.
+    assert!(cache.list_snapshot("up", "a/", false).await.is_none());
+
+    // After the TTL it is gone.
+    clock.advance(6_000);
+    assert!(cache.list_snapshot("up", "a/", true).await.is_none(), "snapshot expired");
 }
