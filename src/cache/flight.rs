@@ -17,6 +17,10 @@ use crate::{
 /// Body stream handed to the business plane.
 pub type BodyStream = BoxStream<'static, Result<Bytes, std::io::Error>>;
 
+/// Streaming read granularity (P8): one buffer this size per concurrent
+/// reader, handed out via `BytesMut::freeze` rather than copied.
+const CHUNK: usize = 256 * 1024;
+
 #[derive(Debug, Clone)]
 pub enum FlightProgress {
     /// Driver started; metadata not yet available.
@@ -158,15 +162,19 @@ where
 /// from `offset` for `len` bytes (Range hits; len = bytes from offset).
 pub fn file_body(path: std::path::PathBuf, offset: u64, len: u64) -> BodyStream {
     Box::pin(async_stream::try_stream! {
-        let file = tokio::fs::File::open(&path).await?;
-        use tokio::io::AsyncSeekExt;
-        let mut reader = tokio::io::BufReader::with_capacity(256 * 1024, file);
-        reader.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut file = tokio::fs::File::open(&path).await?;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
         let mut remaining = len;
-        let mut buf = vec![0u8; 256 * 1024];
         while remaining > 0 {
-            let want = buf.len().min(remaining as usize);
-            let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf[..want]).await?;
+            // Size the read buffer to the bytes actually wanted this round
+            // so `read_buf` cannot overshoot the promised length, then hand
+            // the filled buffer out as a frozen `Bytes` — no copy step
+            // (P8). The previous shape also allocated a BufReader buffer
+            // that `read` bypassed on every call.
+            let want = CHUNK.min(remaining as usize);
+            let mut buf = bytes::BytesMut::with_capacity(want);
+            let n = file.read_buf(&mut buf).await?;
             if n == 0 {
                 // Never tolerate a short cache file: the response promised
                 // meta.size_bytes and the h2 layer will call a truncated
@@ -177,7 +185,7 @@ pub fn file_body(path: std::path::PathBuf, offset: u64, len: u64) -> BodyStream 
                 )))?;
             }
             remaining -= n as u64;
-            yield Bytes::copy_from_slice(&buf[..n]);
+            yield buf.freeze();
         }
     })
 }
@@ -227,7 +235,6 @@ pub fn growing_reader_from(
         let mut rx = flight.subscribe();
         let mut pos: u64 = start;
         let mut remaining: Option<u64> = len;
-        let mut buf = vec![0u8; 256 * 1024];
         let mut file: Option<tokio::fs::File> = None;
         // The file cursor tracks `pos` after every read, so a seek is only
         // needed when the handle is (re)opened or after a caught-up wait.
@@ -290,16 +297,17 @@ pub fn growing_reader_from(
                 needs_seek = false;
             }
             let want = match remaining {
-                Some(r) => buf.len().min(r as usize),
-                None => buf.len(),
+                Some(r) => CHUNK.min(r as usize),
+                None => CHUNK,
             };
-            let n = f.read(&mut buf[..want]).await?;
+            let mut buf = bytes::BytesMut::with_capacity(want);
+            let n = f.read_buf(&mut buf).await?;
             if n > 0 {
                 pos += n as u64;
                 if let Some(r) = remaining.as_mut() {
                     *r -= n as u64;
                 }
-                yield Bytes::copy_from_slice(&buf[..n]);
+                yield buf.freeze();
                 continue;
             }
             // EOF while the writer is already past us (or a sealed short
