@@ -5,7 +5,9 @@
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use tokio::sync::watch;
+use futures::FutureExt;
+use std::collections::HashMap;
+use tokio::sync::{watch, Mutex};
 
 use crate::{
     backend::{BackendError, ObjectMeta, StreamSource},
@@ -62,6 +64,96 @@ impl FlightShared {
     }
 }
 
+/// Single-flight registry for cold-miss downloads — the mechanism only:
+/// the per-key map, insert-before-await joining, driver spawning with a
+/// panic guard, and self-removal on every exit path. The policy of what a
+/// driver does (stat → open → pump → install meta) stays with the Cache.
+pub struct Flights {
+    map: std::sync::Arc<Mutex<HashMap<String, std::sync::Arc<FlightShared>>>>,
+    stall_budget: std::time::Duration,
+}
+
+impl Flights {
+    pub fn new(stall_budget: std::time::Duration) -> Self {
+        Self { map: std::sync::Arc::new(Mutex::new(HashMap::new())), stall_budget }
+    }
+
+    /// How many downloads are currently in flight (healthz).
+    pub async fn active(&self) -> usize {
+        self.map.lock().await.len()
+    }
+
+    /// Join the flight for `key`, or start one with `run` as its detached
+    /// driver. Map insertion happens before any await, so a concurrent
+    /// stampede always attaches to the same handle (no TOCTOU window).
+    /// The driver is wrapped in a panic guard and the map entry is removed
+    /// on every exit path — normal, failed, or panicked — because a stale
+    /// entry would turn every future attacher into a zombie-joiner.
+    pub async fn join_or_start<F, Fut>(
+        &self,
+        key: &str,
+        tmp_path: std::path::PathBuf,
+        final_path: std::path::PathBuf,
+        run: F,
+    ) -> std::sync::Arc<FlightShared>
+    where
+        F: FnOnce(std::sync::Arc<FlightShared>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut map = self.map.lock().await;
+        if let Some(f) = map.get(key) {
+            return f.clone();
+        }
+        let f = std::sync::Arc::new(FlightShared::new(tmp_path, final_path, self.stall_budget));
+        map.insert(key.to_string(), f.clone());
+        drop(map);
+        let driver_f = f.clone();
+        let map = std::sync::Arc::clone(&self.map);
+        let map_key = key.to_string();
+        tokio::spawn(async move {
+            drive_guarded(driver_f, run).await;
+            map.lock().await.remove(&map_key);
+        });
+        f
+    }
+
+    /// Spawn `run` as a detached, panic-guarded solo driver: no map entry,
+    /// nothing to join (forced refetches and other private flights). The
+    /// guard publishes Failed if the driver dies without a terminal event,
+    /// so nothing can end up waiting on a dead flight.
+    pub fn spawn_solo<F, Fut>(
+        &self,
+        tmp_path: std::path::PathBuf,
+        final_path: std::path::PathBuf,
+        run: F,
+    ) -> std::sync::Arc<FlightShared>
+    where
+        F: FnOnce(std::sync::Arc<FlightShared>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let f = std::sync::Arc::new(FlightShared::new(tmp_path, final_path, self.stall_budget));
+        tokio::spawn(drive_guarded(f.clone(), run));
+        f
+    }
+}
+
+/// Run a flight driver to completion, guarded against panics: a driver
+/// that panics — or ends without publishing a terminal event — publishes
+/// Failed so attached readers error out instead of waiting forever.
+async fn drive_guarded<F, Fut>(flight: std::sync::Arc<FlightShared>, run: F)
+where
+    F: FnOnce(std::sync::Arc<FlightShared>) -> Fut + Send,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let r = flight.clone();
+    let _ = std::panic::AssertUnwindSafe(run(r)).catch_unwind().await;
+    if !matches!(*flight.progress_tx.borrow(), FlightProgress::Done | FlightProgress::Failed(_)) {
+        let _ = flight.progress_tx.send(FlightProgress::Failed(BackendError::ServerError(
+            "flight driver died without a terminal state (panic?)".into(),
+        )));
+    }
+}
+
 /// Stream the final cache file (already complete on disk), optionally
 /// from `offset` for `len` bytes (Range hits; len = bytes from offset).
 pub fn file_body(path: std::path::PathBuf, offset: u64, len: u64) -> BodyStream {
@@ -76,7 +168,13 @@ pub fn file_body(path: std::path::PathBuf, offset: u64, len: u64) -> BodyStream 
             let want = buf.len().min(remaining as usize);
             let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf[..want]).await?;
             if n == 0 {
-                break; // short file — tolerate
+                // Never tolerate a short cache file: the response promised
+                // meta.size_bytes and the h2 layer will call a truncated
+                // body a protocol error. A short file on disk is a broken
+                // cache entry — say so loudly.
+                Err(std::io::Error::other(format!(
+                    "cached file is {remaining} bytes short of the metadata length"
+                )))?;
             }
             remaining -= n as u64;
             yield Bytes::copy_from_slice(&buf[..n]);
@@ -230,6 +328,19 @@ pub async fn pump_and_seal(
             .map_err(|e| BackendError::Other(format!("write tmp: {e}")))?;
         written += n as u64;
         let _ = tx.send(FlightProgress::Growing(written));
+    }
+    // A SHORT upstream body must never be sealed into the cache: readers
+    // were promised `total_len` bytes, and a truncated file would poison
+    // every later hit. Delete the tmp and fail the flight instead. An
+    // over-long body is harmless — every serving read is bounded by the
+    // promised length — so only the short side fails.
+    if let Some(expected) = src.total_len {
+        if written < expected {
+            let _ = tokio::fs::remove_file(tmp_path).await;
+            return Err(BackendError::ServerError(format!(
+                "upstream short read: got {written} of {expected} bytes"
+            )));
+        }
     }
     out.flush()
         .await
@@ -455,5 +566,24 @@ mod tests {
         driver.await.unwrap();
         assert!(!errored, "a flowing stream must not trip the stall budget");
         assert_eq!(got, 3072, "reader must see every byte the driver wrote");
+    }
+
+    #[tokio::test]
+    async fn panicked_driver_publishes_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let flight = std::sync::Arc::new(FlightShared::new(
+            dir.path().join(".tmp.p"),
+            dir.path().join("p.bin"),
+            DEFAULT_STALL_BUDGET,
+        ));
+        let rx = flight.subscribe();
+        drive_guarded(flight.clone(), |_f| async {
+            panic!("boom");
+        })
+        .await;
+        assert!(
+            matches!(*rx.borrow(), FlightProgress::Failed(_)),
+            "a panicking driver must publish Failed, not leave Pending forever"
+        );
     }
 }

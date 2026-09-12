@@ -127,10 +127,10 @@ pub struct Cache<C: Clock> {
     /// Access-clock bumps awaiting the coalesced flush (R1: per-hit fsync
     /// would bottleneck; flush at most once per second).
     pub dirty_access: Arc<Mutex<HashMap<String, u64>>>,
-    /// In-flight cold-miss downloads, keyed by cache key. Inserted
-    /// synchronously before any await so every concurrent caller attaches
-    /// to the same flight (no TOCTOU stampede window).
-    pub flights: Arc<Mutex<HashMap<String, Arc<FlightShared>>>>,
+    /// In-flight cold-miss downloads, keyed by cache key. The flight
+    /// module owns joining, driver spawning, panic guarding and map
+    /// hygiene; the Cache only supplies the driver policy.
+    pub flights: crate::cache::flight::Flights,
     /// Coverage ledger (efficientcache): staged byte intervals per cache
     /// key. Segment files on disk are the source of truth; this map is
     /// the working view, rebuilt by scan on startup.
@@ -159,7 +159,7 @@ impl<C: Clock + Clone> Cache<C> {
             state: Arc::new(RwLock::new(CacheState::default())),
             meta,
             dirty_access,
-            flights: Arc::new(Mutex::new(HashMap::new())),
+            flights: crate::cache::flight::Flights::new(crate::cache::flight::DEFAULT_STALL_BUDGET),
             coverage: Arc::new(Mutex::new(HashMap::new())),
             promotions: Arc::new(Mutex::new(HashSet::new())),
             reval_inflight: Inflight::new(),
@@ -861,9 +861,8 @@ impl<C: Clock + Clone> Cache<C> {
     }
 
     /// Attach to an existing flight for this key, or create one and spawn
-    /// its driver. Map insertion happens before any await.
-    /// `key` namespaces the flight/map entry and store paths;
-    /// `backend_key` is what the driver stats/opens upstream.
+    /// its driver. Joining (insert-before-await) and map hygiene live in
+    /// the flight module; the driver closure is the Cache's policy.
     async fn attach_or_start(
         &self,
         key: &str,
@@ -871,32 +870,20 @@ impl<C: Clock + Clone> Cache<C> {
         upstream_id: &str,
         slot: Arc<BackendSlot>,
     ) -> Arc<FlightShared> {
-        let mut map = self.flights.lock().await;
-        if let Some(f) = map.get(key) {
-            return f.clone();
-        }
-        let f = Arc::new(FlightShared::new(
-            store::tmp_path(&self.config.cache_dir, key),
-            store::file_path(&self.config.cache_dir, key),
-            crate::cache::flight::DEFAULT_STALL_BUDGET,
-        ));
-        map.insert(key.to_string(), f.clone());
-        drop(map);
-        // Driver is detached: the creator's client may disconnect without
-        // affecting the download other readers are attached to.
-        let driver_f = f.clone();
-        let driver_slot = Arc::clone(&slot);
-        let driver_up = upstream_id.to_string();
         let entry_key = key.to_string();
+        let driver_up = upstream_id.to_string();
         let cfg = Arc::clone(&self.config);
         let state = Arc::clone(&self.state);
         let meta_store = Arc::clone(&self.meta);
-        let flights = Arc::clone(&self.flights);
         let clock = Arc::clone(&self.clock);
-        tokio::spawn(async move {
-            drive_flight(driver_f, driver_slot, backend_key, entry_key, driver_up, cfg, state, meta_store, flights, clock).await;
-        });
-        f
+        self.flights
+            .join_or_start(
+                key,
+                store::tmp_path(&self.config.cache_dir, key),
+                store::file_path(&self.config.cache_dir, key),
+                move |f| drive_flight(f, slot, backend_key, entry_key, driver_up, cfg, state, meta_store, clock),
+            )
+            .await
     }
 
     /// Wait for a flight's metadata, then return the streaming body.
@@ -929,21 +916,6 @@ impl<C: Clock + Clone> Cache<C> {
                                 body: flight::growing_reader(flight),
                             });
                         }
-                        Some(r) if r.offset == 0 => {
-                            // The growing reader already streams from byte 0.
-                            let last = meta.size_bytes.saturating_sub(1);
-                            return Ok(CacheHit {
-                                outcome: CacheOutcome::Miss,
-                                meta: meta_out,
-                                content_range: Some(ContentRange {
-                                    first: 0,
-                                    last,
-                                    total: meta.size_bytes,
-                                }),
-                                content_length: Some(meta.size_bytes),
-                                body: flight::growing_reader(flight),
-                            });
-                        }
                         Some(r) => {
                             // Converge on the flight instead of opening a
                             // second upstream connection. Each upstream open
@@ -953,6 +925,10 @@ impl<C: Clock + Clone> Cache<C> {
                             // cold seek costs only the full pull it needed
                             // anyway, and EdgeOne delivers shards in
                             // ascending order so the wait is normally zero.
+                            // (Offset 0 with a bounded length is the same
+                            // path — `growing_reader_from(0, want)` — so a
+                            // `bytes=0-N` shard never gets promised the
+                            // whole file.)
                             if r.offset >= meta.size_bytes {
                                 return Err(BackendError::RangeNotSatisfiable);
                             }
@@ -1025,24 +1001,18 @@ impl<C: Clock + Clone> Cache<C> {
         upstream_id: String,
         range: Option<crate::backend::ByteRange>,
     ) -> Result<CacheHit, BackendError> {
-        let flight = Arc::new(FlightShared::new(
-            store::tmp_path(&self.config.cache_dir, &key),
-            store::file_path(&self.config.cache_dir, &key),
-            crate::cache::flight::DEFAULT_STALL_BUDGET,
-        ));
-        let driver_f = flight.clone();
-        let driver_slot = Arc::clone(&slot);
         let driver_up = upstream_id.clone();
-        let backend_key = Key::from_validated(backend_key);
         let entry_key = key.clone();
-        let driver_backend_key = backend_key.clone();
+        let backend_key = Key::from_validated(backend_key);
         let cfg = Arc::clone(&self.config);
         let state = Arc::clone(&self.state);
         let meta_store = Arc::clone(&self.meta);
         let clock = Arc::clone(&self.clock);
-        tokio::spawn(async move {
-            drive_flight(driver_f, driver_slot, driver_backend_key, entry_key, driver_up, cfg, state, meta_store, flights_none(), clock).await;
-        });
+        let flight = self.flights.spawn_solo(
+            store::tmp_path(&self.config.cache_dir, &key),
+            store::file_path(&self.config.cache_dir, &key),
+            move |f| drive_flight(f, slot, backend_key, entry_key, driver_up, cfg, state, meta_store, clock),
+        );
         self.await_flight(flight, &key, &upstream_id, range).await
     }
 
@@ -1135,11 +1105,6 @@ impl<C: Clock + Clone> Cache<C> {
             }
         }
     }
-}
-
-fn flights_none() -> Arc<Mutex<HashMap<String, Arc<FlightShared>>>> {
-    // Forced refetches run on a private flight: no map registration needed.
-    Arc::new(Mutex::new(HashMap::new()))
 }
 
 /// Coverage window in millis for an upstream: 0 = no decay.
@@ -1504,7 +1469,6 @@ async fn drive_flight<C: Clock>(
     config: Arc<Config>,
     state: Arc<RwLock<CacheState>>,
     meta_store: Arc<crate::cache::persist::MetaStore>,
-    flights: Arc<Mutex<HashMap<String, Arc<FlightShared>>>>,
     clock: Arc<C>,
 ) {
     let outcome = async {
@@ -1541,7 +1505,6 @@ async fn drive_flight<C: Clock>(
             let _ = flight.progress_tx.send(FlightProgress::Failed(e));
         }
     }
-    flights.lock().await.remove(entry_key.as_str());
 }
 
 async fn insert_meta(

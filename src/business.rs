@@ -539,7 +539,7 @@ where
     // Live-machinery depths (spec §8: the queue-ish counters operators
     // watch when a node misbehaves): active cold-miss flights, promotion
     // assemblies in flight, and pending access-clock flushes.
-    let flights = state.cache.flights.lock().await.len();
+    let flights = state.cache.flights.active().await;
     let promotions = state.cache.promotions.lock().await.len();
     let dirty_access = state.cache.dirty_access.lock().await.len();
     // Per-upstream view: profile + gate depth, so a saturated or
