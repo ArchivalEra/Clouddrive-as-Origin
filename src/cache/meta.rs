@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 /// Versioned metadata for a single cached entry.
-/// Serialized via serde (postcard in production via rkyv/bincode choice;
-/// serde_json in tests for readability — wire format is opaque).
+/// Serialized with serde_json (see `cache::persist`); the wire format is
+/// opaque to callers and versioned by `version`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryMeta {
     pub version: u32,

@@ -112,19 +112,49 @@ impl MetaStore {
     /// Update last_access for an existing entry (coalesced flush path).
     /// Rewrites the entry row. No-op when absent.
     pub async fn bump_last_access(&self, key: &str, new_millis: u64) -> anyhow::Result<()> {
+        self.bump_last_access_batch(&[(key.to_string(), new_millis)]).await
+    }
+
+    /// Update last_access for a whole drained batch in ONE write
+    /// transaction (P5). The coalescing window bounds ticks, not commits:
+    /// per-key commits meant one fsync per dirty key per second.
+    pub async fn bump_last_access_batch(&self, batch: &[(String, u64)]) -> anyhow::Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
         let db = self.db.lock().await;
         let txn = db.begin_write()?;
         {
             let mut entries = txn.open_table(ENTRIES)?;
-            let old: Option<EntryMeta> = match entries.get(key)? {
-                Some(v) => Some(serde_json::from_slice(v.value())?),
-                None => None,
-            };
-            if let Some(mut m) = old {
-                if m.last_access_millis != new_millis {
-                    m.last_access_millis = new_millis;
-                    entries.insert(key, serde_json::to_vec(&m)?.as_slice())?;
+            for (key, ms) in batch {
+                let old: Option<EntryMeta> = match entries.get(key.as_str())? {
+                    Some(v) => Some(serde_json::from_slice(v.value())?),
+                    None => None,
+                };
+                if let Some(mut m) = old {
+                    if m.last_access_millis != *ms {
+                        m.last_access_millis = *ms;
+                        entries.insert(key.as_str(), serde_json::to_vec(&m)?.as_slice())?;
+                    }
                 }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Remove every key in one write transaction (P5): eviction and expiry
+    /// batches used to issue one commit (and fsync) per victim.
+    pub async fn remove_batch(&self, keys: &[String]) -> anyhow::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let db = self.db.lock().await;
+        let txn = db.begin_write()?;
+        {
+            let mut entries = txn.open_table(ENTRIES)?;
+            for key in keys {
+                entries.remove(key.as_str())?;
             }
         }
         txn.commit()?;
@@ -190,6 +220,28 @@ mod tests {
         store.bump_last_access("a.png", 9000).await.unwrap();
         let all = store.load_all().await.unwrap();
         assert_eq!(all[0].last_access_millis, 9000);
+    }
+
+    /// P5: a whole dirty batch must land in ONE commit, not one per key.
+    /// The batch API is the observable half of that: N keys, one call, all
+    /// rows updated.
+    #[tokio::test]
+    async fn batch_bump_and_remove_cover_all_keys_in_one_call() {
+        let dir = tempdir().unwrap();
+        let store = MetaStore::open(&dir.path().join("redb.db")).unwrap();
+        let keys: Vec<String> = (0..200).map(|i| format!("k{i}.bin")).collect();
+        for (i, k) in keys.iter().enumerate() {
+            store.insert(&meta(k, 10, i as u64)).await.unwrap();
+        }
+
+        let batch: Vec<(String, u64)> = keys.iter().map(|k| (k.clone(), 77_000)).collect();
+        store.bump_last_access_batch(&batch).await.unwrap();
+        let all = store.load_all().await.unwrap();
+        assert_eq!(all.len(), 200);
+        assert!(all.iter().all(|m| m.last_access_millis == 77_000), "every row in the batch was bumped");
+
+        store.remove_batch(&keys).await.unwrap();
+        assert_eq!(store.load_all().await.unwrap().len(), 0, "batch remove clears every key");
     }
 
     #[tokio::test]

@@ -61,7 +61,7 @@ One table in one `Database` (`cache_dir/redb.db`):
 - (Deleted C8: `by_last_access` ordered index — zero prod readers; the
   reaper/evictor scan memory. `globals` counters — healthz reads memory.)
 
-`EntryMeta` (postcard/bincode, versioned):
+`EntryMeta` (serde_json, versioned — see the P5 note below):
 
 ```
 version, upstream_id, rel_path, size_bytes, etag, last_modified,
