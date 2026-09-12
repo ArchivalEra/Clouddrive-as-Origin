@@ -553,14 +553,17 @@ impl<C: Clock + Clone> Cache<C> {
         let content_length = Some(end.saturating_sub(start));
         let mut src_stream = src.stream;
         let body: BodyStream = Box::pin(async_stream::try_stream! {
+            // Read straight into a fresh BytesMut and freeze it (P8): the
+            // served bytes are handed over with no copy step.
             use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; 256 * 1024];
+            let mut buf = bytes::BytesMut::with_capacity(256 * 1024);
             loop {
-                let n = src_stream.read(&mut buf).await?;
+                buf.clear();
+                let n = src_stream.read_buf(&mut buf).await?;
                 if n == 0 {
                     break;
                 }
-                yield bytes::Bytes::copy_from_slice(&buf[..n]);
+                yield buf.split().freeze();
             }
         });
         Ok(PassthroughHit {
@@ -780,11 +783,15 @@ impl<C: Clock + Clone> Cache<C> {
         };
         let body: BodyStream = Box::pin(async_stream::try_stream! {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buf = vec![0u8; 256 * 1024];
             let mut file: Option<tokio::fs::File> = None;
             let mut written: u64 = 0;
             while written < want {
-                let n = src_stream.read(&mut buf).await?;
+                // The staged copy must reach the sidecar file AND the
+                // viewer, so this is the one path that needs both a file
+                // write and a served buffer (P8: the serve side is the
+                // frozen bytes, no extra copy).
+                let mut chunk = bytes::BytesMut::with_capacity(256 * 1024);
+                let n = src_stream.read_buf(&mut chunk).await?;
                 if n == 0 {
                     break;
                 }
@@ -794,9 +801,9 @@ impl<C: Clock + Clone> Cache<C> {
                     }
                     file = Some(tokio::fs::File::create(&segpart).await?);
                 }
-                file.as_mut().unwrap().write_all(&buf[..n]).await?;
+                file.as_mut().unwrap().write_all(&chunk).await?;
                 written += n as u64;
-                yield bytes::Bytes::copy_from_slice(&buf[..n]);
+                yield chunk.freeze();
             }
             if written > 0 {
                 drop(file);
