@@ -119,20 +119,34 @@ impl Coverage {
         if start >= end {
             return;
         }
-        self.intervals.push((start, end, now_millis));
-        self.intervals.sort();
-        let mut merged: Vec<(u64, u64, u64)> = Vec::with_capacity(self.intervals.len());
-        for (s, e, t) in self.intervals.drain(..) {
-            if let Some(last) = merged.last_mut() {
-                if s < last.1 {
-                    last.1 = last.1.max(e);
-                    last.2 = last.2.max(t);
-                    continue;
-                }
-            }
-            merged.push((s, e, t));
+        // Insert at the sorted position and merge only the touched
+        // neighbours (P10). The previous shape pushed then re-sorted and
+        // rebuilt the whole vector, so a session of k staged shards cost
+        // O(k^2 log k) for one key.
+        // Overlaps can only touch the interval before and the ones after
+        // the insertion point (the list is sorted and non-overlapping), so
+        // merge locally instead of rebuilding the vector.
+        let idx = self.intervals.partition_point(|(s, _, _)| *s < start);
+        let (lo, merged_start, mut merged_end, mut merged_at) = if idx > 0
+            && self.intervals[idx - 1].1 > start
+        {
+            let (ps, pe, pt) = self.intervals[idx - 1];
+            (idx - 1, ps, pe.max(end), pt.max(now_millis))
+        } else {
+            self.intervals.insert(idx, (start, end, now_millis));
+            (idx, start, end, now_millis)
+        };
+        // Absorb every following interval the merged span now reaches.
+        let mut hi = lo + 1;
+        while hi < self.intervals.len() && self.intervals[hi].0 < merged_end {
+            merged_end = merged_end.max(self.intervals[hi].1);
+            merged_at = merged_at.max(self.intervals[hi].2);
+            hi += 1;
         }
-        self.intervals = merged;
+        if hi > lo + 1 {
+            self.intervals.drain(lo + 1..hi);
+        }
+        self.intervals[lo] = (merged_start, merged_end, merged_at);
     }
 
     /// Drop intervals whose last read is older than `window_millis` ago.
@@ -450,6 +464,48 @@ mod tests {
         assert_eq!(parse_seg_name(&name), Some(("a/b+c.png".into(), 100, 200)));
         assert_eq!(parse_seg_name(".segpart.a.0-10"), None);
         assert_eq!(parse_seg_name(".seg.no-range-here"), None);
+    }
+
+    /// P10: the incremental merge must produce exactly what the old
+    /// sort-and-rebuild did — overlaps merged, distinct intervals kept,
+    /// timestamps taking the max.
+    #[test]
+    fn add_interval_merges_locally_and_equivalently() {
+        let mut c = Coverage::default();
+        c.add_interval(100, 200, 10);
+        c.add_interval(300, 400, 20);
+        assert_eq!(c.intervals, vec![(100, 200, 10), (300, 400, 20)]);
+
+        // Bridge the gap (overlapping both) -> one merged span, max time.
+        c.add_interval(150, 350, 30);
+        assert_eq!(c.intervals, vec![(100, 400, 30)]);
+
+        // Adjacent but NOT overlapping: stays a separate interval so it
+        // keeps its own read time (window-decay semantics, by design).
+        c.add_interval(400, 500, 40);
+        assert_eq!(c.intervals, vec![(100, 400, 30), (400, 500, 40)]);
+
+        // An earlier disjoint interval inserts in sorted position.
+        c.add_interval(10, 20, 5);
+        assert_eq!(c.intervals, vec![(10, 20, 5), (100, 400, 30), (400, 500, 40)]);
+
+        // A contained interval absorbs without changing the bounds.
+        c.add_interval(200, 250, 99);
+        assert_eq!(c.intervals.len(), 3);
+        assert_eq!(c.intervals[1], (100, 400, 99));
+
+        // Empty ranges are ignored.
+        let before = c.intervals.clone();
+        c.add_interval(600, 600, 1);
+        assert_eq!(c.intervals, before);
+
+        // Many sequential disjoint shards stay sorted and single.
+        let mut d = Coverage::default();
+        for i in 0..1000u64 {
+            d.add_interval(i * 10, i * 10 + 5, i);
+        }
+        assert_eq!(d.intervals.len(), 1000);
+        assert!(d.intervals.windows(2).all(|w| w[0].1 <= w[1].0));
     }
 
     #[test]
