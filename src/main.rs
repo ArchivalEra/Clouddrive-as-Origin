@@ -43,10 +43,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(origin_cache::backend::TimedBackend::new(backend));
         slots.insert(
             u.id.clone(),
-            Arc::new(BackendSlot {
-                backend,
-                gate: Arc::new(Semaphore::new(cfg.concurrency_per_upstream)),
-            }),
+            Arc::new(BackendSlot::new(backend, cfg.concurrency_per_upstream)),
         );
     }
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), clock, BackendRegistry::new(slots)));

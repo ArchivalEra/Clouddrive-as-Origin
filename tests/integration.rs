@@ -84,7 +84,7 @@ fn registry_with(backend: Arc<dyn StorageBackend>) -> BackendRegistry {
     let mut slots = HashMap::new();
     slots.insert(
         "primary".to_string(),
-        Arc::new(BackendSlot { backend, gate: Arc::new(Semaphore::new(3)) }),
+        Arc::new(BackendSlot::new(backend, 3)),
     );
     BackendRegistry::new(slots)
 }
@@ -893,4 +893,103 @@ async fn concurrent_hits_stamp_access_without_state_write_lock() {
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     let last = cache.state.read().await.entries.get("hot.bin").unwrap().last_access_millis;
     assert_eq!(last, 5000, "flusher must fold the access stamp into the entry row");
+}
+
+// ---------------------------------------------------------------------------
+// B1: metadata and stream gates are independent — a long transfer must not
+// starve a HEAD. Measured on the node before the split: an idle HEAD took
+// 22 ms, and 14.2 s while three cold pulls held the single shared gate.
+// ---------------------------------------------------------------------------
+
+/// Backend whose `open` blocks until released, so a transfer can be held
+/// open while a metadata call is attempted.
+struct BlockingOpenBackend {
+    bytes: Vec<u8>,
+    release: Arc<tokio::sync::Notify>,
+    opened: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for BlockingOpenBackend {
+    async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
+        Ok(ObjectMeta {
+            size_bytes: self.bytes.len() as u64,
+            etag: Some("v1".into()),
+            last_modified: None,
+            mime_hint: None,
+        })
+    }
+    async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
+        self.opened.fetch_add(1, Ordering::SeqCst);
+        // Hold the transfer open until the test releases it.
+        self.release.notified().await;
+        Ok(StreamSource {
+            stream: Box::new(std::io::Cursor::new(self.bytes.clone())),
+            total_len: Some(self.bytes.len() as u64),
+        })
+    }
+    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    fn id(&self) -> &str {
+        "blocking"
+    }
+}
+
+/// With the stream gate saturated, a metadata stat must still complete
+/// promptly (B1). Under the old single gate it queued behind the transfer.
+#[tokio::test]
+async fn head_not_starved_by_saturated_stream_gate() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let cfg = test_config(dir.path().to_path_buf());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let opened = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(BlockingOpenBackend {
+        bytes: vec![7u8; 4096],
+        release: Arc::clone(&release),
+        opened: Arc::clone(&opened),
+    });
+
+    // Deliberately saturate the STREAM gate (2 permits) with two held
+    // transfers on distinct keys.
+    let mut slots = HashMap::new();
+    let slot = Arc::new(BackendSlot::new(backend, 2));
+    slots.insert("primary".to_string(), Arc::clone(&slot));
+    let cache = Arc::new(Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots)));
+
+    for key in ["a.bin", "b.bin"] {
+        let c = Arc::clone(&cache);
+        tokio::spawn(async move {
+            let _ = c.get(key, None).await; // blocks in open()
+        });
+    }
+    // Wait until both transfers have reached open() (both stream permits held).
+    for _ in 0..200 {
+        if opened.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(opened.load(Ordering::SeqCst) >= 2, "both transfers must hold stream permits");
+    assert_eq!(slot.stream_gate.available_permits(), 0, "stream gate must be saturated");
+
+    // A metadata call on a third key must still be fast: the metadata
+    // gate is separate.
+    let started = std::time::Instant::now();
+    let meta = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cache.head_meta("c.bin"),
+    )
+    .await
+    .expect("HEAD must not queue behind the saturated stream gate")
+    .expect("HEAD must succeed");
+    assert_eq!(meta.size, 4096);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "HEAD took {:?} — metadata is sharing the stream gate again",
+        started.elapsed()
+    );
+
+    release.notify_waiters();
 }

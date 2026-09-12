@@ -683,10 +683,7 @@ mod tests {
         let mut slots: HashMap<String, Arc<BackendSlot>> = HashMap::new();
         slots.insert(
             "primary".into(),
-            Arc::new(BackendSlot {
-                backend: Arc::new(TestMockBackend::new(b"x", None, None).with_listing(primary)),
-                gate: Arc::new(Semaphore::new(3)),
-            }),
+            Arc::new(BackendSlot::new(Arc::new(TestMockBackend::new(b"x", None, None).with_listing(primary)), 3)),
         );
         for (id, listing) in extras {
             let mut u = cfg.upstreams[0].clone();
@@ -694,10 +691,7 @@ mod tests {
             cfg.upstreams.push(u);
             slots.insert(
                 id.into(),
-                Arc::new(BackendSlot {
-                    backend: Arc::new(TestMockBackend::new(b"x", None, None).with_listing(listing)),
-                    gate: Arc::new(Semaphore::new(3)),
-                }),
+                Arc::new(BackendSlot::new(Arc::new(TestMockBackend::new(b"x", None, None).with_listing(listing)), 3)),
             );
         }
         let cache = Arc::new(crate::cache::cache::Cache::new(
