@@ -40,6 +40,17 @@ fn sigv4_gate(
     host_id: &str,
     now_unix: i64,
 ) -> Option<Response> {
+    // Lazy gate (P7): probe for SigV4 material BEFORE building anything.
+    // With no config the layer is off; without an Authorization header and
+    // without a presigned X-Amz-Signature there is nothing to verify. The
+    // old shape percent-decoded the path, parsed the query and copied every
+    // header into owned Strings (tens of allocations) before discovering
+    // that the request was anonymous — the common case.
+    let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
+    let has_presign = query.map_or(false, |q| q.contains("X-Amz-Signature"));
+    if cfg.is_none() || (authorization.is_none() && !has_presign) {
+        return None;
+    }
     let decoded_path = raw_uri_path.percent_decoded();
     let pairs: Vec<(String, String)> = query
         .map(|q| form_urlencoded::parse(q.as_bytes()).map(|(k, v)| (k.into_owned(), v.into_owned())).collect())
@@ -54,7 +65,7 @@ fn sigv4_gate(
         raw_uri_path,
         query_pairs: pairs.into_iter().map(|(k, v)| (k, v)).collect(),
         headers: header_pairs,
-        authorization: headers.get("authorization").and_then(|v| v.to_str().ok()),
+        authorization,
     };
     match sigv4::verify_optional(cfg, &input, now_unix) {
         sigv4::VerifyOutcome::Anonymous | sigv4::VerifyOutcome::Verified(_) => None,
