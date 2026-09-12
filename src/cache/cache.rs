@@ -1075,28 +1075,46 @@ impl<C: Clock + Clone> Cache<C> {
         } else {
             Vec::new()
         };
-        // 2. Filesystem deletes hold no locks.
-        let mut freed: u64 = 0;
-        for key in &expired {
-            for path in store::key_segment_files(&self.config.cache_dir, key) {
-                freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                let _ = std::fs::remove_file(&path);
-            }
-            let _ = std::fs::remove_file(store::segmeta_path(&self.config.cache_dir, key));
-        }
-        if do_sweep {
-            store::sweep_segparts(&self.config.cache_dir, ttl_ms, now);
-            store::sweep_orphan_metas(&self.config.cache_dir);
-        }
-        // 3. State mutation (entries reaper + accounting + sweep stamp).
-        {
+        // 2. Filesystem deletes hold no locks — and run off the async
+        // runtime (blocking read_dir/remove_file in spawn_blocking).
+        let freed = {
+            let cache_dir = self.config.cache_dir.clone();
+            let expired = expired.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut freed: u64 = 0;
+                for key in &expired {
+                    for path in store::key_segment_files(&cache_dir, key) {
+                        freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    let _ = std::fs::remove_file(store::segmeta_path(&cache_dir, key));
+                }
+                if do_sweep {
+                    store::sweep_segparts(&cache_dir, ttl_ms, now);
+                    store::sweep_orphan_metas(&cache_dir);
+                }
+                freed
+            })
+            .await
+            .unwrap_or(0)
+        };
+        // 3. State mutation — memory only, no awaits under the write
+        // guard (C3); deletes for reaped/evicted rows run guard-free.
+        let reaped = {
             let mut s = self.state.write().await;
-            reap(&mut s, &self.config, &self.meta, now).await;
+            let reaped = reap_collect(&mut s, ttl_ms, now);
             if do_sweep {
                 s.segment_sweep_at_millis = now;
                 s.segment_bytes = s.segment_bytes.saturating_sub(freed);
             }
-        }
+            reaped
+        };
+        remove_entries(&self.config, &self.meta, &reaped).await;
+        let evicted = {
+            let mut s = self.state.write().await;
+            evict_pick(&mut s, &self.config)
+        };
+        remove_entries(&self.config, &self.meta, &evicted).await;
         // 4. Ledger removal (coverage only).
         if do_sweep {
             let mut cov = self.coverage.lock().await;
@@ -1516,37 +1534,48 @@ async fn insert_meta(
     meta: &ObjectMeta,
     now: u64,
 ) {
-    let mut s = state.write().await;
-    let old_size = s.entries.get(key).map(|m| m.size_bytes).unwrap_or(0);
-    let entry = EntryMeta {
-        version: 1,
-        upstream_id: upstream_id.to_string(),
-        key: key.to_string(),
-        size_bytes: meta.size_bytes,
-        etag: meta.etag.clone(),
-        last_modified: meta.last_modified.clone(),
-        // Raw provider hint: MIME resolution happens once, at read time
-        // (hit_meta_*), never at write (C3). Old rows holding resolved
-        // values re-resolve idempotently (resolve passes specifics through).
-        content_type: meta.mime_hint.clone(),
-        created_at_millis: s.entries.get(key).map(|m| m.created_at_millis).unwrap_or(now),
-        last_access_millis: now,
-        last_revalidated_millis: Some(now),
-        negative_until_millis: None,
+    // C3 lock discipline: the state write guard never spans a redb commit
+    // or a file delete. Order: build the entry under a read, persist
+    // guard-free, then one await-free write stretch for accounting +
+    // victim selection; the deletes run after the guard drops. Persist
+    // first: on crash between redb and memory, startup rebuilds memory
+    // from redb; the reverse order would lose the row.
+    let (old_size, entry) = {
+        let s = state.read().await;
+        let old_size = s.entries.get(key).map(|m| m.size_bytes).unwrap_or(0);
+        let entry = EntryMeta {
+            version: 1,
+            upstream_id: upstream_id.to_string(),
+            key: key.to_string(),
+            size_bytes: meta.size_bytes,
+            etag: meta.etag.clone(),
+            last_modified: meta.last_modified.clone(),
+            // Raw provider hint: MIME resolution happens once, at read time
+            // (hit_meta_*), never at write. Old rows holding resolved
+            // values re-resolve idempotently (resolve passes specifics through).
+            content_type: meta.mime_hint.clone(),
+            created_at_millis: s.entries.get(key).map(|m| m.created_at_millis).unwrap_or(now),
+            last_access_millis: now,
+            last_revalidated_millis: Some(now),
+            negative_until_millis: None,
+        };
+        (old_size, entry)
     };
-    // Persist first: on crash between redb and memory, startup rebuilds
-    // memory from redb; the reverse order would lose the row.
     if let Err(e) = meta_store.insert(&entry).await {
         tracing::error!(key = %key, error = %e, "redb insert failed");
     }
-    s.total_bytes = s.total_bytes.saturating_sub(old_size) + entry.size_bytes;
-    s.entries.insert(key.to_string(), entry);
-    evict_if_needed(&mut s, config, meta_store).await;
+    let evicted = {
+        let mut s = state.write().await;
+        s.total_bytes = s.total_bytes.saturating_sub(old_size) + entry.size_bytes;
+        s.entries.insert(key.to_string(), entry);
+        evict_pick(&mut s, config)
+    };
+    remove_entries(config, meta_store, &evicted).await;
 }
 
-/// Inactive expiry + max_size LRU over one state lock hold.
-async fn reap(state: &mut CacheState, config: &Config, meta_store: &crate::cache::persist::MetaStore, now: u64) {
-    let ttl_ms = config.inactive_ttl_secs * 1000;
+/// Inactive-expiry collection — memory only. Persistence and file
+/// deletes happen guard-free via [`remove_entries`] (C3 lock discipline).
+fn reap_collect(state: &mut CacheState, ttl_ms: u64, now: u64) -> Vec<(String, u64)> {
     let expired: Vec<String> = state
         .entries
         .iter()
@@ -1558,18 +1587,20 @@ async fn reap(state: &mut CacheState, config: &Config, meta_store: &crate::cache
         })
         .map(|(k, _)| k.clone())
         .collect();
+    let mut out = Vec::with_capacity(expired.len());
     for k in expired {
         if let Some(m) = state.entries.remove(&k) {
             state.total_bytes = state.total_bytes.saturating_sub(m.size_bytes);
-            let _ = meta_store.remove(&k).await;
-            let path = store::file_path(&config.cache_dir, &k);
-            let _ = tokio::fs::remove_file(&path).await;
+            out.push((k, m.size_bytes));
         }
     }
-    evict_if_needed(state, config, meta_store).await;
+    out
 }
 
-async fn evict_if_needed(state: &mut CacheState, config: &Config, meta_store: &crate::cache::persist::MetaStore) {
+/// Max-size LRU victim selection — memory only; deletes happen guard-free
+/// via [`remove_entries`] (C3 lock discipline).
+fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
     while state.total_bytes > config.max_size_bytes && !state.entries.is_empty() {
         let victim = state
             .entries
@@ -1577,19 +1608,33 @@ async fn evict_if_needed(state: &mut CacheState, config: &Config, meta_store: &c
             .filter(|(_, m)| m.negative_until_millis.is_none())
             .min_by_key(|(_, m)| m.eligible_at(config.inactive_ttl_secs))
             .map(|(k, _)| k.clone());
-        if let Some(k) = victim {
-            if let Some(m) = state.entries.remove(&k) {
-                state.total_bytes = state.total_bytes.saturating_sub(m.size_bytes);
-                let _ = meta_store.remove(&k).await;
-                let path = store::file_path(&config.cache_dir, &k);
-                let _ = tokio::fs::remove_file(&path).await;
-                store::prune_empty_parents(&config.cache_dir, &path);
-            } else {
-                break;
+        match victim {
+            Some(k) => {
+                if let Some(m) = state.entries.remove(&k) {
+                    state.total_bytes = state.total_bytes.saturating_sub(m.size_bytes);
+                    out.push((k, m.size_bytes));
+                } else {
+                    break;
+                }
             }
-        } else {
-            break;
+            None => break,
         }
+    }
+    out
+}
+
+/// redb row removal + cache-file deletion for victims collected under a
+/// state guard. Never call this while holding the guard (C3).
+async fn remove_entries(
+    config: &Config,
+    meta_store: &crate::cache::persist::MetaStore,
+    victims: &[(String, u64)],
+) {
+    for (k, _) in victims {
+        let _ = meta_store.remove(k).await;
+        let path = store::file_path(&config.cache_dir, k);
+        let _ = tokio::fs::remove_file(&path).await;
+        store::prune_empty_parents(&config.cache_dir, &path);
     }
 }
 
