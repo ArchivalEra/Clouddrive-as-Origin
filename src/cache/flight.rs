@@ -352,18 +352,24 @@ pub async fn pump_and_seal(
     let mut written: u64 = 0;
     let mut buf = vec![0u8; 256 * 1024];
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Any failure past this point must remove the temp file (P56): the old
+    // shape left it behind on read/write/flush errors, and the startup-only
+    // sweep meant the leak persisted until the next restart.
+    let mut fail_cleanup = |e: BackendError| async {
+        let _ = tokio::fs::remove_file(tmp_path).await;
+        e
+    };
     loop {
-        let n = src
-            .stream
-            .read(&mut buf)
-            .await
-            .map_err(|e| BackendError::ServerError(format!("read stream: {e}")))?;
+        let n = match src.stream.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => return Err(fail_cleanup(BackendError::ServerError(format!("read stream: {e}"))).await),
+        };
         if n == 0 {
             break;
         }
-        out.write_all(&buf[..n])
-            .await
-            .map_err(|e| BackendError::Other(format!("write tmp: {e}")))?;
+        if let Err(e) = out.write_all(&buf[..n]).await {
+            return Err(fail_cleanup(BackendError::Other(format!("write tmp: {e}"))).await);
+        }
         written += n as u64;
         let _ = tx.send(FlightProgress::Growing(written));
     }
@@ -380,12 +386,12 @@ pub async fn pump_and_seal(
             )));
         }
     }
-    out.flush()
-        .await
-        .map_err(|e| BackendError::Other(format!("flush tmp: {e}")))?;
-    out.sync_all()
-        .await
-        .map_err(|e| BackendError::Other(format!("fsync tmp: {e}")))?;
+    if let Err(e) = out.flush().await {
+        return Err(fail_cleanup(BackendError::Other(format!("flush tmp: {e}"))).await);
+    }
+    if let Err(e) = out.sync_all().await {
+        return Err(fail_cleanup(BackendError::Other(format!("fsync tmp: {e}"))).await);
+    }
     drop(out);
     // Blocking fs (dir creation + rename) off the async runtime.
     let tmp = tmp_path.to_path_buf();

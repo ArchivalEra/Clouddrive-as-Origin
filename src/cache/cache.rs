@@ -24,6 +24,15 @@ pub enum CacheOutcome {
     Revalidated,
 }
 
+/// Disk headroom held back from cold pulls (P56): the node must keep room
+/// for logs, the redb file, and an operator's emergency shell even when the
+/// cache is at its configured maximum.
+const DISK_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Never evict a staging ledger row younger than this (P56): an active
+/// transfer's row is touched continuously and must not be yanked mid-flight.
+const STAGE_MIN_AGE_MS: u64 = 60_000;
+
 /// How long a listing walk stays reusable for subsequent pages (P9).
 const LISTING_SNAPSHOT_TTL_MS: u64 = 5_000;
 
@@ -1283,17 +1292,62 @@ impl<C: Clock + Clone> Cache<C> {
         } else {
             Vec::new()
         };
+        // 1b. Staged bytes share the disk budget (P56): `segment_bytes`
+        //     used to be bounded only by time (inactive_ttl), so an
+        //     efficient-profile scrub session could stage far more than
+        //     max_size_bytes while total_bytes stayed at zero. Pick the
+        //     oldest-touched ledger rows first, same LRU shape as entries.
+        let over_budget = {
+            let s = self.state.read().await;
+            s.total_bytes.saturating_add(s.segment_bytes) > self.config.max_size_bytes
+        };
+        let stage_victims: Vec<(String, u64)> = if over_budget {
+            let cov = self.coverage.lock().await;
+            let mut rows: Vec<(u64, String)> =
+                cov.iter().map(|(k, c)| (c.last_touch_millis, k.clone())).collect();
+            rows.sort();
+            let mut over = {
+                let s = self.state.read().await;
+                s.total_bytes
+                    .saturating_add(s.segment_bytes)
+                    .saturating_sub(self.config.max_size_bytes)
+            };
+            let mut picked = Vec::new();
+            for (_, k) in rows {
+                if over == 0 {
+                    break;
+                }
+                let sz = cov.get(&k).map(|c| c.covered_bytes()).unwrap_or(0);
+                // Never evict a row that is actively staging right now.
+                if sz == 0 || now.saturating_sub(cov[&k].last_touch_millis) < STAGE_MIN_AGE_MS {
+                    continue;
+                }
+                over = over.saturating_sub(sz);
+                picked.push((k, sz));
+            }
+            picked
+        } else {
+            Vec::new()
+        };
+
         // 2. Filesystem deletes hold no locks — and run off the async
         // runtime (blocking read_dir/remove_file in spawn_blocking).
+        let mut victims: Vec<String> = expired.clone();
+        victims.extend(stage_victims.iter().map(|(k, _)| k.clone()));
+        // `segment_bytes` is accounted from the LEDGER (finalize_coverage
+        // adds to it, scan_segments rebuilds it), so eviction subtracts
+        // the ledger's bytes too — not only what a disk scan happened to
+        // find.
+        let stage_freed: u64 = stage_victims.iter().map(|(_, b)| *b).sum();
         let freed = {
             let cache_dir = self.config.cache_dir.clone();
-            let expired = expired.clone();
+            let victims = victims.clone();
             tokio::task::spawn_blocking(move || {
                 // One top-level index for the whole batch (P4): the old
                 // shape walked the entire cache once per expired key.
                 let index = store::segment_index(&cache_dir);
                 let mut freed: u64 = 0;
-                for key in &expired {
+                for key in &victims {
                     if let Some(paths) = index.get(key) {
                         for path in paths {
                             freed += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -1306,6 +1360,10 @@ impl<C: Clock + Clone> Cache<C> {
                     store::sweep_segparts(&cache_dir, ttl_ms, now);
                     store::sweep_orphan_metas(&cache_dir);
                 }
+                // Abandoned cold-pull temps are swept every tick, not only
+                // at boot (P56): a mid-write failure leaves the tmp behind
+                // and the next restart could be days away.
+                let _ = store::cleanup_stale_tmps(&cache_dir, ttl_ms, now);
                 freed
             })
             .await
@@ -1316,9 +1374,14 @@ impl<C: Clock + Clone> Cache<C> {
         let reaped = {
             let mut s = self.state.write().await;
             let reaped = reap_collect(&mut s, ttl_ms, now);
+            // `freed` covers BOTH the age-expired rows and any rows evicted
+            // to bring staged bytes under budget, so it must be applied
+            // whenever either path ran — not only on the age sweep.
             if do_sweep {
                 s.segment_sweep_at_millis = now;
-                s.segment_bytes = s.segment_bytes.saturating_sub(freed);
+            }
+            if do_sweep || !stage_victims.is_empty() {
+                s.segment_bytes = s.segment_bytes.saturating_sub(freed.max(stage_freed));
             }
             reaped
         };
@@ -1328,10 +1391,11 @@ impl<C: Clock + Clone> Cache<C> {
             evict_pick(&mut s, &self.config)
         };
         remove_entries(&self.config, &self.meta, &evicted).await;
-        // 4. Ledger removal (coverage only).
-        if do_sweep {
+        // 4. Ledger removal (coverage only): expired rows plus any row
+        //    evicted to bring staged bytes back under budget.
+        if do_sweep || !stage_victims.is_empty() {
             let mut cov = self.coverage.lock().await;
-            for key in &expired {
+            for key in expired.iter().chain(stage_victims.iter().map(|(k, _)| k)) {
                 cov.remove(key);
             }
         }
@@ -1715,6 +1779,24 @@ async fn drive_flight<C: Clock>(
             slot.backend.stat(&backend_key).await?
         };
         let _stream_permit = slot.stream_gate.acquire().await;
+        // Capacity admission (P56): refuse to start a transfer that would
+        // cross the reserve floor. Without this the only signal was a
+        // failed write mid-pull, leaving both a broken response and a
+        // leaked temp file. Metadata is already known, so the client gets
+        // a clean error instead of a truncated body.
+        if !store::has_room_for(&config.cache_dir, meta.size_bytes, DISK_RESERVE_BYTES) {
+            let free = store::free_bytes(&config.cache_dir).unwrap_or(0);
+            tracing::warn!(
+                key = %entry_key,
+                want = meta.size_bytes,
+                free,
+                "cold pull refused: not enough free space"
+            );
+            return Err(BackendError::ServerError(format!(
+                "insufficient disk space: need {} bytes, {free} free",
+                meta.size_bytes
+            )));
+        }
         let _ = flight.progress_tx.send(FlightProgress::Meta(meta.clone()));
         // Upstream fetch is ALWAYS a single stream. Measured on the real
         // upstream (OpenList -> Google Drive, 3.1 GB file):

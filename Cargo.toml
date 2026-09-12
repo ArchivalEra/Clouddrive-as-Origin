@@ -41,6 +41,9 @@ rustls-pemfile = "2"
 tokio-util = { version = "0.7", features = ["io"] }
 reqwest_dav = "0.3"
 redb = "2"
+# Already present transitively (redb/tokio); declared for the free-space
+# guard in the capacity model (ADR-0007). No new crate enters the lockfile.
+libc = "0.2"
 percent-encoding = "2.3.2"
 base64 = "0.22"
 form_urlencoded = "1"
