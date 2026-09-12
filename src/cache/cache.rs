@@ -168,8 +168,17 @@ impl<C: Clock + Clone> Cache<C> {
     }
 
     /// Startup: load persisted entries (drop rows whose file vanished),
-    /// sweep partial-download temps, and start the coalesced flush task.
-    pub async fn load_and_start(&self) {
+    /// sweep partial-download temps, and start the coalesced flush task
+    /// plus the reaper loop (60 s — inactive-expiry and max-size LRU run
+    /// in production, matching the ADR-0002 `tick()` interface instead of
+    /// only ever being driven by tests).
+    pub async fn load_and_start(self: &Arc<Self>) {
+        self.load_and_start_with(std::time::Duration::from_secs(60)).await;
+    }
+
+    /// [`Cache::load_and_start`] with an injectable reaper interval (tests
+    /// shorten it so expiry assertions don't wait on the production spacing).
+    pub async fn load_and_start_with(self: &Arc<Self>, reaper_interval: std::time::Duration) {
         // Startup self-heal (spec §3.10): temp files from crashed downloads.
         let _ = store::cleanup_tmps(&self.config.cache_dir);
 
@@ -209,6 +218,19 @@ impl<C: Clock + Clone> Cache<C> {
                         tracing::warn!(key = %key, error = %e, "access-clock flush failed");
                     }
                 }
+            }
+        });
+
+        // Reaper loop: `tick()` drives inactive expiry + max-size LRU, and
+        // until now only tests ever called it — a deployed binary never
+        // reaped anything. Run it on a fixed interval (ADR-0002: tick is
+        // part of the Cache interface, not a test-only affordance).
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(reaper_interval);
+            loop {
+                tick.tick().await;
+                this.tick().await;
             }
         });
     }
