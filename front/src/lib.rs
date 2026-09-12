@@ -52,6 +52,10 @@ pub struct FrontOptions {
     /// Per-client-IP requests/sec ceiling; None disables rate limiting
     /// (threshold lands with the real-traffic baseline, map ticket 45).
     pub rate_rps: Option<u32>,
+    /// Service worker threads for the proxy listener. Pingora's default is
+    /// 1, which serializes all TLS/H2/byte movement on one core (P6).
+    /// None keeps the framework default; callers size it to the box.
+    pub threads: Option<usize>,
 }
 
 /// Parse a CIDR allow/block entry; a bare IP is treated as /32 (or /128).
@@ -451,7 +455,27 @@ pub fn run_front(opts: FrontOptions) -> anyhow::Result<()> {
         business: opts.business,
         rate,
     };
-    let mut service = pingora::proxy::http_proxy_service(&server.configuration, proxy);
+    // Build the proxy service directly rather than via
+    // `http_proxy_service`: its builder path leaves `h2_options` at None
+    // in pingora 0.8.1 (the field exists but has no setter and is marked
+    // TODO upstream), so downstream H2 tuning is unreachable that way.
+    let mut http_proxy = pingora::proxy::HttpProxy::new(proxy, server.configuration.clone());
+    // Downstream H2 flow control. Pingora's upstream H2 client uses an
+    // 8 MiB window with 64 KiB frames, while its downstream default is the
+    // h2 crate's 64 KiB / 16 KiB — so many concurrent range streams share
+    // a small connection window. Match the upstream side (P6).
+    let mut h2 = pingora::protocols::http::v2::server::H2Options::default();
+    h2.initial_window_size(1 << 23)
+        .initial_connection_window_size(1 << 23)
+        .max_frame_size(1 << 16);
+    http_proxy.h2_options = Some(h2);
+    let mut service =
+        pingora::services::listening::Service::new("origin-front".to_string(), http_proxy);
+    if let Some(threads) = opts.threads {
+        // Pingora resolves `service.threads().unwrap_or(conf.threads)`;
+        // the default is 1.
+        service.threads = Some(threads);
+    }
     if !opts.ip_block.is_empty() {
         let filter = std::sync::Arc::new(IpFilter {
             block: parse_cidrs(&opts.ip_block)?,

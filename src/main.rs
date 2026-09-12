@@ -87,6 +87,11 @@ async fn main() -> anyhow::Result<()> {
         ip_block: cfg.front_ip_block.clone(),
         ip_allow: cfg.front_ip_allow.clone(),
         rate_rps: cfg.front_rate_rps,
+        // The box has 2 cores; the business plane already runs its own
+        // workers on them. Pingora's default of 1 thread serializes every
+        // TLS/H2/byte-move on one core (P6). Two proxy threads let TLS and
+        // framing overlap; sized to the box, not unbounded.
+        threads: cfg.front_threads.or(Some(2)),
     };
     let front_thread = std::thread::spawn(move || {
         if let Err(e) = front::run_front(front_opts) {
