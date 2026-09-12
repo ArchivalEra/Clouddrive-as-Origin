@@ -333,15 +333,14 @@ impl ProxyHttp for BusinessProxy {
         ));
         if let Some(opts) = peer.get_mut_peer_options() {
             // The upstream here is the business plane on loopback — the
-            // same process, not a hostile peer. Only the connect timeout
-            // is meaningful (guards a business plane that is not
-            // listening); a body-read cap would sever a legitimate slow
-            // cold pull, which is silent for its whole duration while the
-            // parallel pump fills the cache.
+            // same process, not a hostile peer. read_timeout is per-read
+            // inactivity, not a total body cap: the business plane streams
+            // progress chunks while a cold pull runs, so a flowing pull
+            // never trips it, while a stalled body ends after 30 s instead
+            // of hanging every attached client forever.
             opts.connection_timeout = Some(std::time::Duration::from_secs(3));
             opts.idle_timeout = Some(std::time::Duration::from_secs(60)); // pool keepalive
-            // read_timeout / write_timeout deliberately unset (pingora
-            // default None): see above.
+            opts.read_timeout = Some(std::time::Duration::from_secs(30));
         }
         Ok(peer)
     }

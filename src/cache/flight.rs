@@ -36,12 +36,25 @@ pub struct FlightShared {
     pub tmp_path: std::path::PathBuf,
     pub final_path: std::path::PathBuf,
     pub progress_tx: watch::Sender<FlightProgress>,
+    /// Watch-wait budget: how long a reader waits for progress events
+    /// without the flight advancing before it gives up with a clean error.
+    /// Inactivity, not total time — a slow-but-flowing pull never trips it.
+    pub stall_budget: std::time::Duration,
 }
 
+/// Production default for [`FlightShared::stall_budget`] (tests inject a
+/// shorter one). Generous vs. the ~800 ms upstream open cost; a flowing
+/// upstream gaps well under a second per chunk.
+pub const DEFAULT_STALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl FlightShared {
-    pub fn new(tmp_path: std::path::PathBuf, final_path: std::path::PathBuf) -> Self {
+    pub fn new(
+        tmp_path: std::path::PathBuf,
+        final_path: std::path::PathBuf,
+        stall_budget: std::time::Duration,
+    ) -> Self {
         let (progress_tx, _) = watch::channel(FlightProgress::Pending);
-        Self { tmp_path, final_path, progress_tx }
+        Self { tmp_path, final_path, progress_tx, stall_budget }
     }
 
     pub fn subscribe(&self) -> watch::Receiver<FlightProgress> {
@@ -88,6 +101,25 @@ pub fn file_body(path: std::path::PathBuf, offset: u64, len: u64) -> BodyStream 
 /// written by the time it is requested — the wait is near-zero in
 /// practice, and a genuine cold seek costs only the full pull it would
 /// have needed anyway.
+/// Wait for the next flight progress event within the flight's stall
+/// budget. `Ok(Some(()))` = progress arrived, `Ok(None)` = sender dropped
+/// without a terminal event. A stall-budget exhaustion is a body error:
+/// the response already promised bytes, and hanging forever is the only
+/// worse outcome.
+async fn next_progress(
+    flight: &FlightShared,
+    rx: &mut watch::Receiver<FlightProgress>,
+) -> Result<Option<()>, std::io::Error> {
+    match tokio::time::timeout(flight.stall_budget, rx.changed()).await {
+        Ok(Ok(())) => Ok(Some(())),
+        Ok(Err(_)) => Ok(None),
+        Err(_) => Err(std::io::Error::other(format!(
+            "flight stalled: no progress for {:?}",
+            flight.stall_budget
+        ))),
+    }
+}
+
 pub fn growing_reader_from(
     flight: std::sync::Arc<FlightShared>,
     start: u64,
@@ -121,11 +153,11 @@ pub fn growing_reader_from(
                             FlightProgress::Failed(e) => {
                                 Err(std::io::Error::other(format!("upstream download failed: {e}")))?;
                             }
-                            _ => {
-                                if rx.changed().await.is_err() {
-                                    break; // sender dropped without Done
-                                }
-                            }
+                            _ => match next_progress(&flight, &mut rx).await {
+                                Ok(Some(())) => {}
+                                Ok(None) => break, // sender dropped without Done
+                                Err(e) => Err(e)?,
+                            },
                         }
                         continue;
                     }
@@ -154,11 +186,11 @@ pub fn growing_reader_from(
                 FlightProgress::Failed(e) => {
                     Err(std::io::Error::other(format!("upstream download failed: {e}")))?;
                 }
-                _ => {
-                    if rx.changed().await.is_err() {
-                        break; // sender dropped; treat as end
-                    }
-                }
+                _ => match next_progress(&flight, &mut rx).await {
+                    Ok(Some(())) => {}
+                    Ok(None) => break, // sender dropped; treat as end
+                    Err(e) => Err(e)?,
+                },
             }
         }
     })
@@ -263,7 +295,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join(".tmp.x");
         let finalp = dir.path().join("x.bin");
-        let flight = std::sync::Arc::new(FlightShared::new(tmp.clone(), finalp.clone()));
+        let flight = std::sync::Arc::new(FlightShared::new(tmp.clone(), finalp.clone(), DEFAULT_STALL_BUDGET));
         let mut body = growing_reader(flight.clone());
         let mut body2 = growing_reader(flight.clone());
 
@@ -297,5 +329,131 @@ mod tests {
         driver.await.unwrap();
         assert_eq!(out1, payload);
         assert_eq!(out2, payload);
+    }
+
+    /// A driver that stops advancing (dead upstream) must end every
+    /// attached reader with a clean body error inside the stall budget —
+    /// this is the multi-client TIMEOUT storm's root failure mode, which
+    /// used to hang forever (audit finding C2).
+    #[tokio::test]
+    async fn stalled_flight_ends_reader_within_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".tmp.s");
+        let finalp = dir.path().join("s.bin");
+        let flight = std::sync::Arc::new(FlightShared::new(
+            tmp.clone(),
+            finalp.clone(),
+            std::time::Duration::from_millis(120),
+        ));
+        let meta = ObjectMeta { size_bytes: 1024, etag: None, last_modified: None, mime_hint: None };
+        let _ = flight.progress_tx.send(FlightProgress::Meta(meta));
+
+        struct StallAfterFirst {
+            first: Option<Vec<u8>>,
+        }
+        impl tokio::io::AsyncRead for StallAfterFirst {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if let Some(b) = self.first.take() {
+                    buf.put_slice(&b);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                // Never wakes: a permanently dead upstream.
+                std::task::Poll::Pending
+            }
+        }
+        let src = StreamSource {
+            stream: Box::new(StallAfterFirst { first: Some(vec![7u8; 64]) }),
+            total_len: Some(1024),
+        };
+        let driver = {
+            let flight = flight.clone();
+            tokio::spawn(async move {
+                let _ = pump_and_seal(src, &tmp, &finalp, &flight.progress_tx).await;
+            })
+        };
+
+        use futures::StreamExt;
+        let started = std::time::Instant::now();
+        let mut body = growing_reader(flight.clone());
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), async move {
+            let mut got = 0usize;
+            let mut errored = false;
+            while let Some(c) = body.next().await {
+                match c {
+                    Ok(b) => got += b.len(),
+                    Err(_) => {
+                        errored = true;
+                        break;
+                    }
+                }
+            }
+            (errored, got)
+        })
+        .await
+        .expect("reader must terminate within the test timeout, not hang forever");
+        driver.abort();
+        let (errored, got) = outcome;
+        assert!(errored, "stall must surface as a body error, not silence");
+        assert_eq!(got, 64, "bytes written before the stall must reach the reader");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "stall must end near the stall budget (120 ms), not at the test timeout"
+        );
+    }
+
+    /// Inactivity, not total time: a slow-but-flowing stream must never
+    /// trip the stall budget.
+    #[tokio::test]
+    async fn slow_but_flowing_stream_survives_stall_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".tmp.f");
+        let finalp = dir.path().join("f.bin");
+        let flight = std::sync::Arc::new(FlightShared::new(
+            tmp.clone(),
+            finalp.clone(),
+            std::time::Duration::from_millis(300),
+        ));
+        let meta = ObjectMeta { size_bytes: 3072, etag: None, last_modified: None, mime_hint: None };
+        let _ = flight.progress_tx.send(FlightProgress::Meta(meta));
+
+        let driver = {
+            let flight = flight.clone();
+            tokio::spawn(async move {
+                let mut f = tokio::fs::File::create(&tmp).await.unwrap();
+                use tokio::io::AsyncWriteExt;
+                let mut written = 0u64;
+                for i in 0..3u64 {
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    f.write_all(&vec![i as u8; 1024]).await.unwrap();
+                    written += 1024;
+                    let _ = flight.progress_tx.send(FlightProgress::Growing(written));
+                }
+                f.sync_all().await.unwrap();
+                drop(f);
+                store::install_tmp(&tmp, &finalp).unwrap();
+                let _ = flight.progress_tx.send(FlightProgress::Done);
+            })
+        };
+
+        use futures::StreamExt;
+        let mut body = growing_reader(flight.clone());
+        let mut got = 0usize;
+        let mut errored = false;
+        while let Some(c) = body.next().await {
+            match c {
+                Ok(b) => got += b.len(),
+                Err(_) => {
+                    errored = true;
+                    break;
+                }
+            }
+        }
+        driver.await.unwrap();
+        assert!(!errored, "a flowing stream must not trip the stall budget");
+        assert_eq!(got, 3072, "reader must see every byte the driver wrote");
     }
 }
