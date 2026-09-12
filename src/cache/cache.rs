@@ -415,8 +415,10 @@ impl<C: Clock + Clone> Cache<C> {
                 .backends
                 .get(&upstream_id)
                 .ok_or_else(|| BackendError::Other(format!("unknown upstream {upstream_id}")))?;
-            let _permit = slot.gate.acquire().await;
-            let m = slot.backend.stat(&Key::from_validated(backend_key)).await?;
+            let m = {
+                let _permit = slot.gate.acquire().await;
+                slot.backend.stat(&Key::from_validated(backend_key)).await?
+            };
             return Ok(hit_meta_remote(&key, &m));
         }
         {
@@ -535,9 +537,13 @@ impl<C: Clock + Clone> Cache<C> {
             .backends
             .get(&rk.upstream_id)
             .ok_or_else(|| BackendError::Other(format!("unknown upstream {}", rk.upstream_id)))?;
-        let _permit = slot.gate.acquire().await;
         let bkey = Key::from_validated(rk.backend_key.clone());
-        let meta = slot.backend.stat(&bkey).await?;
+        let meta = {
+            let _permit = slot.gate.acquire().await;
+            slot.backend.stat(&bkey).await?
+        };
+        // The staged transfer below is a stream (B1).
+        let _stream_permit = slot.stream_gate.acquire().await;
         let total = meta.size_bytes;
         let (start, end) = match range {
             None => (0, total),
@@ -1497,11 +1503,15 @@ async fn promote_key(
         None => return,
     };
     let bkey = Key::from_validated(cov.backend_key.clone());
-    let _permit = slot.gate.acquire().await;
-    let live = match slot.backend.stat(&bkey).await {
-        Ok(m) => m,
-        Err(_) => return,
+    let live = {
+        let _permit = slot.gate.acquire().await;
+        match slot.backend.stat(&bkey).await {
+            Ok(m) => m,
+            Err(_) => return,
+        }
     };
+    // Assembly fetches bytes: a stream (B1).
+    let _stream_permit = slot.stream_gate.acquire().await;
     if live.etag != Some(etag) || live.size_bytes != total {
         // Drifted under us: drop staged history, start over.
         reset_coverage(coverage, state, cache_dir, key).await;
@@ -1656,8 +1666,14 @@ async fn drive_flight<C: Clock>(
     clock: Arc<C>,
 ) {
     let outcome = async {
-        let _permit = slot.gate.acquire().await;
-        let meta = slot.backend.stat(&backend_key).await?;
+        // stat is metadata; the pump below is a stream. Take the metadata
+        // permit only for the stat (B1), then the stream permit for the
+        // transfer, so a cold pull cannot starve HEADs.
+        let meta = {
+            let _permit = slot.gate.acquire().await;
+            slot.backend.stat(&backend_key).await?
+        };
+        let _stream_permit = slot.stream_gate.acquire().await;
         let _ = flight.progress_tx.send(FlightProgress::Meta(meta.clone()));
         // Upstream fetch is ALWAYS a single stream. Measured on the real
         // upstream (OpenList -> Google Drive, 3.1 GB file):
@@ -1891,7 +1907,7 @@ mod tests {
         let mut slots = HashMap::new();
         slots.insert(
             "primary".to_string(),
-            Arc::new(BackendSlot { backend: Arc::new(backend), gate: Arc::new(tokio::sync::Semaphore::new(3)) }),
+            Arc::new(BackendSlot::new(Arc::new(backend), 3)),
         );
         let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), BackendRegistry::new(slots));
         (cfg, clock, cache, calls)
@@ -1936,7 +1952,7 @@ mod tests {
         let mut slots = HashMap::new();
         slots.insert(
             "primary".to_string(),
-            Arc::new(BackendSlot { backend: Arc::new(backend), gate: Arc::new(tokio::sync::Semaphore::new(3)) }),
+            Arc::new(BackendSlot::new(Arc::new(backend), 3)),
         );
         let cache = Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots));
         assert!(matches!(cache.get("missing.png", None).await, Err(BackendError::NotFound)));
@@ -1970,7 +1986,7 @@ mod tests {
         let mut slots = HashMap::new();
         slots.insert(
             "primary".to_string(),
-            Arc::new(BackendSlot { backend: Arc::new(backend2), gate: Arc::new(tokio::sync::Semaphore::new(3)) }),
+            Arc::new(BackendSlot::new(Arc::new(backend2), 3)),
         );
         let cache2 = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), BackendRegistry::new(slots));
         {
@@ -2001,7 +2017,7 @@ mod tests {
         let mut slots = HashMap::new();
         slots.insert(
             "primary".to_string(),
-            Arc::new(BackendSlot { backend: Arc::new(backend), gate: Arc::new(tokio::sync::Semaphore::new(3)) }),
+            Arc::new(BackendSlot::new(Arc::new(backend), 3)),
         );
         let cache = Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots));
         let mut hit = cache.get("a.png", None).await.unwrap();

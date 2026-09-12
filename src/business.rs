@@ -801,18 +801,12 @@ mod tests {
         };
         slots.insert(
             "primary".to_string(),
-            Arc::new(BackendSlot {
-                backend: Arc::new(mk("primary", bytes.to_vec())),
-                gate: Arc::new(Semaphore::new(3)),
-            }),
+            Arc::new(BackendSlot::new(Arc::new(mk("primary", bytes.to_vec())), 3)),
         );
         for (id, b) in extra {
             slots.insert(
                 id.to_string(),
-                Arc::new(BackendSlot {
-                    backend: Arc::new(mk(id, b)),
-                    gate: Arc::new(Semaphore::new(3)),
-                }),
+                Arc::new(BackendSlot::new(Arc::new(mk(id, b)), 3)),
             );
         }
         let cache = Arc::new(Cache::new(Arc::new(cfg.clone()), Arc::new(MockClock::new(0)), BackendRegistry::new(slots)));
@@ -854,7 +848,7 @@ mod tests {
         let mut slots = HashMap::new();
         slots.insert(
             "primary".to_string(),
-            Arc::new(BackendSlot { backend: Arc::new(backend), gate: Arc::new(Semaphore::new(3)) }),
+            Arc::new(BackendSlot::new(Arc::new(backend), 3)),
         );
         let cache = Arc::new(Cache::new(Arc::new(cfg.clone()), Arc::new(MockClock::new(0)), BackendRegistry::new(slots)));
         Fixture {
@@ -893,7 +887,7 @@ mod tests {
         let mut slots = HashMap::new();
         slots.insert(
             "primary".to_string(),
-            Arc::new(BackendSlot { backend: Arc::new(backend), gate: Arc::new(Semaphore::new(3)) }),
+            Arc::new(BackendSlot::new(Arc::new(backend), 3)),
         );
         let cache = Arc::new(Cache::new(Arc::new(cfg.clone()), Arc::new(MockClock::new(0)), BackendRegistry::new(slots)));
         Fixture {

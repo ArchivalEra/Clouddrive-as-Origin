@@ -405,11 +405,33 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// One configured upstream's runtime pieces: the provider backend plus
-/// its Graph/Drive concurrency gate (spec §4: per-upstream ≤ N).
+/// One configured upstream's runtime pieces: the provider backend plus its
+/// per-upstream concurrency gates (spec §4: per-upstream ≤ N).
+///
+/// Two gates, deliberately separate (B1). The measurement that justified
+/// the split: with a single shared gate, a HEAD on one key took **14.2 s**
+/// while three long cold pulls held the permits, versus **22 ms** idle —
+/// metadata operations were queueing behind byte-moving transfers. Metadata
+/// (stat/HEAD/list/direct_url) and streams (cold-miss pumps, passthrough
+/// staging, promotion assembly) now have independent budgets, so a long
+/// download can never starve a HEAD.
 pub struct BackendSlot {
     pub backend: Arc<dyn StorageBackend>,
+    /// Metadata gate: concurrent stat / HEAD / list / link lookups.
     pub gate: Arc<Semaphore>,
+    /// Stream gate: concurrent byte-moving transfers.
+    pub stream_gate: Arc<Semaphore>,
+}
+
+impl BackendSlot {
+    /// Both gates start at the configured per-upstream concurrency.
+    pub fn new(backend: Arc<dyn StorageBackend>, concurrency: usize) -> Self {
+        Self {
+            backend,
+            gate: Arc::new(Semaphore::new(concurrency)),
+            stream_gate: Arc::new(Semaphore::new(concurrency)),
+        }
+    }
 }
 
 /// Registry of constructed backends, keyed by upstream id (from config).
