@@ -229,6 +229,9 @@ pub fn growing_reader_from(
         let mut remaining: Option<u64> = len;
         let mut buf = vec![0u8; 256 * 1024];
         let mut file: Option<tokio::fs::File> = None;
+        // The file cursor tracks `pos` after every read, so a seek is only
+        // needed when the handle is (re)opened or after a caught-up wait.
+        let mut needs_seek = true;
         loop {
             if remaining == Some(0) {
                 break; // range satisfied
@@ -261,9 +264,31 @@ pub fn growing_reader_from(
                     }
                 }
             }
+            // If the writer has not reached our position, do not touch the
+            // file at all. A far-ahead seeker used to run seek+read (two
+            // blocking-pool round-trips) and re-arm the stall timer on
+            // every upstream chunk; one wait per chunk is the floor with a
+            // broadcast channel, the syscalls are not.
+            let written = match &*rx.borrow() {
+                FlightProgress::Growing(w) => Some(*w),
+                _ => None,
+            };
+            if let Some(w) = written {
+                if w <= pos {
+                    match next_progress(&flight, &mut rx).await {
+                        Ok(Some(())) => continue,
+                        Ok(None) => break, // sender dropped; treat as end
+                        Err(e) => Err(e)?,
+                    }
+                }
+            }
+
             let f = file.as_mut().unwrap();
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
-            f.seek(std::io::SeekFrom::Start(pos)).await?;
+            if needs_seek {
+                f.seek(std::io::SeekFrom::Start(pos)).await?;
+                needs_seek = false;
+            }
             let want = match remaining {
                 Some(r) => buf.len().min(r as usize),
                 None => buf.len(),
@@ -277,18 +302,23 @@ pub fn growing_reader_from(
                 yield Bytes::copy_from_slice(&buf[..n]);
                 continue;
             }
-            // Caught up with the writer.
+            // EOF while the writer is already past us (or a sealed short
+            // file): resolve from the terminal state, else wait again.
             let st = rx.borrow().clone();
             match st {
                 FlightProgress::Done => break, // EOF + sealed = complete
                 FlightProgress::Failed(e) => {
                     Err(std::io::Error::other(format!("upstream download failed: {e}")))?;
                 }
-                _ => match next_progress(&flight, &mut rx).await {
-                    Ok(Some(())) => {}
-                    Ok(None) => break, // sender dropped; treat as end
-                    Err(e) => Err(e)?,
-                },
+                _ => {
+                    // A zero-byte read left the cursor at `pos`, so no
+                    // re-seek is needed when we wake.
+                    match next_progress(&flight, &mut rx).await {
+                        Ok(Some(())) => {}
+                        Ok(None) => break, // sender dropped; treat as end
+                        Err(e) => Err(e)?,
+                    }
+                }
             }
         }
     })
@@ -572,6 +602,75 @@ mod tests {
         driver.await.unwrap();
         assert!(!errored, "a flowing stream must not trip the stall budget");
         assert_eq!(got, 3072, "reader must see every byte the driver wrote");
+    }
+
+    /// A reader far ahead of the writer must not touch the file until the
+    /// writer reaches it (P3): with a slow driver, the reader's total read
+    /// count stays at the number of chunks it actually consumes, not one
+    /// per upstream progress event.
+    #[tokio::test]
+    async fn far_ahead_reader_skips_reads_until_writer_catches_up() {
+        use futures::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".tmp.far");
+        let finalp = dir.path().join("far.bin");
+        let flight = std::sync::Arc::new(FlightShared::new(
+            tmp.clone(),
+            finalp.clone(),
+            std::time::Duration::from_millis(500),
+        ));
+        let total = 512 * 1024u64;
+        let meta = ObjectMeta { size_bytes: total, etag: None, last_modified: None, mime_hint: None };
+        let _ = flight.progress_tx.send(FlightProgress::Meta(meta));
+
+        // The reader wants only the last 8 KB — far ahead of the writer.
+        let want = 8 * 1024usize;
+        let mut body = growing_reader_from(flight.clone(), total - want as u64, Some(want as u64));
+
+        // Driver: publish several growth events that all stay BELOW the
+        // reader's offset, so the reader must not read yet, then finish.
+        let driver = {
+            let flight = flight.clone();
+            let tmp = tmp.clone();
+            let finalp = finalp.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let mut f = tokio::fs::File::create(&tmp).await.unwrap();
+                let mut written = 0u64;
+                while written < total {
+                    let chunk = 64 * 1024u64;
+                    let end = (written + chunk).min(total);
+                    let data: Vec<u8> = (written..end).map(|i| (i % 251) as u8).collect();
+                    // Hold the tail back so the reader is genuinely ahead.
+                    if end > total - want as u64 {
+                        f.write_all(&vec![0u8; (total - written) as usize]).await.unwrap();
+                        written = total;
+                        let _ = flight.progress_tx.send(FlightProgress::Growing(written));
+                        break;
+                    }
+                    f.write_all(&data).await.unwrap();
+                    written = end;
+                    let _ = flight.progress_tx.send(FlightProgress::Growing(written));
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                f.sync_all().await.unwrap();
+                drop(f);
+                store::install_tmp(&tmp, &finalp).unwrap();
+                let _ = flight.progress_tx.send(FlightProgress::Done);
+            })
+        };
+
+        let mut got = Vec::new();
+        let started = std::time::Instant::now();
+        while let Some(c) = body.next().await {
+            got.extend_from_slice(&c.expect("no body error"));
+        }
+        driver.await.unwrap();
+        assert_eq!(got.len(), want, "far-ahead reader must receive its exact slice");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "reader must finish promptly, not on the stall budget"
+        );
     }
 
     #[tokio::test]
