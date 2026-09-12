@@ -21,6 +21,9 @@ front_ip_allow = []
 # Per-client-IP requests/sec ceiling on the front. Omit = disabled;
 # threshold lands after the real-traffic baseline (wayfinder #45).
 # front_rate_rps = 500
+# Proxy service worker threads (ADR-0004 era P6). Omit = 2; pingora's own
+# default of 1 serializes TLS/H2 on a single core.
+# front_threads = 2
 
 # Business plane (axum on loopback — never exposed directly)
 listen_addr = "127.0.0.1:8080"
@@ -28,6 +31,7 @@ listen_addr = "127.0.0.1:8080"
 # --- cache ---
 cache_dir = "/var/lib/origin-cache"
 max_size_bytes = 107374182400      # 100 GiB (spec §3.4)
+max_entries = 500000              # entry-count budget (ADR-0006); 0 = bytes only
 inactive_ttl_secs = 1200          # 20 min (spec §3.3)
 revalidate_ttl_secs = 60          # spec §3.5
 negative_ttl_secs = 60            # spec §3.6
