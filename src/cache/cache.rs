@@ -312,11 +312,9 @@ impl<C: Clock + Clone> Cache<C> {
                         }
                     }
                 }
-                // ... then the per-key redb writes (batched separately: P5).
-                for (key, ms) in batch {
-                    if let Err(e) = meta.bump_last_access(&key, ms).await {
-                        tracing::warn!(key = %key, error = %e, "access-clock flush failed");
-                    }
+                // ... then ONE redb transaction for the whole batch (P5).
+                if let Err(e) = meta.bump_last_access_batch(&batch).await {
+                    tracing::warn!(error = %e, "access-clock flush failed");
                 }
             }
         });
@@ -1777,8 +1775,16 @@ async fn remove_entries(
     meta_store: &crate::cache::persist::MetaStore,
     victims: &[(String, u64)],
 ) {
+    if victims.is_empty() {
+        return;
+    }
+    // One redb transaction for the whole victim batch (P5), then the file
+    // deletes.
+    let keys: Vec<String> = victims.iter().map(|(k, _)| k.clone()).collect();
+    if let Err(e) = meta_store.remove_batch(&keys).await {
+        tracing::warn!(error = %e, "batched redb remove failed");
+    }
     for (k, _) in victims {
-        let _ = meta_store.remove(k).await;
         let path = store::file_path(&config.cache_dir, k);
         let _ = tokio::fs::remove_file(&path).await;
         store::prune_empty_parents(&config.cache_dir, &path);
