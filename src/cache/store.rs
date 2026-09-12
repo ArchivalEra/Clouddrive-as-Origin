@@ -32,16 +32,37 @@ pub fn install_tmp(tmp: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Every file at the TOP LEVEL of cache_dir, in one `read_dir` (P4).
+///
+/// All ephemeral artifacts — `.tmp.*`, `.seg.*`, `.segpart.*`, `.segmeta.*`
+/// — are written flat into cache_dir by `tmp_path`/`seg_path`/`segpart_path`/
+/// `segmeta_path`; only the durable object files mirror the key's nested
+/// path (`file_path`). The sweep helpers therefore never need to recurse:
+/// walking the whole tree made every sweep cost grow with the number of
+/// cached objects while finding nothing new.
+pub fn top_level_files(cache_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(cache_dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            out.push(entry.path());
+        }
+    }
+    out
+}
+
 /// Remove all `.tmp.*` files under cache_dir (startup cleanup).
 pub fn cleanup_tmps(cache_dir: &Path) -> anyhow::Result<usize> {
     let mut removed = 0;
     if !cache_dir.exists() {
         return Ok(0);
     }
-    for entry in walkdir::WalkDir::new(cache_dir).into_iter().filter_map(|e| e.ok()) {
-        let name = entry.file_name().to_string_lossy();
+    for path in top_level_files(cache_dir) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
         if name.starts_with(".tmp.") {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(&path);
             removed += 1;
         }
     }
@@ -232,18 +253,15 @@ pub fn scan_segments(cache_dir: &Path, now_millis: u64) -> (std::collections::Ha
     // Stage 1: drop in-flight orphans (never completed, no ledger claim).
     // Stage 2: fold completed segments; unparseable names are our own junk.
     let mut seg_files: Vec<PathBuf> = Vec::new();
-    for entry in walkdir::WalkDir::new(cache_dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for path in top_level_files(cache_dir) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         if name.starts_with(".segpart.") {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(&path);
         } else if name.starts_with(".seg.") && !name.starts_with(".segmeta.") {
             match parse_seg_name(&name) {
-                Some(_) => seg_files.push(entry.path().to_path_buf()),
+                Some(_) => seg_files.push(path),
                 None => {
-                    let _ = std::fs::remove_file(entry.path());
+                    let _ = std::fs::remove_file(&path);
                 }
             }
         }
@@ -279,20 +297,29 @@ pub fn scan_segments(cache_dir: &Path, now_millis: u64) -> (std::collections::Ha
 /// Completed segment files for one key (for size accounting on sweep).
 pub fn key_segment_files(cache_dir: &Path, key: &str) -> Vec<PathBuf> {
     let prefix = format!(".seg.{}.", escape_key(key));
-    let mut out = Vec::new();
-    if !cache_dir.exists() {
-        return out;
-    }
-    for entry in walkdir::WalkDir::new(cache_dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
+    top_level_files(cache_dir)
+        .into_iter()
+        .filter(|path| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            name.starts_with(&prefix) && parse_seg_name(&name).is_some()
+        })
+        .collect()
+}
+
+/// Completed segments grouped by key, built in ONE top-level pass (P4).
+/// The reaper used to call [`key_segment_files`] per expired key, so one
+/// tick cost O(expired × cache size); this costs one directory read.
+pub fn segment_index(cache_dir: &Path) -> std::collections::HashMap<String, Vec<PathBuf>> {
+    let mut idx: std::collections::HashMap<String, Vec<PathBuf>> = std::collections::HashMap::new();
+    for path in top_level_files(cache_dir) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        if name.starts_with(".seg.") && !name.starts_with(".segmeta.") {
+            if let Some((key, _, _)) = parse_seg_name(&name) {
+                idx.entry(key).or_default().push(path);
+            }
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && parse_seg_name(&name).is_some() {
-            out.push(entry.path().to_path_buf());
-        }
     }
-    out
+    idx
 }
 
 /// Sweep abandoned in-flight `.segpart.*` parts older than `ttl_ms` (fs
@@ -303,18 +330,15 @@ pub fn sweep_segparts(cache_dir: &Path, ttl_ms: u64, now_millis: u64) -> u64 {
         return 0;
     }
     let mut removed_bytes = 0u64;
-    for entry in walkdir::WalkDir::new(cache_dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for path in top_level_files(cache_dir) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         if !name.starts_with(".segpart.") {
             continue;
         }
-        let old = mtime_millis(entry.path()).is_none_or(|m| now_millis.saturating_sub(m) >= ttl_ms);
+        let old = mtime_millis(&path).is_none_or(|m| now_millis.saturating_sub(m) >= ttl_ms);
         if old {
-            removed_bytes += std::fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0);
-            let _ = std::fs::remove_file(entry.path());
+            removed_bytes += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let _ = std::fs::remove_file(&path);
         }
     }
     removed_bytes
@@ -326,27 +350,24 @@ pub fn sweep_orphan_metas(cache_dir: &Path) {
     if !cache_dir.exists() {
         return;
     }
+    // One top-level pass answers both halves: which keys have segments, and
+    // which `.segmeta.*` markers are now orphaned (P4).
+    let files = top_level_files(cache_dir);
     let mut live: HashSet<String> = HashSet::new();
-    for entry in walkdir::WalkDir::new(cache_dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for path in &files {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
         if name.starts_with(".seg.") && !name.starts_with(".segmeta.") {
             if let Some((key, _, _)) = parse_seg_name(&name) {
                 live.insert(key);
             }
         }
     }
-    for entry in walkdir::WalkDir::new(cache_dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for path in &files {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
         if let Some(esc) = name.strip_prefix(".segmeta.") {
             let key = unescape_key(esc).unwrap_or_default();
             if !live.contains(&key) {
-                let _ = std::fs::remove_file(entry.path());
+                let _ = std::fs::remove_file(path);
             }
         }
     }
@@ -373,6 +394,33 @@ mod tests {
         prune_empty_parents(dir.path(), &dest);
         assert!(!dir.path().join("2026/08").exists());
         assert!(!dir.path().join("2026").exists());
+    }
+
+    /// P4: the sweeps only touch the top level, so a nested object tree
+    /// costs nothing to scan and nested files are never mistaken for
+    /// ephemeral artifacts.
+    #[test]
+    fn top_level_sweeps_ignore_nested_objects() {
+        let dir = tempdir().unwrap();
+        // A deep object tree, plus flat ephemeral artifacts.
+        let nested = dir.path().join("2026/08/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("video.mkv"), vec![0u8; 32]).unwrap();
+        std::fs::write(dir.path().join(".tmp.2026_08_deep_video.mkv.1234"), b"partial").unwrap();
+        std::fs::write(dir.path().join(".segpart.2026%2F08%2Fv.mkv.0-10"), b"part").unwrap();
+
+        let removed = cleanup_tmps(dir.path()).unwrap();
+        assert_eq!(removed, 1, "only the top-level tmp is swept");
+        assert!(
+            nested.join("video.mkv").exists(),
+            "nested object files must survive the top-level sweep"
+        );
+
+        // The index is built from one top-level pass and skips nested files.
+        std::fs::write(dir.path().join(".seg.2026%2F08%2Fv.mkv.0-15"), b"seg").unwrap();
+        let idx = segment_index(dir.path());
+        assert_eq!(idx.len(), 1, "index sees only top-level segment files");
+        assert!(idx.contains_key("2026/08/v.mkv"));
     }
 
     #[test]

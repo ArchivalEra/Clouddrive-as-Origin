@@ -583,7 +583,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "walkdir",
  "wiremock",
 ]
 
