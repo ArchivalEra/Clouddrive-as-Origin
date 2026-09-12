@@ -166,17 +166,13 @@ async fn try_relief_valve<C: Clock + Clone>(
     if state.cache.memory_hit_fresh(&rk.cache_key).await {
         return None;
     }
-    let slot = state.cache.backends.get(&rk.upstream_id)?;
     let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
     // Bound the link round-trips: a slow link source must not stall the
     // viewer before the proxy fallback engages.
-    let link = tokio::time::timeout(
-        Duration::from_secs(8),
-        slot.backend.direct_url(&Key::from_validated(rk.backend_key.clone()), ua),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let link = state
+        .cache
+        .direct_url_bounded(&rk.upstream_id, &rk.backend_key, ua, Duration::from_secs(8))
+        .await?;
     if !crate::backend::redirect_target_allowed(&link.url) {
         return None;
     }
@@ -532,16 +528,14 @@ async fn healthz<C>(State(state): State<AppState<C>>) -> impl IntoResponse
 where
     C: Clock + Clone,
 {
-    let (count, bytes, segment_bytes) = {
-        let s = state.cache.state.read().await;
-        (s.entries.len(), s.total_bytes, s.segment_bytes)
-    };
-    // Live-machinery depths (spec §8: the queue-ish counters operators
-    // watch when a node misbehaves): active cold-miss flights, promotion
-    // assemblies in flight, and pending access-clock flushes.
-    let flights = state.cache.flights.active().await;
-    let promotions = state.cache.promotions.lock().await.len();
-    let dirty_access = state.cache.dirty_access.lock().await.len();
+    // Live-machinery view (spec §8: the queue-ish counters operators watch
+    // when a node misbehaves) — read through the Cache snapshot, not the
+    // internals (C4).
+    let snap = state.cache.snapshot().await;
+    let (count, bytes, segment_bytes) = (snap.entries, snap.total_bytes, snap.segment_bytes);
+    let flights = snap.flights_active;
+    let promotions = snap.promotions_active;
+    let dirty_access = snap.dirty_access_pending;
     // Per-upstream view: profile + gate depth, so a saturated or
     // misconfigured upstream is visible without reading logs.
     let upstreams: Vec<serde_json::Value> = state
@@ -600,10 +594,7 @@ where
             return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid key"}))).into_response();
         }
     };
-    let s = state.cache.state.read().await;
-    let already = s.entries.contains_key(&rk.cache_key);
-    drop(s);
-    if already {
+    if state.cache.entry_exists(&rk.cache_key).await {
         return (StatusCode::OK, Json(json!({"status": "hit"}))).into_response();
     }
     // Same primitive as the relief valve's background fill: full fetch, no
