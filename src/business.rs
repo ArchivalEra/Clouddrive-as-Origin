@@ -663,7 +663,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Semaphore;
 
     use crate::{
         backend::{BackendRegistry, BackendSlot, DirectUrl, Key, ObjectMeta, StreamSource, StorageBackend},

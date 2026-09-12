@@ -427,10 +427,17 @@ impl StorageBackend for OpenListBackend {
                     }
                 }
             }
+            // Truncate rather than fail the whole request (P9). A bucket
+            // past the walk budget used to surface as a 500 InternalError,
+            // making the listing path unusable at scale; S3 semantics for
+            // an over-large result set are a truncated page, not an error.
             if out.len() > MAX_LIST_ENTRIES {
-                return Err(BackendError::ServerError(format!(
-                    "listing exceeds {MAX_LIST_ENTRIES} entries"
-                )));
+                tracing::warn!(
+                    cap = MAX_LIST_ENTRIES,
+                    "listing truncated at the walk budget"
+                );
+                out.truncate(MAX_LIST_ENTRIES);
+                break;
             }
         }
         Ok(out)

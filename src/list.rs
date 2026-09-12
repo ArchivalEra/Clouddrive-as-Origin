@@ -115,17 +115,20 @@ fn query_get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
 
 pub(crate) fn is_list_query(query: Option<&str>) -> bool {
     let Some(q) = query else { return false };
+    // Substring probe instead of a full form-urlencoded parse (P9): the
+    // caller parses for real immediately after, so this was a duplicate
+    // allocation of the whole query.
     const TRIGGERS: &[&str] = &[
-        "list-type",
-        "prefix",
-        "delimiter",
-        "max-keys",
-        "continuation-token",
-        "start-after",
-        "marker",
-        "encoding-type",
+        "list-type=",
+        "prefix=",
+        "delimiter=",
+        "max-keys=",
+        "continuation-token=",
+        "start-after=",
+        "marker=",
+        "encoding-type=",
     ];
-    query_map(q).iter().any(|(k, _)| TRIGGERS.contains(&k.as_str()))
+    TRIGGERS.iter().any(|t| q.contains(t))
 }
 
 /// Parse errors that map to AWS `InvalidArgument` 400s.
@@ -205,17 +208,24 @@ struct PageItems {
 
 fn select_items(entries: Vec<ListEntry>, params: &ListParams) -> PageItems {
     let prefix = params.prefix.as_str();
-    let mut contents: Vec<ListEntry> = entries
-        .iter()
-        .filter(|e| !e.is_dir && e.key.starts_with(prefix))
-        .cloned()
-        .collect();
+    // One consuming pass (P9): partition into files and directories instead
+    // of scanning the vector twice and deep-copying every matching file.
+    let mut contents: Vec<ListEntry> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
+    for e in entries {
+        if !e.key.starts_with(prefix) {
+            continue;
+        }
+        if e.is_dir {
+            dirs.push(e.key);
+        } else {
+            contents.push(e);
+        }
+    }
     contents.sort_by(|a, b| a.key.cmp(&b.key));
 
     let mut common_prefixes: Vec<String> = Vec::new();
     if params.delimiter.is_some() {
-        let mut dirs: Vec<String> =
-            entries.iter().filter(|e| e.is_dir && e.key.starts_with(prefix)).map(|e| e.key.clone()).collect();
         dirs.sort();
         dirs.dedup();
         common_prefixes = dirs;
@@ -306,29 +316,42 @@ pub(crate) async fn try_list<C: Clock + Clone>(
     };
     let recursive = params.delimiter.is_none();
 
-    // The listing is a metadata path but still hits the upstream — it must
-    // respect the per-upstream concurrency gate (a large-directory list
-    // walks many PROPFINDs; without the gate, concurrent listers would
-    // hammer OpenList unboundedly).
-    let _permit = slot.gate.acquire().await;
-    let entries = match slot.backend.list(folder, recursive).await {
-        Ok(e) => e,
-        // A missing folder is an empty listing: S3 prefixes are string
-        // filters, not containers.
-        Err(BackendError::NotFound) => Vec::new(),
-        Err(BackendError::AuthRequired) => {
-            return Some(list_error("AccessDenied", "Access Denied", path_key, req_id, host_id, &[]))
-        }
-        Err(e) => {
-            tracing::warn!(upstream = %upstream_id, prefix = %prefix, error = %e, "upstream listing failed");
-            return Some(list_error(
-                "InternalError",
-                "We encountered an internal error. Please try again.",
-                path_key,
-                req_id,
-                host_id,
-                &[],
-            ));
+    // Short-TTL listing snapshot (P9): paging used to re-walk the whole
+    // subtree from upstream for EVERY page (the continuation token only
+    // filtered locally), so page k cost the same as page 1. Each page now
+    // slices one walk held briefly on the Cache. A large recursive walk is
+    // also the expensive case, so this is where the win is largest.
+    let entries = match state.cache.list_snapshot(&upstream_id, folder, recursive).await {
+        Some(e) => e,
+        None => {
+            // The listing is a metadata path but still hits the upstream —
+            // it must respect the per-upstream metadata gate (a
+            // large-directory list walks many PROPFINDs; without a bound,
+            // concurrent listers would hammer OpenList).
+            let _permit = slot.gate.acquire().await;
+            match slot.backend.list(folder, recursive).await {
+                Ok(e) => {
+                    state.cache.store_list_snapshot(&upstream_id, folder, recursive, &e).await;
+                    e
+                }
+                // A missing folder is an empty listing: S3 prefixes are
+                // string filters, not containers.
+                Err(BackendError::NotFound) => Vec::new(),
+                Err(BackendError::AuthRequired) => {
+                    return Some(list_error("AccessDenied", "Access Denied", path_key, req_id, host_id, &[]))
+                }
+                Err(e) => {
+                    tracing::warn!(upstream = %upstream_id, prefix = %prefix, error = %e, "upstream listing failed");
+                    return Some(list_error(
+                        "InternalError",
+                        "We encountered an internal error. Please try again.",
+                        path_key,
+                        req_id,
+                        host_id,
+                        &[],
+                    ));
+                }
+            }
         }
     };
 
@@ -894,6 +917,18 @@ mod tests {
         let (status, _, body) = list_at(&state, "", "list-type=2&encoding-type=base64").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.contains("Invalid Encoding Method specified in Request"), "{body}");
+    }
+
+    /// P9: the list trigger is a cheap substring probe, not a full parse,
+    /// and it must not fire on unrelated queries.
+    #[test]
+    fn is_list_query_probes_without_parsing() {
+        assert!(is_list_query(Some("list-type=2")));
+        assert!(is_list_query(Some("prefix=a/&max-keys=10")));
+        assert!(!is_list_query(Some("foo=bar")));
+        assert!(!is_list_query(Some("")));
+        assert!(!is_list_query(None));
+        assert!(!is_list_query(Some("list-type")));
     }
 
     #[tokio::test]
