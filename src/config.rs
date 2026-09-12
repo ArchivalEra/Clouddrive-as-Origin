@@ -187,6 +187,10 @@ pub struct RawConfig {
     /// disabled (threshold set after the real-traffic baseline).
     #[serde(default)]
     pub front_rate_rps: Option<u32>,
+    /// Proxy service worker threads. Absent = 2 (P6: pingora's default of
+    /// 1 serializes TLS/H2 on a single core).
+    #[serde(default)]
+    pub front_threads: Option<usize>,
     #[serde(default = "default_cache_dir")]
     pub cache_dir: PathBuf,
 
@@ -252,6 +256,7 @@ pub struct Config {
     pub front_ip_block: Vec<String>,
     pub front_ip_allow: Vec<String>,
     pub front_rate_rps: Option<u32>,
+    pub front_threads: Option<usize>,
     pub cache_dir: PathBuf,
     pub max_size_bytes: u64,
     pub inactive_ttl_secs: u64,
@@ -392,6 +397,7 @@ impl Config {
             front_ip_block: raw.front_ip_block,
             front_ip_allow: raw.front_ip_allow,
             front_rate_rps: raw.front_rate_rps,
+            front_threads: raw.front_threads,
             cache_dir: raw.cache_dir,
             max_size_bytes: raw.max_size_bytes,
             inactive_ttl_secs: raw.inactive_ttl_secs,
@@ -421,6 +427,7 @@ impl Default for Config {
             front_ip_block: Vec::new(),
             front_ip_allow: Vec::new(),
             front_rate_rps: None,
+            front_threads: None,
             cache_dir: default_cache_dir(),
             max_size_bytes: default_max_size(),
             inactive_ttl_secs: default_inactive_ttl(),
