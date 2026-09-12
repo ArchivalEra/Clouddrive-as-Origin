@@ -352,7 +352,7 @@ pub enum VerifyOutcome {
 
 /// Derive the SigV4 signing key:
 /// `HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), service), "aws4_request")`.
-fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
+fn derive_signing_key_uncached(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
     let mut secret_buf = String::with_capacity(secret.len() + 4);
     secret_buf.push_str("AWS4");
     secret_buf.push_str(secret);
@@ -360,6 +360,33 @@ fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> 
     let region_key = hmac_sha256(&date_key, region.as_bytes());
     let service_key = hmac_sha256(&region_key, service.as_bytes());
     hmac_sha256(&service_key, b"aws4_request")
+}
+
+/// Cap on cached signing keys. The cache key is
+/// (secret, scope date, region, service): one entry per day in practice,
+/// so this only guards against a hostile/odd client sending many scopes.
+const SIGNING_KEY_CACHE_CAP: usize = 64;
+
+/// Derive the SigV4 signing key, memoized per (secret, date, region,
+/// service). The chain is four HMACs and the inputs change daily, so
+/// recomputing it per request was pure waste (P7).
+fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, [u8; 32]>>> = OnceLock::new();
+    let key = format!("{secret}\u{1}{date}\u{1}{region}\u{1}{service}");
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut c) = cache.lock() {
+        if let Some(k) = c.get(&key) {
+            return *k;
+        }
+        let derived = derive_signing_key_uncached(secret, date, region, service);
+        if c.len() >= SIGNING_KEY_CACHE_CAP {
+            c.clear();
+        }
+        c.insert(key, derived);
+        return derived;
+    }
+    derive_signing_key_uncached(secret, date, region, service)
 }
 
 fn calculate_signature(string_to_sign: &str, secret: &str, date: &str, region: &str, service: &str) -> String {
@@ -378,7 +405,7 @@ fn string_to_sign(canonical_request: &str, amz_date_iso: &str, scope_date: &str,
 /// may sign either the decoded or raw path form (s3s raw-path fallback).
 fn verify_signature(
     canonical_decoded: &str,
-    canonical_raw: &str,
+    canonical_raw: Option<&str>,
     amz_date_iso: &str,
     scope_date: &str,
     region: &str,
@@ -386,7 +413,14 @@ fn verify_signature(
     secret: &str,
     expected: &str,
 ) -> bool {
-    for canonical in [canonical_decoded, canonical_raw] {
+    // Try the decoded form, then the raw form ONLY when the two canonical
+    // requests actually differ — otherwise the second attempt re-signs an
+    // identical string (P7).
+    let candidates = match canonical_raw {
+        Some(raw) if raw != canonical_decoded => [Some(canonical_decoded), Some(raw)],
+        _ => [Some(canonical_decoded), None],
+    };
+    for canonical in candidates.into_iter().flatten() {
         let sts = string_to_sign(canonical, amz_date_iso, scope_date, region, service);
         let computed = calculate_signature(&sts, secret, scope_date, region, service);
         if constant_time_eq(computed.as_bytes(), expected.as_bytes()) {
@@ -564,23 +598,23 @@ fn verify_header(
     );
     // Raw-path variant re-encodes nothing in the URI line.
     let canonical_raw = if path_forms_differ(input.uri_path, input.raw_uri_path) {
-        format!(
+        Some(format!(
             "{}\n{}\n{}\n{}\n{}",
             input.method,
             input.raw_uri_path,
             canonical_query(&input.query_pairs, false),
             canonical_headers,
             signed_list + "\n" + payload_hash
-        )
+        ))
     } else {
-        canonical_decoded.clone()
+        None
     };
 
         let sts_iso = amz_date.fmt_iso8601();
         let expected = signature;
         if !verify_signature(
         &canonical_decoded,
-        &canonical_raw,
+        canonical_raw.as_deref(),
         &sts_iso,
         &credential.date,
         &credential.aws_region,
@@ -667,22 +701,22 @@ fn verify_presigned(
         signed_list
     );
     let canonical_raw = if path_forms_differ(input.uri_path, input.raw_uri_path) {
-        format!(
+        Some(format!(
             "{}\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
             input.method,
             input.raw_uri_path,
             qs,
             canonical_headers,
             signed_list,
-        )
+        ))
     } else {
-        canonical_decoded.clone()
+        None
     };
 
     let sts_iso = amz_date.fmt_iso8601();
     if !verify_signature(
         &canonical_decoded,
-        &canonical_raw,
+        canonical_raw.as_deref(),
         &sts_iso,
         &credential.date,
         &credential.aws_region,
@@ -753,7 +787,7 @@ mod tests {
         // The same canonical request string verifies via the raw comparator.
         assert!(verify_signature(
             &canonical,
-            &canonical,
+            None, // identical forms: the raw retry is skipped
             &date.fmt_iso8601(),
             &date.fmt_date(),
             "us-east-1",
@@ -773,6 +807,36 @@ mod tests {
         assert!(AmzDate::parse("2013-5-24T000000Z").is_none());
         assert!(AmzDate::parse("20130524T000000").is_none());
         assert!(AmzDate::parse("20131324T000000Z").is_none());
+    }
+
+    /// P7: same-scope derivations must reuse the cached key, and the
+    /// raw-form retry must be skipped when both canonical requests are
+    /// identical (no duplicate signature computation).
+    #[test]
+    fn signing_key_is_memoized_and_duplicate_form_is_skipped() {
+        let k1 = derive_signing_key("secret", "20260912", "us-east-1", "s3");
+        let k2 = derive_signing_key("secret", "20260912", "us-east-1", "s3");
+        assert_eq!(k1, k2, "same scope must return the same derived key");
+
+        let k3 = derive_signing_key("secret", "20260913", "us-east-1", "s3");
+        assert_ne!(k1, k3, "a different scope date must derive a different key");
+
+        // Identical canonical forms: only the decoded form is tried.
+        // verify_signature takes a canonical REQUEST (it builds the
+        // string-to-sign internally), so construct the same pair here.
+        let canonical = "GET\n/k.png\n\nhost:x\n\nhost\nUNSIGNED-PAYLOAD";
+        let sts = string_to_sign(canonical, "20260912T000000Z", "20260912", "us-east-1", "s3");
+        let sig = calculate_signature(&sts, "secret", "20260912", "us-east-1", "s3");
+        assert!(verify_signature(
+            canonical,
+            None,
+            "20260912T000000Z",
+            "20260912",
+            "us-east-1",
+            "s3",
+            "secret",
+            &sig
+        ));
     }
 
     #[test]

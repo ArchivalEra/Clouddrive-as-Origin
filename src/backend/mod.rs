@@ -418,18 +418,29 @@ pub struct BackendSlot {
 #[derive(Default, Clone)]
 pub struct BackendRegistry {
     slots: HashMap<String, Arc<BackendSlot>>,
+    /// Precomputed id list (the hot path only needs membership tests).
+    ids: Arc<[String]>,
 }
 
 impl BackendRegistry {
     pub fn new(slots: HashMap<String, Arc<BackendSlot>>) -> Self {
-        Self { slots }
+        let ids: Arc<[String]> = slots.keys().cloned().collect::<Vec<_>>().into();
+        Self { slots, ids }
     }
 
     pub fn get(&self, upstream_id: &str) -> Option<Arc<BackendSlot>> {
         self.slots.get(upstream_id).cloned()
     }
 
-    pub fn ids(&self) -> Vec<String> {
-        self.slots.keys().cloned().collect()
+    /// Upstream ids, cached at construction (P7): resolution tests bucket
+    /// membership on every request, so building a fresh `Vec<String>` each
+    /// time was a per-request allocation proportional to the pool size.
+    pub fn ids(&self) -> Arc<[String]> {
+        self.ids.clone()
+    }
+
+    /// Borrowed form for the hot resolution path (no refcount traffic).
+    pub fn ids_slice(&self) -> &[String] {
+        &self.ids
     }
 }

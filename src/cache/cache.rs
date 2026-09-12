@@ -24,6 +24,18 @@ pub enum CacheOutcome {
     Revalidated,
 }
 
+/// Static metric label for an outcome (P7): keeps the hot path
+/// allocation-free.
+fn outcome_label(o: &CacheOutcome) -> &'static str {
+    match o {
+        CacheOutcome::Hit => "Hit",
+        CacheOutcome::Miss => "Miss",
+        CacheOutcome::Negative => "Negative",
+        CacheOutcome::Stale => "Stale",
+        CacheOutcome::Revalidated => "Revalidated",
+    }
+}
+
 /// Response metadata for the business plane's headers.
 #[derive(Debug, Clone)]
 pub struct HitMeta {
@@ -336,7 +348,7 @@ impl<C: Clock + Clone> Cache<C> {
     /// Resolve a request path to serving coordinates (C2: the single
     /// upstream-resolution seam — bucket alias + prefix routes + validation).
     pub fn resolve(&self, raw_path: &str) -> Result<ResolvedKey, crate::key::KeyError> {
-        resolve_key(raw_path, &self.routes, &self.backends.ids())
+        resolve_key(raw_path, &self.routes, self.backends.ids_slice())
     }
 
     /// Owned view of the live machinery for healthz: operators read a
@@ -858,11 +870,13 @@ impl<C: Clock + Clone> Cache<C> {
     ) -> Result<CacheHit, BackendError> {
         let start = std::time::Instant::now();
         let out = self.get_resolved_inner(rk, range).await;
+        // Static outcome labels (P7): the set is closed, so a per-request
+        // `format!` only produced garbage.
         let label = match &out {
-            Ok(hit) => format!("{:?}", hit.outcome),
-            Err(_) => "error".to_string(),
+            Ok(hit) => outcome_label(&hit.outcome),
+            Err(_) => "error",
         };
-        crate::metrics::observe_serve(&label, start);
+        crate::metrics::observe_serve(label, start);
         out
     }
 
