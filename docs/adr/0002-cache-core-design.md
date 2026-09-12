@@ -76,7 +76,7 @@ Reaper (inactive): range `by_last_access[..now - inactive_ttl]` in chunks 500–
 ## Single-flight & concurrency
 
 - `inflight.rs`: per-key coalescing — first waiter fetches, others await the same `Shared` future (e.g. `tokio::sync::OnceCell` / `async_once_cell`). Different keys do not block. Token refresh has its own per-upstream single-flight in `upstream/auth.rs` (global per upstream on concurrent 401).
-- `upstream`: per-upstream `Semaphore(3)` gates all Graph calls; `fetch.rs` honors `Retry-After` exactly, otherwise jittered exponential backoff capped ~30 s (R3). Host allow-list suffixes from `config.allowed_download_suffixes` (default `.files.1drv.com`, `.sharepoint.com`, `storage.live.com`, R3).
+- `backend`: per-upstream concurrency is **two** semaphores since the 2026-09-12 review (ADR-0004): a metadata gate (`stat` / HEAD / list / link lookups) and a stream gate (cold-miss pumps, passthrough staging, promotion assembly). Both start at `concurrency_per_upstream`. The split exists because a single shared gate let a long transfer starve metadata: a HEAD measured 22 ms idle and 14.2 s while three cold pulls held the permits. Backoff: `Retry-After` honored exactly, else jittered exponential capped ~30 s (R3).
 
 ## Water-pipe, Range, negative, stale
 

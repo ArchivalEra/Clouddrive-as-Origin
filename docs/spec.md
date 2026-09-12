@@ -281,8 +281,11 @@ repo** — it is injected at runtime via an environment variable (e.g.
   in healthz), 429 → `RateLimited` (no Retry-After — jittered backoff),
   5xx → `ServerError` (stale-if-error applies).
 - OpenList owns all provider credential rotation and per-drive quirks;
-  our per-upstream concurrency gate (≤3) still applies to every
-  PROPFIND/GET we issue.
+  our per-upstream concurrency gates (≤ `concurrency_per_upstream`, default
+  3) still apply to every PROPFIND/GET we issue — as two independent
+  budgets since ADR-0004: metadata lookups (stat/HEAD/list/link) and byte
+  streams (cold-miss pumps, passthrough staging, promotion assembly) no
+  longer share one pool, so a long transfer cannot starve a HEAD.
 - ETag semantics: OpenList reports per-driver etags; where a driver
   yields an unstable etag, `getlastmodified` is the revalidation
   fallback (stat-compare either field).
