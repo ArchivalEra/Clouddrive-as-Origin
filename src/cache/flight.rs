@@ -349,7 +349,13 @@ pub async fn pump_and_seal(
         .await
         .map_err(|e| BackendError::Other(format!("fsync tmp: {e}")))?;
     drop(out);
-    store::install_tmp(tmp_path, final_path).map_err(|e| BackendError::Other(e.to_string()))?;
+    // Blocking fs (dir creation + rename) off the async runtime.
+    let tmp = tmp_path.to_path_buf();
+    let dest = final_path.to_path_buf();
+    tokio::task::spawn_blocking(move || store::install_tmp(&tmp, &dest))
+        .await
+        .map_err(|e| BackendError::Other(format!("install join: {e}")))?
+        .map_err(|e| BackendError::Other(e.to_string()))?;
     // NOTE: the driver sends FlightProgress::Done *after* installing the
     // metadata row, so readers that finish streaming always see a
     // consistent cache state. Pump alone only guarantees the rename.
