@@ -2,7 +2,7 @@ use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    backend::{BackendError, BackendRegistry, BackendSlot, ContentRange, Key, ObjectMeta},
+    backend::{BackendError, BackendRegistry, BackendSlot, ContentRange, DirectUrl, Key, ObjectMeta},
     cache::{
         flight::{self, BodyStream, FlightProgress, FlightShared},
         meta::EntryMeta,
@@ -116,6 +116,24 @@ impl Default for CacheState {
     }
 }
 
+/// Owned healthz view of the cache machinery (C4).
+#[derive(Debug, Clone)]
+pub struct CacheSnapshot {
+    pub entries: usize,
+    pub total_bytes: u64,
+    pub segment_bytes: u64,
+    pub flights_active: usize,
+    pub promotions_active: usize,
+    pub dirty_access_pending: usize,
+}
+
+/// The Cache is the only seam between the HTTP layer and the cache
+/// machinery (ADR-0002). Its interface is the request path (get / head /
+/// resolve / per-profile serves), lifecycle (load_and_start / tick), the
+/// relief-valve helpers (prefetch / direct_url_bounded), and the
+/// operator view (snapshot). The pub fields below are the machinery's
+/// working state — consumed by tests; production code goes through the
+/// methods, never through them.
 pub struct Cache<C: Clock> {
     pub config: Arc<Config>,
     pub clock: Arc<C>,
@@ -239,6 +257,46 @@ impl<C: Clock + Clone> Cache<C> {
     /// upstream-resolution seam — bucket alias + prefix routes + validation).
     pub fn resolve(&self, raw_path: &str) -> Result<ResolvedKey, crate::key::KeyError> {
         resolve_key(raw_path, &self.routes, &self.backends.ids())
+    }
+
+    /// Owned view of the live machinery for healthz: operators read a
+    /// snapshot, never the internals (C4).
+    pub async fn snapshot(&self) -> CacheSnapshot {
+        let (entries, total_bytes, segment_bytes) = {
+            let s = self.state.read().await;
+            (s.entries.len(), s.total_bytes, s.segment_bytes)
+        };
+        CacheSnapshot {
+            entries,
+            total_bytes,
+            segment_bytes,
+            flights_active: self.flights.active().await,
+            promotions_active: self.promotions.lock().await.len(),
+            dirty_access_pending: self.dirty_access.lock().await.len(),
+        }
+    }
+
+    /// Whether any entry row (positive or negative tombstone) exists.
+    pub async fn entry_exists(&self, key: &str) -> bool {
+        self.state.read().await.entries.contains_key(key)
+    }
+
+    /// Relief-valve link lookup (A: redirect cold misses): bounded
+    /// `direct_url` against the routed upstream. `None` = unknown upstream
+    /// or the budget blew; the caller owns target validation.
+    pub async fn direct_url_bounded(
+        &self,
+        upstream_id: &str,
+        backend_key: &str,
+        viewer_ua: Option<&str>,
+        budget: std::time::Duration,
+    ) -> Option<DirectUrl> {
+        let slot = self.backends.get(upstream_id)?;
+        let key = Key::from_validated(backend_key.to_string());
+        tokio::time::timeout(budget, slot.backend.direct_url(&key, viewer_ua))
+            .await
+            .ok()?
+            .ok()
     }
 
     /// HEAD-grade metadata lookup: memory entry when fresh, else a single
