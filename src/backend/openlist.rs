@@ -165,7 +165,12 @@ impl OpenListBackend {
         let base_url = cfg.base_url.trim_end_matches('/').to_string();
         let mut builder = reqwest::Client::builder()
             // OpenList may be remote; generous timeout for large media.
-            .connect_timeout(Duration::from_secs(5));
+            // read_timeout is per-read inactivity (resets on every chunk):
+            // a flowing cold pull never trips it, while a genuinely stalled
+            // stream errors after 30 s instead of hanging the driver — and
+            // every reader attached to the flight — forever.
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(30));
         if cfg.accept_invalid_certs {
             builder = builder.danger_accept_invalid_certs(true);
         }

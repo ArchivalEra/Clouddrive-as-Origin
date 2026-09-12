@@ -686,8 +686,9 @@ impl<C: Clock + Clone> Cache<C> {
     /// to a shared download flight; hits stream the cached file; revalidation
     /// stats the upstream (no bytes) and compares etags. A Range request on
     /// a cached file slices locally; on a cold miss with offset > 0 the
-    /// backend stream passes through at that offset while the flight fills
-    /// the cache in the background (dual-channel, spec §3.8).
+    /// reader converges on the flight's growing temp file and waits for the
+    /// writer to reach its offset (single stream — every upstream open pays
+    /// a ~800 ms fixed cost).
     pub async fn get(
         &self,
         raw_key: &str,
@@ -877,6 +878,7 @@ impl<C: Clock + Clone> Cache<C> {
         let f = Arc::new(FlightShared::new(
             store::tmp_path(&self.config.cache_dir, key),
             store::file_path(&self.config.cache_dir, key),
+            crate::cache::flight::DEFAULT_STALL_BUDGET,
         ));
         map.insert(key.to_string(), f.clone());
         drop(map);
@@ -898,10 +900,11 @@ impl<C: Clock + Clone> Cache<C> {
     }
 
     /// Wait for a flight's metadata, then return the streaming body.
-    /// Range handling (§3.8): offset 0 → the growing body itself (it starts
-    /// at byte 0); offset > 0 → dual-channel passthrough from the backend at
-    /// that offset while the flight fills the cache. Failed flights fall
-    /// back to stale-if-error.
+    /// Range handling: offset 0 → the growing body itself (it starts at
+    /// byte 0); offset > 0 → the reader follows the flight's growing temp
+    /// file from that offset and waits for the writer to reach it (single
+    /// stream, no second upstream open). Failed flights fall back to
+    /// stale-if-error.
     async fn await_flight(
         &self,
         flight: Arc<FlightShared>,
@@ -991,8 +994,20 @@ impl<C: Clock + Clone> Cache<C> {
                     return Err(e);
                 }
                 _ => {
-                    if rx.changed().await.is_err() {
-                        return Err(BackendError::Other("flight ended without metadata".into()));
+                    // A stalled driver (or a panic that never publishes a
+                    // terminal state) must not park metadata-waiters
+                    // forever: bounded by the flight's stall budget.
+                    let budget = flight.stall_budget;
+                    match tokio::time::timeout(budget, rx.changed()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            return Err(BackendError::Other("flight ended without metadata".into()));
+                        }
+                        Err(_) => {
+                            return Err(BackendError::Other(format!(
+                                "flight stalled before metadata: no progress for {budget:?}"
+                            )));
+                        }
                     }
                 }
             }
@@ -1013,6 +1028,7 @@ impl<C: Clock + Clone> Cache<C> {
         let flight = Arc::new(FlightShared::new(
             store::tmp_path(&self.config.cache_dir, &key),
             store::file_path(&self.config.cache_dir, &key),
+            crate::cache::flight::DEFAULT_STALL_BUDGET,
         ));
         let driver_f = flight.clone();
         let driver_slot = Arc::clone(&slot);
