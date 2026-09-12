@@ -39,7 +39,39 @@ fn shared_db(path: &Path) -> anyhow::Result<Arc<Mutex<redb::Database>>> {
     if let Some(db) = reg.get(path) {
         return Ok(Arc::clone(db));
     }
-    let db = Arc::new(Mutex::new(redb::Database::create(path)?));
+    let db = match redb::Database::create(path) {
+        Ok(db) => db,
+        Err(e) => {
+            // Degrade instead of crash-looping (ticket #57). A redb file
+            // that will not open (corrupt in a way redb rejects, or not a
+            // file at all) used to propagate into `Cache::new`'s expect()
+            // and, with Restart=always, a boot loop. Quarantine it aside
+            // and start fresh: the cache is rebuildable metadata, and
+            // losing it costs revalidation, not correctness.
+            tracing::error!(
+                path = %path.display(),
+                error = %e,
+                "metadata store failed to open; quarantining and starting fresh"
+            );
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let aside = path.with_extension(format!("db.corrupt-{stamp}"));
+            if let Err(re) = std::fs::rename(path, &aside) {
+                tracing::error!(error = %re, "could not quarantine the bad metadata file");
+            } else {
+                tracing::warn!(quarantined = %aside.display(), "bad metadata file moved aside");
+            }
+            // A directory where the file should be cannot be renamed over;
+            // remove it so the retry can create a real file.
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(path);
+            }
+            redb::Database::create(path)?
+        }
+    };
+    let db = Arc::new(Mutex::new(db));
     reg.insert(path.to_path_buf(), Arc::clone(&db));
     Ok(db)
 }

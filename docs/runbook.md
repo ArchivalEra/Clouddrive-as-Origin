@@ -54,7 +54,19 @@ sudo rm -f /opt/origin-cache/cache-standard/redb.db
 sudo systemctl start origin-cache-standard
 ```
 
-(First request re-stats the upstream; cached files on disk are reused.)
+On restart with no rows present, the service **rebuilds entry rows from the
+object tree** (`scan_object_files`) so the cached files on disk are served
+and reaped rather than orphaned; each rebuilt row carries no ETag, so the
+first access re-stats the upstream and installs real metadata. See ADR-0008.
+
+### Metadata store will not open (boot loop)
+
+If `redb.db` cannot be opened (corrupt in a way redb rejects, or the path is
+not a file), the service **does not crash**: it logs an error, moves the bad
+file aside as `redb.db.corrupt-<epoch>`, and starts with a fresh store. The
+entry rows are then rebuilt from the object tree as above. Inspect
+`journalctl -u origin-cache-standard | grep -i metadata` for the quarantine
+record; the quarantined file can be deleted once the cause is understood.
 
 ### Certificate expiry / renewal
 
