@@ -52,7 +52,47 @@ capability.
 
 ## Recommendation
 
-A2 if the data shows real cold storms at all; drop C5 entirely if
-EdgeOne ordering keeps the wait near zero. A1 only if high-offset storms
-dominate AND the extra open is acceptable per-key. Decision deferred to
-the operator; re-open after T7 acceptance data exists.
+**CLOSED 2026-09-12: drop C5. The data settles it.**
+
+## The measurement that closed it
+
+Captured EdgeOne's origin-pull requests on the node (loopback 8080 is
+plaintext, so `tcpdump -i lo -A 'tcp port 8080'` sees the forwarded
+request headers verbatim) while a client pulled a cold 100 MB object
+through `cdn-oracle.isui.ren`.
+
+Result — 43 ranged requests, all **exactly 1 MiB**, strictly ascending
+from zero:
+
+```
+range: bytes=0-0                 (a 1-byte probe first)
+range: bytes=0-1048575
+range: bytes=1048576-2097151
+range: bytes=2097152-3145727
+...  (contiguous, +1048576 each step)
+range: bytes=44040191             (cut off at the 80 s client timeout)
+```
+
+So the premise C5 was built on holds: EdgeOne's sharded origin-pull walks
+the object front to back in fixed 1 MiB shards. A flight's writer is
+therefore always at or ahead of the offset the next shard asks for, and
+the "reader waits for the writer" cost is **already near zero on the
+real path**. Starting the pump at a non-zero offset would buy nothing
+measurable while adding an extra upstream open and a two-stream seal.
+
+Two further points from the same capture:
+
+- The pull **stalled at 43.8 MB after 80 s** of a 100 MB object, which is
+  the already-documented EdgeOne edge-segment limit (a separate, older
+  finding), not a pump-start problem.
+- Because every shard is 1 MiB, the whole-file pull strategy is
+  unaffected: N shards from EdgeOne converge on one flight exactly as
+  designed.
+
+## Status
+
+No code will implement A1/A2/A3. The friction C5 described is real only
+for **scattered** offset patterns, and those do not come from EdgeOne —
+they come from an artificial seek storm, which is a test shape rather
+than a production one. If a future workload does produce genuinely
+scattered cold seeks, revisit with that evidence.
