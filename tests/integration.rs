@@ -565,3 +565,270 @@ async fn spawned_reaper_expires_entries_without_manual_tick() {
     assert!(cache.state.read().await.entries.is_empty(), "spawned reaper did not expire the entry");
     assert!(!cache.config.cache_dir.join("old.png").exists(), "expired file must be deleted");
 }
+
+// ---------------------------------------------------------------------------
+// Storm suite: multi-client concurrent seeks on one cold key — the surface
+// whose breakdown motivated the refactor (audit findings C1/B2/B3).
+// ---------------------------------------------------------------------------
+
+/// Storm-suite backend: counts stat+open calls, delays a real open so
+/// readers join an in-flight download, and can be switched to fail / panic
+/// / undershoot on open to exercise flight failure propagation.
+struct StormBackend {
+    payload: Vec<u8>,
+    calls: Arc<AtomicUsize>,
+    mode: Arc<std::sync::Mutex<StormMode>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum StormMode {
+    Good,
+    FailOpen,
+    PanicOpen,
+    ShortBody,
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for StormBackend {
+    async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ObjectMeta {
+            size_bytes: self.payload.len() as u64,
+            etag: Some("v1".into()),
+            last_modified: None,
+            mime_hint: None,
+        })
+    }
+    async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mode = *self.mode.lock().unwrap();
+        match mode {
+            StormMode::FailOpen => Err(BackendError::ServerError("open refused".into())),
+            StormMode::PanicOpen => panic!("storm open boom"),
+            StormMode::ShortBody => {
+                let cut = self.payload.len() / 2;
+                Ok(StreamSource {
+                    stream: Box::new(std::io::Cursor::new(self.payload[..cut].to_vec())),
+                    total_len: Some(self.payload.len() as u64),
+                })
+            }
+            StormMode::Good => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let len = self.payload.len() as u64;
+                Ok(StreamSource {
+                    stream: Box::new(std::io::Cursor::new(self.payload.clone())),
+                    total_len: Some(len),
+                })
+            }
+        }
+    }
+    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    async fn list(&self, _prefix: &str, _recursive: bool) -> Result<Vec<origin_cache::backend::ListEntry>, BackendError> {
+        Ok(vec![])
+    }
+    fn id(&self) -> &str {
+        "storm"
+    }
+}
+
+/// Collect a body, allowing a terminal Err: returns (bytes, errored).
+async fn read_body_allow_error(body: BodyStream) -> (Vec<u8>, bool) {
+    use futures::StreamExt;
+    let mut body = body;
+    let mut out = Vec::new();
+    let mut errored = false;
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(b) => out.extend_from_slice(&b),
+            Err(_) => {
+                errored = true;
+                break;
+            }
+        }
+    }
+    (out, errored)
+}
+
+async fn wait_map_empty(cache: &Cache<MockClock>) {
+    for _ in 0..200 {
+        if cache.flights.active().await == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("flight map never emptied");
+}
+
+/// The storm core: 20 concurrent ranged cold misses on ONE key must share
+/// exactly one upstream stat + one open (ADR-0003 acceptance, ranged), and
+/// every seek must receive its exact byte slice. A second wave serves the
+/// same slices as disk hits.
+#[tokio::test]
+async fn ranged_cold_misses_on_one_key_coalesce() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = StormBackend {
+        payload: payload.clone(),
+        calls: Arc::clone(&calls),
+        mode: Arc::new(std::sync::Mutex::new(StormMode::Good)),
+    };
+    let cache = Arc::new(Cache::new(
+        test_config(dir.path().to_path_buf()),
+        Arc::clone(&clock),
+        registry_with(Arc::new(backend)),
+    ));
+
+    // 20 distinct offsets (i*173 % 4096), 64 bytes each, all cold.
+    let mut tasks = Vec::new();
+    for i in 0..20u64 {
+        let cache = Arc::clone(&cache);
+        tasks.push(tokio::spawn(async move {
+            let offset = (i * 173) % 4096;
+            let mut hit = cache
+                .get("storm.bin", Some(ByteRange::bounded(offset, 64)))
+                .await
+                .expect("ranged cold miss must succeed");
+            let body = read_body(&mut hit.body).await;
+            (offset, body)
+        }));
+    }
+    for t in tasks {
+        let (offset, body) = t.await.unwrap();
+        assert_eq!(body, payload[offset as usize..(offset + 64) as usize], "seek @{offset} bytes must be exact");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "1 stat + 1 open for 20 ranged cold misses");
+    wait_installed(&cache, "storm.bin").await;
+
+    // Second wave: same seeks served from disk as hits, bytes still exact.
+    for i in 0..20u64 {
+        let offset = (i * 173) % 4096;
+        let mut hit = cache.get("storm.bin", Some(ByteRange::bounded(offset, 64))).await.unwrap();
+        assert_eq!(hit.outcome, CacheOutcome::Hit);
+        assert_eq!(read_body(&mut hit.body).await, payload[offset as usize..(offset + 64) as usize]);
+    }
+}
+
+/// A failed open must reach every attached reader as a clean body error,
+/// release the flight map entry, and leave the key retryable.
+#[tokio::test]
+async fn flight_failure_reaches_attached_readers_and_clears_map() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let payload: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
+    let mode = Arc::new(std::sync::Mutex::new(StormMode::FailOpen));
+    let backend = StormBackend {
+        payload: payload.clone(),
+        calls: Arc::new(AtomicUsize::new(0)),
+        mode: Arc::clone(&mode),
+    };
+    let cache = Arc::new(Cache::new(
+        test_config(dir.path().to_path_buf()),
+        Arc::clone(&clock),
+        registry_with(Arc::new(backend)),
+    ));
+
+    let mut tasks = Vec::new();
+    for _ in 0..3 {
+        let cache = Arc::clone(&cache);
+        tasks.push(tokio::spawn(async move {
+            // A fast-failing flight may publish Failed before Meta is ever
+            // observed — then get() itself errors. Either surfacing is the
+            // failure reaching the client; neither may hang.
+            match cache.get("flaky.bin", None).await {
+                Err(_) => (Vec::new(), true),
+                Ok(mut hit) => read_body_allow_error(hit.body).await,
+            }
+        }));
+    }
+    for t in tasks {
+        let (out, errored) = t.await.unwrap();
+        assert!(errored, "failed flight must surface as an error");
+        assert!(out.is_empty() || out.len() <= 100);
+    }
+    wait_map_empty(&cache).await;
+
+    *mode.lock().unwrap() = StormMode::Good;
+    let mut hit = cache.get("flaky.bin", None).await.unwrap();
+    assert_eq!(read_body(&mut hit.body).await, payload, "retry after failure must succeed");
+}
+
+/// A driver panic must not leave a zombie flight: readers error out, the
+/// map entry is released, and the key is immediately retryable (B3).
+#[tokio::test]
+async fn panicked_driver_fails_flight_and_releases_key() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let payload: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
+    let mode = Arc::new(std::sync::Mutex::new(StormMode::PanicOpen));
+    let backend = StormBackend {
+        payload: payload.clone(),
+        calls: Arc::new(AtomicUsize::new(0)),
+        mode: Arc::clone(&mode),
+    };
+    let cache = Arc::new(Cache::new(
+        test_config(dir.path().to_path_buf()),
+        Arc::clone(&clock),
+        registry_with(Arc::new(backend)),
+    ));
+
+    let cache2 = Arc::clone(&cache);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+        cache2.get("panic.bin", None).await
+    })
+    .await
+    .expect("must not hang on a panicking driver");
+    // Fast panic: Failed may beat Meta — get() errors directly. Either
+    // surfacing is fine; hanging forever is not.
+    let errored = match outcome {
+        Err(_) => true,
+        Ok(mut hit) => read_body_allow_error(hit.body).await.1,
+    };
+    assert!(errored, "panic must surface as an error");
+    wait_map_empty(&cache).await;
+    assert!(cache.state.read().await.entries.is_empty(), "a panicked flight installs nothing");
+
+    *mode.lock().unwrap() = StormMode::Good;
+    let mut hit = cache.get("panic.bin", None).await.unwrap();
+    assert_eq!(read_body(&mut hit.body).await, payload, "key must be retryable after a panic");
+}
+
+/// A short upstream body must never be sealed into the cache: the flight
+/// fails, no entry is installed, and a retry pulls the full object (B2).
+#[tokio::test]
+async fn short_upstream_body_is_never_sealed() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let payload: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
+    let mode = Arc::new(std::sync::Mutex::new(StormMode::ShortBody));
+    let backend = StormBackend {
+        payload: payload.clone(),
+        calls: Arc::new(AtomicUsize::new(0)),
+        mode: Arc::clone(&mode),
+    };
+    let cache = Arc::new(Cache::new(
+        test_config(dir.path().to_path_buf()),
+        Arc::clone(&clock),
+        registry_with(Arc::new(backend)),
+    ));
+
+    let (out, errored) = match cache.get("short.bin", None).await {
+        Err(_) => (Vec::new(), true),
+        Ok(mut hit) => read_body_allow_error(hit.body).await,
+    };
+    assert!(errored, "short body must surface as an error");
+    assert!(out.len() <= 50, "at most the bytes that did land reach the reader");
+    wait_map_empty(&cache).await;
+    assert!(cache.state.read().await.entries.is_empty(), "short read must not install an entry");
+    assert!(
+        !cache.config.cache_dir.join("short.bin").exists(),
+        "short read must not be renamed into the cache"
+    );
+
+    *mode.lock().unwrap() = StormMode::Good;
+    let mut hit = cache.get("short.bin", None).await.unwrap();
+    assert_eq!(read_body(&mut hit.body).await, payload, "retry must pull the full object");
+}
