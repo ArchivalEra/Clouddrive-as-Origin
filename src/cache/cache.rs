@@ -1223,11 +1223,16 @@ impl<C: Clock + Clone> Cache<C> {
             let cache_dir = self.config.cache_dir.clone();
             let expired = expired.clone();
             tokio::task::spawn_blocking(move || {
+                // One top-level index for the whole batch (P4): the old
+                // shape walked the entire cache once per expired key.
+                let index = store::segment_index(&cache_dir);
                 let mut freed: u64 = 0;
                 for key in &expired {
-                    for path in store::key_segment_files(&cache_dir, key) {
-                        freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        let _ = std::fs::remove_file(&path);
+                    if let Some(paths) = index.get(key) {
+                        for path in paths {
+                            freed += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                            let _ = std::fs::remove_file(path);
+                        }
                     }
                     let _ = std::fs::remove_file(store::segmeta_path(&cache_dir, key));
                 }
