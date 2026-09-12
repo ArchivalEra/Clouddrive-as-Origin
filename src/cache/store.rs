@@ -69,6 +69,55 @@ pub fn cleanup_tmps(cache_dir: &Path) -> anyhow::Result<usize> {
     Ok(removed)
 }
 
+/// Free bytes on the filesystem holding `path`, or `None` if unknown
+/// (capacity guard, P56). A cache that accepts writes knows the disk it
+/// writes to; without this the only signal was a failed write.
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` fills the struct on success; we only read the two
+    // fields we need and check the return code first.
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    }
+}
+
+/// Whether a cold pull of `want` bytes should start, given free space and a
+/// reserve floor. `reserve` keeps the node from being filled to zero (the
+/// OS needs room for logs, redb, and an operator's emergency shell).
+pub fn has_room_for(path: &Path, want: u64, reserve: u64) -> bool {
+    match free_bytes(path) {
+        Some(free) => free.saturating_sub(reserve) >= want,
+        // Unknown free space must not block serving: the write itself
+        // remains the backstop.
+        None => true,
+    }
+}
+
+/// Remove `.tmp.*` files older than `ttl_ms` (P56). Startup sweeps every
+/// tmp; this periodic form must be age-guarded, because an in-flight cold
+/// pull's temp file is young and must not be deleted underneath its driver.
+pub fn cleanup_stale_tmps(cache_dir: &Path, ttl_ms: u64, now_millis: u64) -> u64 {
+    let mut removed = 0u64;
+    for path in top_level_files(cache_dir) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        if !name.starts_with(".tmp.") {
+            continue;
+        }
+        let old = mtime_millis(&path).is_none_or(|m| now_millis.saturating_sub(m) >= ttl_ms);
+        if old {
+            removed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    removed
+}
+
 /// Prune empty parent directories up to (but not including) cache_dir.
 pub fn prune_empty_parents(cache_dir: &Path, file: &Path) {
     let mut cur = file.parent();

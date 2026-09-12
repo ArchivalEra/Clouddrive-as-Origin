@@ -7,8 +7,8 @@ use tempfile::tempdir;
 use origin_cache::{
     backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, Key, ListEntry, ObjectMeta, StreamSource, StorageBackend},
     cache::cache::{Cache, CacheOutcome},
-    cache::flight::BodyStream,
-    clock::MockClock,
+    cache::flight::{BodyStream, FlightProgress},
+    clock::{Clock, MockClock},
     config::Config,
     routing::{RouteRule, RouteTable},
 };
@@ -1074,4 +1074,113 @@ async fn entry_count_cap_evicts_lru_even_under_byte_budget() {
     );
     assert!(s.entries.contains_key("k5"), "the most recent key must survive");
     drop(s);
+}
+
+// ---------------------------------------------------------------------------
+// P56: disk capacity is bounded — staged sidecars join the budget, stale
+// temps are swept periodically, and a cold pull is refused when the disk
+// is too full.
+// ---------------------------------------------------------------------------
+
+/// Staged (segment) bytes must count against max_size_bytes, not only the
+/// entry byte total. Before this, an efficient-profile scrub could stage
+/// unbounded sidecar bytes while total_bytes stayed at zero.
+#[tokio::test]
+async fn staged_segment_bytes_join_the_disk_budget() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config::default();
+    cfg.cache_dir = dir.path().to_path_buf();
+    cfg.inactive_ttl_secs = 1_200;
+    cfg.max_size_bytes = 4096; // tiny: staged bytes alone exceed it
+    let cfg = Arc::new(cfg);
+
+    let backend = CountingBackend {
+        bytes: b"x".to_vec(),
+        etag: Some("v1".into()),
+        calls: Arc::new(AtomicUsize::new(0)),
+        fail: None,
+    };
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+
+    // Simulate staged sidecars whose ledger rows were touched well in the
+    // past, so the min-age guard (60s) allows eviction.
+    let touched = 10_000u64;
+    clock.advance(120_000);
+    {
+        let mut cov = cache.coverage.lock().await;
+        for key in ["s1.bin", "s2.bin"].iter() {
+            let mut c = origin_cache::cache::store::Coverage {
+                total: 8192,
+                last_touch_millis: touched,
+                ..Default::default()
+            };
+            c.add_interval(0, 8192, touched);
+            cov.insert(key.to_string(), c);
+        }
+    }
+    cache.state.write().await.segment_bytes = 16_384; // > max_size_bytes
+
+    cache.tick().await;
+
+    let s = cache.state.read().await;
+    let cov = cache.coverage.lock().await;
+    assert!(
+        s.total_bytes.saturating_add(s.segment_bytes) <= cfg.max_size_bytes,
+        "staged bytes must be brought back under the shared budget (got {} + {})",
+        s.total_bytes,
+        s.segment_bytes
+    );
+    assert!(cov.is_empty(), "evicted ledger rows must be dropped");
+}
+
+/// A mid-write failure must not leave the temp file behind: the leak used
+/// to persist until the next restart.
+#[tokio::test]
+async fn failed_pump_removes_its_temp_file() {
+    use origin_cache::cache::flight::pump_and_seal;
+    let dir = tempdir().unwrap();
+    let tmp = dir.path().join(".tmp.leak");
+    let finalp = dir.path().join("leak.bin");
+    let (tx, _rx) = tokio::sync::watch::channel(FlightProgress::Pending);
+
+    // A stream that errors after yielding a little data.
+    struct FailingStream;
+    impl tokio::io::AsyncRead for FailingStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            buf.put_slice(&[1u8; 16]);
+            std::task::Poll::Ready(Err(std::io::Error::other("upstream died")))
+        }
+    }
+    let src = StreamSource {
+        stream: Box::new(FailingStream),
+        total_len: Some(1024),
+    };
+
+    let res = pump_and_seal(src, &tmp, &finalp, &tx).await;
+    assert!(res.is_err(), "a failing stream must fail the pump");
+    assert!(!tmp.exists(), "the temp file must be removed on failure");
+}
+
+/// The free-space guard helper must refuse a transfer that would cross the
+/// reserve floor, and must never block when free space is unknown.
+#[test]
+fn disk_room_check_respects_the_reserve() {
+    use origin_cache::cache::store::{free_bytes, has_room_for};
+    let dir = tempfile::tempdir().unwrap();
+    let free = free_bytes(dir.path()).expect("statvfs must work on a real dir");
+    assert!(free > 0, "a real filesystem reports free space");
+
+    // Absurdly large request must be refused.
+    assert!(!has_room_for(dir.path(), u64::MAX, 0));
+    // A tiny request with no reserve fits.
+    assert!(has_room_for(dir.path(), 1, 0));
+    // A reserve larger than the disk must refuse even a tiny request.
+    assert!(!has_room_for(dir.path(), 1, u64::MAX));
+    // Unknown path must not block serving (None -> true).
+    assert!(has_room_for(std::path::Path::new("/nonexistent/probe/path"), 1, 0));
 }
