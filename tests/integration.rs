@@ -491,7 +491,7 @@ async fn cache_entries_and_access_clock_survive_restart() {
         calls: Arc::clone(&calls),
         fail: None,
     };
-    let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend)));
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
     cache.load_and_start().await;
     let mut hit = cache.get("a.png", None).await.unwrap();
     assert_eq!(read_body(&mut hit.body).await, b"persisted");
@@ -511,11 +511,11 @@ async fn cache_entries_and_access_clock_survive_restart() {
         fail: Some(BackendError::ServerError("must not be contacted".into())),
     };
     let clock2 = Arc::new(MockClock::new(5000));
-    let cache2 = Cache::new(
+    let cache2 = Arc::new(Cache::new(
         test_config(dir.path().to_path_buf()),
         Arc::clone(&clock2),
         registry_with(Arc::new(backend2)),
-    );
+    ));
     cache2.load_and_start().await;
 
     // Entry reloaded from redb: fresh clock (now=5000) vs last_access —
@@ -524,4 +524,44 @@ async fn cache_entries_and_access_clock_survive_restart() {
     assert_eq!(hit2.outcome, CacheOutcome::Hit);
     assert_eq!(read_body(&mut hit2.body).await, b"persisted");
     assert_eq!(calls2.load(Ordering::SeqCst), 0, "restart hit must not touch upstream");
+}
+
+/// B1 regression guard: the reaper loop spawned by `load_and_start` must
+/// collect expired entries on its own — no manual `tick()` call. Until this
+/// wiring existed, a deployed binary never reaped anything (audit finding).
+#[tokio::test]
+async fn spawned_reaper_expires_entries_without_manual_tick() {
+    let dir = tempdir().unwrap();
+    let cfg = test_config(dir.path().to_path_buf());
+    let clock = Arc::new(MockClock::new(0));
+    let backend = CountingBackend {
+        bytes: b"ttl".to_vec(),
+        etag: Some("v1".into()),
+        calls: Arc::new(AtomicUsize::new(0)),
+        fail: None,
+    };
+    let cache = Arc::new(Cache::new(
+        Arc::clone(&cfg),
+        Arc::clone(&clock),
+        registry_with(Arc::new(backend)),
+    ));
+    // 50 ms production-style reaper loop instead of the 60 s default.
+    cache.load_and_start_with(std::time::Duration::from_millis(50)).await;
+
+    let mut hit = cache.get("old.png", None).await.unwrap();
+    assert_eq!(read_body(&mut hit.body).await, b"ttl");
+    wait_installed(&cache, "old.png").await;
+
+    // Default inactive_ttl is 1200 s; step past it and give the reaper a
+    // real-time moment to fire (the loop interval is wall time, the TTL is
+    // mock-clock time).
+    clock.advance(1_201_000);
+    for _ in 0..200 {
+        if cache.state.read().await.entries.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(cache.state.read().await.entries.is_empty(), "spawned reaper did not expire the entry");
+    assert!(!cache.config.cache_dir.join("old.png").exists(), "expired file must be deleted");
 }
