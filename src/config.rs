@@ -336,6 +336,56 @@ impl Config {
         if raw.routes.is_empty() {
             anyhow::bail!("at least one [[routes]] required");
         }
+
+        // Zero/duplicate values that silently break serving (ticket #58).
+        // Each of these was reached either by measurement or by reading the
+        // consumer; every one of them produced a service that looked up but
+        // did nothing useful. Fail loudly at boot instead.
+        if raw.concurrency_per_upstream == 0 {
+            anyhow::bail!(
+                "concurrency_per_upstream = 0 would deadlock every request: \
+                 the per-upstream semaphores are built with zero permits and \
+                 every acquire awaits forever"
+            );
+        }
+        if let Some(0) = raw.front_threads {
+            anyhow::bail!(
+                "front_threads = 0 is invalid: pingora asserts a non-zero thread \
+                 count, and the resulting panic left the process alive with no listener"
+            );
+        }
+        if raw.max_size_bytes == 0 {
+            anyhow::bail!(
+                "max_size_bytes = 0 would evict every entry on every tick, \
+                 leaving the cache permanently empty"
+            );
+        }
+        if raw.inactive_ttl_secs == 0 {
+            anyhow::bail!(
+                "inactive_ttl_secs = 0 would expire every entry on every tick, \
+                 disabling the disk cache (and the staged-segment sweep)"
+            );
+        }
+        {
+            // Duplicate ids were silently resolved by "last one wins" in the
+            // slot map, so one upstream's config vanished with no message.
+            let mut seen = std::collections::HashSet::new();
+            for u in &raw.upstreams {
+                if u.id.trim().is_empty() {
+                    anyhow::bail!("[[upstreams]] entry has an empty id");
+                }
+                if u.base_url.trim().is_empty() {
+                    anyhow::bail!("upstream {}: base_url must not be empty", u.id);
+                }
+                if !seen.insert(u.id.as_str()) {
+                    anyhow::bail!(
+                        "duplicate upstream id {:?}: ids must be unique, otherwise \
+                         one entry silently overwrites the other",
+                        u.id
+                    );
+                }
+            }
+        }
         // Upstream URL policy: https everywhere except loopback http.
         for u in &raw.upstreams {
             upstream_url_policy(&u.base_url, &u.id)?;
@@ -478,6 +528,112 @@ mod tests {
         let raw = std::fs::read_to_string("config.example.toml").unwrap();
         let cfg = Config::from_toml_str(&raw).unwrap();
         assert_eq!(cfg.routes.resolve("2026/08/a.png"), "media");
+    }
+
+    /// Ticket #58: every one of these values produced a service that started
+    /// cleanly and then did nothing useful. They must be rejected at boot.
+    #[test]
+    fn rejects_zero_and_duplicate_values_that_break_serving() {
+        // Base config that parses; each case below perturbs exactly one field.
+        let base = r#"
+            [[upstreams]]
+            id = "a"
+            type = "openlist"
+            base_url = "http://127.0.0.1:5244/dav"
+            username_env = "A_USER"
+            password_env = "A_PASS"
+            [[routes]]
+            prefix = ""
+            upstream = "a"
+        "#;
+        assert!(Config::from_toml_str(base).is_ok(), "the baseline must parse");
+
+        // Top-level fields must precede any [table]; prepend, do not insert
+        // after [[routes]].
+        let with_field = |field: &str| format!("{field}\n{base}");
+        for (field, needle) in [
+            // Semaphore::new(0): every acquire awaits forever.
+            ("concurrency_per_upstream = 0", "concurrency_per_upstream"),
+            // pingora asserts a non-zero thread count; the panic left no listener.
+            ("front_threads = 0", "front_threads"),
+            // Evicts every entry on every tick.
+            ("max_size_bytes = 0", "max_size_bytes"),
+            // Expires every entry on every tick.
+            ("inactive_ttl_secs = 0", "inactive_ttl_secs"),
+        ] {
+            let err = Config::from_toml_str(&with_field(field))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{field} must be rejected; got: {err}");
+        }
+
+        // Duplicate upstream ids: one silently overwrote the other.
+        let toml = r#"
+            [[upstreams]]
+            id = "dup"
+            type = "openlist"
+            base_url = "http://127.0.0.1:5244/dav"
+            username_env = "A_USER"
+            password_env = "A_PASS"
+            [[upstreams]]
+            id = "dup"
+            type = "openlist"
+            base_url = "http://127.0.0.1:5245/dav"
+            username_env = "B_USER"
+            password_env = "B_PASS"
+            [[routes]]
+            prefix = ""
+            upstream = "dup"
+        "#;
+        let err = Config::from_toml_str(toml).unwrap_err().to_string();
+        assert!(err.contains("duplicate upstream id"), "got: {err}");
+
+        // Empty id and empty base_url are equally unusable.
+        let toml = base.replace("id = \"a\"", "id = \"\"");
+        assert!(Config::from_toml_str(&toml).is_err(), "empty id must be rejected");
+        let toml = base.replace("http://127.0.0.1:5244/dav", "");
+        assert!(Config::from_toml_str(&toml).is_err(), "empty base_url must be rejected");
+    }
+
+    /// The zero semantics that ARE documented must keep working: these are
+    /// feature switches, not mistakes.
+    #[test]
+    fn documented_zero_semantics_still_accepted() {
+        // max_entries = 0 disables the entry-count cap (bytes-only budget).
+        let toml = r#"
+            max_entries = 0
+
+            [[upstreams]]
+            id = "a"
+            type = "openlist"
+            base_url = "http://127.0.0.1:5244/dav"
+            username_env = "A_USER"
+            password_env = "A_PASS"
+            [[routes]]
+            prefix = ""
+            upstream = "a"
+        "#;
+        assert!(Config::from_toml_str(toml).is_ok(), "max_entries = 0 is a documented switch");
+
+        // coverage_window_secs = 0 means "no decay".
+        let toml = r#"
+            [[upstreams]]
+            id = "a"
+            type = "openlist"
+            base_url = "http://127.0.0.1:5244/dav"
+            username_env = "A_USER"
+            password_env = "A_PASS"
+            cache_profile = "eff"
+
+            [cache_profiles.eff]
+            coverage_threshold = 0.5
+            coverage_window_secs = 0
+
+            [[routes]]
+            prefix = ""
+            upstream = "a"
+        "#;
+        assert!(Config::from_toml_str(toml).is_ok(), "window 0 means no decay");
     }
 
     #[test]

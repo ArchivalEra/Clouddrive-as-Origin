@@ -132,14 +132,80 @@ origin-cache serves stale-if-error from disk while OpenList is down
 
 ## Health checks
 
+The health endpoints live on the **business plane's loopback ports** (plain
+HTTP). They are NOT reachable on the front TLS ports: the front refuses
+`/_internal/*` (ADR-0009), and probing `http://127.0.0.1:7777` speaks
+plaintext to a TLS listener, which hangs up with no response.
+
 ```sh
-curl -s http://127.0.0.1:7777/_internal/healthz   # standard: entries/bytes/flights
-curl -s http://127.0.0.1:7778/_internal/healthz   # nocache: entries=0 by design
-cat /opt/origin-cache/watchdog.log                # watchdog failures
+curl -s http://127.0.0.1:8080/_internal/healthz   # standard
+curl -s http://127.0.0.1:8081/_internal/healthz   # nocache (entries=0 by design)
+cat /opt/origin-cache/watchdog.log                # verdict transitions + daily heartbeat
 ```
+
+`healthz` answers `200` whenever the process is serving, and reports a
+health **verdict** in the body: `"degraded": true` plus
+`"degraded_reasons": [...]`. Read the reasons, not just the status code:
+
+```sh
+curl -s http://127.0.0.1:8080/_internal/healthz | python3 -m json.tool
+```
+
+The watchdog log is quiet by design: it writes a line only when the verdict
+CHANGES, plus one `HB` line per day. A long silence means "still healthy";
+a missing `HB` for more than a day means **the watchdog itself stopped**.
+
+## Service is up but requests are failing
+
+Symptom: the units are active and healthz answers, but clients see errors.
+`healthz` reports the cache's view; the request path's view is in the
+front's metrics and access log.
+
+```sh
+# Error rate by status (5xx is the signal; 4xx is usually client-side)
+curl -s http://127.0.0.1:9090/metrics | grep 'front_requests_total{.*status="5"'
+
+# Recent failures, with the error string the front recorded
+sudo journalctl -u origin-cache-standard --no-pager -n 100 | grep -i 'front access' | grep -v 'status="2'
+
+# Upstream health: 401/403 auth, 429 throttling, 5xx provider errors
+curl -s http://127.0.0.1:9090/metrics | grep 'backend_call_duration_seconds_count'
+```
+
+Common causes: OpenList credentials expired (`AuthRequired` ⇒ check
+`healthz` upstream entries), the provider throttling us (`429` ⇒ the cache
+backs off per ADR-0010 and serves stale where it can), or disk pressure
+(see "Disk full" above).
+
+## Requests are slow
+
+Symptom: no errors, but latency is high. Split the latency by segment
+before changing anything — the bottleneck has historically been the CDN
+edge, not this node.
+
+```sh
+# Attribution: front TTFB vs cache serve vs upstream call, with percentiles
+deploy/metrics-report.sh http://127.0.0.1:9090/metrics 30
+```
+
+Read the verdict line it prints: a large `front_upstream_ttfb` with a small
+`cache_serve` means the time is going to OpenList/the provider; a large
+`cache_serve` with a small `backend_call` means it is going to this node.
+
+```sh
+# Is it the node or the link? Local disk throughput, no network involved
+sudo dd if=/opt/origin-cache/cache-standard/<key> of=/dev/null bs=1M count=200
+```
+
+If local reads are fast and `metrics-report` blames the upstream segment,
+the problem is OpenList or the provider — not this service. If the whole
+path is fast from the node but slow from a client, the time is in the edge
+segment (see `docs/notes/` for the EdgeOne findings).
 
 ## Test data cleanup
 
-The 3 GiB coverage test file lives in googledrive1 (`coverage-test-3g.bin`)
-and its promoted cache entry in `cache-efficient/`. Delete both when done:
-WebDAV DELETE + `sudo rm -rf /opt/origin-cache/cache-efficient`.
+The 3 GiB coverage test file lives in googledrive1 (`coverage-test-3g.bin`).
+The retired efficient test instance used to promote it into
+`cache-efficient/`; that instance is gone (ADR-0009), so only the upstream
+object needs deleting. Use the repo's lab suite (`deploy/lab/run-lab.sh`
+with `deploy/lab/config-c.toml`) if the efficient profile needs re-testing.
