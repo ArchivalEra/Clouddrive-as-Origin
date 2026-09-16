@@ -564,10 +564,36 @@ where
             })
         })
         .collect();
+    // Health verdict (C1). The status code stays a liveness signal (200 =
+    // the process is serving); the verdict lives in the body so a caller can
+    // distinguish "answering" from "healthy". This handler used to return a
+    // hardcoded "ok" with no checks at all, which made it useless as a
+    // monitor: a node with a full disk, a quarantined metadata store or an
+    // unreadable cache still reported perfect health.
+    let mut reasons: Vec<&str> = Vec::new();
+    if matches!(snap.store, crate::cache::persist::StoreState::Quarantined { .. }) {
+        reasons.push("metadata_store_quarantined");
+    }
+    if snap.rebuilt_rows > 0 {
+        reasons.push("metadata_rows_rebuilt");
+    }
+    match snap.disk_free_bytes {
+        Some(free) if free < snap.disk_reserve_bytes => reasons.push("disk_below_reserve"),
+        _ => {}
+    }
+    let store = match &snap.store {
+        crate::cache::persist::StoreState::Ready => json!({"state": "ready"}),
+        crate::cache::persist::StoreState::Quarantined { moved_to } => {
+            json!({"state": "quarantined", "moved_to": moved_to})
+        }
+    };
+    let degraded = !reasons.is_empty();
     (
         StatusCode::OK,
         Json(json!({
-            "status": "ok",
+            "status": if degraded { "degraded" } else { "ok" },
+            "degraded": degraded,
+            "degraded_reasons": reasons,
             "plane": "business",
             "version": env!("CARGO_PKG_VERSION"),
             "entries": count,
@@ -578,6 +604,10 @@ where
             "dirty_access_flushes": dirty_access,
             "coverage_keys": coverage_keys,
             "coverage_intervals": coverage_intervals,
+            "store": store,
+            "rebuilt_rows": snap.rebuilt_rows,
+            "disk_free_bytes": snap.disk_free_bytes,
+            "disk_reserve_bytes": snap.disk_reserve_bytes,
             "sigv4_enabled": state.sigv4_config.is_some(),
             "upstreams": upstreams,
         })),
@@ -1424,6 +1454,23 @@ mod tests {
         assert!(body.contains("\"sigv4_enabled\":false"), "{body}");
         assert!(body.contains("\"profile\":\"efficient\""), "{body}");
         assert!(body.contains("\"id\":\"primary\""), "{body}");
+    }
+
+    /// C1: healthz must carry a real verdict, not a hardcoded "ok". A fresh
+    /// node is healthy; the response must say so explicitly (so a monitor
+    /// can tell "answering" from "healthy") and expose the disk numbers.
+    #[tokio::test]
+    async fn healthz_reports_a_verdict_and_disk_state() {
+        let fx = fixture(b"x", None, Vec::new(), false);
+        let resp = healthz(State(fx.state.clone())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "liveness stays 200");
+        let (_, _, body) = body_text(resp).await;
+        assert!(body.contains("\"degraded\":false"), "{body}");
+        assert!(body.contains("\"status\":\"ok\""), "{body}");
+        assert!(body.contains("\"store\":{\"state\":\"ready\"}"), "{body}");
+        assert!(body.contains("\"disk_free_bytes\":"), "{body}");
+        assert!(body.contains("\"disk_reserve_bytes\":"), "{body}");
+        assert!(body.contains("\"rebuilt_rows\":0"), "{body}");
     }
 
     /// healthz on a nocache upstream reports the profile so an operator
