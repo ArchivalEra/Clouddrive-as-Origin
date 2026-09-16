@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Oracle node health watchdog (map #30 T4): checks the three systemd
-# units and the disk watermark; logs failures. Notification channel
-# hooks in later (mail server project integration).
+# Oracle node health watchdog (map #30 T4): checks the systemd units, the
+# disk watermark and the business-plane healthz; logs failures. Notification
+# channel hooks in later (mail server project integration) -- which means
+# this log is currently only read by a human, so a false alarm here is pure
+# noise and a missed real failure is invisible.
 #
 # Install:  sudo install -m 0755 deploy/oracle/watchdog.sh /opt/origin-cache/watchdog.sh
 #           sudo cp deploy/oracle/origin-cache-watchdog.service /etc/systemd/system/
@@ -31,9 +33,18 @@ elif [ -n "${pct:-}" ] && [ "$pct" -ge "$DISK_WARN_PCT" ]; then
 fi
 
 # --- healthz probe (business plane reachable) --------------------------------
-if ! curl -s -m 5 -o /dev/null http://127.0.0.1:7777/_internal/healthz; then
-  log "FAIL healthz standard unreachable"
+# The business plane answers on its own loopback port (plaintext). Probing the
+# FRONT ports instead means speaking TLS to a TLS listener: the old script
+# asked `http://127.0.0.1:7777` and got 000 every time, so it logged "healthz
+# unreachable" on every run since it was written -- a watchdog reporting a
+# permanent outage that never happened. 94 log lines, 94 FAILs.
+#
+# Probing the business plane is also the more meaningful check: it is the
+# component that actually serves cache semantics, and it stays meaningful
+# whether or not the front is up.
+if ! curl -s -m 5 -o /dev/null http://127.0.0.1:8080/_internal/healthz; then
+  log "FAIL healthz standard (business :8080) unreachable"
 fi
-if ! curl -s -m 5 -o /dev/null http://127.0.0.1:7778/_internal/healthz; then
-  log "FAIL healthz nocache unreachable"
+if ! curl -s -m 5 -o /dev/null http://127.0.0.1:8081/_internal/healthz; then
+  log "FAIL healthz nocache (business :8081) unreachable"
 fi
