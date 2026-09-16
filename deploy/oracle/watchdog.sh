@@ -11,7 +11,7 @@
 set -u
 
 UNITS="origin-cache-standard origin-cache-nocache"
-LOG=/tmp/wdtest/watchdog.log
+LOG=/opt/origin-cache/watchdog.log
 DISK_WARN_PCT=85
 DISK_CRIT_PCT=95
 
@@ -19,8 +19,8 @@ log() { echo "$(date -Is) $*" >> "$LOG"; }
 
 # State file (D3): one line per run recording the last verdict, so the log
 # can report TRANSITIONS instead of every run. Written atomically.
-STATE=/tmp/wdtest/watchdog.state
-HEARTBEAT=/tmp/wdtest/watchdog.heartbeat
+STATE=/opt/origin-cache/watchdog.state
+HEARTBEAT=/opt/origin-cache/watchdog.heartbeat
 
 # Collect problems in a string; empty means healthy.
 PROBLEMS=""
