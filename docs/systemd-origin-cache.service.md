@@ -6,7 +6,7 @@ loopback). The oracle node runs **three** units, installed by
 
 - `origin-cache-standard.service` — https front on `[::]:7777` (TLS)
 - `origin-cache-nocache.service` — internal front on `[::]:7778`
-- `origin-cache-port80.service` — acme webroot + 301 helper on `:80`
+- (retired 2026-09-12) `origin-cache-port80.service` — a Python acme/301 helper on `:80`; removed after it burned a core (no connection timeout) and proved unnecessary (DNS-01 renewal, `:80` cloud-filtered).
 
 Install: `sudo bash deploy/oracle/install.sh <binary> [--keep-env]`
 (`--keep-env` preserves an existing `origin-cache.env` with real secrets).
@@ -43,7 +43,7 @@ WantedBy=multi-user.target
 
 Notes vs the earlier template: `DynamicUser=yes` was replaced by a real
 `opc` user (the cache dir and redb must survive restarts with a stable
-owner); the port80 unit runs as root (privileged port 80).
+owner). No unit binds a privileged port any more.
 
 ## Env file (`/etc/origin-cache/origin-cache.env`)
 

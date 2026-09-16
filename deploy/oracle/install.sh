@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot installer for the Oracle Clouddrive-as-Origin node.
 #   - copies the binary + configs into /opt/origin-cache
-#   - writes the 3 systemd units (standard / nocache / port80)
+#   - writes the 2 systemd units (standard / nocache)
 #   - enables and starts them
 #
 # Usage:  sudo bash deploy/oracle/install.sh <path-to-release-binary> [--keep-env]
@@ -22,7 +22,6 @@ mkdir -p "$APP/cache-standard" "$APP/cache-nocache" "$APP/acme-webroot"
 install -m 0755 "$SRC_BIN" "$APP/origin-cache"
 install -m 0644 "$REPO_DIR/deploy/oracle/config-standard.toml" "$APP/config-standard.toml"
 install -m 0644 "$REPO_DIR/deploy/oracle/config-nocache.toml"  "$APP/config-nocache.toml"
-install -m 0755 "$REPO_DIR/deploy/port80.py" "$APP/port80.py"
 chown -R "$USER:$USER" "$APP"
 
 # Environment file: contains real secrets at runtime, written by the
@@ -91,26 +90,13 @@ RestartSec=3
 WantedBy=multi-user.target
 UNIT
 
-cat > /etc/systemd/system/origin-cache-port80.service <<UNIT
-[Unit]
-Description=Clouddrive-as-Origin port80 helper (acme webroot + 301)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-# Root: binds privileged port 80.
-ExecStart=/usr/bin/python3 $APP/port80.py
-WorkingDirectory=$APP
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
 systemctl daemon-reload
-systemctl enable --now origin-cache-standard origin-cache-nocache origin-cache-port80
-systemctl restart origin-cache-standard origin-cache-nocache origin-cache-port80
+systemctl enable --now origin-cache-standard origin-cache-nocache
+systemctl restart origin-cache-standard origin-cache-nocache
 
-echo "installed: three units enabled+started. Edit $APP/origin-cache.env secrets."
+# The port-80 helper is gone: retired 2026-09-12 after it burned half the
+# 2-core node for a week (ThreadingHTTPServer, one thread per connection,
+# no timeout, so public scanners never released a thread). Nothing needed
+# it -- the certificate renews via DNS-01, and :80 is filtered at the
+# cloud layer.
+echo "installed: two units enabled+started. Edit $APP/origin-cache.env secrets."
