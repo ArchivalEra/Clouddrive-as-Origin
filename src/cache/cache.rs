@@ -326,17 +326,32 @@ impl<C: Clock + Clone> Cache<C> {
             }
         };
         let loaded = persisted.len();
-        let mut state = self.state.write().await;
-        state.segment_bytes = staged;
+        // Resolve file existence OUTSIDE the state guard (O4): the loop
+        // used to await `metadata` and `redb remove` while holding
+        // `state.write()`, which is exactly the shape the C3 lock
+        // discipline forbids. Startup is single-threaded so it was
+        // harmless in practice, but a rule with an exception is not a rule.
+        let mut live_rows = Vec::with_capacity(persisted.len());
+        let mut lost_rows: Vec<String> = Vec::new();
         for m in persisted {
             let path = store::file_path(&self.config.cache_dir, &m.key);
             if tokio::fs::metadata(&path).await.is_ok() {
-                state.total_bytes += m.size_bytes;
-                state.entries.insert(m.key.clone(), m);
+                live_rows.push(m);
             } else {
                 // File lost while we were down — drop the row too.
-                let _ = self.meta.remove(&m.key).await;
+                lost_rows.push(m.key);
             }
+        }
+        if !lost_rows.is_empty() {
+            if let Err(e) = self.meta.remove_batch(&lost_rows).await {
+                tracing::warn!(error = %e, "startup: dropping rows for vanished files failed");
+            }
+        }
+        let mut state = self.state.write().await;
+        state.segment_bytes = staged;
+        for m in live_rows {
+            state.total_bytes += m.size_bytes;
+            state.entries.insert(m.key.clone(), m);
         }
         // Rebuild path (ticket #57): rows missing but bytes present means
         // metadata was lost (corrupt store, manual `rm redb.db`). Recreate
@@ -1993,32 +2008,51 @@ fn reap_collect(state: &mut CacheState, ttl_ms: u64, now: u64) -> Vec<(String, u
 /// Max-size LRU victim selection — memory only; deletes happen guard-free
 /// via [`remove_entries`] (C3 lock discipline).
 fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
-    let mut out = Vec::new();
     // Two independent budgets (P10): bytes AND entry count. Entry rows cost
     // roughly 500 B of RAM each (key stored twice plus five Strings), and
     // max_size_bytes alone let millions of small objects exhaust memory on
     // a 10.9 GB node while sitting far under the byte cap.
-    let over_bytes = |s: &CacheState| s.total_bytes > config.max_size_bytes;
-    let over_entries = |s: &CacheState| {
-        config.max_entries > 0 && s.entries.len() > config.max_entries
+    let over_bytes = state.total_bytes > config.max_size_bytes;
+    let over_entries = config.max_entries > 0 && state.entries.len() > config.max_entries;
+    if !over_bytes && !over_entries {
+        return Vec::new();
+    }
+
+    // How far over we are, then ONE pass ordered by LRU (O2). The previous
+    // shape called `min_by_key` inside the eviction loop, so a sweep of k
+    // victims rescanned the whole entry map k times: O(entries x victims)
+    // under the state write guard, which blocks every hit.
+    let bytes_over = state.total_bytes.saturating_sub(config.max_size_bytes);
+    let entries_over = if over_entries {
+        state.entries.len().saturating_sub(config.max_entries)
+    } else {
+        0
     };
-    while (over_bytes(state) || over_entries(state)) && !state.entries.is_empty() {
-        let victim = state
-            .entries
-            .iter()
-            .filter(|(_, m)| m.negative_until_millis.is_none())
-            .min_by_key(|(_, m)| m.eligible_at(config.inactive_ttl_secs))
-            .map(|(k, _)| k.clone());
-        match victim {
-            Some(k) => {
-                if let Some(m) = state.entries.remove(&k) {
-                    state.total_bytes = state.total_bytes.saturating_sub(m.size_bytes);
-                    out.push((k, m.size_bytes));
-                } else {
-                    break;
-                }
-            }
-            None => break,
+
+    // Collect evictable rows (negative tombstones are not LRU-eligible:
+    // they hold no file and expire on their own clock), ordered oldest
+    // first. `sort_unstable_by_key` on the eligibility timestamp gives the
+    // same victim order as repeated `min_by_key` did.
+    let mut candidates: Vec<(u64, String, u64)> = state
+        .entries
+        .iter()
+        .filter(|(_, m)| m.negative_until_millis.is_none())
+        .map(|(k, m)| (m.eligible_at(config.inactive_ttl_secs), k.clone(), m.size_bytes))
+        .collect();
+    candidates.sort_unstable_by_key(|(eligible, _, _)| *eligible);
+
+    let mut out = Vec::new();
+    let mut freed = 0u64;
+    for (_, key, size) in candidates {
+        // Stop once BOTH budgets are satisfied: whatever drove the sweep is
+        // now back under its cap.
+        if freed >= bytes_over && out.len() >= entries_over {
+            break;
+        }
+        if let Some(m) = state.entries.remove(&key) {
+            state.total_bytes = state.total_bytes.saturating_sub(m.size_bytes);
+            freed = freed.saturating_add(m.size_bytes);
+            out.push((key, m.size_bytes));
         }
     }
     out
