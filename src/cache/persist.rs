@@ -23,6 +23,22 @@ use crate::cache::meta::EntryMeta;
 
 const ENTRIES: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("entries");
 
+/// Run a blocking redb transaction off the async worker (O3). `commit()`
+/// is an fsync: on the 2-core node it parks the calling worker for
+/// milliseconds and every task scheduled there waits behind it.
+/// `block_in_place` first hands the worker's other tasks to a fresh
+/// thread, so the runtime keeps serving while the fsync lands. Tests run a
+/// current-thread runtime where `block_in_place` panics, so the flavor is
+/// checked and the work runs inline there.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 pub struct MetaStore {
     db: Arc<Mutex<redb::Database>>,
 }
@@ -112,33 +128,37 @@ impl MetaStore {
     /// lives in memory).
     pub async fn insert(&self, meta: &EntryMeta) -> anyhow::Result<()> {
         let db = self.db.lock().await;
-        let txn = db.begin_write()?;
-        {
-            let mut entries = txn.open_table(ENTRIES)?;
-            entries.insert(meta.key.as_str(), serde_json::to_vec(meta)?.as_slice())?;
-        }
-        txn.commit()?;
-        Ok(())
+        blocking(|| {
+            let txn = db.begin_write()?;
+            {
+                let mut entries = txn.open_table(ENTRIES)?;
+                entries.insert(meta.key.as_str(), serde_json::to_vec(meta)?.as_slice())?;
+            }
+            txn.commit()?;
+            Ok(())
+        })
     }
 
     /// Remove an entry (expiry / eviction / tombstone drop).
     pub async fn remove(&self, key: &str) -> anyhow::Result<Option<EntryMeta>> {
         let db = self.db.lock().await;
-        let txn = db.begin_write()?;
-        // Copy out of the table before deserializing: guards borrow the
-        // table, so the table binding is dropped before leaving scope.
-        let removed_bytes: Option<Vec<u8>> = {
-            let mut entries = txn.open_table(ENTRIES)?;
-            let out = match entries.remove(key) {
-                Ok(Some(v)) => Some(v.value().to_vec()),
-                Ok(None) => None,
-                Err(e) => return Err(e.into()),
+        blocking(|| {
+            let txn = db.begin_write()?;
+            // Copy out of the table before deserializing: guards borrow the
+            // table, so the table binding is dropped before leaving scope.
+            let removed_bytes: Option<Vec<u8>> = {
+                let mut entries = txn.open_table(ENTRIES)?;
+                let out = match entries.remove(key) {
+                    Ok(Some(v)) => Some(v.value().to_vec()),
+                    Ok(None) => None,
+                    Err(e) => return Err(e.into()),
+                };
+                drop(entries);
+                out
             };
-            drop(entries);
-            out
-        };
-        txn.commit()?;
-        removed_bytes.map(|b| serde_json::from_slice(&b)).transpose().map_err(anyhow::Error::from)
+            txn.commit()?;
+            removed_bytes.map(|b| serde_json::from_slice(&b)).transpose().map_err(anyhow::Error::from)
+        })
     }
 
     /// Update last_access for an existing entry (coalesced flush path).
@@ -155,24 +175,26 @@ impl MetaStore {
             return Ok(());
         }
         let db = self.db.lock().await;
-        let txn = db.begin_write()?;
-        {
-            let mut entries = txn.open_table(ENTRIES)?;
-            for (key, ms) in batch {
-                let old: Option<EntryMeta> = match entries.get(key.as_str())? {
-                    Some(v) => Some(serde_json::from_slice(v.value())?),
-                    None => None,
-                };
-                if let Some(mut m) = old {
-                    if m.last_access_millis != *ms {
-                        m.last_access_millis = *ms;
-                        entries.insert(key.as_str(), serde_json::to_vec(&m)?.as_slice())?;
+        blocking(|| {
+            let txn = db.begin_write()?;
+            {
+                let mut entries = txn.open_table(ENTRIES)?;
+                for (key, ms) in batch {
+                    let old: Option<EntryMeta> = match entries.get(key.as_str())? {
+                        Some(v) => Some(serde_json::from_slice(v.value())?),
+                        None => None,
+                    };
+                    if let Some(mut m) = old {
+                        if m.last_access_millis != *ms {
+                            m.last_access_millis = *ms;
+                            entries.insert(key.as_str(), serde_json::to_vec(&m)?.as_slice())?;
+                        }
                     }
                 }
             }
-        }
-        txn.commit()?;
-        Ok(())
+            txn.commit()?;
+            Ok(())
+        })
     }
 
     /// Remove every key in one write transaction (P5): eviction and expiry
@@ -182,15 +204,17 @@ impl MetaStore {
             return Ok(());
         }
         let db = self.db.lock().await;
-        let txn = db.begin_write()?;
-        {
-            let mut entries = txn.open_table(ENTRIES)?;
-            for key in keys {
-                entries.remove(key.as_str())?;
+        blocking(|| {
+            let txn = db.begin_write()?;
+            {
+                let mut entries = txn.open_table(ENTRIES)?;
+                for key in keys {
+                    entries.remove(key.as_str())?;
+                }
             }
-        }
-        txn.commit()?;
-        Ok(())
+            txn.commit()?;
+            Ok(())
+        })
     }
 }
 
