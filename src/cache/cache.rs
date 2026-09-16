@@ -452,12 +452,21 @@ impl<C: Clock + Clone> Cache<C> {
     }
 
     /// A listing snapshot younger than [`LISTING_SNAPSHOT_TTL`], if any.
-    pub async fn list_snapshot(&self, upstream: &str, folder: &str, recursive: bool) -> Option<Vec<ListEntry>> {
+    pub async fn list_snapshot(
+        &self,
+        upstream: &str,
+        folder: &str,
+        recursive: bool,
+    ) -> Option<Arc<Vec<ListEntry>>> {
         let now = self.clock.now_millis();
         let g = self.listings.lock().await;
+        // Hand out the Arc, not a copy (O5): the map already stores
+        // `Arc<Vec<_>>`, so cloning the whole vector per page made a
+        // 50k-entry walk allocate 50k entries AGAIN for every page while
+        // only a page's worth was ever rendered.
         g.get(&(upstream.to_string(), folder.to_string(), recursive))
             .filter(|(at, _)| now.saturating_sub(*at) < LISTING_SNAPSHOT_TTL_MS)
-            .map(|(_, v)| v.as_ref().clone())
+            .map(|(_, v)| Arc::clone(v))
     }
 
     /// Record a fresh listing walk for paging reuse.
