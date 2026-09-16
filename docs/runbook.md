@@ -9,15 +9,20 @@ SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
 - **EdgeOne** → origin-pull `apple.dib.l.cd:7777` (https) / `:80` (http),
   Host header `cdn-oracle.isui.ren`. Edge cert is EdgeOne-managed; origin
   cert is Let's Encrypt `cdn-oracle.isui.ren` (DNS-01 via dnspod).
-- **origin-cache** (3 systemd units): standard `[::]:7777` TLS / nocache
+- **origin-cache** (2 systemd units): standard `[::]:7777` TLS / nocache
   `[::]:7778`.
 
   The port-80 helper was retired 2026-09-12 (see "Retired: port-80 helper"
   below). :80 is filtered at the cloud layer and the certificate renews via
   DNS-01, so nothing needed it.
 - **OpenList** on the same box: `127.0.0.1:5244`, mount `googledrive1`.
-- **Watchdog**: `origin-cache-watchdog.timer` every 5 min → logs to
-  `/opt/origin-cache/watchdog.log`.
+- **cloudflared** (`cloudflared.service`): outbound-only tunnel to the
+  Cloudflare Worker that receives this node's status reports.
+- **Watchdog** (`origin-cache-watchdog.timer`): every 5 min it logs verdict
+  transitions to `/opt/origin-cache/watchdog.log` and sends a status
+  heartbeat to the blog worker (`docs/status-reporting.md`). Both service
+  units additionally run `/opt/origin-cache/watchdog.sh --down %n` as
+  `ExecStopPost`, so a non-clean exit is reported with its cause.
 
 ## Traffic switch (EdgeOne → oracle)
 
@@ -110,10 +115,10 @@ If renewal failed: `sudo ~/.acme.sh/acme.sh --renew -d cdn-oracle.isui.ren --dns
 
 ### Test artifacts (kept for regression)
 
-- `origin-cache-efficient.service` (port 7780): coverage test instance,
-  keep for T2/T3 regression.
 - `coverage-test-3g.bin` in googledrive1 + `/tmp/coverage-test-3g.bin`:
-  3 GiB coverage test file. Delete via WebDAV when no longer needed.
+  3 GiB coverage test file. Delete via WebDAV when no longer needed. The
+  efficient test instance that used to promote it is gone (see "Test data
+  cleanup").
 
 ### Disk full
 
@@ -161,6 +166,28 @@ curl -s http://127.0.0.1:8080/_internal/healthz | python3 -m json.tool
 The watchdog log is quiet by design: it writes a line only when the verdict
 CHANGES, plus one `HB` line per day. A long silence means "still healthy";
 a missing `HB` for more than a day means **the watchdog itself stopped**.
+
+The same watchdog also sends a status heartbeat to the blog worker every 5
+minutes; the full interface is in `docs/status-reporting.md`.
+
+## The blog card says the node is offline
+
+The card is fed by the watchdog's heartbeat, and the far side calls the node
+offline after 15 minutes of silence. Silence has two possible causes and the
+node being healthy is consistent with the second one, so check both:
+
+```sh
+systemctl is-active origin-cache-watchdog.timer cloudflared   # the senders
+tail -5 /opt/origin-cache/watchdog.log                        # report failures
+sudo -u opc /opt/origin-cache/watchdog.sh                     # send one now
+```
+
+A `report heartbeat failed http=NNN` line localises the problem to the
+receiver (a 4xx means the far side rejected the payload; a 000 means the
+request never left). No line at all, with the timer active, means the run
+never happened — check `systemctl list-timers origin-cache-watchdog.timer`.
+`report skipped: jq not installed` means the host lost `jq`, which the
+reporting path needs.
 
 ## Service is up but requests are failing
 
