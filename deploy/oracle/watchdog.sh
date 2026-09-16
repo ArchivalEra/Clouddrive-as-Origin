@@ -60,13 +60,29 @@ post() { # payload, label
 # minutes of silence catches it. This hook exists only to make a process
 # death EARLIER and more informative than that silence.
 #
-# A PLANNED stop is deliberately NOT reported. Every deploy is a stop-start,
-# `Restart=always` restarts on its own, and systemd marks a requested stop
-# with SERVICE_RESULT=success -- reporting those would turn each deploy into
-# an outage alert on the far side.
+# A PLANNED stop is deliberately NOT reported: every deploy is a stop-start
+# and `Restart=always` restarts on its own, so reporting those would turn
+# each deploy into an outage alert on the far side. See below for the two
+# systemd results that mean "planned" here.
 send_down() {
   local unit="${1:-origin-cache}" result="${SERVICE_RESULT:-unknown}" code="${EXIT_CODE:-}" status="${EXIT_STATUS:-}"
-  [ "$result" = success ] && return 0
+  # A requested stop stays silent, and on this node that covers TWO shapes:
+  #   - result=success: a clean stop.
+  #   - result=timeout: SIGTERM did not take the process out inside the stop
+  #     window, so systemd escalated to SIGKILL. This is the NORMAL stop path
+  #     here -- the binary drains gracefully for up to 300s while the default
+  #     stop timeout is 90s -- so EVERY deploy produces it. Measured
+  #     2026-09-16: a plain `systemctl restart` logged two down reports with
+  #     result=timeout, which is precisely the false alarm this hook exists
+  #     to avoid.
+  # A hang is not a death either way: the heartbeat keeps reporting
+  # availability while it hangs.
+  case "$result" in
+    success|timeout)
+      log "planned stop, no down report unit=${unit%%.service} result=$result"
+      return 0
+      ;;
+  esac
   # Throttle: `Restart=always` restarts every 3s, so a crash loop would fire
   # this hook ~20 times a minute and flood the far side. The far side's
   # dedupe keys on the timestamp, which every one of those would defeat.
