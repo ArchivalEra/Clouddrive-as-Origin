@@ -1022,7 +1022,11 @@ async fn listing_snapshot_is_reused_then_expires() {
     cache.store_list_snapshot("up", "a/", true, &entries).await;
 
     let got = cache.list_snapshot("up", "a/", true).await.expect("snapshot present");
-    assert_eq!(got, entries, "the second page sees the same walk");
+    assert_eq!(*got, entries, "the second page sees the same walk");
+    // The snapshot is shared, not copied (O5): the returned handle must
+    // alias the stored one, not a fresh vector.
+    let again = cache.list_snapshot("up", "a/", true).await.unwrap();
+    assert!(Arc::ptr_eq(&got, &again), "pages must share one snapshot allocation");
 
     // Different selector = different snapshot.
     assert!(cache.list_snapshot("up", "a/", false).await.is_none());

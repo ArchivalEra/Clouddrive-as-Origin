@@ -18,6 +18,8 @@
 
 use std::sync::OnceLock;
 
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     http::{header::CONTENT_TYPE, StatusCode},
@@ -206,10 +208,12 @@ struct PageItems {
     common_prefixes: Vec<String>,
 }
 
-fn select_items(entries: Vec<ListEntry>, params: &ListParams) -> PageItems {
+fn select_items(entries: &[ListEntry], params: &ListParams) -> PageItems {
     let prefix = params.prefix.as_str();
-    // One consuming pass (P9): partition into files and directories instead
-    // of scanning the vector twice and deep-copying every matching file.
+    // One pass, cloning only what the caller keeps (O5): the snapshot is
+    // shared behind an Arc, so this borrows it instead of consuming a
+    // private copy. Only matching files land in `contents`, so the clone
+    // is bounded by the match set, not the whole walk.
     let mut contents: Vec<ListEntry> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
     for e in entries {
@@ -217,9 +221,9 @@ fn select_items(entries: Vec<ListEntry>, params: &ListParams) -> PageItems {
             continue;
         }
         if e.is_dir {
-            dirs.push(e.key);
+            dirs.push(e.key.clone());
         } else {
-            contents.push(e);
+            contents.push(e.clone());
         }
     }
     contents.sort_by(|a, b| a.key.cmp(&b.key));
@@ -321,7 +325,7 @@ pub(crate) async fn try_list<C: Clock + Clone>(
     // filtered locally), so page k cost the same as page 1. Each page now
     // slices one walk held briefly on the Cache. A large recursive walk is
     // also the expensive case, so this is where the win is largest.
-    let entries = match state.cache.list_snapshot(&upstream_id, folder, recursive).await {
+    let entries: Arc<Vec<ListEntry>> = match state.cache.list_snapshot(&upstream_id, folder, recursive).await {
         Some(e) => e,
         None => {
             // The listing is a metadata path but still hits the upstream —
@@ -332,11 +336,11 @@ pub(crate) async fn try_list<C: Clock + Clone>(
             match slot.backend.list(folder, recursive).await {
                 Ok(e) => {
                     state.cache.store_list_snapshot(&upstream_id, folder, recursive, &e).await;
-                    e
+                    Arc::new(e)
                 }
                 // A missing folder is an empty listing: S3 prefixes are
                 // string filters, not containers.
-                Err(BackendError::NotFound) => Vec::new(),
+                Err(BackendError::NotFound) => Arc::new(Vec::new()),
                 Err(BackendError::AuthRequired) => {
                     return Some(list_error("AccessDenied", "Access Denied", path_key, req_id, host_id, &[]))
                 }
@@ -355,7 +359,7 @@ pub(crate) async fn try_list<C: Clock + Clone>(
         }
     };
 
-    let page = select_items(entries, &params);
+    let page = select_items(&entries, &params);
     match resume_from(&params) {
         Some(Err(())) => {
             return Some(invalid_argument(
