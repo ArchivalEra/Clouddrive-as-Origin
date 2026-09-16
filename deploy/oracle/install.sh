@@ -22,6 +22,9 @@ mkdir -p "$APP/cache-standard" "$APP/cache-nocache" "$APP/acme-webroot"
 install -m 0755 "$SRC_BIN" "$APP/origin-cache"
 install -m 0644 "$REPO_DIR/deploy/oracle/config-standard.toml" "$APP/config-standard.toml"
 install -m 0644 "$REPO_DIR/deploy/oracle/config-nocache.toml"  "$APP/config-nocache.toml"
+# The watchdog is the reporting sender AND the ExecStopPost hook below, so
+# the units are only valid once this file exists.
+install -m 0755 "$REPO_DIR/deploy/oracle/watchdog.sh" "$APP/watchdog.sh"
 chown -R "$USER:$USER" "$APP"
 
 # Environment file: contains real secrets at runtime, written by the
@@ -60,6 +63,11 @@ ProtectHome=yes
 ReadWritePaths=$APP
 Restart=always
 RestartSec=3
+# Report a NON-clean exit to the blog-side worker. Planned stops stay silent
+# (systemd marks them SERVICE_RESULT=success), so a deploy is never an
+# outage alert; the 15-minute dead-man switch is the real detector.
+# See docs/status-reporting.md.
+ExecStopPost=$APP/watchdog.sh --down %n
 
 [Install]
 WantedBy=multi-user.target
@@ -85,14 +93,19 @@ ProtectHome=yes
 ReadWritePaths=$APP
 Restart=always
 RestartSec=3
+ExecStopPost=$APP/watchdog.sh --down %n
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
+cp "$REPO_DIR/deploy/oracle/origin-cache-watchdog.service" /etc/systemd/system/
+cp "$REPO_DIR/deploy/oracle/origin-cache-watchdog.timer"   /etc/systemd/system/
+
 systemctl daemon-reload
 systemctl enable --now origin-cache-standard origin-cache-nocache
-systemctl restart origin-cache-standard origin-cache-nocache
+systemctl enable --now origin-cache-watchdog.timer
+systemctl restart origin-cache-standard origin-cache-nocache origin-cache-watchdog.timer
 
 # The port-80 helper is gone: retired 2026-09-12 after it burned half the
 # 2-core node for a week (ThreadingHTTPServer, one thread per connection,

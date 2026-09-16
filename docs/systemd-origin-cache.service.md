@@ -1,11 +1,14 @@
 # Clouddrive-as-Origin systemd units (deployed shape)
 
 Single binary, two planes (front TLS terminator + axum business plane on
-loopback). The oracle node runs **three** units, installed by
+loopback). The oracle node runs **four** units, all installed by
 `deploy/oracle/install.sh` (which writes them verbatim):
 
 - `origin-cache-standard.service` — https front on `[::]:7777` (TLS)
 - `origin-cache-nocache.service` — internal front on `[::]:7778`
+- `origin-cache-watchdog.service` + `.timer` — health checks every 5 min,
+  the status heartbeat, and the `ExecStopPost` hook
+  (`docs/status-reporting.md`)
 - (retired 2026-09-12) `origin-cache-port80.service` — a Python acme/301 helper on `:80`; removed after it burned a core (no connection timeout) and proved unnecessary (DNS-01 renewal, `:80` cloud-filtered).
 
 Install: `sudo bash deploy/oracle/install.sh <binary> [--keep-env]`
@@ -31,15 +34,18 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/opt/origin-cache
-Restart=on-failure
+Restart=always
 RestartSec=3
-# Graceful shutdown: SIGTERM is handled by the binary (front + business
-# planes drain, then exit).
-TimeoutStopSec=30
+# Reports a NON-clean exit over the tunnel; a planned stop stays silent so a
+# deploy is never an outage alert.
+ExecStopPost=/opt/origin-cache/watchdog.sh --down %n
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+The nocache unit is identical apart from its description, `ExecStart` config
+path and its front port.
 
 Notes vs the earlier template: `DynamicUser=yes` was replaced by a real
 `opc` user (the cache dir and redb must survive restarts with a stable
