@@ -38,9 +38,17 @@ async fn main() -> anyhow::Result<()> {
             ),
             other => anyhow::bail!("upstream {}: unknown type {other:?} (v1 supports \"openlist\")", u.id),
         };
-        // Timing decorator: every backend call is measured (map #47 T2).
-        let backend: Arc<dyn StorageBackend> =
-            Arc::new(origin_cache::backend::TimedBackend::new(backend));
+        // Timing decorator: every backend call is measured (map #47 T2) and
+        // retried per the configured policy (#58). Wired once, so all call
+        // sites are covered.
+        let backend: Arc<dyn StorageBackend> = Arc::new(origin_cache::backend::TimedBackend::with_retry(
+            backend,
+            origin_cache::backend::RetryPolicy {
+                max_attempts: cfg.retry_max_attempts as u32,
+                base_ms: cfg.retry_base_ms,
+                max_ms: cfg.retry_max_ms,
+            },
+        ));
         slots.insert(
             u.id.clone(),
             Arc::new(BackendSlot::new(backend, cfg.concurrency_per_upstream)),

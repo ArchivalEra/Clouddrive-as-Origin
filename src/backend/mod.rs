@@ -220,39 +220,171 @@ pub trait StorageBackend: Send + Sync + 'static {
     fn id(&self) -> &str;
 }
 
-/// Timing decorator (map #47 T2): wraps any `StorageBackend` and records
-/// each call's duration into `backend_call_duration_seconds{op}`. Wired
-/// once at construction so all 14 call sites stay untouched.
+/// Retry policy for upstream calls (ticket #58). Derived from the config's
+/// `retry_*` fields, which existed since the beginning but were never read
+/// while three documents described the behaviour they were supposed to
+/// drive (spec §Resilience, ADR-0002).
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub base_ms: u64,
+    pub max_ms: u64,
+}
+
+impl RetryPolicy {
+    /// No retries: one attempt. Used by tests and by callers that want the
+    /// raw behaviour.
+    pub fn none() -> Self {
+        Self { max_attempts: 1, base_ms: 0, max_ms: 0 }
+    }
+
+    /// Whether another attempt is allowed after `attempt` (1-based).
+    fn allows(&self, attempt: u32) -> bool {
+        attempt < self.max_attempts.max(1)
+    }
+
+    /// Delay before attempt number `attempt + 1`. `Retry-After` is honored
+    /// exactly when present; otherwise exponential backoff from `base_ms`,
+    /// capped at `max_ms`, with additive jitter so a fleet of concurrent
+    /// callers does not resynchronize onto the same retry instant.
+    ///
+    /// A `Retry-After` longer than `max_ms` is NOT truncated. Truncating
+    /// would call the upstream back sooner than it asked, which is how a
+    /// client earns a longer ban -- and the docs are explicit that the
+    /// header is honored exactly. Instead `delay` reports it and
+    /// [`Self::allows`-adjacent logic] declines to retry at all when the
+    /// wait would exceed our ceiling: the upstream's wish is respected, and
+    /// no permit is parked for an hour holding a caller hostage.
+    fn delay(&self, attempt: u32, retry_after_millis: Option<u64>) -> std::time::Duration {
+        if let Some(ms) = retry_after_millis {
+            return std::time::Duration::from_millis(ms);
+        }
+        let exp = self.base_ms.saturating_mul(1u64 << attempt.saturating_sub(1).min(16));
+        let capped = exp.min(self.max_ms);
+        std::time::Duration::from_millis(capped.saturating_add(jitter_ms(capped)))
+    }
+
+    /// Whether a retry is worth attempting at all, given how long we would
+    /// have to wait. Declining here is the alternative to truncating an
+    /// upstream's long `Retry-After`: we neither hammer it early nor hold a
+    /// gate permit for the whole wait.
+    fn worth_waiting(&self, retry_after_millis: Option<u64>) -> bool {
+        match retry_after_millis {
+            // A ceiling of 0 means "no ceiling configured"; accept the wait.
+            Some(ms) => self.max_ms == 0 || ms <= self.max_ms,
+            None => true,
+        }
+    }
+}
+
+/// Additive jitter: up to 25% of `ms`, derived from the clock. Hand-rolled
+/// deliberately -- one call site does not justify a `rand` dependency.
+fn jitter_ms(ms: u64) -> u64 {
+    if ms == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    nanos % (ms / 4).max(1)
+}
+
+/// Whether an error is worth retrying. `NotFound`, `AuthRequired` and
+/// `RangeNotSatisfiable` are deterministic -- a retry cannot change them --
+/// so only throttling and provider failures are retried.
+fn is_retryable(e: &BackendError) -> bool {
+    matches!(e, BackendError::RateLimited { .. } | BackendError::ServerError(_))
+}
+
+/// Timing decorator (map #47 T2): wraps any `StorageBackend`, records each
+/// call's duration into `backend_call_duration_seconds{op}`, and applies the
+/// retry policy. Wired once at construction so all 14 call sites stay
+/// untouched.
+///
+/// Note the cost, accepted deliberately: the per-upstream gate is acquired
+/// by CALLERS, outside this decorator, so a retry loop holds one permit for
+/// the whole backoff. `max_ms` is therefore the bound on how long a
+/// throttled upstream can park a permit.
 pub struct TimedBackend {
     inner: std::sync::Arc<dyn StorageBackend>,
+    retry: RetryPolicy,
 }
 
 impl TimedBackend {
     pub fn new(inner: std::sync::Arc<dyn StorageBackend>) -> Self {
-        Self { inner }
+        Self { inner, retry: RetryPolicy::none() }
+    }
+
+    pub fn with_retry(inner: std::sync::Arc<dyn StorageBackend>, retry: RetryPolicy) -> Self {
+        Self { inner, retry }
+    }
+
+    /// One observable operation with the retry policy applied.
+    async fn attempt<T, F, Fut>(&self, op: &'static str, mut call: F) -> Result<T, BackendError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, BackendError>>,
+    {
+        let mut attempt = 1u32;
+        loop {
+            let out = crate::metrics::observe_backend(op, &mut call).await;
+            match out {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if !is_retryable(&e) || !self.retry.allows(attempt) {
+                        return Err(e);
+                    }
+                    let retry_after = match &e {
+                        BackendError::RateLimited { retry_after_millis } => *retry_after_millis,
+                        _ => None,
+                    };
+                    if !self.retry.worth_waiting(retry_after) {
+                        tracing::warn!(
+                            op,
+                            retry_after_ms = retry_after.unwrap_or(0),
+                            max_ms = self.retry.max_ms,
+                            error = %e,
+                            "upstream asked to wait longer than our ceiling; not retrying"
+                        );
+                        return Err(e);
+                    }
+                    let delay = self.retry.delay(attempt, retry_after);
+                    tracing::warn!(
+                        op,
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %e,
+                        "upstream call failed; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        }
     }
 }
 
 #[async_trait]
 impl StorageBackend for TimedBackend {
     async fn stat(&self, key: &Key) -> Result<ObjectMeta, BackendError> {
-        crate::metrics::observe_backend("stat", || self.inner.stat(key)).await
+        self.attempt("stat", || self.inner.stat(key)).await
     }
 
     async fn open(&self, key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
-        crate::metrics::observe_backend("open", || self.inner.open(key, range)).await
+        self.attempt("open", || self.inner.open(key, range)).await
     }
 
     async fn refresh_if_needed(&self) -> Result<(), BackendError> {
-        crate::metrics::observe_backend("refresh", || self.inner.refresh_if_needed()).await
+        self.attempt("refresh", || self.inner.refresh_if_needed()).await
     }
 
     async fn direct_url(&self, key: &Key, viewer_ua: Option<&str>) -> Result<DirectUrl, BackendError> {
-        crate::metrics::observe_backend("direct_url", || self.inner.direct_url(key, viewer_ua)).await
+        self.attempt("direct_url", || self.inner.direct_url(key, viewer_ua)).await
     }
 
     async fn list(&self, folder: &str, recursive: bool) -> Result<Vec<ListEntry>, BackendError> {
-        crate::metrics::observe_backend("list", || self.inner.list(folder, recursive)).await
+        self.attempt("list", || self.inner.list(folder, recursive)).await
     }
 
     fn id(&self) -> &str {
@@ -464,5 +596,164 @@ impl BackendRegistry {
     /// Borrowed form for the hot resolution path (no refcount traffic).
     pub fn ids_slice(&self) -> &[String] {
         &self.ids
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A backend that fails a scripted number of times, then succeeds.
+    struct FlakyBackend {
+        fails_left: AtomicU32,
+        calls: AtomicU32,
+        error: BackendError,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for FlakyBackend {
+        async fn stat(&self, _k: &Key) -> Result<ObjectMeta, BackendError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fails_left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                return Err(self.error.clone());
+            }
+            Ok(ObjectMeta { size_bytes: 1, etag: None, last_modified: None, mime_hint: None })
+        }
+        async fn open(&self, _k: &Key, _r: Option<ByteRange>) -> Result<StreamSource, BackendError> {
+            unreachable!("not exercised")
+        }
+        async fn refresh_if_needed(&self) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn id(&self) -> &str {
+            "flaky"
+        }
+    }
+
+    fn key() -> Key {
+        Key::from_validated("k".into())
+    }
+
+    #[tokio::test]
+    async fn retries_throttling_then_succeeds() {
+        let inner = std::sync::Arc::new(FlakyBackend {
+            fails_left: AtomicU32::new(2),
+            calls: AtomicU32::new(0),
+            error: BackendError::RateLimited { retry_after_millis: Some(1) },
+        });
+        let backend = TimedBackend::with_retry(
+            inner.clone(),
+            RetryPolicy { max_attempts: 4, base_ms: 1, max_ms: 10 },
+        );
+        let out = backend.stat(&key()).await;
+        assert!(out.is_ok(), "throttling must be retried until it succeeds");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 3, "2 failures + 1 success");
+    }
+
+    #[tokio::test]
+    async fn retries_provider_errors_up_to_the_attempt_cap() {
+        let inner = std::sync::Arc::new(FlakyBackend {
+            fails_left: AtomicU32::new(100), // always fails
+            calls: AtomicU32::new(0),
+            error: BackendError::ServerError("boom".into()),
+        });
+        let backend = TimedBackend::with_retry(
+            inner.clone(),
+            RetryPolicy { max_attempts: 3, base_ms: 1, max_ms: 5 },
+        );
+        assert!(backend.stat(&key()).await.is_err());
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            3,
+            "must stop at max_attempts, not loop forever"
+        );
+    }
+
+    /// Deterministic failures must NOT be retried: a retry cannot change
+    /// them and only burns time and upstream quota.
+    #[tokio::test]
+    async fn deterministic_errors_are_not_retried() {
+        for err in [
+            BackendError::NotFound,
+            BackendError::AuthRequired,
+            BackendError::RangeNotSatisfiable,
+        ] {
+            let inner = std::sync::Arc::new(FlakyBackend {
+                fails_left: AtomicU32::new(100),
+                calls: AtomicU32::new(0),
+                error: err.clone(),
+            });
+            let backend = TimedBackend::with_retry(
+                inner.clone(),
+                RetryPolicy { max_attempts: 4, base_ms: 1, max_ms: 5 },
+            );
+            assert!(backend.stat(&key()).await.is_err());
+            assert_eq!(
+                inner.calls.load(Ordering::SeqCst),
+                1,
+                "{err:?} must not be retried"
+            );
+        }
+    }
+
+    /// An upstream asking for a longer wait than our ceiling must not be
+    /// retried at all: no permit parked, no early callback.
+    #[tokio::test]
+    async fn oversized_retry_after_declines_the_retry() {
+        let inner = std::sync::Arc::new(FlakyBackend {
+            fails_left: AtomicU32::new(100),
+            calls: AtomicU32::new(0),
+            error: BackendError::RateLimited { retry_after_millis: Some(3_600_000) },
+        });
+        let backend = TimedBackend::with_retry(
+            inner.clone(),
+            RetryPolicy { max_attempts: 4, base_ms: 1, max_ms: 5_000 },
+        );
+        let started = std::time::Instant::now();
+        assert!(backend.stat(&key()).await.is_err());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1, "must not wait out an hour");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "must return immediately, not sleep the Retry-After"
+        );
+    }
+
+    /// The default policy (no explicit config) makes exactly one attempt,
+    /// so existing behaviour is unchanged where retry is not configured.
+    #[tokio::test]
+    async fn default_policy_makes_one_attempt() {
+        let inner = std::sync::Arc::new(FlakyBackend {
+            fails_left: AtomicU32::new(100),
+            calls: AtomicU32::new(0),
+            error: BackendError::ServerError("boom".into()),
+        });
+        let backend = TimedBackend::new(inner.clone());
+        assert!(backend.stat(&key()).await.is_err());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// `Retry-After` is honored exactly when we retry, and a value beyond
+    /// our ceiling makes us decline the retry instead of truncating it.
+    #[test]
+    fn retry_after_is_honored_and_oversized_waits_are_declined() {
+        let p = RetryPolicy { max_attempts: 4, base_ms: 100, max_ms: 5_000 };
+        assert_eq!(p.delay(1, Some(250)).as_millis(), 250, "honored exactly");
+        assert_eq!(
+            p.delay(1, Some(3_600_000)).as_millis(),
+            3_600_000,
+            "not truncated: truncating would call back sooner than asked"
+        );
+        // The ceiling is enforced by declining the retry, not by shortening
+        // the wait: no permit is parked for an hour.
+        assert!(p.worth_waiting(Some(250)));
+        assert!(p.worth_waiting(None));
+        assert!(!p.worth_waiting(Some(3_600_000)), "a 1h Retry-After must not be waited out");
+        assert!(p.worth_waiting(Some(5_000)), "the boundary itself is allowed");
+        // Without Retry-After: exponential from base, jittered, capped.
+        let d1 = p.delay(1, None).as_millis();
+        assert!((100..=125).contains(&d1), "base + up to 25% jitter, got {d1}");
+        let capped = p.delay(20, None).as_millis();
+        assert!((5_000..=6_250).contains(&capped), "capped at max_ms + jitter, got {capped}");
     }
 }

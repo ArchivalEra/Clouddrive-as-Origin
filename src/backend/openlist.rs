@@ -209,13 +209,32 @@ impl OpenListBackend {
     }
 
     fn map_status(status: u16, body: String) -> BackendError {
+        Self::map_status_with(status, body, None)
+    }
+
+    /// [`Self::map_status`] with the upstream's `Retry-After`, when it sent
+    /// one (ticket #58). The spec has always required honoring it
+    /// (`spec.md` §Resilience, ADR-0002), and `BackendError::RateLimited`
+    /// already carries the field -- it was simply never populated, so every
+    /// 429 reached the client as a bare 503 with no `retry-after`.
+    fn map_status_with(status: u16, body: String, retry_after_millis: Option<u64>) -> BackendError {
         match status {
             404 => BackendError::NotFound,
-            429 => BackendError::RateLimited { retry_after_millis: None },
+            429 => BackendError::RateLimited { retry_after_millis },
             401 | 403 => BackendError::AuthRequired,
             500..=599 => BackendError::ServerError(format!("{status}: {body}")),
             _ => BackendError::Other(format!("{status}: {body}")),
         }
+    }
+
+    /// Parse `Retry-After` from response headers. RFC 9110 allows either
+    /// delta-seconds or an HTTP-date; the date form needs a clock and is
+    /// rare from providers, so it is ignored here (the caller falls back to
+    /// its jittered backoff, which is bounded either way).
+    fn retry_after_millis(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+        let raw = headers.get("retry-after")?.to_str().ok()?.trim();
+        let secs: u64 = raw.parse().ok()?;
+        Some(secs.saturating_mul(1000))
     }
 
     /// Defense in depth for listing folders: the business layer already
@@ -273,8 +292,9 @@ impl StorageBackend for OpenListBackend {
         let resp = req.send().await.map_err(|e| BackendError::ServerError(format!("dav get: {e}")))?;
         let status = resp.status().as_u16();
         if !(status == 200 || status == 206) {
+            let retry_after = Self::retry_after_millis(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(Self::map_status(status, body));
+            return Err(Self::map_status_with(status, body, retry_after));
         }
         // Full object length from Content-Range total (206) or Content-Length.
         let total_len = resp
