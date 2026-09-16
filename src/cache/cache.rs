@@ -2033,17 +2033,17 @@ fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
     // they hold no file and expire on their own clock), ordered oldest
     // first. `sort_unstable_by_key` on the eligibility timestamp gives the
     // same victim order as repeated `min_by_key` did.
-    let mut candidates: Vec<(u64, String, u64)> = state
+    let mut candidates: Vec<(u64, String)> = state
         .entries
         .iter()
         .filter(|(_, m)| m.negative_until_millis.is_none())
-        .map(|(k, m)| (m.eligible_at(config.inactive_ttl_secs), k.clone(), m.size_bytes))
+        .map(|(k, m)| (m.eligible_at(config.inactive_ttl_secs), k.clone()))
         .collect();
-    candidates.sort_unstable_by_key(|(eligible, _, _)| *eligible);
+    candidates.sort_unstable_by_key(|(eligible, _)| *eligible);
 
     let mut out = Vec::new();
     let mut freed = 0u64;
-    for (_, key, size) in candidates {
+    for (_, key) in candidates {
         // Stop once BOTH budgets are satisfied: whatever drove the sweep is
         // now back under its cap.
         if freed >= bytes_over && out.len() >= entries_over {

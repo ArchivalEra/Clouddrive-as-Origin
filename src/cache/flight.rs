@@ -17,6 +17,15 @@ use crate::{
 /// Body stream handed to the business plane.
 pub type BodyStream = BoxStream<'static, Result<Bytes, std::io::Error>>;
 
+/// Minimum byte progress between two `Growing` publications (O6). The
+/// upstream yields small chunks (whatever hyper hands over, often ~16 KB),
+/// so publishing per chunk meant ~196k watch sends for a 3 GB pull, each
+/// one waking every attached reader. Publishing per MiB cuts that ~64x
+/// while staying far inside the stall budget: at the measured 43.8 MB/s
+/// this is ~43 events/s, so a reader waiting on an offset is woken within
+/// tens of milliseconds of the writer passing it.
+const PUBLISH_INTERVAL: u64 = 1024 * 1024;
+
 /// Streaming read granularity (P8): one buffer this size per concurrent
 /// reader, handed out via `BytesMut::freeze` rather than copied.
 const CHUNK: usize = 256 * 1024;
@@ -216,7 +225,19 @@ async fn next_progress(
     flight: &FlightShared,
     rx: &mut watch::Receiver<FlightProgress>,
 ) -> Result<Option<()>, std::io::Error> {
-    match tokio::time::timeout(flight.stall_budget, rx.changed()).await {
+    next_progress_until(flight, rx, flight.stall_budget).await
+}
+
+/// [`next_progress`] with an explicit remaining budget (O6). Callers that
+/// loop keep ONE deadline across iterations instead of creating and
+/// dropping a timer per wake, which fired for every progress event a
+/// reader ever saw.
+async fn next_progress_until(
+    flight: &FlightShared,
+    rx: &mut watch::Receiver<FlightProgress>,
+    budget: std::time::Duration,
+) -> Result<Option<()>, std::io::Error> {
+    match tokio::time::timeout(budget, rx.changed()).await {
         Ok(Ok(())) => Ok(Some(())),
         Ok(Err(_)) => Ok(None),
         Err(_) => Err(std::io::Error::other(format!(
@@ -239,7 +260,7 @@ pub fn growing_reader_from(
         // The file cursor tracks `pos` after every read, so a seek is only
         // needed when the handle is (re)opened or after a caught-up wait.
         let mut needs_seek = true;
-        loop {
+        'read: loop {
             if remaining == Some(0) {
                 break; // range satisfied
             }
@@ -282,10 +303,40 @@ pub fn growing_reader_from(
             };
             if let Some(w) = written {
                 if w <= pos {
-                    match next_progress(&flight, &mut rx).await {
-                        Ok(Some(())) => continue,
-                        Ok(None) => break, // sender dropped; treat as end
-                        Err(e) => Err(e)?,
+                    // One deadline covers the whole wait for this offset
+                    // (O6): a reader parked at 700 MB must give up after
+                    // ONE stall budget, not after a budget per wake.
+                    let deadline =
+                        tokio::time::Instant::now() + flight.stall_budget;
+                    loop {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            Err(std::io::Error::other(format!(
+                                "flight stalled: no progress for {:?}",
+                                flight.stall_budget
+                            )))?;
+                        }
+                        match next_progress_until(&flight, &mut rx, remaining).await {
+                            Ok(Some(())) => {
+                                // Progress arrived: re-check whether it
+                                // covers our offset; if not, keep waiting
+                                // on the SAME deadline.
+                                let now_written = match &*rx.borrow() {
+                                    FlightProgress::Growing(w) => Some(*w),
+                                    _ => None,
+                                };
+                                match now_written {
+                                    Some(w) if w > pos => break,
+                                    // Terminal states are handled by the
+                                    // read path below.
+                                    None => break,
+                                    _ => continue,
+                                }
+                            }
+                            Ok(None) => break 'read, // sender dropped; treat as end
+                            Err(e) => Err(e)?,
+                        }
                     }
                 }
             }
@@ -359,6 +410,7 @@ pub async fn pump_and_seal(
         let _ = tokio::fs::remove_file(tmp_path).await;
         e
     };
+    let mut published: u64 = 0;
     loop {
         let n = match src.stream.read(&mut buf).await {
             Ok(n) => n,
@@ -371,6 +423,24 @@ pub async fn pump_and_seal(
             return Err(fail_cleanup(BackendError::Other(format!("write tmp: {e}"))).await);
         }
         written += n as u64;
+        // Publish on threshold crossings, not per chunk (O6). Readers only
+        // need "progress happened" plus the current watermark; the terminal
+        // Done/Failed that follows this pump is an unconditional send, so a
+        // sub-interval tail is still announced.
+        //
+        // The FIRST chunk is always published (`published == 0`): without
+        // that, a short object or a stall right after a small write leaves
+        // readers at watermark 0 while bytes already sit on disk, and a
+        // reader waiting for them would never be woken. A test pins it
+        // (a stall after 64 bytes must still deliver those 64).
+        if published == 0 || written - published >= PUBLISH_INTERVAL {
+            published = written;
+            let _ = tx.send(FlightProgress::Growing(written));
+        }
+    }
+    // Announce the final size before the caller's Done, so a reader woken
+    // by Done sees a watermark covering everything on disk.
+    if written > published {
         let _ = tx.send(FlightProgress::Growing(written));
     }
     // A SHORT upstream body must never be sealed into the cache: readers
@@ -616,6 +686,76 @@ mod tests {
         driver.await.unwrap();
         assert!(!errored, "a flowing stream must not trip the stall budget");
         assert_eq!(got, 3072, "reader must see every byte the driver wrote");
+    }
+
+    /// O6 + stall safety: throttling publications must never hide a small
+    /// write. A driver that writes 64 bytes and then stalls must still
+    /// publish that watermark, so a reader waiting on those bytes is woken
+    /// and can read them before the stall budget expires.
+    #[tokio::test]
+    async fn small_write_is_published_before_a_stall() {
+        use futures::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".tmp.small");
+        let finalp = dir.path().join("small.bin");
+        let flight = std::sync::Arc::new(FlightShared::new(
+            tmp.clone(),
+            finalp.clone(),
+            std::time::Duration::from_millis(400),
+        ));
+        let meta = ObjectMeta { size_bytes: 4096, etag: None, last_modified: None, mime_hint: None };
+        let _ = flight.progress_tx.send(FlightProgress::Meta(meta));
+
+        struct SmallThenStall {
+            sent: bool,
+        }
+        impl tokio::io::AsyncRead for SmallThenStall {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if !self.sent {
+                    self.sent = true;
+                    buf.put_slice(&[9u8; 64]);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                std::task::Poll::Pending // dead upstream
+            }
+        }
+        let src = StreamSource {
+            stream: Box::new(SmallThenStall { sent: false }),
+            total_len: Some(4096),
+        };
+        let driver = {
+            let flight = flight.clone();
+            tokio::spawn(async move {
+                let _ = pump_and_seal(src, &tmp, &finalp, &flight.progress_tx).await;
+            })
+        };
+
+        // A reader at 0 wants the first bytes: it must receive them, not
+        // wait out the budget for a watermark that never comes.
+        let mut body = growing_reader(flight.clone());
+        let out = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut got = 0usize;
+            while let Some(c) = body.next().await {
+                match c {
+                    Ok(b) => {
+                        got += b.len();
+                        if got >= 64 {
+                            return got;
+                        }
+                    }
+                    Err(_) => return got,
+                }
+            }
+            got
+        })
+        .await
+        .expect("reader must not hang waiting for a published watermark");
+        driver.abort();
+        assert_eq!(out, 64, "the 64 bytes written before the stall must be published and readable");
     }
 
     /// A reader far ahead of the writer must not touch the file until the
