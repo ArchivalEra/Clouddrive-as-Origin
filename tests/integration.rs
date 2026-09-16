@@ -1257,3 +1257,41 @@ async fn metadata_loss_rebuilds_rows_from_the_object_tree() {
         assert_eq!(s.entries.get("kept.bin").unwrap().size_bytes, 7);
     }
 }
+
+/// O2: eviction must pick the same victims, in the same order, as the
+/// original repeated-minimum scan — and do it in one pass.
+#[tokio::test]
+async fn eviction_picks_lru_victims_in_order() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config::default();
+    cfg.cache_dir = dir.path().to_path_buf();
+    cfg.max_entries = 3; // count budget drives the sweep
+    let cfg = Arc::new(cfg);
+
+    let backend = CountingBackend {
+        bytes: b"x".to_vec(),
+        etag: Some("v".into()),
+        calls: Arc::new(AtomicUsize::new(0)),
+        fail: None,
+    };
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+
+    // Five keys, each accessed later than the last, so recency is strict.
+    for (i, k) in ["k1", "k2", "k3", "k4", "k5"].iter().enumerate() {
+        clock.advance(1000 * (i as u64 + 1));
+        let mut hit = cache.get(k, None).await.unwrap();
+        let _ = read_body(&mut hit.body).await;
+        wait_installed(&cache, k).await;
+    }
+
+    let s = cache.state.read().await;
+    assert!(s.entries.len() <= 3, "count budget must bound the map (got {})", s.entries.len());
+    // The three most recent survive; the two oldest are gone.
+    for k in ["k3", "k4", "k5"] {
+        assert!(s.entries.contains_key(k), "{k} (recent) must survive eviction");
+    }
+    for k in ["k1", "k2"] {
+        assert!(!s.entries.contains_key(k), "{k} (oldest) must be evicted");
+    }
+}
