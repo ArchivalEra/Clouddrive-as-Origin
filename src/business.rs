@@ -653,8 +653,29 @@ pub async fn serve<C>(
 where
     C: Clock + Clone,
 {
+    let listener = bind(addr).await?;
+    serve_on(listener, state, shutdown).await
+}
+
+/// Bind the business listener WITHOUT serving (C2). Callers use this as a
+/// readiness gate: the front plane must not start accepting connections
+/// until this port answers, otherwise requests arriving in the window are
+/// proxied to a closed port and fail after the front's connect timeout.
+pub async fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "business plane listening");
+    Ok(listener)
+}
+
+/// Serve on an already-bound listener (see [`bind`]).
+pub async fn serve_on<C>(
+    listener: TcpListener,
+    state: AppState<C>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()>
+where
+    C: Clock + Clone,
+{
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
         .await?;
