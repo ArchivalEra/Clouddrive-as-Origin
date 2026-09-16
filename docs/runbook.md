@@ -10,7 +10,11 @@ SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
   Host header `cdn-oracle.isui.ren`. Edge cert is EdgeOne-managed; origin
   cert is Let's Encrypt `cdn-oracle.isui.ren` (DNS-01 via dnspod).
 - **origin-cache** (3 systemd units): standard `[::]:7777` TLS / nocache
-  `[::]:7778` / port80 helper `:80` (acme webroot + 301).
+  `[::]:7778`.
+
+  The port-80 helper was retired 2026-09-12 (see "Retired: port-80 helper"
+  below). :80 is filtered at the cloud layer and the certificate renews via
+  DNS-01, so nothing needed it.
 - **OpenList** on the same box: `127.0.0.1:5244`, mount `googledrive1`.
 - **Watchdog**: `origin-cache-watchdog.timer` every 5 min → logs to
   `/opt/origin-cache/watchdog.log`.
@@ -34,7 +38,7 @@ One click, seconds. No origin-side change needed.
 ### Service down (unit inactive)
 
 ```sh
-systemctl is-active origin-cache-standard origin-cache-nocache origin-cache-port80
+systemctl is-active origin-cache-standard origin-cache-nocache
 sudo journalctl -u origin-cache-standard --no-pager -n 50
 sudo systemctl restart origin-cache-standard
 ```
@@ -68,6 +72,18 @@ entry rows are then rebuilt from the object tree as above. Inspect
 `journalctl -u origin-cache-standard | grep -i metadata` for the quarantine
 record; the quarantined file can be deleted once the cause is understood.
 
+### Retired: port-80 helper (2026-09-12)
+
+`origin-cache-port80.service` (a Python `ThreadingHTTPServer` doing ACME
+webroot + 301) was **removed from this node and from the installer**. It had
+one thread per connection and no timeout, so public scanners holding
+connections open kept every thread alive: measured 1021 threads, 1020
+established connections, a sustained full core on a 2-core box, and eventual
+fd exhaustion that left it not answering at all. It served no purpose —
+certificates renew via DNS-01 and `:80` is filtered at the Oracle cloud
+layer. If a future need for `:80` appears, install a server with connection
+timeouts rather than reviving that script.
+
 ### Certificate expiry / renewal
 
 acme.sh auto-renews (next: 2026-11-07). A deploy hook
@@ -81,7 +97,7 @@ If renewal failed: `sudo ~/.acme.sh/acme.sh --renew -d cdn-oracle.isui.ren --dns
 
 ### Log rotation
 
-`/etc/logrotate.d/origin-cache` rotates `port80.log` + `watchdog.log`
+`/etc/logrotate.d/origin-cache` rotates `watchdog.log`
 (daily, 7 copies, compressed). journald capped at 500M
 (`/etc/systemd/journald.conf.d/origin-cache.conf`).
 

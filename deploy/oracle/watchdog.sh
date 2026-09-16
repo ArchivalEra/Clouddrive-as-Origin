@@ -8,7 +8,7 @@
 #           sudo systemctl daemon-reload && sudo systemctl enable --now origin-cache-watchdog.timer
 set -u
 
-UNITS="origin-cache-standard origin-cache-nocache origin-cache-port80"
+UNITS="origin-cache-standard origin-cache-nocache"
 LOG=/opt/origin-cache/watchdog.log
 DISK_WARN_PCT=85
 DISK_CRIT_PCT=95
