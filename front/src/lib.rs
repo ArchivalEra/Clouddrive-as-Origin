@@ -279,6 +279,25 @@ impl ProxyHttp for BusinessProxy {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> ProxyResult<bool> {
+        // healthz is not part of the public surface (D2, #54). It discloses
+        // the upstream topology and configuration and is meant for the
+        // node's own operator and tooling, both of which read it on the
+        // business plane's loopback port. Refusing here removes the path
+        // structurally rather than adding a token that can be leaked or
+        // misconfigured.
+        //
+        // 404, not 403: a caller should not learn that a private surface
+        // exists here at all.
+        //
+        // Scope note: this deliberately covers healthz ONLY. prewarm is a
+        // different case -- it is an authenticated write-side entry point
+        // that the (separate, later) upload pipeline is expected to call
+        // through the public hostname, and every deployed config sets its
+        // shared secret. Refusing it here would break a documented
+        // integration to close a hole that authentication already closes.
+        if session.req_header().uri.path() == "/_internal/healthz" {
+            return Err(Error::new(ErrorType::HTTPStatus(404)));
+        }
         if let Some(gate) = self.rate.as_ref() {
             if let Some(addr) = session.client_addr() {
                 if gate.exceeds(addr) {
