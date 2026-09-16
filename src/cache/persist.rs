@@ -39,24 +39,40 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// What happened when the store was opened (C1): healthz reports this, so a
+/// quarantined or rebuilt store is visible instead of living only in logs.
+/// ADR-0008 says metadata loss costs revalidation rather than correctness --
+/// true, but an operator still needs to SEE that it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreState {
+    /// Opened the existing database normally.
+    Ready,
+    /// The file would not open; it was moved aside and a fresh store took
+    /// its place. Quarantine path is recorded for the operator.
+    Quarantined { moved_to: String },
+}
+
 pub struct MetaStore {
     db: Arc<Mutex<redb::Database>>,
+    state: StoreState,
 }
 
 /// redb 2 forbids a second handle on the same file within one process
 /// ("Database already open"). Cache instances in tests (and a future
 /// config reload) can coexist on one cache_dir, so handles are shared
 /// per path via this process-wide registry.
-fn shared_db(path: &Path) -> anyhow::Result<Arc<Mutex<redb::Database>>> {
+fn shared_db(path: &Path) -> anyhow::Result<(Arc<Mutex<redb::Database>>, StoreState)> {
     static REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<Mutex<redb::Database>>>>> =
         std::sync::OnceLock::new();
     let registry = REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut reg = registry.lock().unwrap();
     if let Some(db) = reg.get(path) {
-        return Ok(Arc::clone(db));
+        // Reopening the same path in-process (tests, a future reload): the
+        // state was decided by the first open.
+        return Ok((Arc::clone(db), StoreState::Ready));
     }
-    let db = match redb::Database::create(path) {
-        Ok(db) => db,
+    let (db, store_state) = match redb::Database::create(path) {
+        Ok(db) => (db, StoreState::Ready),
         Err(e) => {
             // Degrade instead of crash-looping (ticket #57). A redb file
             // that will not open (corrupt in a way redb rejects, or not a
@@ -84,12 +100,18 @@ fn shared_db(path: &Path) -> anyhow::Result<Arc<Mutex<redb::Database>>> {
             if path.is_dir() {
                 let _ = std::fs::remove_dir_all(path);
             }
-            redb::Database::create(path)?
+            let fresh = redb::Database::create(path)?;
+            let moved_to = if aside.exists() {
+                aside.display().to_string()
+            } else {
+                String::new()
+            };
+            (fresh, StoreState::Quarantined { moved_to })
         }
     };
     let db = Arc::new(Mutex::new(db));
     reg.insert(path.to_path_buf(), Arc::clone(&db));
-    Ok(db)
+    Ok((db, store_state))
 }
 
 impl MetaStore {
@@ -97,7 +119,7 @@ impl MetaStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db = shared_db(path)?;
+        let (db, store_state) = shared_db(path)?;
         {
             // Create tables up front so readers never race table creation.
             let db_guard = futures::executor::block_on(db.lock());
@@ -107,7 +129,13 @@ impl MetaStore {
             }
             txn.commit()?;
         }
-        Ok(Self { db })
+        Ok(Self { db, state: store_state })
+    }
+
+    /// What the open did (C1): `Ready`, or quarantined with the path the bad
+    /// file was moved to.
+    pub fn state(&self) -> &StoreState {
+        &self.state
     }
 
     /// Load all entries (startup). Missing-table-safe.

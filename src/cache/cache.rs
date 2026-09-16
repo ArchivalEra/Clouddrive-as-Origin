@@ -223,6 +223,14 @@ pub struct CacheSnapshot {
     /// keys, so operators need to see it).
     pub coverage_keys: usize,
     pub coverage_intervals: usize,
+    /// Whether the metadata store opened cleanly or was quarantined (C1).
+    pub store: crate::cache::persist::StoreState,
+    /// Entry rows rebuilt from the object tree after metadata loss (C1).
+    pub rebuilt_rows: usize,
+    /// Free bytes on the cache filesystem, when known (C1).
+    pub disk_free_bytes: Option<u64>,
+    /// The reserve floor cold pulls are held back from (C1).
+    pub disk_reserve_bytes: u64,
 }
 
 /// The Cache is the only seam between the HTTP layer and the cache
@@ -261,6 +269,9 @@ pub struct Cache<C: Clock> {
     /// listing consistency is eventual anyway.
     pub listings: Arc<Mutex<HashMap<(String, String, bool), (u64, Arc<Vec<ListEntry>>)>>>,
     pub reval_inflight: Inflight<StatData, BackendError>,
+    /// Rows rebuilt from the object tree after metadata loss (C1). Read by
+    /// healthz so a rebuild is visible without reading logs.
+    pub rebuilt_rows: std::sync::atomic::AtomicUsize,
     pub routes: RouteTable,
 }
 
@@ -286,6 +297,7 @@ impl<C: Clock + Clone> Cache<C> {
             promotions: Arc::new(Mutex::new(HashSet::new())),
             listings: Arc::new(Mutex::new(HashMap::new())),
             reval_inflight: Inflight::new(),
+            rebuilt_rows: std::sync::atomic::AtomicUsize::new(0),
             routes,
         }
     }
@@ -389,7 +401,9 @@ impl<C: Clock + Clone> Cache<C> {
                     });
                 }
                 let meta_store = Arc::clone(&self.meta);
+                let n = rebuilt.len();
                 rebuild_entries(&meta_store, &self.state, rebuilt, loaded).await;
+                self.rebuilt_rows.store(n, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -463,6 +477,10 @@ impl<C: Clock + Clone> Cache<C> {
             dirty_access_pending: self.dirty_access.pending(),
             coverage_keys,
             coverage_intervals,
+            store: self.meta.state().clone(),
+            rebuilt_rows: self.rebuilt_rows.load(std::sync::atomic::Ordering::Relaxed),
+            disk_free_bytes: store::free_bytes(&self.config.cache_dir),
+            disk_reserve_bytes: DISK_RESERVE_BYTES,
         }
     }
 
