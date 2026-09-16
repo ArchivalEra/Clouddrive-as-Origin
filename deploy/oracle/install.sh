@@ -107,6 +107,14 @@ systemctl enable --now origin-cache-standard origin-cache-nocache
 systemctl enable --now origin-cache-watchdog.timer
 systemctl restart origin-cache-standard origin-cache-nocache origin-cache-watchdog.timer
 
+# Announce the node as soon as it is serving again. The timer's next tick can
+# be 5 minutes away, and the far side reads silence as "maybe gone"; a
+# heartbeat seconds after a deploy removes that window. The settle delay is
+# so healthz is answering before the probe runs -- probing a service that is
+# still binding would report it down.
+sleep 3
+systemctl start origin-cache-watchdog.service
+
 # The port-80 helper is gone: retired 2026-09-12 after it burned half the
 # 2-core node for a week (ThreadingHTTPServer, one thread per connection,
 # no timeout, so public scanners never released a thread). Nothing needed

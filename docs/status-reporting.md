@@ -91,10 +91,16 @@ or `origin-cache-nocache`) and is the literal `origin-cache` in a heartbeat.
 
 ## Rules the sender follows
 
-1. **A planned stop is silent.** systemd marks a requested stop with
-   `SERVICE_RESULT=success`, and the hook returns without reporting. Every
-   deploy is a stop-start and `Restart=always` restarts on its own, so
-   reporting those would turn each deploy into a false outage alert.
+1. **A planned stop is silent**, which on this node covers two systemd
+   results: `success` (a clean stop) and `timeout`. The second is the normal
+   deploy path here — the binary drains gracefully for up to 300s while the
+   default stop timeout is 90s, so systemd escalates to SIGKILL and *every*
+   `systemctl restart` reports `timeout`. Measured 2026-09-16: the first live
+   deploy logged two down reports that way, which is exactly the false alarm
+   this rule exists to prevent. Everything else (`signal`, `core-dump`,
+   `exit-code`, `oom-kill`, `start-limit-hit`, `resources`) *is* reported. A
+   hang is not a death either: the heartbeat keeps reporting availability
+   while it hangs.
 2. **Down reports are throttled to one per minute** (`notify-down.stamp`).
    `Restart=always` restarts after 3s, so a crash loop would otherwise fire
    the hook ~20 times a minute and defeat the far side's timestamp dedupe.
@@ -107,6 +113,15 @@ or `origin-cache-nocache`) and is the literal `origin-cache` in a heartbeat.
    forwarded: `store.moved_to` carries a filesystem path
    (`/opt/origin-cache/...`) and `upstreams[].id` carries the upstream's name,
    and neither should leave the node.
+5. **A deploy announces itself.** `install.sh` runs the watchdog once right
+   after restarting the units, so a heartbeat lands seconds after the node is
+   serving again instead of waiting out the timer.
+
+Consequence for the receiving side: a `down` event can be followed by up to
+**5 minutes** of silence before the next heartbeat, because that is the
+timer's cadence. A `down` event is therefore "the process died", not "the
+node is gone" — keep the grace window for a down event at least one beat
+wide, and let the 15-minute timeout decide actual unavailability.
 
 ## Open items on this interface
 
