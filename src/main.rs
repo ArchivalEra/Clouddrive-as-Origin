@@ -63,7 +63,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if cfg.prewarm_shared_secret_env.is_none() {
-        warn!("prewarm endpoint is open (no prewarm_shared_secret_env set) — fine behind EdgeOne, risky if directly exposed");
+        // The handler skips its token check entirely when no env var is
+        // named, which makes prewarm an OPEN bandwidth amplifier: any caller
+        // can force a full upstream fetch. A warning was not enough (#54's
+        // fail-open finding). Refuse to start unless it is configured, so
+        // this cannot be deployed open by accident.
+        anyhow::bail!(
+            "prewarm_shared_secret_env is not set: the prewarm endpoint would be              unauthenticated and any caller could force upstream fetches. Name an              env var holding the shared secret, or remove the endpoint."
+        );
     }
 
     let business_addr = cfg.listen_addr;

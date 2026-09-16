@@ -23,8 +23,15 @@ SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
 
 1. EdgeOne console: add origin `apple.dib.l.cd` port 7777 (https) / 80
    (http), Host header `cdn-oracle.isui.ren`, origin cert verification ON.
-2. Verify origin reachable: `curl -s https://cdn-oracle.isui.ren/_internal/healthz`
-   → 200.
+2. Verify the origin is serving. From the node (the public path does not
+   expose healthz by design -- see "Health checks"):
+   ```sh
+   curl -s http://127.0.0.1:8080/_internal/healthz
+   ```
+   And from your own machine, that the CDN reaches it:
+   ```sh
+   curl -sI https://cdn-oracle.isui.ren/googledrive1/<known-key> | head -3
+   ```
 3. Switch the site's origin to the new config. EdgeOne propagates in
    seconds.
 4. Watch: `sudo journalctl -u origin-cache-standard -f` for origin-pull

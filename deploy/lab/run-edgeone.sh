@@ -34,9 +34,14 @@ body=$(curl -s -m 20 "$BASE/?list-type=2&max-keys=5")
 echo "$body" | grep -q "<ListBucketResult" && echo "$body" | grep -q "<KeyCount>" \
   && ok "list XML" || bad "list: $(echo "$body" | head -c 100)"
 
-note "5. healthz"
-body=$(curl -s -m 20 "$BASE/_internal/healthz")
-echo "$body" | grep -q '"status":"ok"' && ok "healthz ok" || bad "healthz: $body"
+note "5. internal endpoints are not public"
+# healthz is refused at the front by design (D2/#54): it discloses upstream
+# topology and is meant to be read on the business plane's loopback port.
+code=$(curl -s -m 20 -o /dev/null -w "%{http_code}" "$BASE/_internal/healthz")
+[ "$code" = 404 ] && ok "healthz refused on the public path (404)" || bad "healthz: expected 404, got $code"
+# prewarm IS public but must require its token.
+code=$(curl -s -m 20 -o /dev/null -w "%{http_code}" -X POST "$BASE/_internal/prewarm/googledrive1/test-page.html")
+[ "$code" = 401 ] && ok "prewarm requires its token (401)" || bad "prewarm: expected 401, got $code"
 
 note "6. SigV4 signed GET (Authorization forwarded)"
 # Sign with the oracle env credentials (must match SIGV4_* on the node).
