@@ -1,7 +1,7 @@
 use anyhow::Context;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use origin_cache::{
     backend::{BackendRegistry, BackendSlot, OpenListBackend, StorageBackend},
@@ -66,10 +66,22 @@ async fn main() -> anyhow::Result<()> {
         async move { rx.changed().await.ok(); }
     };
 
+    // Readiness gate (C2): bind the business listener NOW, before the front
+    // plane starts accepting. Serving is spawned below on this listener.
+    // Previously bind happened inside the spawned task, so the front thread
+    // could accept connections in the window where the loopback port was
+    // still closed -- those requests failed after the front's 3s connect
+    // timeout for no reason the client could see.
+    let business_listener = origin_cache::business::bind(business_addr)
+        .await
+        .context("bind business plane")?;
+
     let business_handle = tokio::spawn({
         let state = app_state.clone();
         async move {
-            if let Err(e) = origin_cache::business::serve(business_addr, state, business_shutdown).await {
+            if let Err(e) =
+                origin_cache::business::serve_on(business_listener, state, business_shutdown).await
+            {
                 warn!(error = %e, "business plane exited with error");
             }
         }
@@ -93,13 +105,43 @@ async fn main() -> anyhow::Result<()> {
         // framing overlap; sized to the box, not unbounded.
         threads: cfg.front_threads.or(Some(2)),
     };
+    // A front plane that dies must take the process with it (A1). This used
+    // to warn and continue, so a failure here (a bad `front_threads`, a
+    // bind error, a panic inside pingora) left the process ALIVE with NO
+    // listener: systemd sees an active unit, the watchdog sees a healthy
+    // systemd unit, and nothing serves. Dying loudly is the only honest
+    // outcome -- restart policy then does its job.
+    //
+    // `front_threads = 0` is the concrete case found in review: pingora
+    // asserts threads != 0 and panicked inside that thread, and the warn
+    // below swallowed it.
+    let (front_panic_tx, front_panic_rx) = std::sync::mpsc::channel::<String>();
     let front_thread = std::thread::spawn(move || {
-        if let Err(e) = front::run_front(front_opts) {
-            warn!(error = %e, "front plane exited with error");
-        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            front::run_front(front_opts)
+        }));
+        let msg = match outcome {
+            Ok(Ok(())) => "front plane exited without error (unexpected)".to_string(),
+            Ok(Err(e)) => format!("front plane exited with error: {e}"),
+            Err(_) => "front plane panicked".to_string(),
+        };
+        let _ = front_panic_tx.send(msg);
     });
 
-    wait_shutdown().await;
+    // Wait for a shutdown signal OR a front-plane death (A1), whichever
+    // comes first.
+    let front_failure = tokio::task::spawn_blocking({
+        let rx = front_panic_rx;
+        move || rx.recv().ok()
+    });
+    tokio::select! {
+        _ = wait_shutdown() => {}
+        msg = front_failure => {
+            if let Ok(Some(msg)) = msg {
+                error!(reason = %msg, "front plane is gone; shutting down so the supervisor restarts us");
+            }
+        }
+    }
     let _ = shutdown_tx.send(true);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let _ = business_handle.await;
