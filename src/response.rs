@@ -27,6 +27,7 @@ use tracing::warn;
 use crate::{
     backend::{BackendError, ContentRange},
     cache::cache::HitMeta,
+    key::KeyError,
 };
 
 static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -90,8 +91,16 @@ pub(crate) fn s3_error_xml_ex(
 
 /// S3 resource path for error envelopes: the full request path
 /// (`/{bucket}/{key}` in alias form, `/<key>` legacy).
+/// `<Resource>` value for an error envelope. Keys come from the URL, so
+/// they may carry control bytes or XML markup; the envelope is assembled by
+/// string formatting, so escaping belongs here rather than at each caller
+/// (an unescaped key would otherwise break the XML).
 pub(crate) fn resource_path(key: &str) -> String {
-    format!("/{key}")
+    let encoded = percent_encoding::utf8_percent_encode(key, percent_encoding::CONTROLS).to_string();
+    format!(
+        "/{}",
+        encoded.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    )
 }
 
 /// S3 metadata headers shared by GET and HEAD.
@@ -122,6 +131,42 @@ pub(crate) fn s3_meta_headers(
     b
 }
 
+/// S3 error envelope with the request-ID headers, the shape every error
+/// response in this module returns (status + ids + `application/xml`).
+fn envelope(status: StatusCode, body: Body, req_id: &str, host_id: &str) -> Response {
+    let mut resp = Response::builder()
+        .status(status)
+        .header("x-amz-request-id", req_id)
+        .header("x-amz-id-2", host_id)
+        .body(body)
+        .unwrap();
+    resp.headers_mut().insert("content-type", "application/xml".parse().unwrap());
+    resp
+}
+
+/// Typed key-validation failures are `InvalidRequest` 400, not backend failures.
+pub(crate) fn invalid_key_response(
+    e: KeyError,
+    key: &str,
+    req_id: &str,
+    host_id: &str,
+    head_only: bool,
+) -> Response {
+    warn!(key = %key, error = %e, "invalid request key");
+    let body = if head_only {
+        Body::empty()
+    } else {
+        Body::from(s3_error_xml(
+            "InvalidRequest",
+            "The request key is invalid.",
+            &resource_path(key),
+            req_id,
+            host_id,
+        ))
+    };
+    envelope(StatusCode::BAD_REQUEST, body, req_id, host_id)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn error_response(
     e: BackendError,
@@ -133,16 +178,7 @@ pub(crate) fn error_response(
 ) -> Response {
     let resource = resource_path(key);
     let xml = |code: &str, message: &str| s3_error_xml(code, message, &resource, req_id, host_id);
-    let with_ids = |status: StatusCode, body: Body| {
-        let mut resp = Response::builder()
-            .status(status)
-            .header("x-amz-request-id", req_id)
-            .header("x-amz-id-2", host_id)
-            .body(body)
-            .unwrap();
-        resp.headers_mut().insert("content-type", "application/xml".parse().unwrap());
-        resp
-    };
+    let with_ids = |status: StatusCode, body: Body| envelope(status, body, req_id, host_id);
     match e {
         BackendError::NotFound => {
             let body = if head_only { Body::empty() } else { Body::from(xml("NoSuchKey", "The specified key does not exist.")) };
@@ -174,9 +210,13 @@ pub(crate) fn error_response(
             }
             resp
         }
-        BackendError::Other(msg)
-            if msg.contains("traversal") || msg.contains("Empty") || msg.contains("Absolute") =>
-        {
+        // Match the producing wrapper's own prefix, not fragments of the
+        // inner error text. Every key-validation producer writes exactly
+        // `invalid key: {KeyError}` (key.rs, cache.rs), and KeyError's
+        // Display is lowercase ("empty key", "absolute path not allowed"),
+        // so sniffing "Empty"/"Absolute" only ever caught "traversal" --
+        // the other five variants were reported as upstream failures.
+        BackendError::Other(msg) if msg.starts_with("invalid key:") => {
             let body = if head_only { Body::empty() } else { Body::from(xml("InvalidRequest", "The request key is invalid.")) };
             with_ids(StatusCode::BAD_REQUEST, body)
         }
@@ -197,5 +237,73 @@ mod tests {
         assert_eq!(quote_etag("\"abc123\""), "\"abc123\"");
         assert_eq!(quote_etag("d41d8cd98f00b204e9800998ecf8427e-2"), "\"d41d8cd98f00b204e9800998ecf8427e-2\"");
         assert_eq!(quote_etag("W/\"abc\""), "\"abc\"");
+    }
+
+    /// Every KeyError variant must map to 400 through the generic error
+    /// path too, not only through the typed handler seam: a key that is
+    /// rejected inside the cache layer reaches `error_response` as
+    /// `Other("invalid key: ...")` and must never surface as a 502
+    /// upstream failure. Pins all six variants, because the previous
+    /// case-sensitive match on the Display text caught only `traversal`.
+    #[test]
+    fn every_key_error_maps_to_400_not_backend_failure() {
+        let variants = [
+            KeyError::Empty,
+            KeyError::Absolute,
+            KeyError::Traversal,
+            KeyError::Nul,
+            KeyError::Backslash,
+            KeyError::BadPercent,
+        ];
+        for ke in variants {
+            let label = format!("{ke:?}");
+            let resp = error_response(
+                BackendError::from(ke),
+                "some/key",
+                "req-1",
+                "host-1",
+                false,
+                None,
+            );
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{label} must be 400");
+            assert_eq!(resp.headers().get("content-type").unwrap(), "application/xml");
+        }
+        // HEAD keeps the same status with no body.
+        let head = error_response(
+            BackendError::from(KeyError::Empty),
+            "some/key",
+            "req-1",
+            "host-1",
+            true,
+            None,
+        );
+        assert_eq!(head.status(), StatusCode::BAD_REQUEST);
+        // The SSRF/malformed-response class must keep its backend-failure
+        // status: it is not a client key error.
+        let resp = error_response(
+            BackendError::Other("backend error: token rejected".into()),
+            "some/key",
+            "req-1",
+            "host-1",
+            false,
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// A key carrying markup or control bytes must never break the XML
+    /// envelope, whichever path builds it: both the typed handler seam and
+    /// the generic cache-layer branch format `<Resource>` by string
+    /// concatenation.
+    #[test]
+    fn resource_path_escapes_markup_and_controls() {
+        assert_eq!(resource_path("a/b.png"), "/a/b.png");
+        assert_eq!(resource_path("a&b<c>d"), "/a&amp;b&lt;c&gt;d");
+        assert!(resource_path("a\0b").contains("%00"));
+        for key in ["a&b", "x<y>", "n\0l", "plain/key.bin"] {
+            let xml = s3_error_xml("InvalidRequest", "m", &resource_path(key), "r", "h");
+            assert!(!xml.contains("<y>"), "raw markup leaked for {key:?}: {xml}");
+            assert!(xml.contains("</Error>"), "{xml}");
+        }
     }
 }
