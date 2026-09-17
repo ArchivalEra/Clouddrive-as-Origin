@@ -106,7 +106,16 @@ UNIT
 cp "$REPO_DIR/deploy/oracle/origin-cache-watchdog.service" /etc/systemd/system/
 cp "$REPO_DIR/deploy/oracle/origin-cache-watchdog.timer"   /etc/systemd/system/
 
+# Node-local retention config. Both used to exist only on the node, which
+# made a fresh install subtly different from the running one: logs grew
+# without a cap and rotation was whatever someone had typed there.
+install -m 0644 "$REPO_DIR/deploy/oracle/logrotate-origin-cache" /etc/logrotate.d/origin-cache
+install -d -m 0755 /etc/systemd/journald.conf.d
+install -m 0644 "$REPO_DIR/deploy/oracle/journald-origin-cache.conf" \
+  /etc/systemd/journald.conf.d/origin-cache.conf
+
 systemctl daemon-reload
+systemctl restart systemd-journald
 systemctl enable --now origin-cache-standard origin-cache-nocache
 systemctl enable --now origin-cache-watchdog.timer
 systemctl restart origin-cache-standard origin-cache-nocache origin-cache-watchdog.timer

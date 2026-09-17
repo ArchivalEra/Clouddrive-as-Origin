@@ -6,9 +6,11 @@ SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
 
 ## Topology
 
-- **EdgeOne** → origin-pull `apple.dib.l.cd:7777` (https) / `:80` (http),
-  Host header `cdn-oracle.isui.ren`. Edge cert is EdgeOne-managed; origin
-  cert is Let's Encrypt `cdn-oracle.isui.ren` (DNS-01 via dnspod).
+- **EdgeOne** → origin-pull `apple.dib.l.cd:7777` (https) only, Host header
+  `cdn-oracle.isui.ren`. Edge cert is EdgeOne-managed; origin cert is Let's
+  Encrypt `cdn-oracle.isui.ren` (DNS-01 via dnspod). Port 80 is **not** an
+  origin path: it is filtered at the cloud layer and nothing listens on it
+  (see "Retired: port-80 helper").
 - **origin-cache** (2 systemd units): standard `[::]:7777` TLS / nocache
   `[::]:7778`.
 
@@ -26,8 +28,8 @@ SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
 
 ## Traffic switch (EdgeOne → oracle)
 
-1. EdgeOne console: add origin `apple.dib.l.cd` port 7777 (https) / 80
-   (http), Host header `cdn-oracle.isui.ren`, origin cert verification ON.
+1. EdgeOne console: add origin `apple.dib.l.cd` port 7777 (https), Host
+   header `cdn-oracle.isui.ren`, origin cert verification ON.
 2. Verify the origin is serving. From the node (the public path does not
    expose healthz by design -- see "Health checks"):
    ```sh
@@ -45,6 +47,61 @@ SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
 **Rollback**: EdgeOne console → switch origin back to the previous config.
 One click, seconds. No origin-side change needed.
 
+## Restarting: the stop takes about five minutes
+
+`systemctl stop` (and therefore every deploy, since a deploy is stop-start)
+needs roughly **305 seconds** to complete. This is Pingora's graceful drain,
+not a hang:
+
+- `run_front` accepts SIGTERM, then sleeps Pingora's 300s grace period
+  unconditionally, then spends up to ~10s dropping its runtimes.
+- Both units set `TimeoutStopSec=320s` to cover that. The systemd default is
+  90s, and with the default every stop was escalated to SIGKILL of every
+  thread -- so graceful shutdown never actually ran in production, and a
+  deploy looked like a hard crash to the journal.
+- A stop that reports `SERVICE_RESULT=timeout` is therefore a **real
+  failure** now, not the normal path: it means the process did not come down
+  inside a budget that has already been measured to be sufficient.
+- The `ExecStopPost` hook reports every non-clean exit. A successful stop is
+  silent and leaves `planned stop, no down report` in the watchdog log.
+- A crash-looping unit is throttled to one down report a minute, so a loop
+  cannot flood the receiver.
+
+Shortening the window means lowering Pingora's grace period, which is a
+deliberate trade (draining in-flight transfers versus deploy latency) and has
+not been decided.
+
+## Provisioning a fresh node
+
+`deploy/oracle/install.sh <binary> [--keep-env]` does the mechanical part:
+configs, both service units with `ExecStopPost`, the watchdog script and its
+timer, the logrotate and journald configs. What it cannot do, because these
+are node-local and secret-bearing:
+
+1. **`/opt/origin-cache/origin-cache.env`** -- OpenList credentials,
+   `ORIGIN_PREWARM_SECRET`, and the TLS cert/key paths. `install.sh` writes
+   `REPLACE_ME` placeholders on a fresh node; `--keep-env` preserves the real
+   file on reinstall.
+2. **TLS material** at the paths that env file names
+   (`/etc/ssl/dib.l.cd/<host>/cert.pem` + `key.pem` here).
+3. **acme.sh** with a deploy hook, so renewal reinstalls the cert and
+   restarts the service (see "Certificate expiry / renewal").
+4. **The cloudflared tunnel** (`/etc/cloudflared/token`, `cloudflared.service`)
+   -- the status reports ride it, and the tunnel token is the only credential
+   they carry.
+5. **`jq`**, which the watchdog needs to build its report; without it the
+   watchdog logs `report skipped: jq not installed` and stops reporting.
+6. **OpenList** on `127.0.0.1:5244` with the mount the config names.
+
+Verify a fresh node with the "Health checks" commands below, then
+`sudo -u opc /opt/origin-cache/watchdog.sh` to send one report by hand and
+read the answer.
+
+The watchdog's rules are covered by `deploy/oracle/test-watchdog.sh`, which
+`cargo test` runs (it stubs `systemctl`/`df`/`curl` and drives the real
+script). Run it directly to check a behaviour change before deploying:
+`bash deploy/oracle/test-watchdog.sh`.
+
 ## Failure handling
 
 ### Service down (unit inactive)
@@ -56,7 +113,9 @@ sudo systemctl restart origin-cache-standard
 ```
 
 `Restart=always` self-heals on crash; a manual `systemctl stop` stays
-stopped (by design). The watchdog logs failures every 5 min.
+stopped (by design). The watchdog runs every 5 min but writes only on a
+verdict CHANGE, one `HB` line a day, and any report failure -- so a quiet
+log is the healthy case, not a silent watchdog.
 
 ### Mysterious 404s after a config change
 
@@ -69,6 +128,14 @@ sudo systemctl stop origin-cache-standard
 sudo rm -f /opt/origin-cache/cache-standard/redb.db
 sudo systemctl start origin-cache-standard
 ```
+
+This is a deliberate manual act. The service never reaps its own metadata
+store: `redb.db` sits in the cache directory next to the objects, and an
+earlier build treated it as a cached object, counted it, and deleted it
+after the inactivity TTL -- so the node silently ran on an unlinked database
+and lost every row at the next start. A rebuild bug also registered the store
+as an entry; those rows are dropped at load, and `redb.db*` is now both
+reserved as a key and refused at the write and reap paths.
 
 On restart with no rows present, the service **rebuilds entry rows from the
 object tree** (`scan_object_files`) so the cached files on disk are served
@@ -109,16 +176,18 @@ If renewal failed: `sudo ~/.acme.sh/acme.sh --renew -d cdn-oracle.isui.ren --dns
 
 ### Log rotation
 
-`/etc/logrotate.d/origin-cache` rotates `watchdog.log`
-(daily, 7 copies, compressed). journald capped at 500M
-(`/etc/systemd/journald.conf.d/origin-cache.conf`).
+`/etc/logrotate.d/origin-cache` rotates `watchdog.log` (daily, 7 copies,
+compressed). journald is capped at 500M by
+`/etc/systemd/journald.conf.d/origin-cache.conf`. Both files are **in the
+repo** (`deploy/oracle/`) and installed by `install.sh`; they used to live
+only on the node, so a fresh install did not match the running one.
 
 ### Test artifacts (kept for regression)
 
-- `coverage-test-3g.bin` in googledrive1 + `/tmp/coverage-test-3g.bin`:
-  3 GiB coverage test file. Delete via WebDAV when no longer needed. The
-  efficient test instance that used to promote it is gone (see "Test data
-  cleanup").
+- `coverage-test-3g.bin` in googledrive1: 3 GiB coverage test file. Delete
+  via WebDAV when no longer needed. Only the upstream object is durable
+  state -- any `/tmp` copy is gone at the next reboot. The efficient test
+  instance that used to promote it is gone (see "Test data cleanup").
 
 ### Disk full
 
@@ -152,7 +221,7 @@ plaintext to a TLS listener, which hangs up with no response.
 ```sh
 curl -s http://127.0.0.1:8080/_internal/healthz   # standard
 curl -s http://127.0.0.1:8081/_internal/healthz   # nocache (entries=0 by design)
-cat /opt/origin-cache/watchdog.log                # verdict transitions + daily heartbeat
+cat /opt/origin-cache/watchdog.log                # verdict transitions, daily HB, report failures
 ```
 
 `healthz` answers `200` whenever the process is serving, and reports a

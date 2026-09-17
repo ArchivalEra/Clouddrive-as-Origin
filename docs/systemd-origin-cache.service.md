@@ -52,12 +52,15 @@ Notes vs the earlier template: `DynamicUser=yes` was replaced by a real
 `opc` user (the cache dir and redb must survive restarts with a stable
 owner). No unit binds a privileged port any more.
 
-## Env file (`/etc/origin-cache/origin-cache.env`)
+## Env file (`/opt/origin-cache/origin-cache.env`)
+
+Written by `install.sh` with `REPLACE_ME` placeholders on a fresh node and
+preserved by `--keep-env` afterwards; `0600`, owned by `opc`.
 
 ```sh
 # TLS material for the front plane (must match the EdgeOne origin Host).
-ORIGIN_TLS_CERT_PATH=/etc/ssl/dib.l.cd/apple/cert.pem
-ORIGIN_TLS_KEY_PATH=/etc/ssl/dib.l.cd/apple/key.pem
+ORIGIN_TLS_CERT_PATH=/etc/ssl/dib.l.cd/cdn-oracle/cert.pem
+ORIGIN_TLS_KEY_PATH=/etc/ssl/dib.l.cd/cdn-oracle/key.pem
 # OpenList web-UI credentials (loopback http is allowed).
 OPENLIST_USERNAME=...
 OPENLIST_PASSWORD=...
@@ -73,6 +76,11 @@ OPENLIST_PASSWORD=...
 - The binary reads the config path as its first argument; the config
   declares `front_listen` / `listen_addr` / `cache_dir` and the upstream
   list. Secrets stay in the env file, never in the TOML.
+- `CacheDirectory=origin-cache` creates `/var/cache/origin-cache` and sets
+  `$CACHE_DIRECTORY`; **nothing reads it**. The real cache lives where the
+  config says: `/opt/origin-cache/cache-standard` and `cache-nocache`,
+  inside the unit's `ReadWritePaths`. Do not look for cached objects under
+  `/var/cache`.
 - The deployed node uses a real `opc` user (stable cache-dir owner);
   `DynamicUser=yes` remains an option for ephemeral installs.
 - EdgeOne origin-pull is HTTPS to `front_listen` (`[::]:7777` on the
