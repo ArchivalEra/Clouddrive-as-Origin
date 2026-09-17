@@ -50,15 +50,27 @@ fn rand_suffix() -> u32 {
     h.finish() as u32
 }
 
+/// Whether `dest` is the metadata store itself: a direct child of the cache
+/// directory whose name belongs to the store.
+///
+/// The parent check is the point. A nested object may legitimately be called
+/// `redb.db` (`<bucket>/redb.db`); refusing by file name alone protected
+/// those from reaping and blocked installing them, which the node showed as
+/// `refusing to reap a metadata store path key=googledrive1/redb.db`.
+pub fn is_meta_store_path(cache_dir: &Path, dest: &Path) -> bool {
+    dest.parent() == Some(cache_dir)
+        && dest.file_name().is_some_and(|n| is_meta_store_name(&n.to_string_lossy()))
+}
+
 /// Atomically install a completed download: fsync tmp then rename.
 ///
-/// Refuses an infrastructure destination: this is the single funnel where
-/// object bytes reach disk, and a key that named the metadata store would
-/// otherwise replace the live database with object content.
-pub fn install_tmp(tmp: &Path, dest: &Path) -> anyhow::Result<()> {
-    let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+/// Refuses the one destination that must never receive object bytes -- the
+/// metadata store -- so a key that named it cannot replace the live
+/// database. `cache_dir` is what makes that check exact rather than a
+/// name-pattern match.
+pub fn install_tmp(tmp: &Path, dest: &Path, cache_dir: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(
-        !is_meta_store_name(&name),
+        !is_meta_store_path(cache_dir, dest),
         "refusing to install an object over the metadata store ({})",
         dest.display()
     );
@@ -557,19 +569,31 @@ mod tests {
     }
 
     /// Installing over the metadata store would replace the live database
-    /// with object bytes. Refused at the funnel, whatever the caller.
+    /// with object bytes. Refused at the funnel, whatever the caller -- but
+    /// only for the store ITSELF: an object legitimately named `redb.db`
+    /// under a bucket alias lives one level down and must install normally.
+    /// The node found the difference: the first version matched by file name
+    /// alone and blocked those nested objects.
     #[test]
-    fn install_tmp_refuses_a_metadata_store_destination() {
+    fn install_tmp_refuses_the_store_but_not_a_nested_object_of_that_name() {
         let dir = tempdir().unwrap();
         let live = dir.path().join(META_STORE_FILE);
         std::fs::write(&live, b"the real database").unwrap();
         let tmp = tmp_path(dir.path(), "evil");
         std::fs::write(&tmp, b"object bytes").unwrap();
 
-        let err = install_tmp(&tmp, &live).unwrap_err();
+        let err = install_tmp(&tmp, &live, dir.path()).unwrap_err();
         assert!(err.to_string().contains("metadata store"), "{err}");
         assert_eq!(std::fs::read(&live).unwrap(), b"the real database");
         assert!(tmp.exists(), "the refused tmp must not be consumed");
+
+        // A nested object with the same file name is not the store.
+        let nested = dir.path().join("bucket/redb.db");
+        let nested_tmp = tmp_path(dir.path(), "bucket/redb.db");
+        std::fs::write(&nested_tmp, b"a real object").unwrap();
+        install_tmp(&nested_tmp, &nested, dir.path()).expect("a nested name is not the store");
+        assert_eq!(std::fs::read(&nested).unwrap(), b"a real object");
+        assert_eq!(std::fs::read(&live).unwrap(), b"the real database");
     }
 
     #[test]
@@ -580,7 +604,7 @@ mod tests {
         let tmp = tmp_path(dir.path(), key);
         std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
         std::fs::write(&tmp, b"hello").unwrap();
-        install_tmp(&tmp, &dest).unwrap();
+        install_tmp(&tmp, &dest, dir.path()).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
         assert!(!tmp.exists());
         // prune after delete

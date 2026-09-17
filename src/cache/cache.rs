@@ -346,13 +346,13 @@ impl<C: Clock + Clone> Cache<C> {
         let mut live_rows = Vec::with_capacity(persisted.len());
         let mut lost_rows: Vec<String> = Vec::new();
         for m in persisted {
-            // A row naming the metadata store or one of its derivatives is
-            // leftovers from the rebuild bug: the scanner used to adopt them
-            // as cached objects. Drop the ROW and keep the FILE -- the store
-            // is not a cache object, and the reaper must never be handed a
-            // path to it. Prefix-matched, so the quarantine archive is
-            // covered as well as the store itself.
-            if store::is_meta_store_name(&m.key) {
+            // A row naming the metadata store is leftovers from the rebuild
+            // bug: the scanner used to adopt it as a cached object. Drop the
+            // ROW and keep the FILE. `is_reserved_key` is the same rule the
+            // request path applies, so only keys no valid request could have
+            // produced are dropped here; a nested `bucket/redb.db` is an
+            // ordinary object and stays.
+            if store::is_reserved_key(&m.key) {
                 lost_rows.push(m.key);
                 continue;
             }
@@ -1734,7 +1734,7 @@ async fn promote_key(
         return;
     }
     let dest = store::file_path(cache_dir, key);
-    if store::install_tmp(&tmp, &dest).is_err() {
+    if store::install_tmp(&tmp, &dest, cache_dir).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return;
     }
@@ -2109,8 +2109,7 @@ async fn remove_entries(
         // here even if it somehow reached the victim list. Losing a reaped
         // object costs a re-fetch; deleting the metadata store costs every
         // row.
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        if store::is_meta_store_name(&name) {
+        if store::is_meta_store_path(&config.cache_dir, &path) {
             tracing::warn!(key = %k, "refusing to reap a metadata store path");
             continue;
         }
@@ -2209,12 +2208,17 @@ mod tests {
     /// dropped with the FILE intact. The reaper turns a key back into a
     /// deletion, so keeping one of these rows is what let the node destroy
     /// its own metadata store.
+    ///
+    /// A NESTED row that merely shares the name is a real object and must
+    /// survive: the node's log showed `googledrive1/redb.db` being treated as
+    /// the store.
     #[tokio::test]
     async fn load_drops_store_rows_and_never_deletes_the_file() {
         let dir = tempdir().unwrap();
         let store = crate::cache::persist::MetaStore::open(&dir.path().join(store::META_STORE_FILE)).unwrap();
-        for key in [store::META_STORE_FILE, "redb.db.corrupt-1789556382"] {
+        for key in [store::META_STORE_FILE, "redb.db.corrupt-1789556382", "bucket/redb.db"] {
             let path = dir.path().join(key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, b"database bytes").unwrap();
             store
                 .insert(&EntryMeta {
@@ -2243,11 +2247,16 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reloaded.iter().all(|m| !store::is_meta_store_name(&m.key)),
+            reloaded.iter().all(|m| !store::is_reserved_key(&m.key)),
             "store rows must be dropped at load: {:?}",
             reloaded.iter().map(|m| &m.key).collect::<Vec<_>>()
         );
-        for key in [store::META_STORE_FILE, "redb.db.corrupt-1789556382"] {
+        assert!(
+            reloaded.iter().any(|m| m.key == "bucket/redb.db"),
+            "a nested object that shares the store's name must survive: {:?}",
+            reloaded.iter().map(|m| &m.key).collect::<Vec<_>>()
+        );
+        for key in [store::META_STORE_FILE, "redb.db.corrupt-1789556382", "bucket/redb.db"] {
             assert!(dir.path().join(key).exists(), "{key} must survive the load");
         }
     }
@@ -2266,16 +2275,27 @@ mod tests {
         // than "nothing is ever deleted".
         let victim = dir.path().join("a.bin");
         std::fs::write(&victim, b"obj").unwrap();
+        // A nested object that happens to share the store's file name: the
+        // node's log showed this being protected too, which leaked disk
+        // instead of protecting the database.
+        let nested = dir.path().join("bucket/redb.db");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, b"nested object").unwrap();
         let meta = crate::cache::persist::MetaStore::open(&live).unwrap();
 
         remove_entries(
             &cfg,
             &meta,
-            &[(store::META_STORE_FILE.to_string(), 14), ("a.bin".to_string(), 3)],
+            &[
+                (store::META_STORE_FILE.to_string(), 14),
+                ("bucket/redb.db".to_string(), 13),
+                ("a.bin".to_string(), 3),
+            ],
         )
         .await;
 
         assert!(live.exists(), "the reaper must not delete the metadata store");
+        assert!(!nested.exists(), "a nested object of the same name must still be reaped");
         assert!(!victim.exists(), "ordinary victims are still reaped");
     }
 
