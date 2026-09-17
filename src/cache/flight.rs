@@ -464,9 +464,13 @@ pub async fn pump_and_seal(
     }
     drop(out);
     // Blocking fs (dir creation + rename) off the async runtime.
+    // `tmp_path` comes from `store::tmp_path(cache_dir, _)`, so its parent IS
+    // the cache root; that is what lets the install guard tell the metadata
+    // store apart from a nested object that happens to share its name.
     let tmp = tmp_path.to_path_buf();
     let dest = final_path.to_path_buf();
-    tokio::task::spawn_blocking(move || store::install_tmp(&tmp, &dest))
+    let cache_root = tmp.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+    tokio::task::spawn_blocking(move || store::install_tmp(&tmp, &dest, &cache_root))
         .await
         .map_err(|e| BackendError::Other(format!("install join: {e}")))?
         .map_err(|e| BackendError::Other(e.to_string()))?;
@@ -665,7 +669,7 @@ mod tests {
                 }
                 f.sync_all().await.unwrap();
                 drop(f);
-                store::install_tmp(&tmp, &finalp).unwrap();
+                store::install_tmp(&tmp, &finalp, dir.path()).unwrap();
                 let _ = flight.progress_tx.send(FlightProgress::Done);
             })
         };
@@ -809,7 +813,7 @@ mod tests {
                 }
                 f.sync_all().await.unwrap();
                 drop(f);
-                store::install_tmp(&tmp, &finalp).unwrap();
+                store::install_tmp(&tmp, &finalp, dir.path()).unwrap();
                 let _ = flight.progress_tx.send(FlightProgress::Done);
             })
         };
