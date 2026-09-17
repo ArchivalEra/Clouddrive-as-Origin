@@ -283,7 +283,7 @@ struct StatData {
 impl<C: Clock + Clone> Cache<C> {
     pub fn new(config: Arc<Config>, clock: Arc<C>, backends: BackendRegistry) -> Self {
         let routes = config.routes.clone();
-        let meta = Arc::new(crate::cache::persist::MetaStore::open(&config.cache_dir.join("redb.db")).expect("open redb metadata store"));
+        let meta = Arc::new(crate::cache::persist::MetaStore::open(&config.cache_dir.join(store::META_STORE_FILE)).expect("open redb metadata store"));
         let dirty_access = Arc::new(AccessClock::new());
         Self {
             config,
@@ -346,6 +346,14 @@ impl<C: Clock + Clone> Cache<C> {
         let mut live_rows = Vec::with_capacity(persisted.len());
         let mut lost_rows: Vec<String> = Vec::new();
         for m in persisted {
+            // A row naming the metadata store is leftovers from the rebuild
+            // bug: the scanner used to adopt `redb.db` as a cached object.
+            // Drop the ROW and keep the FILE -- the store is not a cache
+            // object, and the reaper must never be handed a path to it.
+            if m.key == store::META_STORE_FILE {
+                lost_rows.push(m.key);
+                continue;
+            }
             let path = store::file_path(&self.config.cache_dir, &m.key);
             if tokio::fs::metadata(&path).await.is_ok() {
                 live_rows.push(m);

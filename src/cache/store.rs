@@ -5,6 +5,20 @@ pub fn file_path(cache_dir: &Path, key: &str) -> PathBuf {
     cache_dir.join(key)
 }
 
+/// Name of the redb metadata database, which lives at the top level of
+/// cache_dir alongside the object tree. Every directory walk over that
+/// directory must skip it — see [`scan_object_files`].
+pub const META_STORE_FILE: &str = "redb.db";
+
+/// Whether a top-level name belongs to the metadata store rather than to
+/// the object tree. Covers the store itself and everything derived from it
+/// (the quarantine archive `redb.db.corrupt-<epoch>`). No legitimate cache
+/// object can collide: objects are the NESTED files, and the top level
+/// holds only infrastructure and ephemeral artifacts.
+pub fn is_meta_store_name(name: &str) -> bool {
+    name.starts_with(META_STORE_FILE)
+}
+
 pub fn tmp_path(cache_dir: &Path, key: &str) -> PathBuf {
     // .tmp.<key>.<rand> — rand suffix avoids collision under concurrent
     // fetch; slashes are flattened so nested keys still land in a flat
@@ -106,18 +120,23 @@ pub fn has_room_for(path: &Path, want: u64, reserve: u64) -> bool {
 /// top-level names and recurses into directories sees exactly the object
 /// tree.
 ///
-/// Why it exists: after metadata loss (corrupt redb, a manual `rm`), the
-/// entry rows are gone but the bytes are not. Without this, those files
-/// are neither served (`serve_from_disk` needs a row) nor reaped — they
-/// leak silently, which is what the runbook used to paper over.
+/// The metadata store is skipped by name. It lives at the top level of the
+/// same directory, has no dot prefix, and looks exactly like a cached
+/// object — so a rebuild adopted `redb.db` as an entry, counted its size as
+/// cached bytes, and then the inactive reaper DELETED it once the TTL
+/// passed: the node silently ran on an unlinked database and lost its rows
+/// on the next start. Kept here (not at the call site) so every caller is
+/// safe; the name must match the one `Cache::new` opens.
 pub fn scan_object_files(cache_dir: &Path) -> Vec<(String, u64)> {
     fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, u64)>) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for entry in rd.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            // Top-level dot-entries are ephemeral, never objects.
-            if dir == root && name.starts_with('.') {
+            // Top-level dot-entries are ephemeral, never objects; anything
+            // belonging to the metadata store is infrastructure, never an
+            // object.
+            if dir == root && (name.starts_with('.') || is_meta_store_name(&name)) {
                 continue;
             }
             match entry.file_type() {
@@ -525,6 +544,40 @@ mod tests {
         let idx = segment_index(dir.path());
         assert_eq!(idx.len(), 1, "index sees only top-level segment files");
         assert!(idx.contains_key("2026/08/v.mkv"));
+    }
+
+    /// The metadata store sits at the top level of cache_dir with no dot
+    /// prefix, so the object scanner must skip it BY NAME. Before that
+    /// guard, a rebuild adopted `redb.db` as a cached object, counted its
+    /// size as cached bytes and let the inactive reaper delete it -- the
+    /// process kept serving from the unlinked inode and the next start
+    /// came up with no rows at all.
+    #[test]
+    fn scan_object_files_never_adopts_the_metadata_store() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(META_STORE_FILE), vec![0u8; 4096]).unwrap();
+        // A sibling artifact of the same shape: the retired-file naming
+        // used by the quarantine path must also stay out of the tree.
+        std::fs::write(dir.path().join("redb.db.corrupt-1789556382"), b"x").unwrap();
+        std::fs::write(dir.path().join(".tmp.a.b.1234"), b"y").unwrap();
+        let nested = dir.path().join("2026/08");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("a.png"), vec![0u8; 10]).unwrap();
+
+        let found = scan_object_files(dir.path());
+        let names: Vec<&str> = found.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names.len(), 1, "only the nested object is a cache object: {names:?}");
+        assert_eq!(names[0], "2026/08/a.png");
+        assert!(
+            dir.path().join(META_STORE_FILE).exists(),
+            "the scanner must not delete or move the store"
+        );
+        // The same guard must cover names derived from the store: the
+        // quarantine archive is not a cached object either.
+        assert!(is_meta_store_name("redb.db.corrupt-1789556382"));
+        assert!(is_meta_store_name("redb.db"));
+        assert!(!is_meta_store_name("2026"));
+        assert!(!is_meta_store_name(".tmp.a.b.1234"));
     }
 
     #[test]
