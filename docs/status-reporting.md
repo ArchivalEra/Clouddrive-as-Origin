@@ -91,16 +91,12 @@ or `origin-cache-nocache`) and is the literal `origin-cache` in a heartbeat.
 
 ## Rules the sender follows
 
-1. **A planned stop is silent**, which on this node covers two systemd
-   results: `success` (a clean stop) and `timeout`. The second is the normal
-   deploy path here — the binary drains gracefully for up to 300s while the
-   default stop timeout is 90s, so systemd escalates to SIGKILL and *every*
-   `systemctl restart` reports `timeout`. Measured 2026-09-16: the first live
-   deploy logged two down reports that way, which is exactly the false alarm
-   this rule exists to prevent. Everything else (`signal`, `core-dump`,
-   `exit-code`, `oom-kill`, `start-limit-hit`, `resources`) *is* reported. A
-   hang is not a death either: the heartbeat keeps reporting availability
-   while it hangs.
+1. **A successful stop is silent** (`SERVICE_RESULT=success`). Both service
+   units set `TimeoutStopSec=320s`, covering Pingora's 300-second grace
+   period, runtime shutdown, and scheduling overhead. The former 90-second
+   limit caused ordinary restarts to be killed. With the corrected budget,
+   `timeout` is reported as a failure again rather than being suppressed.
+   Other non-success results are also reported.
 2. **Down reports are throttled to one per minute** (`notify-down.stamp`).
    `Restart=always` restarts after 3s, so a crash loop would otherwise fire
    the hook ~20 times a minute and defeat the far side's timestamp dedupe.

@@ -63,6 +63,8 @@ ProtectHome=yes
 ReadWritePaths=$APP
 Restart=always
 RestartSec=3
+# Pingora waits 300s before shutting down its runtimes (up to 10s more).
+TimeoutStopSec=320s
 # Report a NON-clean exit to the blog-side worker. Planned stops stay silent
 # (systemd marks them SERVICE_RESULT=success), so a deploy is never an
 # outage alert; the 15-minute dead-man switch is the real detector.
@@ -93,6 +95,8 @@ ProtectHome=yes
 ReadWritePaths=$APP
 Restart=always
 RestartSec=3
+# Pingora waits 300s before shutting down its runtimes (up to 10s more).
+TimeoutStopSec=320s
 ExecStopPost=$APP/watchdog.sh --down %n
 
 [Install]
