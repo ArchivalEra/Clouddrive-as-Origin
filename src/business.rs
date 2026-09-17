@@ -21,7 +21,7 @@ use crate::{
     clock::Clock,
     config::{ColdMiss, Config},
     key::ResolvedKey,
-    response::{error_response, request_ids, s3_meta_headers},
+    response::{error_response, invalid_key_response, request_ids, s3_meta_headers},
     sigv4,
 };
 
@@ -276,14 +276,7 @@ where
     let rk = match state.cache.resolve(&path_key) {
         Ok(rk) => rk,
         Err(e) => {
-            return error_response(
-                BackendError::Other(format!("invalid key: {e}")),
-                &path_key,
-                &req_id,
-                &host_id,
-                false,
-                None,
-            );
+            return invalid_key_response(e, path_key, &req_id, &host_id, false);
         }
     };
     let key = &rk.cache_key;
@@ -476,14 +469,7 @@ where
     let rk = match state.cache.resolve(&path_key) {
         Ok(rk) => rk,
         Err(e) => {
-            return error_response(
-                BackendError::Other(format!("invalid key: {e}")),
-                &path_key,
-                &req_id,
-                &host_id,
-                true,
-                None,
-            );
+            return invalid_key_response(e, path_key, &req_id, &host_id, true);
         }
     };
     let key = &rk.cache_key;
@@ -1762,6 +1748,118 @@ mod tests {
         assert!(body.contains("fetched"), "{body}");
         assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
         assert!(!fx.state.cache.state.read().await.entries.contains_key("w.bin"));
+    }
+
+    #[tokio::test]
+    async fn root_handlers_reject_empty_object_keys_without_backend_calls() {
+        let fx = fixture(b"unused", None, vec![], false);
+        for query in [None, Some(""), Some("download=1")] {
+            let resp = get_key_root(
+                State(fx.state.clone()),
+                headers(&[]),
+                RawQuery(query.map(str::to_owned)),
+                OriginalUri("/".parse().unwrap()),
+            ).await;
+            let (status, h, body) = body_text(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(h.get("content-type").unwrap(), "application/xml");
+            assert!(h.contains_key("x-amz-request-id"));
+            assert!(h.contains_key("x-amz-id-2"));
+            assert!(body.contains("<Code>InvalidRequest</Code>"), "{body}");
+            assert!(body.contains("<Resource>/</Resource>"), "{body}");
+        }
+        for query in [None, Some("list-type=2")] {
+            let resp = head_key_root(
+                State(fx.state.clone()),
+                headers(&[]),
+                RawQuery(query.map(str::to_owned)),
+                OriginalUri("/".parse().unwrap()),
+            ).await;
+            let (status, h, body) = body_text(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(h.get("content-type").unwrap(), "application/xml");
+            assert!(h.contains_key("x-amz-request-id"));
+            assert!(h.contains_key("x-amz-id-2"));
+            assert!(body.is_empty());
+        }
+        assert_eq!(fx.stat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_object_keys_are_bad_requests_for_get_and_head() {
+        let fx = fixture(b"unused", None, vec![], false);
+        // Every KeyError variant, including a bucket-alias traversal.
+        for key in ["", "/absolute", "../outside", "nul\0key", "back\\slash", "bad%", "primary/../outside"] {
+            let get = get_key(
+                State(fx.state.clone()), Path(key.into()), headers(&[]), RawQuery(None),
+                OriginalUri(DEFAULT_TEST_URI.clone()),
+            ).await;
+            let (status, h, body) = body_text(get).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "GET {key:?}");
+            assert_eq!(h.get("content-type").unwrap(), "application/xml");
+            assert!(h.contains_key("x-amz-request-id"));
+            assert!(h.contains_key("x-amz-id-2"));
+            assert!(body.contains("<Code>InvalidRequest</Code>"), "{body}");
+            let head = head_key(
+                State(fx.state.clone()), Path(key.into()), headers(&[]), RawQuery(None),
+                OriginalUri(DEFAULT_TEST_URI.clone()),
+            ).await;
+            let (status, h, body) = body_text(head).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "HEAD {key:?}");
+            assert_eq!(h.get("content-type").unwrap(), "application/xml");
+            assert!(h.contains_key("x-amz-request-id"));
+            assert!(h.contains_key("x-amz-id-2"));
+            assert!(body.is_empty());
+        }
+        assert_eq!(fx.stat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn root_router_preserves_v2_and_v1_listing() {
+        use crate::backend::{ListEntry, TestMockBackend};
+        use tower::ServiceExt;
+
+        let fx = fixture(b"unused", None, vec![], false);
+        let backend = TestMockBackend::new(b"unused", None, None).with_listing(vec![ListEntry {
+            key: "listed.bin".into(),
+            size: 6,
+            etag: None,
+            last_modified: None,
+            is_dir: false,
+        }]);
+        let slots = HashMap::from([(
+            "primary".into(),
+            Arc::new(BackendSlot::new(Arc::new(backend), 3)),
+        )]);
+        let state = AppState {
+            cache: Arc::new(Cache::new(
+                Arc::clone(&fx.state.config), Arc::new(MockClock::new(0)), BackendRegistry::new(slots),
+            )),
+            config: Arc::clone(&fx.state.config),
+            sigv4_config: None,
+        };
+        for (uri, v2) in [("/?list-type=2&delimiter=/", true), ("/?delimiter=/", false)] {
+            let request = axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let (status, h, body) = body_text(router(state.clone()).oneshot(request).await.unwrap()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(h.get("content-type").unwrap(), "application/xml");
+            assert!(body.contains("<ListBucketResult"), "{body}");
+            assert!(body.contains("<Name>primary</Name>"), "{body}");
+            assert!(body.contains("<Key>listed.bin</Key>"), "{body}");
+            assert_eq!(body.contains("<KeyCount>1</KeyCount>"), v2);
+        }
+        // Exercise the actual root route, not just the standalone handlers.
+        for method in ["GET", "HEAD"] {
+            let request = axum::http::Request::builder()
+                .method(method).uri("/").body(Body::empty()).unwrap();
+            let (status, _, body) = body_text(router(state.clone()).oneshot(request).await.unwrap()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body.is_empty(), method == "HEAD");
+        }
     }
 
     /// Router construction smoke test: every route path must survive
