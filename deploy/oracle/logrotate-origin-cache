@@ -1,0 +1,25 @@
+# Log rotation for the node's watchdog log.
+#
+# The watchdog is the only thing that writes here, and it appends a line per
+# verdict change plus one HB line a day, so the file is small and slow; a
+# week of copies is plenty of history to answer "when did this start".
+#
+# copytruncate, not a create+reopen: the watchdog opens the file per write
+# with `>>`, so there is no long-lived descriptor to signal -- but copytruncate
+# is what the node has always run and it keeps rotation atomic from the
+# writer's point of view (a line lands in either the old or the new file).
+#
+# Install: sudo cp deploy/oracle/logrotate-origin-cache /etc/logrotate.d/origin-cache
+#
+# This file used to list /opt/origin-cache/port80.log as well; the port-80
+# helper was retired 2026-09-12 and its entry was removed with it, so rotation
+# no longer references a file nothing writes.
+/opt/origin-cache/watchdog.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
