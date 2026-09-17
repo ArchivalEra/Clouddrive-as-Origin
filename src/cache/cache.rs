@@ -346,11 +346,13 @@ impl<C: Clock + Clone> Cache<C> {
         let mut live_rows = Vec::with_capacity(persisted.len());
         let mut lost_rows: Vec<String> = Vec::new();
         for m in persisted {
-            // A row naming the metadata store is leftovers from the rebuild
-            // bug: the scanner used to adopt `redb.db` as a cached object.
-            // Drop the ROW and keep the FILE -- the store is not a cache
-            // object, and the reaper must never be handed a path to it.
-            if m.key == store::META_STORE_FILE {
+            // A row naming the metadata store or one of its derivatives is
+            // leftovers from the rebuild bug: the scanner used to adopt them
+            // as cached objects. Drop the ROW and keep the FILE -- the store
+            // is not a cache object, and the reaper must never be handed a
+            // path to it. Prefix-matched, so the quarantine archive is
+            // covered as well as the store itself.
+            if store::is_meta_store_name(&m.key) {
                 lost_rows.push(m.key);
                 continue;
             }
@@ -2102,6 +2104,16 @@ async fn remove_entries(
     }
     for (k, _) in victims {
         let path = store::file_path(&config.cache_dir, k);
+        // Last-resort guard: this is the only place a key is turned back
+        // into a deletion, so a row that names infrastructure is refused
+        // here even if it somehow reached the victim list. Losing a reaped
+        // object costs a re-fetch; deleting the metadata store costs every
+        // row.
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if store::is_meta_store_name(&name) {
+            tracing::warn!(key = %k, "refusing to reap a metadata store path");
+            continue;
+        }
         let _ = tokio::fs::remove_file(&path).await;
         store::prune_empty_parents(&config.cache_dir, &path);
     }
@@ -2190,6 +2202,81 @@ mod tests {
         );
         let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), BackendRegistry::new(slots));
         (cfg, clock, cache, calls)
+    }
+
+    /// A store row left behind by the rebuild bug -- including the quarantine
+    /// archive, whose name the layout derives from the store -- must be
+    /// dropped with the FILE intact. The reaper turns a key back into a
+    /// deletion, so keeping one of these rows is what let the node destroy
+    /// its own metadata store.
+    #[tokio::test]
+    async fn load_drops_store_rows_and_never_deletes_the_file() {
+        let dir = tempdir().unwrap();
+        let store = crate::cache::persist::MetaStore::open(&dir.path().join(store::META_STORE_FILE)).unwrap();
+        for key in [store::META_STORE_FILE, "redb.db.corrupt-1789556382"] {
+            let path = dir.path().join(key);
+            std::fs::write(&path, b"database bytes").unwrap();
+            store
+                .insert(&EntryMeta {
+                    version: 1,
+                    upstream_id: "primary".into(),
+                    key: key.into(),
+                    size_bytes: 14,
+                    etag: None,
+                    last_modified: None,
+                    content_type: None,
+                    created_at_millis: 0,
+                    last_access_millis: 0,
+                    last_revalidated_millis: None,
+                    negative_until_millis: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let (_cfg, _clock, cache, _calls) = test_cache(dir.path().to_path_buf(), b"x", None, None);
+        Arc::new(cache).load_and_start().await;
+
+        let reloaded = crate::cache::persist::MetaStore::open(&dir.path().join(store::META_STORE_FILE))
+            .unwrap()
+            .load_all()
+            .await
+            .unwrap();
+        assert!(
+            reloaded.iter().all(|m| !store::is_meta_store_name(&m.key)),
+            "store rows must be dropped at load: {:?}",
+            reloaded.iter().map(|m| &m.key).collect::<Vec<_>>()
+        );
+        for key in [store::META_STORE_FILE, "redb.db.corrupt-1789556382"] {
+            assert!(dir.path().join(key).exists(), "{key} must survive the load");
+        }
+    }
+
+    /// Last-resort guard on the single deletion site: even if a store key
+    /// reaches the victim list, the reaper must refuse it.
+    #[tokio::test]
+    async fn reaper_refuses_to_delete_a_store_path() {
+        let dir = tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.cache_dir = dir.path().to_path_buf();
+        let cfg = Arc::new(cfg);
+        let live = dir.path().join(store::META_STORE_FILE);
+        std::fs::write(&live, b"database bytes").unwrap();
+        // A real object alongside it, so the refusal is specific rather
+        // than "nothing is ever deleted".
+        let victim = dir.path().join("a.bin");
+        std::fs::write(&victim, b"obj").unwrap();
+        let meta = crate::cache::persist::MetaStore::open(&live).unwrap();
+
+        remove_entries(
+            &cfg,
+            &meta,
+            &[(store::META_STORE_FILE.to_string(), 14), ("a.bin".to_string(), 3)],
+        )
+        .await;
+
+        assert!(live.exists(), "the reaper must not delete the metadata store");
+        assert!(!victim.exists(), "ordinary victims are still reaped");
     }
 
     #[tokio::test]

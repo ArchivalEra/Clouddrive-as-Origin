@@ -16,6 +16,8 @@ pub enum KeyError {
     Backslash,
     #[error("invalid percent encoding")]
     BadPercent,
+    #[error("reserved name")]
+    ReservedName,
 }
 
 /// Validate a cache key per spec §2 / ADR 0001.
@@ -57,6 +59,12 @@ pub fn validate_key(raw: &str) -> Result<String, KeyError> {
         if seg == ".." || seg == "%2e%2e" || seg == "%2E%2E" {
             return Err(KeyError::Traversal);
         }
+    }
+    // Names the cache directory's top level reserves for infrastructure.
+    // Checked on the RAW form, which is what `file_path` joins onto
+    // cache_dir -- percent-encoded dots do not become dots on disk.
+    if crate::cache::store::is_reserved_key(raw) {
+        return Err(KeyError::ReservedName);
     }
     Ok(raw.to_string())
 }
@@ -168,6 +176,26 @@ mod tests {
         assert_eq!(validate_key(""), Err(KeyError::Empty));
         assert_eq!(validate_key("a\0b"), Err(KeyError::Nul));
         assert_eq!(validate_key("a%00b"), Err(KeyError::Nul));
+    }
+
+    /// A bare key becomes a top-level name in cache_dir, where the metadata
+    /// store and the `.tmp`/`.seg` artifacts live; taking one would let an
+    /// install overwrite the live database or have the sweeps delete a
+    /// cached object. Only the first segment is reserved, so objects nested
+    /// under a bucket alias keep working.
+    #[test]
+    fn rejects_names_reserved_by_the_cache_directory() {
+        for raw in ["redb.db", "redb.db.corrupt-1789556382", ".tmp.a.b.1234", ".seg.x.0-1", ".hidden"] {
+            assert_eq!(validate_key(raw), Err(KeyError::ReservedName), "{raw}");
+        }
+        // Nested names are ordinary objects: reserving them would break
+        // cache keys that merely look like an artifact.
+        assert!(validate_key("googledrive1/.hidden").is_ok());
+        assert!(validate_key("googledrive1/redb.dbase").is_ok());
+        assert!(validate_key("2026/08/a.png").is_ok());
+        // Percent-encoded dots are not dots on disk, so they are not
+        // reserved either.
+        assert!(validate_key("%2Ehidden").is_ok());
     }
 
     fn test_routes() -> RouteTable {
