@@ -36,6 +36,7 @@ ProtectHome=yes
 ReadWritePaths=/opt/origin-cache
 Restart=always
 RestartSec=3
+TimeoutStopSec=320s
 # Reports a NON-clean exit over the tunnel; a planned stop stays silent so a
 # deploy is never an outage alert.
 ExecStopPost=/opt/origin-cache/watchdog.sh --down %n
