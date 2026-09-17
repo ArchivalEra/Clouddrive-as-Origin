@@ -145,9 +145,8 @@ pub fn redirect_target_allowed(url: &str) -> bool {
         s.split(']').next().unwrap_or("")
     } else {
         auth.split(':').next().unwrap_or("")
-    }
-    .to_ascii_lowercase();
-    host == "localhost" || host.starts_with("localhost.") || host.starts_with("127.") || host == "::1"
+    };
+    crate::net::is_loopback_host(host)
 }
 
 /// Unified backend error taxonomy — cache semantics (negative cache,
@@ -429,6 +428,23 @@ mod tests {
         assert!(redirect_target_allowed("http://127.0.0.1:8080/f"));
         assert!(redirect_target_allowed("http://localhost:5244/f"));
         assert!(redirect_target_allowed("http://[::1]:8080/f"));
+    }
+
+    /// A host that only STARTS with a loopback name is a host the upstream
+    /// controls, and allowing plaintext http to it would leak the query
+    /// string's signature. The upstream policy has the mirror of this test,
+    /// and both hold because they call one shared predicate rather than
+    /// two copies of the check.
+    #[test]
+    fn redirect_target_rejects_hosts_that_merely_look_loopback() {
+        for url in [
+            "http://127.evil.com/f",
+            "http://localhost.evil.com/f",
+            "http://127.0.0.1.evil.com/f",
+            "http://localhosts/f",
+        ] {
+            assert!(!redirect_target_allowed(url), "{url} must not be an allowed target");
+        }
     }
 
     #[tokio::test]

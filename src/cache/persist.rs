@@ -39,6 +39,25 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Where a store that will not open gets moved to. The `<epoch>` in the name
+/// is what the runbook tells an operator to look for, and the probe keeps a
+/// second failure inside the same second from renaming over the first
+/// archive: `rename` replaces silently, so an unlucky second would have cost
+/// the evidence of the first failure.
+fn quarantine_path(path: &std::path::Path, stamp: u64) -> std::path::PathBuf {
+    let first = path.with_extension(format!("db.corrupt-{stamp}"));
+    if !first.exists() {
+        return first;
+    }
+    for n in 2u32.. {
+        let candidate = path.with_extension(format!("db.corrupt-{stamp}-{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("counted far enough to find a free name")
+}
+
 /// What happened when the store was opened (C1): healthz reports this, so a
 /// quarantined or rebuilt store is visible instead of living only in logs.
 /// ADR-0008 says metadata loss costs revalidation rather than correctness --
@@ -89,7 +108,7 @@ fn shared_db(path: &Path) -> anyhow::Result<(Arc<Mutex<redb::Database>>, StoreSt
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let aside = path.with_extension(format!("db.corrupt-{stamp}"));
+            let aside = quarantine_path(path, stamp);
             if let Err(re) = std::fs::rename(path, &aside) {
                 tracing::error!(error = %re, "could not quarantine the bad metadata file");
             } else {
@@ -326,6 +345,37 @@ mod tests {
 
         store.remove_batch(&keys).await.unwrap();
         assert_eq!(store.load_all().await.unwrap().len(), 0, "batch remove clears every key");
+    }
+
+    #[test]
+    fn quarantine_archives_never_overwrite_each_other() {
+        let dir = tempdir().unwrap();
+        let store = dir.path().join("redb.db");
+        std::fs::write(&store, b"bad").unwrap();
+
+        // First failure in a second uses the documented name.
+        let first = quarantine_path(&store, 1000);
+        assert_eq!(first.file_name().unwrap().to_string_lossy(), "redb.db.corrupt-1000");
+
+        // A second failure inside the same second must not land on it:
+        // rename would replace the archive and lose the first evidence.
+        std::fs::write(&first, b"first archive").unwrap();
+        let second = quarantine_path(&store, 1000);
+        assert_ne!(second, first);
+        assert_eq!(second.file_name().unwrap().to_string_lossy(), "redb.db.corrupt-1000-2");
+
+        std::fs::write(&second, b"second archive").unwrap();
+        let third = quarantine_path(&store, 1000);
+        assert_eq!(third.file_name().unwrap().to_string_lossy(), "redb.db.corrupt-1000-3");
+
+        // The earlier archives are intact.
+        assert_eq!(std::fs::read(&first).unwrap(), b"first archive");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second archive");
+        // A later second still gets the plain name.
+        assert_eq!(
+            quarantine_path(&store, 1001).file_name().unwrap().to_string_lossy(),
+            "redb.db.corrupt-1001"
+        );
     }
 
     #[tokio::test]

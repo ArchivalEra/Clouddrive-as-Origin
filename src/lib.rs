@@ -8,6 +8,7 @@ pub mod key;
 pub mod list;
 pub mod metrics;
 pub mod mime;
+pub mod net;
 pub mod response;
 pub mod routing;
 pub mod sigv4;

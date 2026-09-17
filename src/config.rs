@@ -132,11 +132,10 @@ fn default_backend_type() -> String {
 
 /// Loopback/localhost hosts are allowed to speak plain http to us (the
 /// reference deployment runs OpenList beside the cache); everything else
-/// must be https because WebDAV credentials ride on it.
-fn is_loopback_host(host: &str) -> bool {
-    let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
-    h == "localhost" || h.starts_with("localhost.") || h.starts_with("127.") || h == "::1"
-}
+/// must be https because WebDAV credentials ride on it. The predicate lives
+/// in [`crate::net`] because the redirect policy needs the same one, and two
+/// copies is how one of them stays wrong.
+use crate::net::is_loopback_host;
 
 fn upstream_url_policy(base_url: &str, upstream_id: &str) -> anyhow::Result<()> {
     let (scheme, rest) = base_url
@@ -679,6 +678,35 @@ mod tests {
     fn remote_http_rejected_https_required() {
         assert!(Config::from_toml_str(&upstream_toml("http://media.example.com/dav")).is_err());
         assert!(Config::from_toml_str(&upstream_toml("https://media.example.com/dav")).is_ok());
+    }
+
+    /// A host that merely STARTS with a loopback name is somebody else's
+    /// host: `127.evil.com` and `localhost.evil.com` are public DNS names,
+    /// so accepting plain http to them would put the WebDAV credentials on
+    /// the wire. The redirect policy has the mirror of this test, and both
+    /// hold because they call one shared predicate.
+    #[test]
+    fn hosts_that_merely_look_loopback_do_not_get_plain_http() {
+        for host in [
+            "127.evil.com",
+            "localhost.evil.com",
+            "127.0.0.1.evil.com",
+            "localhosts",
+            "128.0.0.1",
+        ] {
+            assert!(
+                Config::from_toml_str(&upstream_toml(&format!("http://{host}:5244/dav"))).is_err(),
+                "{host} must not be accepted over plain http"
+            );
+        }
+        // The genuine loopback spellings still are, including the RFC 6761
+        // `.localhost` TLD.
+        for host in ["127.0.0.1", "localhost", "[::1]", "openlist.localhost"] {
+            assert!(
+                Config::from_toml_str(&upstream_toml(&format!("http://{host}:5244/dav"))).is_ok(),
+                "{host} must stay usable over plain http"
+            );
+        }
     }
 
     #[test]
