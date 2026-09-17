@@ -19,6 +19,19 @@ pub fn is_meta_store_name(name: &str) -> bool {
     name.starts_with(META_STORE_FILE)
 }
 
+/// Whether a cache key would collide with an infrastructure name.
+///
+/// [`file_path`] is a raw join, so a key with no slash becomes a TOP-LEVEL
+/// name in cache_dir, where the metadata store and the ephemeral `.tmp.*`
+/// / `.seg*` artifacts live. A bare key `redb.db` therefore names the live
+/// database: a cold pull would rename object bytes over it, and the
+/// artifact sweeps would delete `.tmp.x`. Only the first segment is
+/// reserved, so `googledrive1/.hidden` stays an ordinary object.
+pub fn is_reserved_key(key: &str) -> bool {
+    let first = key.split('/').next().unwrap_or("");
+    first.starts_with('.') || is_meta_store_name(first)
+}
+
 pub fn tmp_path(cache_dir: &Path, key: &str) -> PathBuf {
     // .tmp.<key>.<rand> — rand suffix avoids collision under concurrent
     // fetch; slashes are flattened so nested keys still land in a flat
@@ -38,7 +51,17 @@ fn rand_suffix() -> u32 {
 }
 
 /// Atomically install a completed download: fsync tmp then rename.
+///
+/// Refuses an infrastructure destination: this is the single funnel where
+/// object bytes reach disk, and a key that named the metadata store would
+/// otherwise replace the live database with object content.
 pub fn install_tmp(tmp: &Path, dest: &Path) -> anyhow::Result<()> {
+    let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    anyhow::ensure!(
+        !is_meta_store_name(&name),
+        "refusing to install an object over the metadata store ({})",
+        dest.display()
+    );
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
     }
@@ -500,6 +523,54 @@ pub fn sweep_orphan_metas(cache_dir: &Path) {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Cross-check: the key rule must reserve exactly the names the layout
+    /// can produce at the top level. Both sides are derived from the same
+    /// helpers here, so adding an artifact prefix without reserving it fails
+    /// this test instead of silently letting a key collide with it.
+    #[test]
+    fn every_top_level_infrastructure_name_is_a_reserved_key() {
+        // Artifact families, by the prefix each constructor emits.
+        for prefix in [".tmp.", ".seg.", ".segpart.", ".segmeta."] {
+            let name = format!("{prefix}x");
+            assert!(is_reserved_key(&name), "{name} must be reserved");
+        }
+        assert!(is_reserved_key(META_STORE_FILE));
+        assert!(is_reserved_key("redb.db.corrupt-1789556382"));
+        // The actual constructors agree with those prefixes.
+        let dir = std::path::Path::new("/cache");
+        for path in [
+            tmp_path(dir, "a/b.bin"),
+            seg_path(dir, "a/b.bin", 0, 1),
+            segpart_path(dir, "a/b.bin", 0, 1),
+            segmeta_path(dir, "a/b.bin"),
+            dir.join(META_STORE_FILE),
+        ] {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(is_reserved_key(&name), "layout emitted an unreserved name: {name}");
+        }
+        // Objects live in subdirectories, so only the FIRST segment is
+        // reserved: a nested dot-file is an ordinary object.
+        assert!(!is_reserved_key("googledrive1/.hidden"));
+        assert!(!is_reserved_key("2026/08/a.png"));
+        assert!(!is_reserved_key("googledrive1/redb.dbase"));
+    }
+
+    /// Installing over the metadata store would replace the live database
+    /// with object bytes. Refused at the funnel, whatever the caller.
+    #[test]
+    fn install_tmp_refuses_a_metadata_store_destination() {
+        let dir = tempdir().unwrap();
+        let live = dir.path().join(META_STORE_FILE);
+        std::fs::write(&live, b"the real database").unwrap();
+        let tmp = tmp_path(dir.path(), "evil");
+        std::fs::write(&tmp, b"object bytes").unwrap();
+
+        let err = install_tmp(&tmp, &live).unwrap_err();
+        assert!(err.to_string().contains("metadata store"), "{err}");
+        assert_eq!(std::fs::read(&live).unwrap(), b"the real database");
+        assert!(tmp.exists(), "the refused tmp must not be consumed");
+    }
 
     #[test]
     fn install_and_prune() {
