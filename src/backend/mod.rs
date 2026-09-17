@@ -168,15 +168,15 @@ pub enum BackendError {
     /// Client requested a Range beyond the object size (HTTP 416).
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
+    /// The client's key failed validation. Its own variant, not `Other`:
+    /// the response layer must answer 400 regardless of the phrasing, and
+    /// classifying it by inspecting `Other`'s text was case-sensitive over
+    /// lowercase messages, so only one of six key errors mapped correctly.
+    #[error("invalid key: {0}")]
+    InvalidKey(#[from] crate::key::KeyError),
     /// Includes SSRF allow-list rejections and malformed responses.
     #[error("backend error: {0}")]
     Other(String),
-}
-
-impl From<crate::key::KeyError> for BackendError {
-    fn from(e: crate::key::KeyError) -> Self {
-        BackendError::Other(format!("invalid key: {e}"))
-    }
 }
 
 /// Unified storage-source abstraction (spec §5.1). The business plane
@@ -678,6 +678,8 @@ mod retry_tests {
             BackendError::NotFound,
             BackendError::AuthRequired,
             BackendError::RangeNotSatisfiable,
+            // A malformed client key cannot become valid by asking again.
+            BackendError::InvalidKey(crate::key::KeyError::Empty),
         ] {
             let inner = std::sync::Arc::new(FlakyBackend {
                 fails_left: AtomicU32::new(100),

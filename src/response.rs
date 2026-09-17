@@ -210,14 +210,15 @@ pub(crate) fn error_response(
             }
             resp
         }
-        // Match the producing wrapper's own prefix, not fragments of the
-        // inner error text. Every key-validation producer writes exactly
-        // `invalid key: {KeyError}` (key.rs, cache.rs), and KeyError's
-        // Display is lowercase ("empty key", "absolute path not allowed"),
-        // so sniffing "Empty"/"Absolute" only ever caught "traversal" --
-        // the other five variants were reported as upstream failures.
-        BackendError::Other(msg) if msg.starts_with("invalid key:") => {
-            let body = if head_only { Body::empty() } else { Body::from(xml("InvalidRequest", "The request key is invalid.")) };
+        // Typed, not text-matched: the client's key failed validation, so
+        // the answer is 400 whatever the error says.
+        BackendError::InvalidKey(ke) => {
+            warn!(key = %key, error = %ke, "invalid request key");
+            let body = if head_only {
+                Body::empty()
+            } else {
+                Body::from(xml("InvalidRequest", "The request key is invalid."))
+            };
             with_ids(StatusCode::BAD_REQUEST, body)
         }
         other => {
@@ -254,6 +255,7 @@ mod tests {
             KeyError::Nul,
             KeyError::Backslash,
             KeyError::BadPercent,
+            KeyError::ReservedName,
         ];
         for ke in variants {
             let label = format!("{ke:?}");
@@ -282,6 +284,18 @@ mod tests {
         // status: it is not a client key error.
         let resp = error_response(
             BackendError::Other("backend error: token rejected".into()),
+            "some/key",
+            "req-1",
+            "host-1",
+            false,
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // Text must no longer decide the status: an `Other` that merely
+        // looks like a key error is still a backend failure, and a typed
+        // key error is 400 however it is worded.
+        let resp = error_response(
+            BackendError::Other("invalid key: empty key".into()),
             "some/key",
             "req-1",
             "host-1",

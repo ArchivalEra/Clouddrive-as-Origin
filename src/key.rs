@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::routing::RouteTable;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum KeyError {
     #[error("empty key")]
     Empty,

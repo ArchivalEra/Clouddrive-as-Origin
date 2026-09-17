@@ -10,6 +10,7 @@ use origin_cache::{
     cache::flight::{BodyStream, FlightProgress},
     clock::{Clock, MockClock},
     config::Config,
+    key::KeyError,
     routing::{RouteRule, RouteTable},
 };
 
@@ -334,12 +335,18 @@ async fn traversal_payloads_are_400_via_fetch_error() {
         Err(e) => e,
         Ok(_) => panic!("traversal key must not resolve"),
     };
-    assert!(matches!(err, BackendError::Other(_)));
+    assert!(
+        matches!(err, BackendError::InvalidKey(KeyError::Traversal)),
+        "traversal must arrive typed, not as an opaque backend error: {err:?}"
+    );
     let err2 = match cache.get("%2e%2e%2fetc/passwd", None).await {
         Err(e) => e,
         Ok(_) => panic!("encoded traversal key must not resolve"),
     };
-    assert!(matches!(err2, BackendError::Other(_)));
+    assert!(
+        matches!(err2, BackendError::InvalidKey(KeyError::Traversal)),
+        "encoded traversal must arrive typed too: {err2:?}"
+    );
 }
 
 #[tokio::test]
