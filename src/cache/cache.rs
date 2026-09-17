@@ -553,7 +553,7 @@ impl<C: Clock + Clone> Cache<C> {
     /// installs; a confirmed absence installs a negative tombstone so
     /// HEAD 404s share the negative-cache window with GET).
     pub async fn head_meta(&self, raw_key: &str) -> Result<HitMeta, BackendError> {
-        let rk = self.resolve(raw_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+        let rk = self.resolve(raw_key)?;
         self.head_resolved(&rk).await
     }
 
@@ -1020,7 +1020,7 @@ impl<C: Clock + Clone> Cache<C> {
         raw_key: &str,
         range: Option<crate::backend::ByteRange>,
     ) -> Result<CacheHit, BackendError> {
-        let rk = self.resolve(raw_key).map_err(|e| BackendError::Other(format!("invalid key: {e}")))?;
+        let rk = self.resolve(raw_key)?;
         self.get_resolved(&rk, range).await
     }
 
