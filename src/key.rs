@@ -60,13 +60,22 @@ pub fn validate_key(raw: &str) -> Result<String, KeyError> {
             return Err(KeyError::Traversal);
         }
     }
-    // Names the cache directory's top level reserves for infrastructure.
-    // Checked on the RAW form, which is what `file_path` joins onto
-    // cache_dir -- percent-encoded dots do not become dots on disk.
-    if crate::cache::store::is_reserved_key(raw) {
+    Ok(raw.to_string())
+}
+
+/// Reject a CACHE key that would name infrastructure.
+///
+/// Only the cache identity is checked, never the provider-side key: the
+/// cache key is what `store::file_path` joins onto `cache_dir`, while the
+/// backend key is only ever sent upstream. Under a bucket alias the two
+/// differ -- `/googledrive1/redb.db` has the safe cache key
+/// `googledrive1/redb.db` and the backend key `redb.db` -- so checking the
+/// backend key would make a legitimately-named upstream object unfetchable.
+fn reject_reserved_cache_key(cache_key: &str) -> Result<(), KeyError> {
+    if crate::cache::store::is_reserved_key(cache_key) {
         return Err(KeyError::ReservedName);
     }
-    Ok(raw.to_string())
+    Ok(())
 }
 
 fn percent_decode(s: &str) -> Result<String, KeyError> {
@@ -119,13 +128,18 @@ pub struct ResolvedKey {
 /// namespaces happens here, once.
 pub fn resolve_key(raw_path: &str, routes: &RouteTable, buckets: &[String]) -> Result<ResolvedKey, KeyError> {
     if let Some((bucket, rest)) = split_bucket(raw_path, buckets) {
+        let cache_key = validate_key(raw_path)?;
+        reject_reserved_cache_key(&cache_key)?;
         return Ok(ResolvedKey {
-            cache_key: validate_key(raw_path)?,
+            cache_key,
+            // Provider-side name only: it never becomes a local path, so a
+            // name the cache directory reserves is fine here.
             backend_key: validate_key(rest)?,
             upstream_id: bucket.to_string(),
         });
     }
     let cache_key = validate_key(raw_path)?;
+    reject_reserved_cache_key(&cache_key)?;
     let upstream_id = routes.resolve(&cache_key).to_string();
     Ok(ResolvedKey { backend_key: cache_key.clone(), cache_key, upstream_id })
 }
@@ -178,24 +192,35 @@ mod tests {
         assert_eq!(validate_key("a%00b"), Err(KeyError::Nul));
     }
 
-    /// A bare key becomes a top-level name in cache_dir, where the metadata
-    /// store and the `.tmp`/`.seg` artifacts live; taking one would let an
-    /// install overwrite the live database or have the sweeps delete a
-    /// cached object. Only the first segment is reserved, so objects nested
-    /// under a bucket alias keep working.
+    /// A bare cache key becomes a top-level name in cache_dir, where the
+    /// metadata store and the `.tmp`/`.seg` artifacts live; taking one would
+    /// let an install overwrite the live database or have the sweeps delete
+    /// a cached object.
+    ///
+    /// Only the CACHE key is reserved. Under a bucket alias the provider-side
+    /// key is a different string and never becomes a local path, so an
+    /// upstream object named `redb.db` or `.hidden` stays fetchable through
+    /// `/googledrive1/...` -- which is the only path the CDN uses.
     #[test]
-    fn rejects_names_reserved_by_the_cache_directory() {
+    fn rejects_cache_keys_that_name_cache_directory_infrastructure() {
+        let routes = test_routes();
         for raw in ["redb.db", "redb.db.corrupt-1789556382", ".tmp.a.b.1234", ".seg.x.0-1", ".hidden"] {
-            assert_eq!(validate_key(raw), Err(KeyError::ReservedName), "{raw}");
+            assert_eq!(
+                resolve_key(raw, &routes, &["primary".into()]),
+                Err(KeyError::ReservedName),
+                "{raw} as a cache key"
+            );
         }
-        // Nested names are ordinary objects: reserving them would break
-        // cache keys that merely look like an artifact.
-        assert!(validate_key("googledrive1/.hidden").is_ok());
-        assert!(validate_key("googledrive1/redb.dbase").is_ok());
-        assert!(validate_key("2026/08/a.png").is_ok());
-        // Percent-encoded dots are not dots on disk, so they are not
-        // reserved either.
-        assert!(validate_key("%2Ehidden").is_ok());
+        // Through the bucket alias the cache key is prefixed, so the same
+        // object name is an ordinary key.
+        for raw in ["primary/redb.db", "primary/.hidden", "primary/redb.dbase"] {
+            let rk = resolve_key(raw, &routes, &["primary".into()]).expect(raw);
+            assert_eq!(rk.cache_key, raw);
+        }
+        // Synthetic cache keys: `validate_key` itself stays syntax-only, so
+        // the seam is what holds the reservation, and a stored row's key is
+        // still validatable.
+        assert!(validate_key("primary/.hidden").is_ok());
     }
 
     fn test_routes() -> RouteTable {
