@@ -14,7 +14,14 @@
 set -u
 
 UNITS="origin-cache-standard origin-cache-nocache"
-LOG=/opt/origin-cache/watchdog.log
+# State files, kept together so a test can point them at a scratch directory.
+# The node's watchdog unit declares no EnvironmentFile, so on the node these
+# defaults are what runs (same reasoning as REPORT_URL below).
+STATE_DIR="${STATE_DIR:-/opt/origin-cache}"
+LOG="$STATE_DIR/watchdog.log"
+STATE="$STATE_DIR/watchdog.state"
+HEARTBEAT="$STATE_DIR/watchdog.heartbeat"
+DOWN_STAMP="$STATE_DIR/notify-down.stamp"
 DISK_WARN_PCT=85
 DISK_CRIT_PCT=95
 
@@ -75,7 +82,7 @@ send_down() {
   # dedupe keys on the timestamp, which every one of those would defeat.
   # One down report per minute is plenty -- the heartbeat (which still goes
   # out every 5 minutes, with status=down) carries the state meanwhile.
-  local stamp=/opt/origin-cache/notify-down.stamp now last
+  local stamp="$DOWN_STAMP" now last
   now=$(date +%s)
   last=$(cat "$stamp" 2>/dev/null || echo 0)
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
@@ -110,11 +117,6 @@ send_down() {
 case "${1:-}" in
   --down) send_down "${2:-origin-cache}"; exit 0 ;;
 esac
-
-# State file (D3): one line per run recording the last verdict, so the log
-# can report TRANSITIONS instead of every run. Written atomically.
-STATE=/opt/origin-cache/watchdog.state
-HEARTBEAT=/opt/origin-cache/watchdog.heartbeat
 
 # Collect problems in a string; empty means healthy.
 PROBLEMS=""
