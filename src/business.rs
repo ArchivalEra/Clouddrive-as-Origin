@@ -1750,6 +1750,35 @@ mod tests {
         assert!(!fx.state.cache.state.read().await.entries.contains_key("w.bin"));
     }
 
+    /// A malformed object key is a client error: 400 with the S3
+    /// `InvalidRequest` envelope on GET, and the same status with an empty
+    /// body on HEAD.
+    async fn assert_invalid_request_400(resp: Response, what: &str) {
+        let head = what.starts_with("HEAD");
+        let (status, h, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}");
+        assert_eq!(h.get("content-type").unwrap(), "application/xml", "{what}");
+        assert!(h.contains_key("x-amz-request-id"), "{what}");
+        assert!(h.contains_key("x-amz-id-2"), "{what}");
+        if head {
+            assert!(body.is_empty(), "HEAD must not carry a body: {what} {body}");
+        } else {
+            assert!(body.contains("<Code>InvalidRequest</Code>"), "{what} {body}");
+        }
+    }
+
+    /// A rejected key must never reach the provider: no stat, no open, no
+    /// direct backend call.
+    fn assert_no_backend_calls(fx: &Fixture, what: &str) {
+        for (name, n) in [
+            ("stat", fx.stat_calls.load(Ordering::SeqCst)),
+            ("open", fx.open_calls.load(Ordering::SeqCst)),
+            ("direct", fx.direct_calls.load(Ordering::SeqCst)),
+        ] {
+            assert_eq!(n, 0, "{what}: {name} must not be called for a rejected key");
+        }
+    }
+
     #[tokio::test]
     async fn root_handlers_reject_empty_object_keys_without_backend_calls() {
         let fx = fixture(b"unused", None, vec![], false);
@@ -1760,13 +1789,7 @@ mod tests {
                 RawQuery(query.map(str::to_owned)),
                 OriginalUri("/".parse().unwrap()),
             ).await;
-            let (status, h, body) = body_text(resp).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(h.get("content-type").unwrap(), "application/xml");
-            assert!(h.contains_key("x-amz-request-id"));
-            assert!(h.contains_key("x-amz-id-2"));
-            assert!(body.contains("<Code>InvalidRequest</Code>"), "{body}");
-            assert!(body.contains("<Resource>/</Resource>"), "{body}");
+            assert_invalid_request_400(resp, &format!("GET / query={query:?}")).await;
         }
         for query in [None, Some("list-type=2")] {
             let resp = head_key_root(
@@ -1775,49 +1798,73 @@ mod tests {
                 RawQuery(query.map(str::to_owned)),
                 OriginalUri("/".parse().unwrap()),
             ).await;
-            let (status, h, body) = body_text(resp).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(h.get("content-type").unwrap(), "application/xml");
-            assert!(h.contains_key("x-amz-request-id"));
-            assert!(h.contains_key("x-amz-id-2"));
-            assert!(body.is_empty());
+            assert_invalid_request_400(resp, &format!("HEAD / query={query:?}")).await;
         }
-        assert_eq!(fx.stat_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 0);
+        assert_no_backend_calls(&fx, "root handlers");
     }
 
+    /// Every way a key can be rejected that a URI can actually express, driven
+    /// through the real axum Router so path extraction and percent-decoding
+    /// are part of the test rather than only direct handler calls.
     #[tokio::test]
     async fn invalid_object_keys_are_bad_requests_for_get_and_head() {
+        use tower::ServiceExt;
+
         let fx = fixture(b"unused", None, vec![], false);
-        // Every KeyError variant, including a bucket-alias traversal.
-        for key in ["", "/absolute", "../outside", "nul\0key", "back\\slash", "bad%", "primary/../outside"] {
+        let keys = [
+            "/../outside",              // traversal
+            "/googledrive1/../outside", // traversal under a bucket alias
+            "/nul%00key",               // NUL, percent-decoded by axum
+            "/back%5Cslash",            // backslash, percent-decoded
+            "/bad%",                    // malformed percent encoding
+            "/redb.db",                 // reserved: the metadata store
+            "/.tmp.a.b.1234",           // reserved: an ephemeral artifact
+        ];
+        for key in keys {
+            for method in ["GET", "HEAD"] {
+                let request = axum::http::Request::builder()
+                    .method(method)
+                    .uri(key)
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = router(fx.state.clone()).oneshot(request).await.unwrap();
+                assert_invalid_request_400(resp, &format!("{method} {key}")).await;
+            }
+        }
+        assert_no_backend_calls(&fx, "invalid keys via the router");
+    }
+
+    /// The rejections a URI cannot express, so the handler seam is the only
+    /// place they can be reached: an empty key, and an absolute key (a
+    /// leading slash in a URI is consumed by the URL, so `/absolute` routed
+    /// for real yields the perfectly valid key `absolute` and a 200).
+    #[tokio::test]
+    async fn invalid_object_keys_unreachable_by_uri_are_rejected_at_the_seam() {
+        let fx = fixture(b"unused", None, vec![], false);
+        for key in ["", "/absolute"] {
             let get = get_key(
                 State(fx.state.clone()), Path(key.into()), headers(&[]), RawQuery(None),
                 OriginalUri(DEFAULT_TEST_URI.clone()),
             ).await;
-            let (status, h, body) = body_text(get).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "GET {key:?}");
-            assert_eq!(h.get("content-type").unwrap(), "application/xml");
-            assert!(h.contains_key("x-amz-request-id"));
-            assert!(h.contains_key("x-amz-id-2"));
-            assert!(body.contains("<Code>InvalidRequest</Code>"), "{body}");
+            assert_invalid_request_400(get, &format!("GET key={key:?}")).await;
             let head = head_key(
                 State(fx.state.clone()), Path(key.into()), headers(&[]), RawQuery(None),
                 OriginalUri(DEFAULT_TEST_URI.clone()),
             ).await;
-            let (status, h, body) = body_text(head).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "HEAD {key:?}");
-            assert_eq!(h.get("content-type").unwrap(), "application/xml");
-            assert!(h.contains_key("x-amz-request-id"));
-            assert!(h.contains_key("x-amz-id-2"));
-            assert!(body.is_empty());
+            assert_invalid_request_400(head, &format!("HEAD key={key:?}")).await;
         }
-        assert_eq!(fx.stat_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 0);
+        assert_no_backend_calls(&fx, "seam-only invalid keys");
+        // Proof of the claim above: the same text through real routing is a
+        // valid key, not an error. It legitimately reaches the backend, so
+        // the no-call assertion sits before it.
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder().uri("/absolute").body(Body::empty()).unwrap();
+        let (status, _, _) = body_text(router(fx.state.clone()).oneshot(request).await.unwrap()).await;
+        assert_ne!(status, StatusCode::BAD_REQUEST, "routed /absolute is the key `absolute`");
     }
 
+    /// V1 and V2 listing must keep working: the invalid-key fix must not
+    /// turn a legitimate bucket listing into an error.
     #[tokio::test]
     async fn root_router_preserves_v2_and_v1_listing() {
         use crate::backend::{ListEntry, TestMockBackend};
@@ -1845,21 +1892,31 @@ mod tests {
         for (uri, v2) in [("/?list-type=2&delimiter=/", true), ("/?delimiter=/", false)] {
             let request = axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap();
             let (status, h, body) = body_text(router(state.clone()).oneshot(request).await.unwrap()).await;
-            assert_eq!(status, StatusCode::OK);
+            assert_eq!(status, StatusCode::OK, "{uri}");
             assert_eq!(h.get("content-type").unwrap(), "application/xml");
             assert!(body.contains("<ListBucketResult"), "{body}");
             assert!(body.contains("<Name>primary</Name>"), "{body}");
             assert!(body.contains("<Key>listed.bin</Key>"), "{body}");
             assert_eq!(body.contains("<KeyCount>1</KeyCount>"), v2);
         }
-        // Exercise the actual root route, not just the standalone handlers.
+    }
+
+    /// The root route itself answers 400 through real routing, for both
+    /// methods. Kept separate from the listing test: one is the invalid-key
+    /// contract, the other is the list contract, and they change for
+    /// different reasons.
+    #[tokio::test]
+    async fn root_router_answers_400_for_root_get_and_head() {
+        use tower::ServiceExt;
+
+        let fx = fixture(b"unused", None, vec![], false);
         for method in ["GET", "HEAD"] {
             let request = axum::http::Request::builder()
                 .method(method).uri("/").body(Body::empty()).unwrap();
-            let (status, _, body) = body_text(router(state.clone()).oneshot(request).await.unwrap()).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(body.is_empty(), method == "HEAD");
+            let resp = router(fx.state.clone()).oneshot(request).await.unwrap();
+            assert_invalid_request_400(resp, &format!("{method} / via router")).await;
         }
+        assert_no_backend_calls(&fx, "root via router");
     }
 
     /// Router construction smoke test: every route path must survive

@@ -246,8 +246,8 @@ mod tests {
     /// `Other("invalid key: ...")` and must never surface as a 502
     /// upstream failure. Pins all six variants, because the previous
     /// case-sensitive match on the Display text caught only `traversal`.
-    #[test]
-    fn every_key_error_maps_to_400_not_backend_failure() {
+    #[tokio::test]
+    async fn every_key_error_maps_to_400_not_backend_failure() {
         let variants = [
             KeyError::Empty,
             KeyError::Absolute,
@@ -270,7 +270,6 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{label} must be 400");
             assert_eq!(resp.headers().get("content-type").unwrap(), "application/xml");
         }
-        // HEAD keeps the same status with no body.
         let head = error_response(
             BackendError::from(KeyError::Empty),
             "some/key",
@@ -280,6 +279,15 @@ mod tests {
             None,
         );
         assert_eq!(head.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            head.headers().get("content-length").is_none_or(|v| v == "0"),
+            "a HEAD error must not carry a body: {:?}",
+            head.headers().get("content-length")
+        );
+        assert!(
+            axum::body::to_bytes(head.into_body(), 1024).await.unwrap().is_empty(),
+            "HEAD must answer with an empty body"
+        );
         // The SSRF/malformed-response class must keep its backend-failure
         // status: it is not a client key error.
         let resp = error_response(
