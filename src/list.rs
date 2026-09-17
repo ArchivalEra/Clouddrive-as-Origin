@@ -92,6 +92,9 @@ fn open_token(token: &str) -> Option<String> {
 /// Parsed list request. `list_type` selects the wire dialect: V2 only for
 /// the exact string "2"; everything else (including absent) is V1.
 pub(crate) struct ListParams {
+    /// Whether a listing parameter was present at all. Carried here so the
+    /// dispatch decision and the parse are one pass, not two.
+    pub is_list: bool,
     pub is_v2: bool,
     pub prefix: String,
     pub delimiter: Option<String>,
@@ -115,22 +118,27 @@ fn query_get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
-pub(crate) fn is_list_query(query: Option<&str>) -> bool {
-    let Some(q) = query else { return false };
-    // Substring probe instead of a full form-urlencoded parse (P9): the
-    // caller parses for real immediately after, so this was a duplicate
-    // allocation of the whole query.
-    const TRIGGERS: &[&str] = &[
-        "list-type=",
-        "prefix=",
-        "delimiter=",
-        "max-keys=",
-        "continuation-token=",
-        "start-after=",
-        "marker=",
-        "encoding-type=",
-    ];
-    TRIGGERS.iter().any(|t| q.contains(t))
+/// Parameter names that make a request a bucket listing. Matched as whole
+/// parameter NAMES, never as substrings: the substring probe this replaces
+/// treated `?xprefix=1` (which contains `prefix=`) as a listing, so an
+/// object GET carrying an unrelated parameter was routed into the listing
+/// handler and answered with a listing instead of the object.
+const LIST_PARAMS: &[&str] = &[
+    "list-type",
+    "prefix",
+    "delimiter",
+    "max-keys",
+    "continuation-token",
+    "start-after",
+    "marker",
+    "encoding-type",
+];
+
+/// Whether any listing parameter is present, decided from the parsed pairs
+/// so the caller keeps that parse instead of repeating it (the reason the
+/// substring probe existed in the first place).
+fn has_list_param(pairs: &[(String, String)]) -> bool {
+    pairs.iter().any(|(k, _)| LIST_PARAMS.contains(&k.as_str()))
 }
 
 /// Parse errors that map to AWS `InvalidArgument` 400s.
@@ -144,6 +152,7 @@ pub(crate) enum ListParamError {
 impl ListParams {
     pub(crate) fn parse(query: &str) -> Result<Self, ListParamError> {
         let pairs = query_map(query);
+        let is_list = has_list_param(&pairs);
         let encoding_type = query_get(&pairs, "encoding-type");
         let encoding_url = match encoding_type {
             None => false,
@@ -160,6 +169,7 @@ impl ListParams {
             }
         }
         Ok(Self {
+            is_list,
             is_v2: query_get(&pairs, "list-type") == Some("2"),
             prefix: query_get(&pairs, "prefix").unwrap_or("").to_string(),
             delimiter: query_get(&pairs, "delimiter").filter(|s| !s.is_empty()).map(str::to_string),
@@ -296,14 +306,18 @@ pub(crate) async fn try_list<C: Clock + Clone>(
     req_id: &str,
     host_id: &str,
 ) -> Option<Response> {
-    if !is_list_query(query) {
-        return None;
-    }
+    // One parse decides both "is this a listing" and what it asks for. The
+    // probe used to scan the raw query for parameter substrings and the
+    // parse then repeated the work; deciding from the parsed pairs is both
+    // correct (`?xprefix=1` is not a listing) and still a single pass.
     let query = query.unwrap_or("");
     let params = match ListParams::parse(query) {
         Ok(p) => p,
         Err(e) => return Some(invalid_argument(&e, path_key, req_id, host_id)),
     };
+    if !params.is_list {
+        return None;
+    }
     let Some(upstream_id) = resolve_list_bucket(path_key, state) else {
         return Some(no_such_bucket(path_key, req_id, host_id));
     };
@@ -926,13 +940,32 @@ mod tests {
     /// P9: the list trigger is a cheap substring probe, not a full parse,
     /// and it must not fire on unrelated queries.
     #[test]
-    fn is_list_query_probes_without_parsing() {
-        assert!(is_list_query(Some("list-type=2")));
-        assert!(is_list_query(Some("prefix=a/&max-keys=10")));
-        assert!(!is_list_query(Some("foo=bar")));
-        assert!(!is_list_query(Some("")));
-        assert!(!is_list_query(None));
-        assert!(!is_list_query(Some("list-type")));
+    /// The listing dispatch must key on whole parameter NAMES. A substring
+    /// probe routed `?xprefix=1` (it contains `prefix=`) into the listing
+    /// handler, so an object GET with an unrelated parameter was answered
+    /// with a listing; and a value that happens to contain `marker=` did the
+    /// same.
+    #[test]
+    fn listing_dispatch_matches_parameter_names_not_substrings() {
+        let is_list = |q: &str| ListParams::parse(q).map(|p| p.is_list).unwrap_or(true);
+        // Not listings: these merely CONTAIN a parameter name. Asserted
+        // first so a regression reports the defect rather than a detail.
+        assert!(!is_list("xprefix=1"), "xprefix is not prefix");
+        assert!(!is_list("download=1&xmarker=2"), "xmarker is not marker");
+        assert!(!is_list("q=a%26prefix%3D1"), "a value mentioning prefix= is not prefix");
+        assert!(!is_list("foo=bar"));
+        assert!(!is_list(""));
+        // Case matters: S3 parameter names are lowercase, and treating
+        // `PREFIX` as one would answer a listing to an object request.
+        assert!(!is_list("PREFIX=a"));
+        // Real listings.
+        assert!(is_list("list-type=2"));
+        assert!(is_list("prefix=a/&max-keys=10"));
+        assert!(is_list("delimiter=/"));
+        // A bare name is still the parameter, empty-valued, as the query
+        // parser reports it; deciding otherwise would mean splitting on "=",
+        // which is the same substring reasoning this test exists to remove.
+        assert!(is_list("list-type"));
     }
 
     #[tokio::test]
