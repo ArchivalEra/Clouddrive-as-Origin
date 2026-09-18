@@ -22,8 +22,8 @@ Decided after R1–R3 + D1 + ADR 0002. The harness must exercise every item in `
 
 ## Env contract
 
-- **CI (GitHub Actions)**: no real OneDrive; all tests use `wiremock` + accelerated clock + temp `cache_dir`. `cargo test` is the gate.
-- **Pre-launch smoke (OCI VPS, operator)**: one manual run with `ORIGIN_HOST` env, two real OneDrive upstreams (delegated refresh tokens via `*_REFRESH_TOKEN` env, `consumers` tenant), EdgeOne → `${ORIGIN_HOST}` over HTTPS. Verifies device-code bootstrap, real downloadUrl fetch, and `429`/retry behavior against production throttling.
+- **CI (GitHub Actions)**: no real upstream; all tests use `wiremock` + accelerated clock + temp `cache_dir`. `cargo test` is the gate. (No CI config exists in the repo today; `cargo test` is run locally and before a deploy. Recorded 2026-09-17.)
+- **Pre-launch smoke**: retired 2026-09-17. It described two real **OneDrive** upstreams with delegated refresh tokens and device-code bootstrap — the Graph world this project no longer runs. The live equivalent is the deployed node itself: `docs/runbook.md` "Health checks", plus `deploy/measure-client-ttfb.sh` for the client-side budget and `deploy/lab/run-edgeone.sh` for the CDN path.
 - **Real hostname `${ORIGIN_HOST}` and all secrets** remain env-only (never in repo), consistent with the standing rule.
 
 ## Out of scope for this harness
