@@ -11,4 +11,5 @@ pub mod mime;
 pub mod net;
 pub mod response;
 pub mod routing;
+pub mod shutdown;
 pub mod sigv4;
