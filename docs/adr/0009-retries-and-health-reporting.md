@@ -56,9 +56,13 @@ left the watchdog unable to see anything but a dead socket.
    because per-run logging on success made "healthy all along"
    indistinguishable from "the watchdog itself died".
 
-**Not decided here:** an alerting channel. The watchdog writes a local log, so
-a human must read it; that was a deliberate earlier choice and the map keeps
-it in the fog (revisit with multiple nodes).
+**Superseded 2026-09-17:** an alerting channel does exist. The blog-side
+status channel sends a heartbeat every five minutes and a death event on a
+non-clean exit, riding the node's existing cloudflared tunnel, with the far
+side calling the node offline after 15 minutes of silence
+(`docs/status-reporting.md`). What remains true from the note above: the local
+log is still the authoritative record and a human still reads it for anything
+the card does not carry. Revisit with multiple nodes.
 
 ## Consequences
 

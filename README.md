@@ -1,15 +1,18 @@
 # Clouddrive-as-Origin
 
-Pull-through origin cache for OneDrive — a general-purpose image (and
-static-asset) origin that fronts one or more OneDrive accounts via
-Microsoft Graph.
+Pull-through origin cache for cloud drives — a general-purpose
+static-asset origin that fronts one or more drives through OpenList
+(WebDAV). The Microsoft Graph / OneDrive upstream this repo started on is
+gone; the upstream is OpenList today, and the client-facing namespace is flat
+so adding an upstream never changes a URL.
 
 EdgeOne (or any CDN) origin-pulls `GET /<key>` over HTTPS. On hit the
 service streams from local disk; on miss it fetches from the owning
-OneDrive upstream via Graph, streams to the client while writing to
-disk (water-pipe), and caches for 20 minutes of inactivity with
-LRU eviction under a `max_size` cap. See [docs/spec.md](docs/spec.md)
-for the full contract, cache semantics, and acceptance checklist.
+OpenList upstream, streams to the client while writing to disk
+(water-pipe), and caches for 20 minutes of inactivity with LRU eviction
+under a `max_size` cap. See [docs/spec.md](docs/spec.md) for the full
+contract, cache semantics, and the acceptance checklist (verified
+2026-09-17, with evidence named per line).
 
 ## Architecture
 

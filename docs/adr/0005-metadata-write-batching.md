@@ -36,9 +36,22 @@ key. Eviction and expiry did the same per victim.
   same string). Left as is: removing it would be a schema change for a few tens
   of bytes per entry, and the row is rebuilt on startup regardless.
 
-## Not decided here
+## Decided later: the blocking commit moved off the async worker
 
-Whether the blocking commit should move off the async worker
-(`spawn_blocking`). It is a real cost but a separate, smaller change; the
-measurement that would justify it is fsync-wait time on the redb mutex during a
-large flush, which has not been collected.
+Recorded 2026-09-17; the note below had gone stale. Commit `be1b0b7`
+("perf(persist): run redb commits off the async worker") did it: every write
+transaction now runs inside `block_in_place`, which first hands the worker's
+other tasks to a fresh thread, so an fsync no longer parks an async worker
+with other requests queued behind it. The helper checks the runtime flavor and
+runs inline on a current-thread runtime, where `block_in_place` would panic.
+
+**Honest note on the measurement:** this was justified by the mechanism (a
+commit is an fsync, and a 2-core node has few workers to spare) rather than by
+the fsync-wait measurement the note asked for. That measurement is still not
+collected — the change is in and the mechanism is sound, but the number behind
+it is not on record.
+
+**Originally written as not decided here:** whether the blocking commit should
+move off the async worker (`spawn_blocking`). It is a real cost but a
+separate, smaller change; the measurement that would justify it is fsync-wait
+time on the redb mutex during a large flush, which has not been collected.
