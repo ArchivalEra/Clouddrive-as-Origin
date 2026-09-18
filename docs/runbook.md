@@ -47,29 +47,40 @@ SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
 **Rollback**: EdgeOne console → switch origin back to the previous config.
 One click, seconds. No origin-side change needed.
 
-## Restarting: the stop takes about five minutes
+## Restarting: seconds when idle, about five minutes when busy
 
 `systemctl stop` (and therefore every deploy, since a deploy is stop-start)
-needs roughly **305 seconds** to complete. This is Pingora's graceful drain,
-not a hang:
+takes **about 2 seconds when nothing is in flight** and **about 305 seconds
+when something is**. Both were measured on the node; ADR-0011 records the
+decision and the measurements.
 
-- `run_front` accepts SIGTERM, then sleeps Pingora's 300s grace period
-  unconditionally, then spends up to ~10s dropping its runtimes.
-- Both units set `TimeoutStopSec=320s` to cover that. The systemd default is
-  90s, and with the default every stop was escalated to SIGKILL of every
-  thread -- so graceful shutdown never actually ran in production, and a
-  deploy looked like a hard crash to the journal.
+- Pingora stops the listener the instant SIGTERM arrives and then sleeps its
+  300s grace period unconditionally, with no early exit for an idle server.
+  The adaptive path in `src/shutdown.rs` samples the front's in-flight
+  connection count across a 3s settle window: never leaves zero → the process
+  exits immediately (`exiting without the drain window` in the journal);
+  anything in flight → the full drain runs (`connections in flight; draining
+  gracefully`).
+- Both units set `TimeoutStopSec=320s` to cover the drain. The systemd default
+  is 90s, and with the default every stop was escalated to SIGKILL of every
+  thread — graceful shutdown never actually ran, and a deploy looked like a
+  hard crash to the journal.
 - A stop that reports `SERVICE_RESULT=timeout` is therefore a **real
-  failure** now, not the normal path: it means the process did not come down
-  inside a budget that has already been measured to be sufficient.
+  failure**: the budget has been measured to be sufficient, so exceeding it
+  means something is wrong rather than that the stop was ordinary.
+- **A busy stop truncates the tail of what is in flight**, by roughly the
+  data still in the network when the session closes — measured as ~4 MiB of a
+  100 MiB transfer to a client throttled at 1 MB/s, while the same transfer
+  with no restart completed. The drain still extends service a long way (that
+  client reached 98s of a 100s transfer), and it is not a matter of the grace
+  period being short: the front had finished writing the body and the session
+  had ended. A client with a retry resumes. Deploying while a large transfer
+  is running costs that transfer its tail, so prefer a quiet moment.
 - The `ExecStopPost` hook reports every non-clean exit. A successful stop is
   silent and leaves `planned stop, no down report` in the watchdog log.
 - A crash-looping unit is throttled to one down report a minute, so a loop
   cannot flood the receiver.
 
-Shortening the window means lowering Pingora's grace period, which is a
-deliberate trade (draining in-flight transfers versus deploy latency) and has
-not been decided.
 
 ## Provisioning a fresh node
 
