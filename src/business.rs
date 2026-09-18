@@ -592,6 +592,7 @@ where
             "coverage_intervals": coverage_intervals,
             "store": store,
             "rebuilt_rows": snap.rebuilt_rows,
+            "prewarm_inflight": snap.prewarm_inflight,
             "disk_free_bytes": snap.disk_free_bytes,
             "disk_reserve_bytes": snap.disk_reserve_bytes,
             "sigv4_enabled": state.sigv4_config.is_some(),
@@ -627,17 +628,32 @@ where
     if state.cache.entry_exists(&rk.cache_key).await {
         return (StatusCode::OK, Json(json!({"status": "hit"}))).into_response();
     }
-    // Same primitive as the relief valve's background fill: full fetch, no
-    // client attached.
-    match state.cache.prefetch(&rk).await {
-        Ok(()) => (StatusCode::OK, Json(json!({"status": "fetched"}))).into_response(),
-        Err(BackendError::NotFound) => {
-            (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+    // Spec §10: answer immediately, fetch behind the caller. The prewarm
+    // caller is a pipeline warming an object before the CDN asks for it, and
+    // the old shape made it wait out a whole upstream fetch -- minutes for a
+    // large object, with nothing it could do about a failure anyway. The
+    // trade: there is no synchronous 404/502 any more, so the outcome is
+    // reported in the log and counted in healthz instead.
+    let cache = Arc::clone(&state.cache);
+    let warmed = rk.clone();
+    cache.prewarm_inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn(async move {
+        let _inflight = PrewarmInflight(&cache.prewarm_inflight);
+        match cache.prefetch(&warmed).await {
+            Ok(()) => tracing::info!(key = %warmed.cache_key, "prewarm finished"),
+            Err(e) => tracing::warn!(key = %warmed.cache_key, error = %e, "prewarm fetch failed"),
         }
-        Err(e) => {
-            warn!(key = %key, error = %e, "prewarm fetch failed");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": "upstream error"}))).into_response()
-        }
+    });
+    (StatusCode::ACCEPTED, Json(json!({"status": "accepted"}))).into_response()
+}
+
+/// Decrements the in-flight prewarm count on every exit path, including a
+/// panic inside the fetch, so healthz cannot report a phantom queue.
+struct PrewarmInflight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for PrewarmInflight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1292,14 +1308,51 @@ mod tests {
         assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 0);
     }
 
+    /// Spec §10: prewarm answers at once and fetches behind the caller, so
+    /// the row appears after the response, not before it.
     #[tokio::test]
-    async fn prewarm_fetches_via_prefetch() {
+    async fn prewarm_accepts_immediately_and_fetches_in_the_background() {
         let fx = fixture(b"0123456789", None, vec![], false);
         let resp = prewarm(State(fx.state.clone()), Path("w.bin".into()), headers(&[])).await.into_response();
         let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.contains("accepted"), "{body}");
+        for _ in 0..200 {
+            if fx.state.cache.state.read().await.entries.contains_key("w.bin") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            fx.state.cache.state.read().await.entries.contains_key("w.bin"),
+            "the background fetch must still install the row"
+        );
+        // The in-flight count must come back down on its own, or healthz
+        // would report a queue that never drains.
+        for _ in 0..100 {
+            if fx.state.cache.prewarm_inflight.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            fx.state.cache.prewarm_inflight.load(Ordering::SeqCst),
+            0,
+            "the prewarm in-flight count must return to zero"
+        );
+    }
+
+    /// A second prewarm for an object already cached is a synchronous hit;
+    /// nothing new is fetched and nothing is counted as in flight.
+    #[tokio::test]
+    async fn prewarm_reports_a_hit_without_queueing_anything() {
+        let fx = fixture(b"0123456789", None, vec![], false);
+        prime(&fx, "w.bin").await;
+        let resp = prewarm(State(fx.state.clone()), Path("w.bin".into()), headers(&[])).await.into_response();
+        let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("fetched"), "{body}");
-        assert!(fx.state.cache.state.read().await.entries.contains_key("w.bin"));
+        assert!(body.contains("hit"), "{body}");
+        assert_eq!(fx.state.cache.prewarm_inflight.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1630,7 +1683,7 @@ mod tests {
             .await
             .into_response();
         let (status, _, _) = body_text(resp).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::ACCEPTED);
         std::env::remove_var("TEST_PW_SECRET");
     }
 
@@ -1737,15 +1790,23 @@ mod tests {
         assert_eq!(stray_cache_files(&fx), 0);
     }
 
-    /// Nocache prewarm: a no-op fetch (nothing to fill) that still reports
-    /// success; never opens the backend for bytes.
+    /// Nocache prewarm: accepted like any other, but the background fetch is
+    /// a no-op (there is nothing to fill); it never opens the backend and
+    /// installs no row.
     #[tokio::test]
     async fn nocache_prewarm_is_noop() {
         let fx = fixture_nocache(b"0123456789");
         let resp = prewarm(State(fx.state.clone()), Path("w.bin".into()), headers(&[])).await.into_response();
         let (status, _, body) = body_text(resp).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("fetched"), "{body}");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.contains("accepted"), "{body}");
+        // Let the background task run before judging what it did.
+        for _ in 0..20 {
+            if fx.state.cache.prewarm_inflight.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
         assert!(!fx.state.cache.state.read().await.entries.contains_key("w.bin"));
     }

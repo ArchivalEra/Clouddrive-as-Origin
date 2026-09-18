@@ -227,6 +227,8 @@ pub struct CacheSnapshot {
     pub store: crate::cache::persist::StoreState,
     /// Entry rows rebuilt from the object tree after metadata loss (C1).
     pub rebuilt_rows: usize,
+    /// Background prewarm fetches in flight (spec §10).
+    pub prewarm_inflight: usize,
     /// Free bytes on the cache filesystem, when known (C1).
     pub disk_free_bytes: Option<u64>,
     /// The reserve floor cold pulls are held back from (C1).
@@ -272,6 +274,10 @@ pub struct Cache<C: Clock> {
     /// Rows rebuilt from the object tree after metadata loss (C1). Read by
     /// healthz so a rebuild is visible without reading logs.
     pub rebuilt_rows: std::sync::atomic::AtomicUsize,
+    /// Background prewarm fetches in flight (spec §10 asks healthz to report
+    /// the queue depth; prewarm answers immediately and fetches behind the
+    /// caller, so this is the count that stands in for a queue).
+    pub prewarm_inflight: std::sync::atomic::AtomicUsize,
     pub routes: RouteTable,
 }
 
@@ -298,6 +304,7 @@ impl<C: Clock + Clone> Cache<C> {
             listings: Arc::new(Mutex::new(HashMap::new())),
             reval_inflight: Inflight::new(),
             rebuilt_rows: std::sync::atomic::AtomicUsize::new(0),
+            prewarm_inflight: std::sync::atomic::AtomicUsize::new(0),
             routes,
         }
     }
@@ -489,6 +496,7 @@ impl<C: Clock + Clone> Cache<C> {
             coverage_intervals,
             store: self.meta.state().clone(),
             rebuilt_rows: self.rebuilt_rows.load(std::sync::atomic::Ordering::Relaxed),
+            prewarm_inflight: self.prewarm_inflight.load(std::sync::atomic::Ordering::Relaxed),
             disk_free_bytes: store::free_bytes(&self.config.cache_dir),
             disk_reserve_bytes: DISK_RESERVE_BYTES,
         }
