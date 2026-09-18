@@ -150,7 +150,30 @@ async fn main() -> anyhow::Result<()> {
         move || rx.recv().ok()
     });
     tokio::select! {
-        _ = wait_shutdown() => {}
+        _ = wait_shutdown() => {
+            // Adaptive stop (see origin_cache::shutdown): the front plane has
+            // already closed its listener, and Pingora would otherwise sleep
+            // its full 300s grace period even with nothing to drain -- five
+            // minutes of an origin serving nothing, on every deploy. If the
+            // in-flight count stays at zero for a settle window there is
+            // nothing to protect, so exit now and let the supervisor's
+            // TimeoutStopSec=320s remain the budget for the busy path.
+            let action = origin_cache::shutdown::observe_settle(|| {
+                origin_front::CONNECTIONS_ACTIVE.get()
+            })
+            .await;
+            if action == origin_cache::shutdown::StopAction::FastExit {
+                // Note the accepted trade: this skips the business plane's
+                // drain. With no front connections there is no client work in
+                // flight -- only loopback health probes, which a probe client
+                // treats as a miss either way. The settle window also exceeds
+                // the access-clock flush cadence, so pending LRU timestamps
+                // are already committed.
+                info!("no connections in flight; exiting without the drain window");
+                std::process::exit(0);
+            }
+            info!("connections in flight; draining gracefully");
+        }
         msg = front_failure => {
             if let Ok(Some(msg)) = msg {
                 error!(reason = %msg, "front plane is gone; shutting down so the supervisor restarts us");
