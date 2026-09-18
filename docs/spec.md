@@ -462,15 +462,38 @@ repo never contains `${ORIGIN_HOST}`'s real value.
 
 ## 8. Observability
 
+Amended 2026-09-17 to describe what exists, with the two places the original
+text no longer matched called out rather than dropped.
+
 - Structured log, one line per request: `key`, outcome
   (`hit` / `hit-refresh` / `miss` / `stale` / `negative` / `error`),
-  bytes, upstream latency. No token, secret, or full `downloadUrl` in
-  logs.
+  bytes. No token, secret, or full `downloadUrl` in logs. — holds: the front
+  emits a `front access` line (method, path, status, bytes, duration, proto,
+  xff) and the cache an outcome line (key, outcome, size). Upstream latency
+  is a metric rather than a log field:
+  `backend_call_duration_seconds{op}`.
 - Per-minute self-check log: entry count, cached bytes, per-category
-  counts for the last minute.
-- `/healthz` exposes the same counters plus per-upstream token state.
+  counts for the last minute. — **replaced by design.** A per-minute line was
+  noise next to the watchdog's transition-only logging plus one daily `HB`
+  line (see `docs/status-reporting.md`); the same counters are available on
+  demand from `/healthz` and continuously on the metrics endpoint. The quiet
+  log is deliberate: silence means the verdict did not change, and a missing
+  `HB` means the checker itself stopped.
+- `/healthz` exposes the same counters plus per-upstream token state. —
+  **counters yes, token state no.** healthz reports `entries`, `bytes`,
+  `segment_bytes`, `flights_active`, `promotions_active`,
+  `dirty_access_flushes`, `coverage_keys`, `coverage_intervals`,
+  `prewarm_inflight`, `store.state`, `rebuilt_rows`, `disk_free_bytes`,
+  `disk_reserve_bytes`, and per upstream `id` / `profile` / `cold_miss` /
+  `sigv4_layer`. **Known blind spot:** an upstream credential expiring does
+  not move the verdict — healthz probes local serving, so every cold miss can
+  fail with `AuthRequired` while healthz still says `ok` and the status card
+  still says `active`. Today that is visible only in the logs and in
+  `front_requests_total{status="502"}` / `backend_call_duration_seconds` on
+  the metrics endpoint. Candidate ticket; not implemented here.
 - `/_internal/healthz` additionally reports `segment_bytes` (staged,
-  unpromoted efficientcache sidecars).
+  unpromoted efficientcache sidecars). — holds.
+
 
 ## 9. Non-goals (v1 explicitly out of scope)
 
@@ -484,34 +507,83 @@ repo never contains `${ORIGIN_HOST}`'s real value.
 
 ## 10. Acceptance checklist
 
-- [ ] Cold miss TTFB < 1.5 s (typical domestic → VPS) and first byte
+Verified 2026-09-17 against `eaec3f1`. Every line names evidence that can be
+re-run (`cargo test <name>`, or the script path). Two lines were reworded to
+match the implementation and one was retired as vacuous.
+
+- [x] Cold miss TTFB < 1.5 s (typical domestic → VPS) and first byte
       arrives before download completes.
-- [ ] 20 concurrent cold requests for the same `key` → exactly 1 Graph
-      metadata call + 1 download.
-- [ ] 20 min without access (test may use an accelerated clock) →
+      — `deploy/measure-client-ttfb.sh`: measured 2026-09-16 from a domestic
+      client through EdgeOne, 0.66–0.91 s cold, all inside the budget. The
+      script states its own limit: it measures latency, not concurrency.
+      Streaming: `cache::flight::tests::growing_reader_follows_writer`.
+- [x] 20 concurrent cold requests for the same `key` → exactly one upstream
+      metadata call + one download.
+      — `tests/integration.rs::single_flight_20_concurrent_same_key_one_fetch`
+      (asserts the upstream call count).
+- [x] 20 min without access (test may use an accelerated clock) →
       file and metadata both gone, `du` returns to zero.
-- [ ] Fill past `max_size` → eviction order = ascending last-access,
+      — `inactive_ttl_expiry_removes_file_and_meta`,
+      `inactive_expiry_via_tick`,
+      `spawned_reaper_expires_entries_without_manual_tick`.
+- [x] Fill past `max_size` → eviction order = ascending last-access,
       total returns within limit.
-- [ ] After modifying the file on OneDrive: first access outside the
+      — `max_size_evicts_lru_order`, `eviction_picks_lru_victims_in_order`,
+      `entry_count_cap_evicts_lru_even_under_byte_budget`.
+- [x] After modifying the file upstream: first access outside the
       revalidation TTL returns the new content with no interruption.
-- [ ] Upstream `500` → serve stale file with `Warning` when available.
-- [ ] Traversal payloads (`..%2f` etc.) all `400`.
-- [ ] Cache hits and eviction order survive a restart.
-- [ ] Logs and `/healthz` satisfy §8 with zero secret leakage.
-- [ ] Two-upstream routing: keys matching different prefixes hit
+      — `revalidation_uses_stat_and_serves_updated_content`,
+      `revalidation_not_modified_serves_revalidated`.
+- [x] Upstream `500` → serve stale file with `Warning` when available.
+      — `cache::cache::tests::stale_if_error_serves_cached`.
+- [x] Traversal payloads (`..%2f` etc.) all `400`.
+      — `tests/integration.rs::traversal_payloads_are_400_via_fetch_error`
+      (typed since 2026-09-17, not text-matched),
+      `business::tests::invalid_object_keys_are_bad_requests_for_get_and_head`
+      (through the real router),
+      `response::tests::every_key_error_maps_to_400_not_backend_failure`.
+- [x] Cache hits and eviction order survive a restart.
+      — `cache_entries_and_access_clock_survive_restart`; on the live node
+      2026-09-17 a real restart re-served the same object with `entries=1,
+      rebuilt_rows=0`, i.e. the rows came from the store, not a rebuild.
+- [x] Logs and `/healthz` satisfy §8 with zero secret leakage.
+      — §8 as amended below; the status report's field whitelist is asserted
+      by `deploy/oracle/test-watchdog.sh` ("no healthz internals leak").
+- [x] Two-upstream routing: keys matching different prefixes hit
       different upstreams; adding a third upstream requires only a
       config change.
-- [ ] Range: cached file serves `206` via file seek; cold-miss `Range`
+      — `tests/integration.rs::two_upstream_routing_by_prefix`.
+- [x] Range: cached file serves `206` via file seek; cold-miss `Range`
       passes through from the backend at the requested offset (first
       byte before any full download completes) while the background
       full fetch lands a complete cache file — never a partial one.
-- [ ] MIME fallback: `.flac` / `.webp` / `.avif` served with correct
+      — `range_on_cached_file_slices_and_reports_content_range`,
+      `range_cold_miss_offset_zero_streams_full_with_content_range`,
+      `range_cold_miss_dual_channel_passthrough_and_background_fill`,
+      `unsatisfiable_range_rejected`, `short_upstream_body_is_never_sealed`.
+- [x] MIME fallback: `.flac` / `.webp` / `.avif` served with correct
       `Content-Type` even when the provider returns
       `application/octet-stream`.
-- [ ] `prewarm` returns `202` immediately; the background fetch passes
+      — `tests/integration.rs::mime_fallback_overrides_octet_stream`.
+- [x] `prewarm` returns `202` immediately; the background fetch passes
       single-flight (concurrent prewarm + visitor = one upstream fetch)
-      and `healthz` reports the prewarm queue depth.
-- [ ] OpenList backend: PROPFIND stat mapping, ranged streaming GET,
+      and `healthz` reports the in-flight fetch count.
+      — `prewarm_accepts_immediately_and_fetches_in_the_background`,
+      `prewarm_reports_a_hit_without_queueing_anything`,
+      `prewarm_secret_gate_blocks_anonymous`; healthz field
+      `prewarm_inflight`. Reworded 2026-09-17: prewarm has no queue by
+      design, it has fetches in flight, and that count is what healthz
+      reports. Until `eaec3f1` the handler awaited the whole fetch and
+      answered `200`, contradicting §2.
+- [x] OpenList backend: PROPFIND stat mapping, ranged streaming GET,
       error taxonomy (404/401/429) — wiremock-tested end to end.
-- [ ] Restart survival holds with redb (already in §3.10) for BOTH
-      provider types.
+      — `tests/openlist.rs`: `stat_maps_propfind_to_object_meta`,
+      `stat_missing_key_maps_to_not_found`,
+      `stat_bad_credentials_map_to_auth_required`,
+      `open_passes_range_header_and_streams`, `unknown_type_is_rejected`.
+- [~] ~~Restart survival holds with redb (already in §3.10) for BOTH
+      provider types.~~
+      **Retired 2026-09-17**: only one backend type exists (`openlist`;
+      `main.rs` refuses any other), so the cross-provider half of this line
+      cannot fail. Reinstate it if a second type lands.
+
