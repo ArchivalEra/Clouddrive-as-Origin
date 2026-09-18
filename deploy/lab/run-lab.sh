@@ -146,10 +146,17 @@ files=$(ls "$LAB/cache-b" | grep -vc "^redb.db$\|^serve.log$")
 [ "$files" = 0 ] && ok "nocache dir clean" || { bad "nocache stray files: $files"; ls "$LAB/cache-b"; }
 
 note "6. nocache prewarm no-op"
-out=$(H -s -X POST "http://127.0.0.1:7778/_internal/prewarm/media/hello.txt" -H "x-prewarm-token: $PREWARM_SECRET")
-echo "$out" | grep -q fetched && ok "prewarm fetched" || bad "prewarm: $out"
+# Spec §2: a miss answers 202 immediately and fetches behind the caller, so
+# the assertion is on the acceptance and on what the background fetch did
+# (nothing, for a nocache node), not on a synchronous "fetched" body.
+code=$(H -s -o /tmp/lab-prewarm.json -w "%{http_code}" -X POST "http://127.0.0.1:7778/_internal/prewarm/media/hello.txt" -H "x-prewarm-token: $PREWARM_SECRET")
+out=$(cat /tmp/lab-prewarm.json)
+[ "$code" = 202 ] && echo "$out" | grep -q accepted && ok "prewarm accepted (202)" || bad "prewarm: http=$code body=$out"
+sleep 1  # let the background fetch run before judging its side effects
 files=$(ls "$LAB/cache-b" | grep -vc "^redb.db$\|^serve.log$")
 [ "$files" = 0 ] && ok "prewarm wrote nothing" || bad "prewarm wrote files"
+inflight=$(H http://127.0.0.1:7778/_internal/healthz | grep -o '"prewarm_inflight":[0-9]*')
+[ "$inflight" = '"prewarm_inflight":0' ] && ok "prewarm queue drains to zero" || bad "prewarm inflight: $inflight"
 
 note "7. nocache healthz profile"
 out=$(H http://127.0.0.1:7778/_internal/healthz)
