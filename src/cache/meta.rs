@@ -17,6 +17,15 @@ pub struct EntryMeta {
     pub last_revalidated_millis: Option<u64>,
     /// If Some, this is a negative 404 tombstone until that timestamp.
     pub negative_until_millis: Option<u64>,
+    /// A promoted entry's hold, in the clock domain: until this timestamp the
+    /// entry is immune to both the inactivity TTL and being chosen as an
+    /// eviction victim. 0 = no hold.
+    ///
+    /// `serde(default)` is load-bearing: rows written before this field
+    /// existed have no such key, and without a default the whole store would
+    /// fail to deserialize on the first start after an upgrade.
+    #[serde(default)]
+    pub hold_until_millis: u64,
 }
 
 impl EntryMeta {
@@ -24,8 +33,18 @@ impl EntryMeta {
         self.negative_until_millis.map_or(false, |until| now_millis < until)
     }
 
+    /// When this entry becomes eligible for eviction. A held entry reports
+    /// its hold deadline instead, so it sorts LAST in the eviction order --
+    /// protected, but not immortal: when nothing else can bring the cache
+    /// back under budget, the hold yields rather than letting the magazine
+    /// run permanently over its cap.
     pub fn eligible_at(&self, inactive_ttl_secs: u64) -> u64 {
-        self.last_access_millis + inactive_ttl_secs * 1000
+        (self.last_access_millis + inactive_ttl_secs * 1000).max(self.hold_until_millis)
+    }
+
+    /// Whether the hold is still running.
+    pub fn is_held(&self, now_millis: u64) -> bool {
+        self.hold_until_millis > 0 && now_millis < self.hold_until_millis
     }
 }
 
@@ -47,6 +66,7 @@ mod tests {
             last_access_millis: 0,
             last_revalidated_millis: None,
             negative_until_millis: Some(5000),
+            hold_until_millis: 0,
         };
         assert!(m.is_negative(4999));
         assert!(!m.is_negative(5000));
@@ -67,6 +87,7 @@ mod tests {
             last_access_millis: 1000,
             last_revalidated_millis: None,
             negative_until_millis: None,
+            hold_until_millis: 0,
         };
         assert_eq!(m.eligible_at(1200), 1000 + 1200 * 1000);
     }

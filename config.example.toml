@@ -35,6 +35,14 @@ max_entries = 500000              # entry-count budget (ADR-0006); 0 = bytes onl
 inactive_ttl_secs = 1200          # 20 min (spec §3.3)
 revalidate_ttl_secs = 60          # spec §3.5
 negative_ttl_secs = 60            # spec §3.6
+# Hold window for a freshly PROMOTED entry: while it runs, the entry is
+# immune to the inactivity TTL and sorts last for eviction. Assembling a large
+# object costs many upstream fetches and the inactivity clock cannot see that,
+# so without a hold, pausing a video to look elsewhere can sweep the merge you
+# just paid for. It is a deadline, not an exemption: once it passes, normal
+# rules resume, and it yields early rather than let the cache exceed
+# max_size_bytes. 0 = off.
+promoted_hold_secs = 1800         # 30 min
 
 # --- per-upstream throttling ---
 concurrency_per_upstream = 3

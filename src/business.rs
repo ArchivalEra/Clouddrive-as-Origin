@@ -1348,6 +1348,32 @@ mod tests {
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
     }
 
+    /// A staged object the magazine could never keep is not promoted.
+    /// Assembling it would consume the staged segments and hand the cache an
+    /// entry it must eject on the next tick -- destroying warmth it could have
+    /// kept as segments. Coverage is satisfied; only the byte budget says no.
+    #[tokio::test]
+    async fn an_object_larger_than_the_cache_is_never_promoted() {
+        let bytes: Vec<u8> = (0..100u8).collect();
+        // Full coverage in one read, against a 50-byte budget.
+        let fx = base(&bytes).etag(Some("v1")).coverage(0.8, 4).max_size_bytes(50).build();
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("f.bin".into()),
+            headers(&[("range", "bytes=0-99")]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        body_text(resp).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !fx.state.cache.state.read().await.entries.contains_key("f.bin"),
+            "an object bigger than the whole budget must stay staged, never merged"
+        );
+        assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 100)], "and its segments survive");
+    }
+
     /// Window decay: staged intervals older than the coverage
     /// window stop counting — a 60% read, a window expiry, then a 20% read
     /// must NOT promote (coverage decayed to 20%).
