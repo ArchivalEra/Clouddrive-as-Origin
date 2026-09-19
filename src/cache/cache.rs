@@ -2,7 +2,7 @@ use std::{collections::{HashMap, HashSet}, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    backend::{BackendError, BackendRegistry, BackendSlot, ContentRange, DirectUrl, Key, ObjectMeta},
+    backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, ContentRange, DirectUrl, Key, ObjectMeta},
     cache::{
         flight::{self, BodyStream, FlightProgress, FlightShared},
         meta::EntryMeta,
@@ -119,6 +119,40 @@ pub struct PassthroughHit {
     pub content_range: Option<ContentRange>,
     pub content_length: Option<u64>,
     pub body: BodyStream,
+}
+
+/// What one request should be answered with, decided in one place.
+///
+/// The serve-mode decision used to be spread over business.rs (`try_relief_valve`,
+/// `try_nocache`, `try_passthrough`, then the water-pipe) while each mode's
+/// implementation was a separate `Cache` method, so the profile concept had no
+/// locality: a fourth profile meant four files. Here the order lives with the
+/// modes; the caller renders.
+///
+/// The ORDER is load-bearing and is preserved verbatim: the relief valve
+/// first, then the nocache passthrough, then the efficient passthrough, then
+/// the ordinary cached path. Range validation and the 416 precedence stay in
+/// the caller — they are request validation, not mode selection.
+pub enum ServeOutcome {
+    /// Hand the viewer the upstream's own signed link (307).
+    Redirect { location: String },
+    /// Stream these bytes, with the status and headers this path decided.
+    Stream(StreamPlan),
+}
+
+/// The render facts for a streaming answer, taken from whichever path
+/// produced it. Carried explicitly rather than re-derived, because the three
+/// paths disagree on purpose: nocache and the cached path answer 206 only
+/// when a content-range is present, while the efficient passthrough always
+/// answers 206.
+pub struct StreamPlan {
+    pub status: axum::http::StatusCode,
+    pub meta: HitMeta,
+    pub content_range: Option<ContentRange>,
+    pub content_length: Option<u64>,
+    pub body: BodyStream,
+    /// Only the cached path reports this: a stale serve adds `Warning: 110`.
+    pub stale: bool,
 }
 
 pub struct CacheState {
@@ -1005,6 +1039,109 @@ impl<C: Clock + Clone> Cache<C> {
         };
         crate::metrics::observe_serve(label, start);
         out
+    }
+
+    /// Decide how to answer one GET — see [`ServeOutcome`] for the order and
+    /// why the decision lives here rather than in the handler.
+    pub async fn serve(
+        self: &Arc<Self>,
+        rk: &ResolvedKey,
+        range: Option<ByteRange>,
+        viewer_ua: Option<&str>,
+    ) -> Result<ServeOutcome, BackendError> {
+        let prof = self.config.cache_profile(&rk.upstream_id);
+
+        // 1. Relief valve: a redirect-capable upstream hands the viewer its own
+        // signed link and we fill the cache in the background. Hit-first (a
+        // fresh memory entry never redirects), and every failure falls through
+        // -- the valve can only save bandwidth, never break a fetch. The link
+        // must also be a legal header value, or the viewer would receive a
+        // redirect it cannot follow.
+        let redirect_capable = self
+            .config
+            .upstream(&rk.upstream_id)
+            .map(|u| u.cold_miss == crate::config::ColdMiss::Redirect)
+            .unwrap_or(false);
+        if redirect_capable && !self.memory_hit_fresh(&rk.cache_key).await {
+            let link = self
+                .direct_url_bounded(
+                    &rk.upstream_id,
+                    &rk.backend_key,
+                    viewer_ua,
+                    std::time::Duration::from_secs(8),
+                )
+                .await;
+            if let Some(link) = link {
+                if crate::backend::redirect_target_allowed(&link.url)
+                    && link.url.parse::<axum::http::HeaderValue>().is_ok()
+                {
+                    let cache = Arc::clone(self);
+                    let rk_owned = rk.clone();
+                    tokio::spawn(async move {
+                        let _ = cache.prefetch(&rk_owned).await;
+                    });
+                    return Ok(ServeOutcome::Redirect { location: link.url });
+                }
+            }
+        }
+
+        // 2. Nocache profile: pure water-pipe, no disk, no stale-if-error.
+        if prof.nocache {
+            if let Ok(hit) = self.serve_nocache(rk, range).await {
+                tracing::info!(key = %rk.cache_key, size = hit.meta.size, "nocache passthrough response");
+                return Ok(ServeOutcome::Stream(StreamPlan {
+                    // 206 only when a range was actually honoured.
+                    status: if hit.content_range.is_some() {
+                        axum::http::StatusCode::PARTIAL_CONTENT
+                    } else {
+                        axum::http::StatusCode::OK
+                    },
+                    meta: hit.meta,
+                    content_range: hit.content_range,
+                    content_length: hit.content_length,
+                    body: hit.body,
+                    stale: false,
+                }));
+            }
+        }
+
+        // 3. Efficient profile: a ranged miss streams origin bytes while the
+        // served interval is staged. Always 206 (this path only runs with a
+        // range); a fresh entry is served from disk instead.
+        if prof.efficient && range.is_some() && !self.memory_hit_fresh(&rk.cache_key).await {
+            if let Ok(hit) = self.serve_passthrough(rk, range, prof.min_file_size).await {
+                tracing::info!(key = %rk.cache_key, size = hit.meta.size, "passthrough response");
+                return Ok(ServeOutcome::Stream(StreamPlan {
+                    status: axum::http::StatusCode::PARTIAL_CONTENT,
+                    meta: hit.meta,
+                    content_range: hit.content_range,
+                    content_length: hit.content_length,
+                    body: hit.body,
+                    stale: false,
+                }));
+            }
+        }
+
+        // 4. The ordinary cached path.
+        let hit = self.get_resolved(rk, range).await?;
+        tracing::info!(
+            key = %rk.cache_key,
+            outcome = ?hit.outcome,
+            size = hit.meta.size,
+            "cache response"
+        );
+        Ok(ServeOutcome::Stream(StreamPlan {
+            status: if hit.content_range.is_some() {
+                axum::http::StatusCode::PARTIAL_CONTENT
+            } else {
+                axum::http::StatusCode::OK
+            },
+            meta: hit.meta,
+            content_range: hit.content_range,
+            content_length: hit.content_length,
+            body: hit.body,
+            stale: hit.outcome == CacheOutcome::Stale,
+        }))
     }
 
     async fn get_resolved_inner(

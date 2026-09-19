@@ -10,17 +10,15 @@ use serde_json::json;
 use std::{
     net::SocketAddr,
     sync::Arc,
-    time::Duration,
 };
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{
     backend::{BackendError, ByteRange, ContentRange},
-    cache::cache::{Cache, CacheOutcome},
+    cache::cache::{Cache, ServeOutcome},
     clock::Clock,
-    config::{ColdMiss, Config},
-    key::ResolvedKey,
+    config::Config,
     response::{error_response, invalid_key_response, request_ids, s3_meta_headers},
     sigv4,
 };
@@ -165,53 +163,6 @@ fn parse_client_range(headers: &HeaderMap) -> Result<ClientRange, ()> {
 /// Every failure (disabled, unsupported, rejected target, slow link)
 /// silently falls through to the water-pipe — the valve can only save
 /// bandwidth, never break a fetch.
-async fn try_relief_valve<C: Clock + Clone>(
-    state: &AppState<C>,
-    rk: &ResolvedKey,
-    headers: &HeaderMap,
-) -> Option<Response> {
-    let redirect = state
-        .config
-        .upstream(&rk.upstream_id)
-        .map(|u| u.cold_miss == ColdMiss::Redirect)
-        .unwrap_or(false);
-    if !redirect {
-        return None;
-    }
-    if state.cache.memory_hit_fresh(&rk.cache_key).await {
-        return None;
-    }
-    let ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
-    // Bound the link round-trips: a slow link source must not stall the
-    // viewer before the proxy fallback engages.
-    let link = state
-        .cache
-        .direct_url_bounded(&rk.upstream_id, &rk.backend_key, ua, Duration::from_secs(8))
-        .await?;
-    if !crate::backend::redirect_target_allowed(&link.url) {
-        return None;
-    }
-    // Fill in background; the viewer leaves now.
-    let cache = Arc::clone(&state.cache);
-    let rk_owned = rk.clone();
-    tokio::spawn(async move {
-        let _ = cache.prefetch(&rk_owned).await;
-    });
-    let (req_id, host_id) = request_ids();
-    let location: axum::http::HeaderValue = link.url.parse().ok()?;
-    Some(
-        Response::builder()
-            .status(StatusCode::TEMPORARY_REDIRECT)
-            .header("location", location)
-            // The 307 itself must never be edge-cached: the signed target
-            // expires while the URL stays the same.
-            .header("cache-control", "no-store")
-            .header("x-amz-request-id", req_id)
-            .header("x-amz-id-2", host_id)
-            .body(Body::empty())
-            .unwrap(),
-    )
-}
 
 async fn get_key<C>(
     State(state): State<AppState<C>>,
@@ -293,11 +244,6 @@ where
         }
         Ok(r) => r,
     };
-    // A relief valve: cold + redirect-capable upstreams leave via 307
-    // (hits never redirect — checked inside). Falls through to proxy.
-    if let Some(redirect) = try_relief_valve(&state, &rk, &headers).await {
-        return redirect;
-    }
     // Suffix ranges need the object size up front: one lightweight stat
     // (memory or single PROPFIND — never a flight).
     let range = match parsed {
@@ -320,32 +266,13 @@ where
         }
     };
 
-    if let Some(passthrough) = try_nocache(&state, &rk, range, &req_id, &host_id).await {
-        return passthrough;
-    }
-    if let Some(passthrough) = try_passthrough(&state, &rk, range, &req_id, &host_id).await {
-        return passthrough;
-    }
-
-    match state.cache.get_resolved(&rk, range).await {
-        Ok(hit) => {
-            let status =
-                if hit.content_range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
-            info!(key = %key, outcome = ?hit.outcome, size = hit.meta.size, "cache response");
-
-            let mut builder = Response::builder().status(status);
-            if let Some(cr) = &hit.content_range {
-                builder = builder.header("content-range", cr.header_value());
-            }
-            if let Some(len) = hit.content_length {
-                builder = builder.header("content-length", len);
-            }
-            builder = s3_meta_headers(builder, &hit.meta, &req_id, &host_id);
-            if hit.outcome == CacheOutcome::Stale {
-                builder = builder.header("warning", "110 - \"Response is Stale\"");
-            }
-            builder.body(Body::from_stream(hit.body)).unwrap()
-        }
+    // One decision, rendered here. The serve-mode order (relief valve →
+    // nocache → efficient passthrough → cached) lives in `Cache::serve`,
+    // because it is profile semantics and profile semantics had four homes.
+    let viewer_ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    match state.cache.serve(&rk, range, viewer_ua).await {
+        Ok(ServeOutcome::Redirect { location }) => redirect_response(location, &req_id, &host_id),
+        Ok(ServeOutcome::Stream(plan)) => stream_response(plan, &req_id, &host_id),
         Err(e) => {
             // Size hint for 416 Content-Range: best-effort memory peek, no
             // upstream call (SHOULD-level per R1).
@@ -355,66 +282,54 @@ where
     }
 }
 
+/// The 307 the relief valve asks for: the upstream's own signed link.
+///
+/// `no-store` because the signed target expires while the URL stays the same,
+/// so an edge that cached this would hand out dead links.
+fn redirect_response(location: String, req_id: &str, host_id: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header("location", location)
+        .header("cache-control", "no-store")
+        .header("x-amz-request-id", req_id)
+        .header("x-amz-id-2", host_id)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Render whatever `Cache::serve` decided to stream. The status and the
+/// content-range came from the path that produced the bytes, not from here:
+/// nocache and the cached path answer 206 only when a range was honoured,
+/// while the efficient passthrough always does.
+fn stream_response(
+    plan: crate::cache::cache::StreamPlan,
+    req_id: &str,
+    host_id: &str,
+) -> Response {
+    let mut builder = Response::builder().status(plan.status);
+    if let Some(cr) = &plan.content_range {
+        builder = builder.header("content-range", cr.header_value());
+    }
+    if let Some(len) = plan.content_length {
+        builder = builder.header("content-length", len);
+    }
+    builder = s3_meta_headers(builder, &plan.meta, req_id, host_id);
+    if plan.stale {
+        builder = builder.header("warning", "110 - \"Response is Stale\"");
+    }
+    builder.body(Body::from_stream(plan.body)).unwrap()
+}
+
 /// Nocache profile (small-footprint nodes): every GET water-pipes
 /// origin-to-viewer with zero disk writes — no entries, no flights, no
 /// segments, no tombstones. Range or not, cold or not: everything goes
 /// through; only header metadata is stat'd. Every failure surfaces via
 /// the standard error mapping (no stale-if-error: there is no disk copy).
-async fn try_nocache<C: Clock + Clone>(
-    state: &AppState<C>,
-    rk: &ResolvedKey,
-    range: Option<ByteRange>,
-    req_id: &str,
-    host_id: &str,
-) -> Option<Response> {
-    let prof = state.config.cache_profile(&rk.upstream_id);
-    if !prof.nocache {
-        return None;
-    }
-    let hit = state.cache.serve_nocache(rk, range).await.ok()?;
-    info!(key = %rk.cache_key, size = hit.meta.size, "nocache passthrough response");
-    let status = if hit.content_range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK };
-    let mut builder = Response::builder().status(status);
-    if let Some(cr) = &hit.content_range {
-        builder = builder.header("content-range", cr.header_value());
-    }
-    if let Some(len) = hit.content_length {
-        builder = builder.header("content-length", len);
-    }
-    builder = s3_meta_headers(builder, &hit.meta, req_id, host_id);
-    Some(builder.body(Body::from_stream(hit.body)).unwrap())
-}
 
 /// Efficient profile (P2-a): ranged misses passthrough origin straight to
 /// the viewer while staging the served interval (no flight, no full fill).
 /// Fresh entries serve from disk via the B path below; every failure here
 /// falls through to it (stale-if-error included).
-async fn try_passthrough<C: Clock + Clone>(
-    state: &AppState<C>,
-    rk: &ResolvedKey,
-    range: Option<ByteRange>,
-    req_id: &str,
-    host_id: &str,
-) -> Option<Response> {
-    let prof = state.config.cache_profile(&rk.upstream_id);
-    if !prof.efficient || range.is_none() {
-        return None;
-    }
-    if state.cache.memory_hit_fresh(&rk.cache_key).await {
-        return None;
-    }
-    let hit = state.cache.serve_passthrough(rk, range, prof.min_file_size).await.ok()?;
-    info!(key = %rk.cache_key, size = hit.meta.size, "passthrough response");
-    let mut builder = Response::builder().status(StatusCode::PARTIAL_CONTENT);
-    if let Some(cr) = &hit.content_range {
-        builder = builder.header("content-range", cr.header_value());
-    }
-    if let Some(len) = hit.content_length {
-        builder = builder.header("content-length", len);
-    }
-    builder = s3_meta_headers(builder, &hit.meta, req_id, host_id);
-    Some(builder.body(Body::from_stream(hit.body)).unwrap())
-}
 
 /// HEAD: headers identical to GET, always 200 on success (even when ranged),
 /// always an empty body. Served from memory meta or a single stat — never a
@@ -967,6 +882,81 @@ mod tests {
         assert_eq!(h.get("content-length").unwrap(), "4");
         assert_eq!(h.get("content-range").unwrap(), "bytes 2-5/10");
         assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// HEAD never takes the relief valve, and this is the one difference
+    /// between the two entry points that no test pinned: a redirect-capable
+    /// upstream that makes GET answer 307 leaves HEAD answering 200, because
+    /// a HEAD cannot follow a redirect and still report the object's shape.
+    /// Pinned deliberately -- if the two paths are ever unified, the choice
+    /// has to be made on purpose rather than by accident.
+    #[tokio::test]
+    async fn head_never_redirects_even_when_get_does() {
+        let fx = fixture_full(
+            b"0123456789",
+            None,
+            vec![],
+            false,
+            Some("https://cdn.example.com/f?sign=x"),
+            true,
+        );
+        let get = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let (status, _, _) = body_text(get).await;
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "GET uses the valve");
+        let probes_after_get = fx.direct_calls.load(Ordering::SeqCst);
+        assert_eq!(probes_after_get, 1, "the valve probed the link once");
+
+        let head = head_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let (status, h, body) = body_text(head).await;
+        assert_eq!(status, StatusCode::OK, "HEAD does not redirect");
+        assert!(body.is_empty());
+        assert_eq!(h.get("content-length").unwrap(), "10");
+        // And it does not even ask the backend for a link.
+        assert_eq!(
+            fx.direct_calls.load(Ordering::SeqCst),
+            probes_after_get,
+            "HEAD adds no link probe"
+        );
+    }
+
+    /// HEAD on a nocache profile does not go through the GET passthrough: it
+    /// reports the object's shape from a stat, writing nothing to disk. Pinned
+    /// because the GET path for this profile is a different code path
+    /// (`serve_nocache`), and the two must stay behaviourally consistent
+    /// without sharing an implementation.
+    #[tokio::test]
+    async fn head_on_nocache_reports_shape_without_touching_disk() {
+        let fx = fixture_nocache(b"0123456789");
+        let resp = head_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let (status, h, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+        assert_eq!(h.get("content-length").unwrap(), "10");
+        assert_eq!(fx.stat_calls.load(Ordering::SeqCst), 1, "one stat, no bytes");
+        assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
+        assert!(staged_segments(&fx, "a.bin").is_empty(), "nocache stages nothing");
+        assert_eq!(stray_cache_files(&fx), 0, "and writes nothing");
     }
 
     #[tokio::test]
