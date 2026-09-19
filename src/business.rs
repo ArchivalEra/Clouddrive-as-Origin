@@ -957,20 +957,13 @@ mod tests {
     }
 
     /// Segment sidecars currently staged for `key` (test introspection).
+    /// Goes through the store rather than re-deriving the filename shape:
+    /// that rule has exactly one owner, and this helper used to be a copy.
     fn staged_segments(fx: &Fixture, key: &str) -> Vec<(u64, u64)> {
-        let prefix = format!(".seg.{}.", crate::cache::store::escape_key(key));
-        let mut out = Vec::new();
-        let rd = std::fs::read_dir(&fx.state.config.cache_dir).unwrap();
-        for entry in rd.filter_map(|e| e.ok()) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&prefix) {
-                let range = name[prefix.len()..].to_string();
-                let (s, e) = range.split_once('-').unwrap();
-                out.push((s.parse().unwrap(), e.parse().unwrap()));
-            }
-        }
-        out.sort();
-        out
+        crate::cache::store::segments_for_key(&fx.state.config.cache_dir, key)
+            .into_iter()
+            .map(|(start, end, _)| (start, end))
+            .collect()
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -1736,7 +1729,7 @@ mod tests {
         std::fs::read_dir(fx.state.config.cache_dir.clone())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy() != "redb.db")
+            .filter(|e| e.file_name().to_string_lossy() != crate::cache::store::META_STORE_FILE)
             .count()
     }
 

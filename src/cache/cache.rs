@@ -1555,7 +1555,7 @@ async fn finalize_coverage(
         if version_changed {
             // New bytes already sealed above: keep this file, drop the rest.
             let fresh = store::seg_path(&span.cache_dir, &span.key, span.start, span.end);
-            remove_key_segments(&span.cache_dir, &span.key, Some(&fresh));
+            store::remove_key_segments(&span.cache_dir, &span.key, Some(&fresh));
             *entry = store::Coverage::default();
         }
         if span.etag.is_some() {
@@ -1589,25 +1589,6 @@ async fn finalize_coverage(
         let _ = tokio::fs::write(store::segmeta_path(&span.cache_dir, &span.key), b).await;
     }
     state.write().await.segment_bytes += span.bytes;
-}
-
-/// Drop a key's completed segments + version marker (etag reset path).
-/// In-flight `.segpart.*` files are left alone (concurrent transfers).
-fn remove_key_segments(cache_dir: &std::path::Path, key: &str, keep: Option<&std::path::Path>) {
-    let esc = store::escape_key(key);
-    let prefix = format!(".seg.{esc}.");
-    if let Ok(rd) = std::fs::read_dir(cache_dir) {
-        for entry in rd.filter_map(|e| e.ok()) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&prefix) {
-                if keep.is_some_and(|k| entry.path() == k) {
-                    continue;
-                }
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-    let _ = std::fs::remove_file(store::segmeta_path(cache_dir, key));
 }
 
 /// Full history reset for one key: drop staged files + version marker +
@@ -1763,15 +1744,9 @@ async fn assemble_file(
     tmp: &std::path::Path,
 ) -> bool {
     use tokio::io::AsyncWriteExt;
-    // Index segment files by interval (parsed names only).
-    let mut segs: Vec<(u64, u64, std::path::PathBuf)> = Vec::new();
-    for path in store::key_segment_files(cache_dir, key) {
-        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        if let Some((_, s, e)) = store::parse_seg_name(&name) {
-            segs.push((s, e, path));
-        }
-    }
-    segs.sort();
+    // Index segment files by interval; the store parses the names so the
+    // filename shape is not re-derived here.
+    let segs = store::segments_for_key(cache_dir, key);
     let mut out = match tokio::fs::File::create(tmp).await {
         Ok(f) => f,
         Err(_) => return false,

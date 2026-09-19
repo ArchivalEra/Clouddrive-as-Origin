@@ -464,6 +464,40 @@ pub fn key_segment_files(cache_dir: &Path, key: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// A key's completed segments as `(start, end, path)`, with the name parsed
+/// here so no caller re-derives the filename shape.
+pub fn segments_for_key(cache_dir: &Path, key: &str) -> Vec<(u64, u64, PathBuf)> {
+    let mut out: Vec<(u64, u64, PathBuf)> = key_segment_files(cache_dir, key)
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            parse_seg_name(&name).map(|(_, start, end)| (start, end, path))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Drop a key's completed segments and its version marker (the etag-reset
+/// path). In-flight `.segpart.*` files are left alone: a concurrent transfer
+/// still owns them.
+///
+/// `keep` names the one segment to preserve — the one being promoted.
+///
+/// This lives here rather than at the caller because the filename shape is
+/// this module's rule. Re-deriving it by hand is the class of bug that once
+/// let a sweep reach the metadata store, and it is why the prefix is spelled
+/// exactly once (`seg_path`) instead of in a `format!` at each use site.
+pub fn remove_key_segments(cache_dir: &Path, key: &str, keep: Option<&Path>) {
+    for path in key_segment_files(cache_dir, key) {
+        if keep.is_some_and(|k| k == path.as_path()) {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    let _ = std::fs::remove_file(segmeta_path(cache_dir, key));
+}
+
 /// Completed segments grouped by key, built in ONE top-level pass (P4).
 /// The reaper used to call [`key_segment_files`] per expired key, so one
 /// tick cost O(expired × cache size); this costs one directory read.
@@ -594,6 +628,51 @@ mod tests {
         install_tmp(&nested_tmp, &nested, dir.path()).expect("a nested name is not the store");
         assert_eq!(std::fs::read(&nested).unwrap(), b"a real object");
         assert_eq!(std::fs::read(&live).unwrap(), b"the real database");
+    }
+
+    /// The reset path must drop a key's segments and its version marker, keep the
+    /// one segment being promoted, and — the part that matters most — never
+    /// touch anything that is not this key's. `segments_for_key` is the same
+    /// rule the sweeps use, so a name that parses as another key's segment is
+    /// left alone.
+    #[test]
+    fn remove_key_segments_keeps_the_promoted_segment_and_others_keys() {
+        let dir = tempdir().unwrap();
+        let kept = seg_path(dir.path(), "v/f.bin", 0, 30);
+        let dropped = seg_path(dir.path(), "v/f.bin", 30, 60);
+        let other = seg_path(dir.path(), "v/g.bin", 0, 30);
+        let meta = segmeta_path(dir.path(), "v/f.bin");
+        for path in [&kept, &dropped, &other, &meta] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        // The metadata store sits in the same directory and must survive.
+        let store = dir.path().join(META_STORE_FILE);
+        std::fs::write(&store, b"database").unwrap();
+
+        remove_key_segments(dir.path(), "v/f.bin", Some(&kept));
+
+        assert!(kept.exists(), "the promoted segment must be kept");
+        assert!(!dropped.exists(), "the other segments of this key must go");
+        assert!(!meta.exists(), "the version marker must go with them");
+        assert!(other.exists(), "another key's segments are not ours to delete");
+        assert!(store.exists(), "the metadata store must never be swept");
+    }
+
+    /// The parsed view the assembly and test helpers use: sorted, and only
+    /// names that really are segment names.
+    #[test]
+    fn segments_for_key_reports_parsed_intervals_in_order() {
+        let dir = tempdir().unwrap();
+        std::fs::write(seg_path(dir.path(), "v/f.bin", 50, 80), b"x").unwrap();
+        std::fs::write(seg_path(dir.path(), "v/f.bin", 0, 30), b"x").unwrap();
+        // Junk with the right prefix is not a segment.
+        std::fs::write(dir.path().join(".seg.v%2Ff.bin.garbage"), b"x").unwrap();
+        std::fs::write(seg_path(dir.path(), "v/g.bin", 0, 10), b"x").unwrap();
+
+        let segs = segments_for_key(dir.path(), "v/f.bin");
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!((segs[0].0, segs[0].1), (0, 30), "sorted by start");
+        assert_eq!((segs[1].0, segs[1].1), (50, 80));
     }
 
     #[test]
