@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
@@ -347,7 +347,6 @@ pub struct CacheSnapshot {
     /// the number that explains a `total_bytes` above `max_size_bytes`.
     pub stray_bytes: u64,
     pub flights_active: usize,
-    pub promotions_active: usize,
     pub dirty_access_pending: usize,
     /// Coverage-ledger rows and their total interval count (P10: the
     /// ledger is the other structure that grows with distinct scrubbed
@@ -395,7 +394,6 @@ pub struct Cache<C: Clock> {
     pub coverage: Arc<Mutex<HashMap<String, store::Coverage>>>,
     /// Keys with a promotion task in flight (P2-b single-flight: threshold
     /// re-hits while promoting attach to nothing — the task re-verifies).
-    pub promotions: Arc<Mutex<HashSet<String>>>,
     /// The magazine: every byte-budget decision (admission, eviction,
     /// pressure reclaim, install, delete) lives behind this receiver.
     pub(crate) magazine: Magazine,
@@ -425,15 +423,11 @@ impl<C: Clock + Clone> Cache<C> {
         let dirty_access = Arc::new(AccessClock::new());
         let state = Arc::new(RwLock::new(CacheState::default()));
         let coverage = Arc::new(Mutex::new(HashMap::new()));
-        let promotions = Arc::new(Mutex::new(HashSet::new()));
         let magazine = Magazine::new(Arc::clone(&state), Arc::clone(&config), Arc::clone(&meta));
         let staging = Staging::new(
             Arc::clone(&coverage),
             Arc::clone(&state),
             Arc::clone(&config),
-            backends.clone(),
-            Arc::clone(&promotions),
-            magazine.clone(),
         );
         Self {
             config,
@@ -444,7 +438,6 @@ impl<C: Clock + Clone> Cache<C> {
             dirty_access,
             flights: crate::cache::flight::Flights::new(crate::cache::flight::DEFAULT_STALL_BUDGET),
             coverage,
-            promotions,
             staging,
             reval_inflight: Inflight::new(),
             rebuilt_rows: std::sync::atomic::AtomicUsize::new(0),
@@ -560,7 +553,6 @@ impl<C: Clock + Clone> Cache<C> {
                         last_access_millis: now,
                         last_revalidated_millis: None,
                         negative_until_millis: None,
-                        hold_until_millis: 0,
                         // Metadata loss leaves nothing but the size, so the
                         // size rule is the only information available: a
                         // rebuilt row larger than the budget is admitted as
@@ -639,7 +631,6 @@ impl<C: Clock + Clone> Cache<C> {
             segment_bytes,
             stray_bytes,
             flights_active: self.flights.active().await,
-            promotions_active: self.promotions.lock().await.len(),
             dirty_access_pending: self.dirty_access.pending(),
             coverage_keys,
             coverage_intervals,
@@ -1126,7 +1117,7 @@ impl<C: Clock + Clone> Cache<C> {
             let fetch_start = fetch_start;
             let seg = store::seg_path(&cache_dir, &cache_key, fetch_start, end);
             let clock = Arc::clone(&clock);
-            let staging = staging.clone();
+            let staging = self.staging.clone();
             let cache_dir = cache_dir.clone();
             let cache_key = cache_key.clone();
             let backend_key = backend_key.clone();
@@ -1154,7 +1145,7 @@ impl<C: Clock + Clone> Cache<C> {
                             // Seal it here.
                             let _ = tokio::fs::rename(&segpart, &seg).await;
                             staging
-                                .seal_and_maybe_promote(FinalizedSpan {
+                                .seal_span(FinalizedSpan {
                                     cache_dir,
                                     key: cache_key,
                                     backend_key,
@@ -1228,7 +1219,7 @@ impl<C: Clock + Clone> Cache<C> {
                 let seg = store::seg_path(&cache_dir, &cache_key, fetch_start, fetch_start + written);
                 let _ = tokio::fs::rename(&segpart, &seg).await;
                 staging
-                    .seal_and_maybe_promote(FinalizedSpan {
+                    .seal_span(FinalizedSpan {
                         cache_dir,
                         key: cache_key,
                         backend_key,
@@ -1943,7 +1934,7 @@ async fn drive_flight<C: Clock>(
     match outcome {
         Ok(meta) => {
             magazine
-                .install(&entry_key, &upstream_id, &meta, clock.now_millis(), 0, oversize)
+                .install(&entry_key, &upstream_id, &meta, clock.now_millis(), oversize)
                 .await;
             let _ = flight.progress_tx.send(FlightProgress::Done);
         }
@@ -2016,7 +2007,6 @@ mod tests {
                     last_access_millis: 0,
                     last_revalidated_millis: None,
                     negative_until_millis: None,
-                    hold_until_millis: 0,
                     oversize: false,
                 })
                 .await
@@ -2108,70 +2098,6 @@ mod tests {
             BodySource::Disk,
             "the second read is served from the file on this node"
         );
-    }
-
-    /// A promoted entry carries a hold, armed only by the promotion path.
-    /// It is immune to the inactivity TTL while the hold runs, and normal TTL
-    /// rules resume when it expires -- otherwise pausing a video long enough
-    /// to look elsewhere would sweep the merge that was just paid for.
-    #[tokio::test]
-    async fn a_promoted_entry_is_held_against_inactivity_expiry() {
-        let dir = tempdir().unwrap();
-        let mut cfg = Config::default();
-        cfg.cache_dir = dir.path().to_path_buf();
-        cfg.inactive_ttl_secs = 10;
-        cfg.promoted_hold_secs = 100;
-        let cfg = Arc::new(cfg);
-        let clock = Arc::new(MockClock::new(0));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let backend = crate::testsupport::MockBackend::counting(vec![], None, Arc::clone(&calls), None);
-        let mut slots = HashMap::new();
-        slots.insert("primary".to_string(), Arc::new(BackendSlot::new(Arc::new(backend), 3)));
-        let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), BackendRegistry::new(slots));
-
-        let meta = ObjectMeta { size_bytes: 10, etag: None, last_modified: None, mime_hint: None };
-        // As the promotion path writes it: a deadline 100 s out.
-        cache
-            .magazine
-            .install("held.bin", "primary", &meta, 0, 100_000, false)
-            .await;
-
-        clock.advance(20_000); // past the inactivity TTL, well inside the hold
-        cache.tick().await;
-        assert!(
-            cache.state.read().await.entries.contains_key("held.bin"),
-            "the hold must survive the inactivity TTL"
-        );
-
-        clock.advance(100_000); // past the hold itself
-        cache.tick().await;
-        assert!(
-            !cache.state.read().await.entries.contains_key("held.bin"),
-            "after the hold, normal TTL rules apply again"
-        );
-    }
-
-    #[tokio::test]
-    async fn negative_cache_and_expiry_via_tick() {
-        let dir = tempdir().unwrap();
-        let mut cfg = Config::default();
-        cfg.cache_dir = dir.path().to_path_buf();
-        cfg.negative_ttl_secs = 2;
-        let cfg = Arc::new(cfg);
-        let clock = Arc::new(MockClock::new(0));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let backend = crate::testsupport::MockBackend::counting(vec![], None, Arc::clone(&calls), Some(BackendError::NotFound));
-        let mut slots = HashMap::new();
-        slots.insert(
-            "primary".to_string(),
-            Arc::new(BackendSlot::new(Arc::new(backend), 3)),
-        );
-        let cache = Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots));
-        assert!(matches!(cache.get_by_key("missing.png", None).await, Err(BackendError::NotFound)));
-        assert!(matches!(cache.get_by_key("missing.png", None).await, Err(BackendError::NotFound)));
-        clock.advance(3000);
-        cache.tick().await;
-        assert!(matches!(cache.get_by_key("missing.png", None).await, Err(BackendError::NotFound)));
     }
 
     #[tokio::test]

@@ -805,7 +805,7 @@ async fn efficient_passthrough_waits_for_a_stream_permit() {
     cfg.upstreams[0].cache_profile = "efficient".into();
     cfg.cache_profiles.insert(
         "efficient".into(),
-        CacheProfile { coverage_threshold: 0.9, min_file_size: 1, coverage_window_secs: 3600 },
+        CacheProfile { min_file_size: 1, coverage_window_secs: 3600 },
     );
     let cfg = Arc::new(cfg);
 

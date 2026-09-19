@@ -64,10 +64,6 @@ fn default_cache_profile() -> String {
     "standard".into()
 }
 
-fn default_coverage_threshold() -> f64 {
-    0.8
-}
-
 fn default_min_file_size() -> u64 {
     64 * 1024 * 1024
 }
@@ -77,10 +73,6 @@ fn default_min_file_size() -> u64 {
 /// costs many upstream fetches, and the 20-minute inactivity clock has no way
 /// to know that: pause a video to look at something else and the merge you
 /// just paid for is swept. 0 disables the hold.
-fn default_promoted_hold_secs() -> u64 {
-    1800
-}
-
 fn default_coverage_window_secs() -> u64 {
     3600
 }
@@ -94,8 +86,6 @@ fn default_coverage_window_secs() -> u64 {
 /// stale partial reads never accumulate into a promotion.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RawCacheProfile {
-    #[serde(default = "default_coverage_threshold")]
-    pub coverage_threshold: f64,
     #[serde(default = "default_min_file_size")]
     pub min_file_size: u64,
     #[serde(default = "default_coverage_window_secs")]
@@ -105,7 +95,6 @@ pub struct RawCacheProfile {
 /// Validated fill-policy profile.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheProfile {
-    pub coverage_threshold: f64,
     pub min_file_size: u64,
     pub coverage_window_secs: u64,
 }
@@ -120,18 +109,17 @@ pub struct CacheProfile {
 pub struct EffectiveProfile {
     pub efficient: bool,
     pub nocache: bool,
-    pub coverage_threshold: f64,
     pub min_file_size: u64,
     pub coverage_window_secs: u64,
 }
 
 impl EffectiveProfile {
     pub fn standard() -> Self {
-        Self { efficient: false, nocache: false, coverage_threshold: default_coverage_threshold(), min_file_size: default_min_file_size(), coverage_window_secs: default_coverage_window_secs() }
+        Self { efficient: false, nocache: false, min_file_size: default_min_file_size(), coverage_window_secs: default_coverage_window_secs() }
     }
 
     pub fn nocache() -> Self {
-        Self { efficient: false, nocache: true, coverage_threshold: 0.0, min_file_size: 0, coverage_window_secs: 0 }
+        Self { efficient: false, nocache: true, min_file_size: 0, coverage_window_secs: 0 }
     }
 }
 
@@ -216,8 +204,6 @@ pub struct RawConfig {
     #[serde(default = "default_negative_ttl")]
     pub negative_ttl_secs: u64,
     /// Hold window for a freshly promoted entry; 0 disables it.
-    #[serde(default = "default_promoted_hold_secs")]
-    pub promoted_hold_secs: u64,
     #[serde(default = "default_concurrency")]
     #[serde(alias = "graph_concurrency_per_upstream")]
     pub concurrency_per_upstream: usize,
@@ -284,8 +270,6 @@ pub struct Config {
     pub revalidate_ttl_secs: u64,
     pub negative_ttl_secs: u64,
     /// Hold window granted to a freshly promoted entry (see
-    /// [`default_promoted_hold_secs`]); 0 disables it.
-    pub promoted_hold_secs: u64,
     pub concurrency_per_upstream: usize,
     pub retry_max_attempts: u32,
     pub retry_base_ms: u64,
@@ -334,7 +318,6 @@ impl Config {
                 Some(p) => EffectiveProfile {
                     efficient: true,
                     nocache: false,
-                    coverage_threshold: p.coverage_threshold,
                     min_file_size: p.min_file_size,
                     coverage_window_secs: p.coverage_window_secs,
                 },
@@ -421,20 +404,13 @@ impl Config {
                 }
             }
         }
-        // Fill-policy profiles: threshold sanity + every non-standard
-        // reference resolves. Fail fast at boot, not on first miss.
+        // Fill-policy profiles: every non-standard reference resolves. Fail
+        // fast at boot, not on first miss.
         let mut profiles = HashMap::new();
         for (name, raw) in &raw.cache_profiles {
-            if !(raw.coverage_threshold > 0.0 && raw.coverage_threshold <= 1.0) {
-                anyhow::bail!(
-                    "cache_profiles.{name}: coverage_threshold must be in (0, 1], got {}",
-                    raw.coverage_threshold
-                );
-            }
             profiles.insert(
                 name.clone(),
                 CacheProfile {
-                    coverage_threshold: raw.coverage_threshold,
                     min_file_size: raw.min_file_size,
                     coverage_window_secs: raw.coverage_window_secs,
                 },
@@ -478,7 +454,6 @@ impl Config {
             inactive_ttl_secs: raw.inactive_ttl_secs,
             revalidate_ttl_secs: raw.revalidate_ttl_secs,
             negative_ttl_secs: raw.negative_ttl_secs,
-            promoted_hold_secs: raw.promoted_hold_secs,
             concurrency_per_upstream: raw.concurrency_per_upstream,
             retry_max_attempts: raw.retry_max_attempts,
             retry_base_ms: raw.retry_base_ms,
@@ -510,7 +485,6 @@ impl Default for Config {
             inactive_ttl_secs: default_inactive_ttl(),
             revalidate_ttl_secs: default_revalidate_ttl(),
             negative_ttl_secs: default_negative_ttl(),
-            promoted_hold_secs: default_promoted_hold_secs(),
             concurrency_per_upstream: default_concurrency(),
             retry_max_attempts: default_retry_max(),
             retry_base_ms: default_retry_base(),
@@ -642,7 +616,6 @@ mod tests {
             cache_profile = "eff"
 
             [cache_profiles.eff]
-            coverage_threshold = 0.5
             coverage_window_secs = 0
 
             [[routes]]
@@ -781,27 +754,16 @@ mod tests {
 
     #[test]
     fn efficient_profile_validates() {
-        let ok = profile_toml("[cache_profiles.efficient]\ncoverage_threshold = 0.8", "cache_profile = \"efficient\"");
+        let ok = profile_toml("[cache_profiles.efficient]\nmin_file_size = 4", "cache_profile = \"efficient\"");
         let cfg = Config::from_toml_str(&ok).unwrap();
         let p = cfg.cache_profile("a");
         assert!(p.efficient);
-        assert_eq!(p.coverage_threshold, 0.8);
         // Standard is the default everywhere.
         assert!(!Config::from_toml_str(&upstream_toml("http://127.0.0.1:5244/dav")).unwrap().cache_profile("a").efficient);
     }
 
     #[test]
-    fn profile_threshold_and_reference_validated() {
-        let bad_threshold = profile_toml(
-            "[cache_profiles.efficient]\ncoverage_threshold = 1.5",
-            "cache_profile = \"efficient\"",
-        );
-        assert!(Config::from_toml_str(&bad_threshold).is_err());
-        let zero_threshold = profile_toml(
-            "[cache_profiles.efficient]\ncoverage_threshold = 0.0",
-            "cache_profile = \"efficient\"",
-        );
-        assert!(Config::from_toml_str(&zero_threshold).is_err());
+    fn profile_reference_validated() {
         let dangling = profile_toml("", "cache_profile = \"ghost\"");
         assert!(Config::from_toml_str(&dangling).is_err());
     }

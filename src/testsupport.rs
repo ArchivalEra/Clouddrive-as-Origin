@@ -583,7 +583,7 @@ pub struct FixtureBuilder {
     direct: Option<String>,
     redirect: bool,
     profile: Option<String>,
-    coverage: Option<(f64, u64)>,
+    coverage: Option<u64>,
     max_size_bytes: Option<u64>,
     mime: Option<String>,
     last_modified: Option<String>,
@@ -641,9 +641,9 @@ impl FixtureBuilder {
     }
 
     /// Efficient-profile knobs; implies `profile("efficient")`.
-    pub fn coverage(mut self, threshold: f64, min_file_size: u64) -> Self {
+    pub fn coverage(mut self, min_file_size: u64) -> Self {
         self.profile = Some("efficient".into());
-        self.coverage = Some((threshold, min_file_size));
+        self.coverage = Some(min_file_size);
         self
     }
     pub fn mime(mut self, mime: Option<&str>) -> Self {
@@ -667,10 +667,10 @@ impl FixtureBuilder {
         if let Some(profile) = &self.profile {
             cfg.upstreams[0].cache_profile = profile.clone();
         }
-        if let Some((threshold, min_file_size)) = self.coverage {
+        if let Some(min_file_size) = self.coverage {
             cfg.cache_profiles.insert(
                 "efficient".into(),
-                CacheProfile { coverage_threshold: threshold, min_file_size, coverage_window_secs: 3600 },
+                CacheProfile { min_file_size, coverage_window_secs: 3600 },
             );
         }
 
