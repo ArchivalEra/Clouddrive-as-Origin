@@ -16,6 +16,7 @@
 //! The listing path is metadata-only: it never touches the object cache
 //! (no flights, no staging, no prewarm).
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use std::sync::Arc;
@@ -139,6 +140,57 @@ const LIST_PARAMS: &[&str] = &[
 /// substring probe existed in the first place).
 fn has_list_param(pairs: &[(String, String)]) -> bool {
     pairs.iter().any(|(k, _)| LIST_PARAMS.contains(&k.as_str()))
+}
+
+/// How long one upstream walk is reused for paging (P9).
+pub const LISTING_SNAPSHOT_TTL_MS: u64 = 5_000;
+
+/// Short-TTL memo of one upstream listing walk, keyed by
+/// `(upstream, folder, recursive)`.
+///
+/// Lives beside the listing logic rather than on `Cache`: there it was a pair
+/// of methods with exactly one caller, while the key is entirely a listing
+/// concept. `now_millis` comes from the caller — the house idiom in
+/// `Inflight` and `Flights` — so this holds no clock of its own.
+#[derive(Clone, Default)]
+pub struct ListingCache {
+    rows: Arc<tokio::sync::Mutex<HashMap<(String, String, bool), (u64, Arc<Vec<ListEntry>>)>>>,
+}
+
+impl ListingCache {
+    /// A snapshot younger than the TTL, if any. Hands out the `Arc`, not a
+    /// copy (O5): a 50k-entry walk used to be re-allocated for every page while
+    /// only a page's worth was rendered.
+    pub async fn get(
+        &self,
+        upstream: &str,
+        folder: &str,
+        recursive: bool,
+        now_millis: u64,
+    ) -> Option<Arc<Vec<ListEntry>>> {
+        let g = self.rows.lock().await;
+        g.get(&(upstream.to_string(), folder.to_string(), recursive))
+            .filter(|(at, _)| now_millis.saturating_sub(*at) < LISTING_SNAPSHOT_TTL_MS)
+            .map(|(_, v)| Arc::clone(v))
+    }
+
+    /// Record a fresh walk for paging reuse, dropping expired rows first so the
+    /// map stays bounded by the live TTL window.
+    pub async fn put(
+        &self,
+        upstream: &str,
+        folder: &str,
+        recursive: bool,
+        entries: &[ListEntry],
+        now_millis: u64,
+    ) {
+        let mut g = self.rows.lock().await;
+        g.retain(|_, (at, _)| now_millis.saturating_sub(*at) < LISTING_SNAPSHOT_TTL_MS);
+        g.insert(
+            (upstream.to_string(), folder.to_string(), recursive),
+            (now_millis, Arc::new(entries.to_vec())),
+        );
+    }
 }
 
 /// Parse errors that map to AWS `InvalidArgument` 400s.
@@ -339,7 +391,8 @@ pub(crate) async fn try_list<C: Clock + Clone>(
     // filtered locally), so page k cost the same as page 1. Each page now
     // slices one walk held briefly on the Cache. A large recursive walk is
     // also the expensive case, so this is where the win is largest.
-    let entries: Arc<Vec<ListEntry>> = match state.cache.list_snapshot(&upstream_id, folder, recursive).await {
+    let now_millis = state.cache.clock.now_millis();
+    let entries: Arc<Vec<ListEntry>> = match state.listings.get(&upstream_id, folder, recursive, now_millis).await {
         Some(e) => e,
         None => {
             // The listing is a metadata path but still hits the upstream —
@@ -349,7 +402,7 @@ pub(crate) async fn try_list<C: Clock + Clone>(
             let _permit = slot.gate.acquire().await;
             match slot.backend.list(folder, recursive).await {
                 Ok(e) => {
-                    state.cache.store_list_snapshot(&upstream_id, folder, recursive, &e).await;
+                    state.listings.put(&upstream_id, folder, recursive, &e, now_millis).await;
                     Arc::new(e)
                 }
                 // A missing folder is an empty listing: S3 prefixes are
@@ -698,7 +751,7 @@ fn no_such_bucket(path_key: &str, req_id: &str, host_id: &str) -> Response {
 mod tests {
     use super::*;
     use crate::{
-        backend::{BackendRegistry, BackendSlot, TestMockBackend},
+        backend::{BackendRegistry, BackendSlot},
         clock::MockClock,
         config::Config,
         response::request_ids,
@@ -724,7 +777,7 @@ mod tests {
         let mut slots: HashMap<String, Arc<BackendSlot>> = HashMap::new();
         slots.insert(
             "primary".into(),
-            Arc::new(BackendSlot::new(Arc::new(TestMockBackend::new(b"x", None, None).with_listing(primary)), 3)),
+            Arc::new(BackendSlot::new(Arc::new(crate::testsupport::MockBackend::new(b"x", None, None).with_listing(primary)), 3)),
         );
         for (id, listing) in extras {
             let mut u = cfg.upstreams[0].clone();
@@ -732,7 +785,7 @@ mod tests {
             cfg.upstreams.push(u);
             slots.insert(
                 id.into(),
-                Arc::new(BackendSlot::new(Arc::new(TestMockBackend::new(b"x", None, None).with_listing(listing)), 3)),
+                Arc::new(BackendSlot::new(Arc::new(crate::testsupport::MockBackend::new(b"x", None, None).with_listing(listing)), 3)),
             );
         }
         let cache = Arc::new(crate::cache::cache::Cache::new(
@@ -740,7 +793,7 @@ mod tests {
             Arc::new(MockClock::new(0)),
             BackendRegistry::new(slots),
         ));
-        AppState { cache, config: Arc::new(cfg), sigv4_config: None }
+        AppState { cache, config: Arc::new(cfg), sigv4_config: None, listings: Default::default() }
     }
 
     async fn list_at(state: &AppState<MockClock>, path: &str, query: &str) -> (StatusCode, axum::http::HeaderMap, String) {

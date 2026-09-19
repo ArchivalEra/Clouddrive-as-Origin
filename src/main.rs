@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         cache,
         config: Arc::clone(&cfg),
         sigv4_config: origin_cache::sigv4::SigV4Config::from_env(),
+        listings: Default::default(),
     };
 
     if cfg.prewarm_shared_secret_env.is_none() {
