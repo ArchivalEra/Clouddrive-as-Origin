@@ -108,6 +108,10 @@ impl PercentDecodePath for str {
 pub struct AppState<C: Clock + Clone> {
     pub cache: Arc<Cache<C>>,
     pub config: Arc<Config>,
+    /// Short-TTL memo of one upstream listing walk, for S3 list paging (P9).
+    /// Owned by the listing module rather than by `Cache`: the key is a
+    /// listing concept and `Cache` had a pair of methods with one caller.
+    pub listings: crate::list::ListingCache,
     /// Inbound SigV4 credentials (named env vars, read once at boot).
     /// `None` = anonymous-first everywhere (the #28 default).
     pub sigv4_config: Option<sigv4::SigV4Config>,
@@ -1441,6 +1445,7 @@ mod tests {
             cache: fx.state.cache.clone(),
             config: Arc::new(cfg),
             sigv4_config: None,
+            listings: Default::default(),
         };
         // Wrong token: rejected.
         let resp = prewarm(State(state.clone()), Path("w.bin".into()), headers(&[("x-prewarm-token", "wrong")]))
@@ -1696,6 +1701,7 @@ mod tests {
             )),
             config: Arc::clone(&fx.state.config),
             sigv4_config: None,
+            listings: Default::default(),
         };
         for (uri, v2) in [("/?list-type=2&delimiter=/", true), ("/?delimiter=/", false)] {
             let request = axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap();

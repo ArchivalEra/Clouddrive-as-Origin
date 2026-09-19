@@ -892,22 +892,27 @@ async fn listing_snapshot_is_reused_then_expires() {
         ListEntry { key: "a/1.bin".into(), size: 1, etag: None, last_modified: None, is_dir: false },
         ListEntry { key: "a/2.bin".into(), size: 2, etag: None, last_modified: None, is_dir: false },
     ];
-    assert!(cache.list_snapshot("up", "a/", true).await.is_none(), "cold snapshot is empty");
-    cache.store_list_snapshot("up", "a/", true, &entries).await;
+    // The memo lives beside the listing logic now, not on the cache, and it
+    // takes `now` from its caller rather than holding a clock.
+    let listings = origin_cache::list::ListingCache::default();
+    let at = |clock: &MockClock| clock.now_millis();
 
-    let got = cache.list_snapshot("up", "a/", true).await.expect("snapshot present");
+    assert!(listings.get("up", "a/", true, at(&clock)).await.is_none(), "cold snapshot is empty");
+    listings.put("up", "a/", true, &entries, at(&clock)).await;
+
+    let got = listings.get("up", "a/", true, at(&clock)).await.expect("snapshot present");
     assert_eq!(*got, entries, "the second page sees the same walk");
     // The snapshot is shared, not copied (O5): the returned handle must
     // alias the stored one, not a fresh vector.
-    let again = cache.list_snapshot("up", "a/", true).await.unwrap();
+    let again = listings.get("up", "a/", true, at(&clock)).await.unwrap();
     assert!(Arc::ptr_eq(&got, &again), "pages must share one snapshot allocation");
 
     // Different selector = different snapshot.
-    assert!(cache.list_snapshot("up", "a/", false).await.is_none());
+    assert!(listings.get("up", "a/", false, at(&clock)).await.is_none());
 
     // After the TTL it is gone.
     clock.advance(6_000);
-    assert!(cache.list_snapshot("up", "a/", true).await.is_none(), "snapshot expired");
+    assert!(listings.get("up", "a/", true, at(&clock)).await.is_none(), "snapshot expired");
 }
 
 // ---------------------------------------------------------------------------
