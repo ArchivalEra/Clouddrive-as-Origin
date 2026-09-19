@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc};
-use tokio::sync::Semaphore;
 
 use tempfile::tempdir;
 
@@ -66,7 +65,7 @@ async fn single_flight_20_concurrent_same_key_one_fetch() {
     for _ in 0..20 {
         let c = Arc::clone(&cache);
         handles.push(tokio::spawn(async move {
-            let mut hit = c.get_by_key("same.png", None).await?;
+            let hit = c.get_by_key("same.png", None).await?;
             let mut body = hit.body;
             origin_cache::cache::flight::drain(&mut body)
                 .await
@@ -624,7 +623,7 @@ async fn flight_failure_reaches_attached_readers_and_clears_map() {
             // failure reaching the client; neither may hang.
             match cache.get_by_key("flaky.bin", None).await {
                 Err(_) => (Vec::new(), true),
-                Ok(mut hit) => read_body_allow_error(hit.body).await,
+                Ok(hit) => read_body_allow_error(hit.body).await,
             }
         }));
     }
@@ -669,7 +668,7 @@ async fn panicked_driver_fails_flight_and_releases_key() {
     // surfacing is fine; hanging forever is not.
     let errored = match outcome {
         Err(_) => true,
-        Ok(mut hit) => read_body_allow_error(hit.body).await.1,
+        Ok(hit) => read_body_allow_error(hit.body).await.1,
     };
     assert!(errored, "panic must surface as an error");
     wait_map_empty(&cache).await;
@@ -701,7 +700,7 @@ async fn short_upstream_body_is_never_sealed() {
 
     let (out, errored) = match cache.get_by_key("short.bin", None).await {
         Err(_) => (Vec::new(), true),
-        Ok(mut hit) => read_body_allow_error(hit.body).await,
+        Ok(hit) => read_body_allow_error(hit.body).await,
     };
     assert!(errored, "short body must surface as an error");
     assert!(out.len() <= 50, "at most the bytes that did land reach the reader");
@@ -1130,7 +1129,7 @@ async fn efficient_passthrough_waits_for_a_stream_permit() {
 async fn listing_snapshot_is_reused_then_expires() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
-    let cache = Arc::new(Cache::new(
+    let _cache = Arc::new(Cache::new(
         test_config(dir.path().to_path_buf()),
         Arc::clone(&clock),
         registry_with(Arc::new(CountingBackend::counting(b"x".to_vec(), None, Arc::new(AtomicUsize::new(0)), None))),
