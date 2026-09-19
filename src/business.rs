@@ -204,6 +204,11 @@ where
     C: Clock + Clone,
 {
     let (req_id, host_id) = request_ids();
+    // First body byte minus this instant is the number that says whether a
+    // seek felt smooth (see `metrics::BODY_TTFB`). It is taken before the
+    // SigV4 gate so the sample covers everything the viewer waited for,
+    // including the parts that never reach the cache.
+    let started = std::time::Instant::now();
     // Inbound SigV4 gate (#28): optional verify-if-present. The raw URI
     // path is exactly what the client signed; the business path may be
     // percent-decoded.
@@ -272,7 +277,7 @@ where
     let viewer_ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
     match state.cache.serve(&rk, range, viewer_ua).await {
         Ok(ServeOutcome::Redirect { location }) => redirect_response(location, &req_id, &host_id),
-        Ok(ServeOutcome::Stream(plan)) => stream_response(plan, &req_id, &host_id),
+        Ok(ServeOutcome::Stream(plan)) => stream_response(plan, &req_id, &host_id, started),
         Err(e) => {
             // Size hint for 416 Content-Range: best-effort memory peek, no
             // upstream call (SHOULD-level per R1).
@@ -305,6 +310,7 @@ fn stream_response(
     plan: crate::cache::cache::StreamPlan,
     req_id: &str,
     host_id: &str,
+    started: std::time::Instant,
 ) -> Response {
     let mut builder = Response::builder().status(plan.status);
     if let Some(cr) = &plan.content_range {
@@ -317,7 +323,41 @@ fn stream_response(
     if plan.stale {
         builder = builder.header("warning", "110 - \"Response is Stale\"");
     }
-    builder.body(Body::from_stream(plan.body)).unwrap()
+    let source = plan.source.label();
+    crate::metrics::observe_source(source);
+    builder
+        .body(Body::from_stream(instrument_body(plan.body, source, started)))
+        .unwrap()
+}
+
+/// Wrap a body so the viewer's actual wait and byte count are measured.
+///
+/// `metrics::CACHE_SERVE` stops at response construction (every observed
+/// function returns an unconsumed body), so the transfer needs its own
+/// instrument: this records the time to the first byte — the seek-smoothness
+/// number — and the bytes delivered, both labelled by where the bytes came
+/// from. A body that never yields still reports zero bytes.
+fn instrument_body(
+    body: crate::cache::flight::BodyStream,
+    source: &'static str,
+    started: std::time::Instant,
+) -> crate::cache::flight::BodyStream {
+    use futures::StreamExt;
+    Box::pin(async_stream::try_stream! {
+        let mut body = body;
+        let mut first = true;
+        let mut delivered: u64 = 0;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            if first {
+                first = false;
+                crate::metrics::observe_body_ttfb(source, started);
+            }
+            delivered += chunk.len() as u64;
+            yield chunk;
+        }
+        crate::metrics::observe_body_bytes(source, delivered);
+    })
 }
 
 /// Nocache profile (small-footprint nodes): every GET water-pipes
@@ -1797,5 +1837,80 @@ mod tests {
     async fn router_constructs_without_panic() {
         let fx = fixture(b"0123456789", None, vec![], false);
         let _app = router(fx.state.clone());
+    }
+
+    /// Read one counter's current value for a source label. The registry is
+    /// process-global and the tests share it, so callers assert on the
+    /// INCREASE, which concurrent increments can only make larger.
+    fn body_bytes(source: &str) -> f64 {
+        prometheus::gather()
+            .iter()
+            .find(|f| f.get_name() == "cache_body_bytes_total")
+            .and_then(|f| {
+                f.get_metric().iter().find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.get_name() == "source" && l.get_value() == source)
+                })
+            })
+            .map(|m| m.get_counter().get_value())
+            .unwrap_or(0.0)
+    }
+
+    /// The body wrapper must not change a byte, and it must count what it
+    /// delivered. `cache_serve_duration_seconds` stops at response
+    /// construction, so without this wrapper a viewer's actual transfer —
+    /// and its time to first byte — is invisible.
+    #[tokio::test]
+    async fn instrument_body_delivers_every_byte_and_counts_it() {
+        use futures::StreamExt;
+
+        let before = body_bytes("upstream");
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+            Ok(bytes::Bytes::from_static(b"abc")),
+            Ok(bytes::Bytes::from_static(b"de")),
+        ];
+        let body: crate::cache::flight::BodyStream = Box::pin(futures::stream::iter(chunks));
+        let mut wrapped = instrument_body(body, "upstream", std::time::Instant::now());
+
+        let mut out = Vec::new();
+        while let Some(chunk) = wrapped.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(out, b"abcde", "the wrapper must be transparent");
+        assert!(
+            body_bytes("upstream") - before >= 5.0,
+            "every delivered byte must be counted against its source"
+        );
+    }
+
+    /// And the HTTP path must actually label its responses: the wrapper
+    /// only reports what `stream_response` told it. Only the positive claim
+    /// is asserted — the registry is process-global, so any "and not that
+    /// other source" assertion would race with the tests running beside
+    /// this one. Exact attribution is pinned by
+    /// `cache::cache::tests::serve_labels_the_bytes_with_their_source`,
+    /// which reads the plan instead of the counters.
+    #[tokio::test]
+    async fn http_get_records_its_byte_source() {
+        let fx = fixture(b"0123456789", None, vec![], false);
+        let before_disk = body_bytes("disk");
+        prime(&fx, "a.bin").await;
+        reset(&fx);
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "0123456789");
+        assert!(
+            body_bytes("disk") - before_disk >= 10.0,
+            "a hit is disk bytes and must be counted as such"
+        );
     }
 }
