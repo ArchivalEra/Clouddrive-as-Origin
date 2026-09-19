@@ -222,6 +222,19 @@ sudo systemctl restart openlist
 origin-cache serves stale-if-error from disk while OpenList is down
 (standard profile); nocache profile has no disk fallback (by design).
 
+## Node acceptance after a deploy
+
+`deploy/oracle/accept.sh` is the post-deploy gate: it polls readiness, then
+asserts the serving contract (GET 200 / range 206 with a content-range /
+HEAD), key handling (reserved names 400, nested look-alikes 404), the
+healthz surfaces (`stray_bytes` present, verdict `ok`), the three body
+metrics on the front plane's `/metrics`, the watchdog report endpoint, and
+that every unit is active with `systemctl --failed` empty.
+
+```sh
+scp deploy/oracle/accept.sh <node>:/home/opc/ && ssh <node> 'bash accept.sh'
+```
+
 ## Health checks
 
 The health endpoints live on the **business plane's loopback ports** (plain

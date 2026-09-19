@@ -529,7 +529,6 @@ pub fn run_front(opts: FrontOptions) -> anyhow::Result<()> {
     }
 
     server.run_forever();
-    Ok(())
 }
 
 #[cfg(test)]

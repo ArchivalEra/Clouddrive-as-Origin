@@ -12,7 +12,27 @@ OpenList upstream, streams to the client while writing to disk
 (water-pipe), and caches for 20 minutes of inactivity with LRU eviction
 under a `max_size` cap. See [docs/spec.md](docs/spec.md) for the full
 contract, cache semantics, and the acceptance checklist (verified
-2026-09-17, with evidence named per line).
+2026-09-17, with evidence named per line; §10 gains nine admission-round
+lines on 2026-09-19).
+
+Three things the one-paragraph summary above leaves out (2026-09-19):
+
+* **Fill policy is per upstream** (`cache_profile`): `standard` is the
+  water-pipe described above; `efficient` stages the served ranges of
+  ranged misses as sidecars and promotes a key once coverage passes a
+  threshold; `nocache` is pure streaming with zero disk writes.
+* **The magazine only governs what fits.** An object larger than
+  `max_size_bytes` cannot be brought into budget by evicting anyone, so it
+  is admitted as a *resident stray*: cached while the disk allows it,
+  outside the byte budget, reclaimed by the inactivity clock. `bytes` in
+  healthz can therefore legitimately exceed `max_size_bytes` by
+  `stray_bytes` (ADR-0013/0014).
+* **Observability:** `/_internal/healthz` reports the cache state
+  (`entries`, `bytes`, `stray_bytes`, `segment_bytes`, disk headroom, …),
+  and the front plane's `/metrics` exposes
+  `cache_serve_source_total{source}` and
+  `cache_body_ttfb_seconds{source}` — the pair that says whether seeking
+  is served from this node's disk or from upstream.
 
 ## Architecture
 

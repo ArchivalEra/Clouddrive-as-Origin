@@ -373,7 +373,7 @@ pub struct Cache<C: Clock> {
     /// Keys with a promotion task in flight (P2-b single-flight: threshold
     /// re-hits while promoting attach to nothing — the task re-verifies).
     pub promotions: Arc<Mutex<HashSet<String>>>,
-    pub reval_inflight: Inflight<StatData, BackendError>,
+    pub(crate) reval_inflight: Inflight<StatData, BackendError>,
     /// Rows rebuilt from the object tree after metadata loss (C1). Read by
     /// healthz so a rebuild is visible without reading logs.
     pub rebuilt_rows: std::sync::atomic::AtomicUsize,
@@ -385,7 +385,7 @@ pub struct Cache<C: Clock> {
 }
 
 #[derive(Debug, Clone)]
-struct StatData {
+pub(crate) struct StatData {
     meta: ObjectMeta,
 }
 
@@ -1772,9 +1772,13 @@ impl<C: Clock + Clone> Cache<C> {
     }
 
     /// Drive both reapers: inactive expiry + max_size LRU. Called by `tick()`.
-    /// Lock discipline: the state guard and the coverage mutex are never
-    /// held together (finalize takes them coverage→state; inverting here
-    /// would deadlock).
+    /// Lock discipline is ORDERING, not exclusion: the coverage mutex is
+    /// always taken BEFORE any state guard, and never the reverse. Every
+    /// site follows it (finalize 1959→2001, reset 2020→2022, and the
+    /// staged-victim block below, which holds coverage across a state READ).
+    /// Inverting the order deadlocks. Nothing enforces this but the layout —
+    /// see ADR-0008 and the magazine/staging module split that is meant to
+    /// make it structural.
     pub async fn tick(&self) {
         let now = self.clock.now_millis();
         let ttl_ms = self.config.inactive_ttl_secs * 1000;

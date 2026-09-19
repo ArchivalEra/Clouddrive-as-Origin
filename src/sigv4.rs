@@ -35,9 +35,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 // Canonical primitives (s3s sig_v4/methods.rs port).
 // ---------------------------------------------------------------------------
 
-const EMPTY_STRING_SHA256_HASH: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
 /// AWS SigV4 custom URI encoding (RFC 3986 unreserved + AWS's additions).
 fn uri_encode(output: &mut String, input: &str, encode_slash: bool) {
     fn to_hex(x: u8) -> u8 {
