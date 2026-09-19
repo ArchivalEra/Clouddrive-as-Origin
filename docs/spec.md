@@ -125,11 +125,15 @@ repo** — it is injected at runtime via an environment variable (e.g.
    minutes pass with no access, delete the file and its metadata.
    Any access resets the clock.
 
-4. **max_size eviction:** when total cached bytes exceed
-   `max_size` (default 100 GiB, configurable), evict entries in order
-   of **earliest expiry = earliest last-access** until usage is back
-   within the limit — i.e. LRU. Eviction must remove metadata and, if
-   the parent directory becomes empty, prune it.
+4. **max_size eviction (magazine):** the cache is a magazine, not a
+   hoard: it holds what fits and ejects the oldest to make room. When
+   total cached bytes exceed `max_size` (default 100 GiB, configurable),
+   evict entries in order of **earliest expiry = earliest last-access**
+   until usage is back within the limit — i.e. LRU. Staged sidecars are
+   in the same budget as entries (ADR-0007), so a partially-watched large
+   object competes for room on the same terms as a complete one, and the
+   magazine ejects whichever was touched longest ago. Eviction must remove
+   metadata and, if the parent directory becomes empty, prune it.
 
 5. **Revalidation on access (no background polling):** an entry that is
    present but older than a short TTL (default 60 s, configurable)
