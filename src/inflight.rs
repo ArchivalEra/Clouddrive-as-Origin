@@ -39,7 +39,7 @@ impl<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Infligh
         };
         let res = cell.get_or_init(|| f()).await.clone();
         {
-            let mut guard = self.cells.lock().await;
+            let guard = self.cells.lock().await;
             if let Some(c) = guard.get(&key) {
                 if Arc::ptr_eq(c, &cell) {
                     // Cooldown: keep the cell alive briefly so staggered

@@ -1,6 +1,5 @@
 use anyhow::Context;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use origin_cache::{

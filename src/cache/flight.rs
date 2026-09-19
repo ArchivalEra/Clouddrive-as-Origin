@@ -397,7 +397,7 @@ pub async fn pump_and_seal(
     // Any failure past this point must remove the temp file (P56): the old
     // shape left it behind on read/write/flush errors, and the startup-only
     // sweep meant the leak persisted until the next restart.
-    let mut fail_cleanup = |e: BackendError| async {
+    let fail_cleanup = |e: BackendError| async {
         let _ = tokio::fs::remove_file(tmp_path).await;
         e
     };
