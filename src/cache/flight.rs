@@ -199,45 +199,18 @@ pub fn file_body(path: std::path::PathBuf, offset: u64, len: u64) -> BodyStream 
     })
 }
 
-/// Stream a file while its driver writes it. Retries `File::open` until
-/// the driver creates the temp file, follows the growing length, and
-/// terminates on Done (EOF) or Failed.
-/// Follow the flight's growing temp file from `start`, yielding at most
-/// `len` bytes (None = to end). This is the single reader for BOTH
-/// whole-file and ranged cold misses: a ranged request waits for the
-/// writer to reach its offset instead of opening a second upstream
-/// connection.
-///
-/// Why converge instead of passing ranged reads through: every upstream
-/// open pays a ~800 ms fixed stream-open cost, so N concurrent Range
-/// requests used to mean N upstream connections (measured: 5 concurrent
-/// ranges -> 5 opens). EdgeOne's sharded origin-pull delivers shards in
-/// ascending offset order, so a shard's offset is normally already
-/// written by the time it is requested — the wait is near-zero in
-/// practice, and a genuine cold seek costs only the full pull it would
-/// have needed anyway.
-/// Wait for the next flight progress event within the flight's stall
-/// budget. `Ok(Some(()))` = progress arrived, `Ok(None)` = sender dropped
-/// without a terminal event. A stall-budget exhaustion is a body error:
-/// the response already promised bytes, and hanging forever is the only
-/// worse outcome.
+/// Wait for the next flight progress event, bounded by the flight's stall
+/// budget **per wait**: the budget measures inactivity, so a caller that
+/// loops re-arms it on every event instead of holding one deadline over
+/// the whole wait. `Ok(Some(()))` = progress arrived, `Ok(None)` = sender
+/// dropped without a terminal event. A stall-budget exhaustion is a body
+/// error: the response already promised bytes, and hanging forever is the
+/// only worse outcome.
 async fn next_progress(
     flight: &FlightShared,
     rx: &mut watch::Receiver<FlightProgress>,
 ) -> Result<Option<()>, std::io::Error> {
-    next_progress_until(flight, rx, flight.stall_budget).await
-}
-
-/// [`next_progress`] with an explicit remaining budget (O6). Callers that
-/// loop keep ONE deadline across iterations instead of creating and
-/// dropping a timer per wake, which fired for every progress event a
-/// reader ever saw.
-async fn next_progress_until(
-    flight: &FlightShared,
-    rx: &mut watch::Receiver<FlightProgress>,
-    budget: std::time::Duration,
-) -> Result<Option<()>, std::io::Error> {
-    match tokio::time::timeout(budget, rx.changed()).await {
+    match tokio::time::timeout(flight.stall_budget, rx.changed()).await {
         Ok(Ok(())) => Ok(Some(())),
         Ok(Err(_)) => Ok(None),
         Err(_) => Err(std::io::Error::other(format!(
@@ -247,6 +220,23 @@ async fn next_progress_until(
     }
 }
 
+/// Follow the flight's growing temp file from `start`, yielding at most
+/// `len` bytes (None = to end). This is the single reader for BOTH
+/// whole-file and ranged cold misses: a ranged request waits for the
+/// writer to reach its offset instead of opening a second upstream
+/// connection. The temp file needs no creating ritual — `File::open` is
+/// retried until the driver makes it, the growing length is followed, and
+/// the reader terminates on Done (EOF) or Failed.
+///
+/// Why converge instead of passing ranged reads through: every upstream
+/// open pays a ~640 ms fixed stream-open cost, so N concurrent Range
+/// requests used to mean N upstream connections (measured: 5 concurrent
+/// ranges -> 5 opens). EdgeOne's sharded origin-pull delivers shards in
+/// ascending offset order, so a shard's offset is normally already
+/// written by the time it is requested — the wait is near-zero in
+/// practice, and a genuine cold seek costs only the full pull it would
+/// have needed anyway. The wait is bounded by inactivity (see
+/// [`next_progress`]), never by total elapsed time.
 pub fn growing_reader_from(
     flight: std::sync::Arc<FlightShared>,
     start: u64,
@@ -303,25 +293,26 @@ pub fn growing_reader_from(
             };
             if let Some(w) = written {
                 if w <= pos {
-                    // One deadline covers the whole wait for this offset
-                    // (O6): a reader parked at 700 MB must give up after
-                    // ONE stall budget, not after a budget per wake.
-                    let deadline =
-                        tokio::time::Instant::now() + flight.stall_budget;
+                    // The stall budget measures INACTIVITY, not elapsed
+                    // time: every progress event re-arms the full budget,
+                    // so a reader parked ahead of the writer waits as long
+                    // as the pull keeps advancing. One deadline covering
+                    // the whole wait (the old O6 shape) contradicted the
+                    // contract this type documents: at the measured
+                    // 27 MB/s a reader ~800 MB ahead was killed mid-body
+                    // with `flight stalled` even though the pull was
+                    // flowing perfectly.
+                    //
+                    // Re-arming cannot spin. The watermark only grows, so
+                    // an event means `written` rose; once it passes `pos`
+                    // this loop exits, and a pull that truly stops
+                    // publishing trips the budget exactly as before.
                     loop {
-                        let remaining =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remaining.is_zero() {
-                            Err(std::io::Error::other(format!(
-                                "flight stalled: no progress for {:?}",
-                                flight.stall_budget
-                            )))?;
-                        }
-                        match next_progress_until(&flight, &mut rx, remaining).await {
+                        match next_progress(&flight, &mut rx).await {
                             Ok(Some(())) => {
                                 // Progress arrived: re-check whether it
                                 // covers our offset; if not, keep waiting
-                                // on the SAME deadline.
+                                // with a fresh budget.
                                 let now_written = match &*rx.borrow() {
                                     FlightProgress::Growing(w) => Some(*w),
                                     _ => None,
@@ -828,6 +819,77 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "reader must finish promptly, not on the stall budget"
+        );
+    }
+
+    /// The stall budget measures inactivity, not total wall time: a reader
+    /// parked ahead of the writer must survive a wait LONGER than one
+    /// budget as long as progress keeps arriving. One deadline covering the
+    /// whole wait trips at the first budget (150 ms here, while the writer
+    /// still needs ~300 ms to reach the reader) and kills the body of a
+    /// perfectly healthy pull.
+    #[tokio::test]
+    async fn far_ahead_reader_survives_a_flowing_writer_beyond_one_budget() {
+        use futures::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".tmp.flow");
+        let finalp = dir.path().join("flow.bin");
+        let budget = std::time::Duration::from_millis(150);
+        let flight = std::sync::Arc::new(FlightShared::new(tmp.clone(), finalp.clone(), budget));
+        let total = 4 * 1024 * 1024u64;
+        let meta = ObjectMeta { size_bytes: total, etag: None, last_modified: None, mime_hint: None };
+        let _ = flight.progress_tx.send(FlightProgress::Meta(meta));
+
+        const MIB: u64 = 1024 * 1024;
+        let driver = {
+            let flight = flight.clone();
+            let tmp = tmp.clone();
+            let finalp = finalp.clone();
+            let dir = dir.path().to_path_buf();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let mut f = tokio::fs::File::create(&tmp).await.unwrap();
+                for i in 1..=4u64 {
+                    f.write_all(&vec![i as u8; MIB as usize]).await.unwrap();
+                    let _ = flight.progress_tx.send(FlightProgress::Growing(i * MIB));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                f.sync_all().await.unwrap();
+                drop(f);
+                store::install_tmp(&tmp, &finalp, &dir).unwrap();
+                let _ = flight.progress_tx.send(FlightProgress::Done);
+            })
+        };
+
+        // Let the driver publish its first watermark and create the temp
+        // file, so the reader enters the offset wait (not the file-open
+        // wait, which re-arms per event already).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let want = MIB;
+        let mut body = growing_reader_from(flight.clone(), total - want, Some(want));
+
+        let started = std::time::Instant::now();
+        let mut got = Vec::new();
+        let mut errored = None;
+        while let Some(c) = body.next().await {
+            match c {
+                Ok(b) => got.extend_from_slice(&b),
+                Err(e) => {
+                    errored = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        let waited = started.elapsed();
+        driver.await.unwrap();
+        assert_eq!(
+            errored, None,
+            "a flowing pull must not trip the budget (waited {waited:?}, budget {budget:?})"
+        );
+        assert_eq!(got.len() as u64, want, "the reader must receive its exact slice");
+        assert!(
+            waited > budget,
+            "this test only proves anything if the wait outlasted one budget (waited {waited:?})"
         );
     }
 
