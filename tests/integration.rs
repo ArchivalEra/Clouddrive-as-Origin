@@ -798,13 +798,27 @@ impl StorageBackend for BlockingOpenBackend {
             mime_hint: None,
         })
     }
-    async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
+    async fn open(&self, _key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
         self.opened.fetch_add(1, Ordering::SeqCst);
         // Hold the transfer open until the test releases it.
         self.release.notified().await;
+        // Honour the range like a real upstream: the 206 body must end at
+        // the requested length, or a staged serve would overshoot it.
+        let total = self.bytes.len() as u64;
+        let (start, end) = match range {
+            None => (0, total),
+            Some(r) => {
+                if r.offset >= total {
+                    return Err(BackendError::RangeNotSatisfiable);
+                }
+                (r.offset, r.length.map_or(total, |l| (r.offset + l).min(total)))
+            }
+        };
         Ok(StreamSource {
-            stream: Box::new(std::io::Cursor::new(self.bytes.clone())),
-            total_len: Some(self.bytes.len() as u64),
+            stream: Box::new(std::io::Cursor::new(
+                self.bytes[start as usize..end as usize].to_vec(),
+            )),
+            total_len: Some(total),
         })
     }
     async fn refresh_if_needed(&self) -> Result<(), BackendError> {
@@ -871,6 +885,100 @@ async fn head_not_starved_by_saturated_stream_gate() {
     );
 
     release.notify_waiters();
+}
+
+/// The efficient passthrough MOVES BYTES, so it must hold the STREAM gate
+/// (B1 / ADR-0004) — for the transfer, not just until the response is
+/// built. Its old shape took the metadata gate (the head-of-line class
+/// ADR-0004 split off) and released it when the response was constructed,
+/// so two viewers of the same range opened two upstream streams and the
+/// stream budget saw neither.
+#[tokio::test]
+async fn efficient_passthrough_waits_for_a_stream_permit() {
+    use origin_cache::cache::cache::ServeOutcome;
+    use origin_cache::config::CacheProfile;
+
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+    cfg.upstreams[0].cache_profile = "efficient".into();
+    cfg.cache_profiles.insert(
+        "efficient".into(),
+        CacheProfile { coverage_threshold: 0.9, min_file_size: 1, coverage_window_secs: 3600 },
+    );
+    let cfg = Arc::new(cfg);
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let opened = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(BlockingOpenBackend {
+        bytes: vec![7u8; 4096],
+        release: Arc::clone(&release),
+        opened: Arc::clone(&opened),
+    });
+    let mut slots = HashMap::new();
+    // Two stream permits; the test holds both, so no transfer can start.
+    let slot = Arc::new(BackendSlot::new(backend, 2));
+    slots.insert("primary".to_string(), Arc::clone(&slot));
+    let cache = Arc::new(Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots)));
+
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.push(Arc::clone(&slot.stream_gate).acquire_owned().await.unwrap());
+    }
+    assert_eq!(slot.stream_gate.available_permits(), 0, "stream gate saturated");
+
+    let rk = cache.resolve("a.bin").unwrap();
+    let passthrough = {
+        let cache = Arc::clone(&cache);
+        let rk = rk.clone();
+        tokio::spawn(async move { cache.serve(&rk, Some(ByteRange::bounded(0, 64)), None).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        opened.load(Ordering::SeqCst),
+        0,
+        "a passthrough must take a stream permit BEFORE opening upstream"
+    );
+
+    // Free the gate: the transfer proceeds, and the permit it takes must
+    // stay held for the body rather than being dropped when `serve` returns.
+    drop(held);
+    for _ in 0..200 {
+        if opened.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(opened.load(Ordering::SeqCst), 1, "the passthrough must now open upstream");
+    assert_eq!(
+        slot.stream_gate.available_permits(),
+        1,
+        "the transfer holds the permit it took"
+    );
+
+    release.notify_one();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), passthrough)
+        .await
+        .expect("the passthrough must finish once the upstream opens")
+        .unwrap()
+        .unwrap();
+    let plan = match outcome {
+        ServeOutcome::Stream(plan) => plan,
+        _ => panic!("a ranged efficient miss must stream"),
+    };
+    assert_eq!(
+        slot.stream_gate.available_permits(),
+        1,
+        "the permit must be held by the body, not released when the response was built"
+    );
+
+    let mut body = plan.body;
+    assert_eq!(read_body(&mut body).await, vec![7u8; 64]);
+    assert_eq!(
+        slot.stream_gate.available_permits(),
+        2,
+        "consuming the body releases the stream permit"
+    );
 }
 
 
