@@ -29,9 +29,34 @@ pub enum CacheOutcome {
 /// cache is at its configured maximum.
 const DISK_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Free-space floor the tick reclaims resident strays down to (ADR-0014).
+/// The reserve alone is too tight to be a working margin: strays sit outside
+/// the magazine's byte budget, so nothing else bounds how much of the disk
+/// they take, and a cold pull that finds less than its own size free would
+/// have to either refuse (which the cache never does) or evict a stray in a
+/// hurry. Keeping this much free at all times makes the admission path's
+/// "make room" step rare instead of routine.
+const DISK_PRESSURE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Never evict a staging ledger row younger than this (P56): an active
 /// transfer's row is touched continuously and must not be yanked mid-flight.
 const STAGE_MIN_AGE_MS: u64 = 60_000;
+
+/// Whether the magazine can hold an object of this size at all. An object
+/// that cannot fit is never made to fit by evicting anyone, so the byte
+/// budget cannot govern it — such an object is admitted as a *resident
+/// stray* instead (ADR-0014): cached while the disk allows it, refused by
+/// the byte budget neither as a victim nor as pressure.
+///
+/// One predicate, three call sites that must agree: promotion's fit guard
+/// (assembling something the magazine must immediately eject would consume
+/// the staged segments and hand the magazine an entry it cannot keep),
+/// staging admission (staged bytes only ever feed promotion, so staging an
+/// un-promotable object writes bytes nobody can read back), and cold-pull
+/// admission (which decides `EntryMeta::oversize`).
+fn fits_magazine(size_bytes: u64, config: &Config) -> bool {
+    size_bytes > 0 && size_bytes <= config.max_size_bytes
+}
 
 /// Static metric label for an outcome (P7): keeps the hot path
 /// allocation-free.
@@ -121,6 +146,23 @@ pub struct PassthroughHit {
     pub content_range: Option<ContentRange>,
     pub content_length: Option<u64>,
     pub body: BodyStream,
+}
+
+impl PassthroughHit {
+    /// The same answer rendered as an ordinary cache hit, for the one caller
+    /// that serves a cold miss WITHOUT caching it (ADR-0013). The headers
+    /// and the body are unchanged; the outcome says "not from cache" and the
+    /// source says where the bytes came from.
+    fn into_cache_hit(self, outcome: CacheOutcome) -> CacheHit {
+        CacheHit {
+            outcome,
+            meta: self.meta,
+            content_range: self.content_range,
+            content_length: self.content_length,
+            body: self.body,
+            source: BodySource::Upstream,
+        }
+    }
 }
 
 /// What one request should be answered with, decided in one place.
@@ -277,6 +319,10 @@ pub struct CacheSnapshot {
     pub entries: usize,
     pub total_bytes: u64,
     pub segment_bytes: u64,
+    /// Of `total_bytes`, how much belongs to resident strays — entries the
+    /// magazine's byte budget neither counts nor evicts (ADR-0014). This is
+    /// the number that explains a `total_bytes` above `max_size_bytes`.
+    pub stray_bytes: u64,
     pub flights_active: usize,
     pub promotions_active: usize,
     pub dirty_access_pending: usize,
@@ -472,6 +518,11 @@ impl<C: Clock + Clone> Cache<C> {
                         last_revalidated_millis: None,
                         negative_until_millis: None,
                         hold_until_millis: 0,
+                        // Metadata loss leaves nothing but the size, so the
+                        // size rule is the only information available: a
+                        // rebuilt row larger than the budget is admitted as
+                        // a stray, exactly as it would be on a cold pull.
+                        oversize: !fits_magazine(size, &self.config),
                     });
                 }
                 let meta_store = Arc::clone(&self.meta);
@@ -534,9 +585,15 @@ impl<C: Clock + Clone> Cache<C> {
     /// Owned view of the live machinery for healthz: operators read a
     /// snapshot, never the internals (C4).
     pub async fn snapshot(&self) -> CacheSnapshot {
-        let (entries, total_bytes, segment_bytes) = {
+        let (entries, total_bytes, segment_bytes, stray_bytes) = {
             let s = self.state.read().await;
-            (s.entries.len(), s.total_bytes, s.segment_bytes)
+            let strays: u64 = s
+                .entries
+                .values()
+                .filter(|m| m.oversize)
+                .map(|m| m.size_bytes)
+                .sum();
+            (s.entries.len(), s.total_bytes, s.segment_bytes, strays)
         };
         let (coverage_keys, coverage_intervals) = {
             let cov = self.coverage.lock().await;
@@ -546,6 +603,7 @@ impl<C: Clock + Clone> Cache<C> {
             entries,
             total_bytes,
             segment_bytes,
+            stray_bytes,
             flights_active: self.flights.active().await,
             promotions_active: self.promotions.lock().await.len(),
             dirty_access_pending: self.dirty_access.pending(),
@@ -717,6 +775,68 @@ impl<C: Clock + Clone> Cache<C> {
         self.state.read().await.entries.contains_key(&key)
     }
 
+    /// One coalesced upstream stat per key, holding the METADATA gate inside
+    /// the coalescer: the permit is taken by whichever caller actually runs
+    /// the PROPFIND, not by every caller that wants the result. Gating
+    /// outside the coalescer would queue a stampede on three permits and
+    /// each straggler would then find the shared cell already gone — the
+    /// measured 50-stats-for-50-requests shape.
+    async fn stat_coalesced(
+        &self,
+        slot: &Arc<BackendSlot>,
+        cache_key: &str,
+        bkey: &Key,
+    ) -> Result<ObjectMeta, BackendError> {
+        self.reval_inflight
+            .run(format!("stat:{cache_key}"), || {
+                let slot = Arc::clone(slot);
+                let k = bkey.clone();
+                async move {
+                    let _permit = slot.gate.acquire().await;
+                    slot.backend.stat(&k).await.map(|meta| StatData { meta })
+                }
+            })
+            .await
+            .map(|s| s.meta)
+    }
+
+    /// Whether `want` bytes can be written to the cache disk, making room
+    /// first if needed: it evicts resident strays (oldest-touched first) and
+    /// then asks again. Returns false when even that is not enough — the
+    /// caller then serves the request WITHOUT caching it rather than
+    /// refusing to serve it (ADR-0013).
+    ///
+    /// Only strays yield here. They sit outside the magazine's byte budget
+    /// by definition (ADR-0014), so removing one is the least destructive
+    /// way to make room; the magazine's own members leave on their clock.
+    /// The tick reclaims strays down to the same floor on its own schedule,
+    /// which keeps this path's eviction step rare.
+    async fn make_room_for(&self, want: u64) -> bool {
+        if store::has_room_for(&self.config.cache_dir, want, DISK_RESERVE_BYTES) {
+            return true;
+        }
+        let free = store::free_bytes(&self.config.cache_dir).unwrap_or(0);
+        let need = DISK_RESERVE_BYTES
+            .saturating_add(want)
+            .saturating_sub(free);
+        let victims = {
+            let mut s = self.state.write().await;
+            pick_strays_for_pressure(&mut s, &self.config, need)
+        };
+        if !victims.is_empty() {
+            tracing::warn!(
+                want,
+                free,
+                victims = victims.len(),
+                "making room for a cold pull by evicting resident strays"
+            );
+            remove_entries(&self.config, &self.meta, &victims).await;
+        }
+        // A second probe, not arithmetic on the first: the deletes above are
+        // asynchronous and the accounting is the filesystem's, not ours.
+        store::has_room_for(&self.config.cache_dir, want, DISK_RESERVE_BYTES)
+    }
+
     /// Background fill: full fetch + drain, no client attached. Powers the
     /// A relief valve (307 now, bytes later) and shares the prewarm path —
     /// one primitive, two callers. Nocache upstreams have nothing to fill
@@ -869,43 +989,19 @@ impl<C: Clock + Clone> Cache<C> {
                 }
             }
         }
-        // Stat single-flight: concurrent cold passthroughs for
-        // the same key must coalesce to ONE upstream stat. The flight runs
-        // OUTSIDE the gate: the gate (concurrency 3) would otherwise
-        // serialize the stat calls and the flight cell would be removed
-        // between permits — 50 concurrent requests would stat 50 times.
+        // Stat single-flight: concurrent requests for the same key coalesce
+        // to ONE upstream stat, and the METADATA gate is taken inside the
+        // coalescer (see `stat_coalesced`) so the gate is paid once per
+        // batched call rather than once per stampeding request.
         let bkey = Key::from_validated(rk.backend_key.clone());
-        let meta = match self
-            .reval_inflight
-            .run(format!("stat:{}", rk.cache_key), || {
-                let slot = Arc::clone(&slot);
-                let k = bkey.clone();
-                async move {
-                    slot.backend.stat(&k).await.map(|meta| StatData { meta })
-                }
-            })
-            .await
-        {
-            Ok(s) => s.meta,
+        let meta = match self.stat_coalesced(&slot, &rk.cache_key, &bkey).await {
+            Ok(m) => m,
             Err(BackendError::NotFound) => {
                 self.install_negative(&rk.cache_key, &rk.upstream_id).await;
                 return Err(BackendError::NotFound);
             }
             Err(e) => return Err(e),
         };
-        // Version gate: a flipped object restarts staged history BEFORE
-        // serving, so new bytes land on a clean ledger (finalize keeps a
-        // same-file backstop for races).
-        {
-            let known = self.coverage.lock().await.get(&rk.cache_key).and_then(|e| e.etag.clone());
-            let changed = match (known.as_deref(), meta.etag.as_deref()) {
-                (Some(a), Some(b)) => a != b,
-                _ => false,
-            };
-            if changed {
-                reset_coverage(&self.coverage, &self.state, &self.config.cache_dir, &rk.cache_key).await;
-            }
-        }
         if meta.size_bytes < min_file_size {
             return Err(BackendError::Other("below min_file_size".into()));
         }
@@ -918,6 +1014,36 @@ impl<C: Clock + Clone> Cache<C> {
                 (r.offset, r.length.map_or(meta.size_bytes, |l| (r.offset + l).min(meta.size_bytes)))
             }
         };
+        // Staging admission (ADR-0013). Staged segments have exactly one
+        // reader - promotion - and promotion is refused for an object the
+        // magazine cannot hold, so staging such an object writes bytes
+        // nobody can ever read back: pure cost, paid on every seek. The disk
+        // gets the same question the cold-pull path asks, because a staged
+        // stream is a disk write like any other.
+        if !fits_magazine(meta.size_bytes, &self.config)
+            || !store::has_room_for(&self.config.cache_dir, end - start, DISK_RESERVE_BYTES)
+        {
+            tracing::info!(
+                key = %rk.cache_key,
+                size = meta.size_bytes,
+                "passthrough without staging: the magazine cannot hold this object"
+            );
+            return self.serve_upstream_range(&slot, rk, range, meta).await;
+        }
+        // Version gate: a flipped object restarts staged history BEFORE
+        // serving, so new bytes land on a clean ledger (finalize keeps a
+        // same-file backstop for races). Only the staging path needs it -
+        // this is the only place new bytes can enter the ledger.
+        {
+            let known = self.coverage.lock().await.get(&rk.cache_key).and_then(|e| e.etag.clone());
+            let changed = match (known.as_deref(), meta.etag.as_deref()) {
+                (Some(a), Some(b)) => a != b,
+                _ => false,
+            };
+            if changed {
+                reset_coverage(&self.coverage, &self.state, &self.config.cache_dir, &rk.cache_key).await;
+            }
+        }
         // The open and the transfer below are a stream, not metadata (B1):
         // this used to take the METADATA gate, which is the head-of-line
         // class ADR-0004 split off, and it released it before a byte moved.
@@ -1319,10 +1445,28 @@ impl<C: Clock + Clone> Cache<C> {
                         None => {}
                     }
                 }
-                Ok(_) => {
+                Ok(stat) => {
                     // Modified (or etag vanished): forced refetch below; the
                     // old file keeps serving other readers until the rename.
-                    return self.forced_fetch(slot, key, backend_key, upstream_id, range).await;
+                    // The refetch is a cold pull in every respect, so it gets
+                    // the same admission: an object that has grown past what
+                    // the disk can hold must not be fetched into nothing.
+                    let live = stat.meta;
+                    if !self.make_room_for(live.size_bytes).await {
+                        tracing::warn!(
+                            key = %key,
+                            want = live.size_bytes,
+                            "serving without caching: the disk cannot hold this object"
+                        );
+                        return Ok(self
+                            .serve_upstream_range(&slot, rk, range, live)
+                            .await?
+                            .into_cache_hit(CacheOutcome::Miss));
+                    }
+                    let oversize = !fits_magazine(live.size_bytes, &self.config);
+                    return self
+                        .forced_fetch(slot, key, backend_key, upstream_id, range, live, oversize)
+                        .await;
                 }
                 Err(BackendError::NotFound) => {
                     self.install_negative(&key, &upstream_id).await;
@@ -1337,11 +1481,39 @@ impl<C: Clock + Clone> Cache<C> {
             }
         }
 
-        // Cold miss: attach-or-create the shared download flight.
-        // The flight is namespaced by cache key; the driver fetches the
-        // provider-side object path.
-        let backend_key = Key::from_validated(backend_key);
-        let flight = self.attach_or_start(&key, backend_key.clone(), &upstream_id, Arc::clone(&slot)).await;
+        // Cold miss. The object's size decides whether the cache may hold it
+        // at all, so the stat comes first — coalesced, and one PROPFIND per
+        // key however many requests stampede here. The decision must be made
+        // BEFORE the flight exists: a flight can only refuse by failing its
+        // readers, and a cache that cannot hold an object must still serve it
+        // (ADR-0013).
+        let bkey = Key::from_validated(backend_key);
+        let meta = match self.stat_coalesced(&slot, &key, &bkey).await {
+            Ok(m) => m,
+            Err(BackendError::NotFound) => {
+                self.install_negative(&key, &upstream_id).await;
+                return Err(BackendError::NotFound);
+            }
+            Err(e) => return Err(e),
+        };
+        if !self.make_room_for(meta.size_bytes).await {
+            tracing::warn!(
+                key = %key,
+                want = meta.size_bytes,
+                "serving without caching: the disk cannot hold this object"
+            );
+            return Ok(self
+                .serve_upstream_range(&slot, rk, range, meta)
+                .await?
+                .into_cache_hit(CacheOutcome::Miss));
+        }
+        // Too big for the magazine is not too big to keep: it is admitted as
+        // a resident stray, which is the only way a large object gets a
+        // single upstream stream instead of one open per shard (ADR-0014).
+        let oversize = !fits_magazine(meta.size_bytes, &self.config);
+        let flight = self
+            .attach_or_start(&key, bkey, &upstream_id, Arc::clone(&slot), meta, oversize)
+            .await;
         self.await_flight(flight, &key, &upstream_id, range).await
     }
 
@@ -1395,6 +1567,8 @@ impl<C: Clock + Clone> Cache<C> {
         backend_key: Key,
         upstream_id: &str,
         slot: Arc<BackendSlot>,
+        meta: ObjectMeta,
+        oversize: bool,
     ) -> Arc<FlightShared> {
         let entry_key = key.to_string();
         let driver_up = upstream_id.to_string();
@@ -1407,7 +1581,11 @@ impl<C: Clock + Clone> Cache<C> {
                 key,
                 store::tmp_path(&self.config.cache_dir, key),
                 store::file_path(&self.config.cache_dir, key),
-                move |f| drive_flight(f, slot, backend_key, entry_key, driver_up, cfg, state, meta_store, clock),
+                move |f| {
+                    drive_flight(
+                        f, slot, backend_key, entry_key, driver_up, cfg, state, meta_store, clock, meta, oversize,
+                    )
+                },
             )
             .await
     }
@@ -1521,6 +1699,7 @@ impl<C: Clock + Clone> Cache<C> {
     /// Revalidation found a changed etag: refetch on a private flight (no
     /// map entry) while the old file keeps serving everyone else; the seal
     /// rename swaps it atomically.
+    #[allow(clippy::too_many_arguments)]
     async fn forced_fetch(
         &self,
         slot: Arc<BackendSlot>,
@@ -1528,6 +1707,8 @@ impl<C: Clock + Clone> Cache<C> {
         backend_key: String,
         upstream_id: String,
         range: Option<crate::backend::ByteRange>,
+        meta: ObjectMeta,
+        oversize: bool,
     ) -> Result<CacheHit, BackendError> {
         let driver_up = upstream_id.clone();
         let entry_key = key.clone();
@@ -1539,7 +1720,11 @@ impl<C: Clock + Clone> Cache<C> {
         let flight = self.flights.spawn_solo(
             store::tmp_path(&self.config.cache_dir, &key),
             store::file_path(&self.config.cache_dir, &key),
-            move |f| drive_flight(f, slot, backend_key, entry_key, driver_up, cfg, state, meta_store, clock),
+            move |f| {
+                drive_flight(
+                    f, slot, backend_key, entry_key, driver_up, cfg, state, meta_store, clock, meta, oversize,
+                )
+            },
         );
         self.await_flight(flight, &key, &upstream_id, range).await
     }
@@ -1579,6 +1764,7 @@ impl<C: Clock + Clone> Cache<C> {
             last_revalidated_millis: None,
             negative_until_millis: Some(until),
             hold_until_millis: 0,
+            oversize: false,
         };
         let _ = self.meta.insert(&entry).await;
         let mut s = self.state.write().await;
@@ -1613,7 +1799,7 @@ impl<C: Clock + Clone> Cache<C> {
         //     oldest-touched ledger rows first, same LRU shape as entries.
         let over_budget = {
             let s = self.state.read().await;
-            s.total_bytes.saturating_add(s.segment_bytes) > self.config.max_size_bytes
+            resident_bytes(&s).saturating_add(s.segment_bytes) > self.config.max_size_bytes
         };
         let stage_victims: Vec<(String, u64)> = if over_budget {
             let cov = self.coverage.lock().await;
@@ -1622,7 +1808,7 @@ impl<C: Clock + Clone> Cache<C> {
             rows.sort();
             let mut over = {
                 let s = self.state.read().await;
-                s.total_bytes
+                resident_bytes(&s)
                     .saturating_add(s.segment_bytes)
                     .saturating_sub(self.config.max_size_bytes)
             };
@@ -1705,6 +1891,30 @@ impl<C: Clock + Clone> Cache<C> {
             evict_pick(&mut s, &self.config)
         };
         remove_entries(&self.config, &self.meta, &evicted).await;
+        // 3b. Disk pressure (ADR-0014). Resident strays sit outside the byte
+        //     budget, so nothing else bounds how much of the disk they take;
+        //     without this the only signal would be a cold pull that cannot
+        //     find room. Reclaim them down to the working floor, oldest
+        //     touched first. Strays only: the byte budget already governs
+        //     the magazine's own members, and freeing resident bytes would
+        //     make the disk a second, silent eviction budget for them.
+        let pressure_victims = {
+            let free = store::free_bytes(&self.config.cache_dir).unwrap_or(u64::MAX);
+            let floor = DISK_RESERVE_BYTES.saturating_add(DISK_PRESSURE_BYTES);
+            if free >= floor {
+                Vec::new()
+            } else {
+                let mut s = self.state.write().await;
+                pick_strays_for_pressure(&mut s, &self.config, floor - free)
+            }
+        };
+        if !pressure_victims.is_empty() {
+            tracing::warn!(
+                victims = pressure_victims.len(),
+                "evicting resident strays: free space is below the working floor"
+            );
+        }
+        remove_entries(&self.config, &self.meta, &pressure_victims).await;
         // 4. Ledger removal (coverage only): expired rows plus any row
         //    evicted to bring staged bytes back under budget.
         if do_sweep || !stage_victims.is_empty() {
@@ -1941,7 +2151,9 @@ async fn promote_key(
     } else {
         now_millis.saturating_add(config.promoted_hold_secs.saturating_mul(1000))
     };
-    insert_meta(state, config, meta_store, key, upstream_id, &live, now_millis, hold_until_millis).await;
+    // Promotion never produces a stray: its fit guard refuses an object the
+    // magazine cannot hold, so the entry it installs is a magazine member.
+    insert_meta(state, config, meta_store, key, upstream_id, &live, now_millis, hold_until_millis, false).await;
     // History is now redundant: drop sidecars + ledger row.
     reset_coverage(coverage, state, cache_dir, key).await;
 }
@@ -2072,21 +2284,20 @@ async fn drive_flight<C: Clock>(
     state: Arc<RwLock<CacheState>>,
     meta_store: Arc<crate::cache::persist::MetaStore>,
     clock: Arc<C>,
+    // The caller's coalesced stat. Admission (the magazine's fit, the disk's
+    // room) is decided there, BEFORE a flight exists, because a flight can
+    // only refuse by failing its readers.
+    meta: ObjectMeta,
+    oversize: bool,
 ) {
     let outcome = async {
-        // stat is metadata; the pump below is a stream. Take the metadata
-        // permit only for the stat (B1), then the stream permit for the
-        // transfer, so a cold pull cannot starve HEADs.
-        let meta = {
-            let _permit = slot.gate.acquire().await;
-            slot.backend.stat(&backend_key).await?
-        };
         let _stream_permit = slot.stream_gate.acquire().await;
-        // Capacity admission (P56): refuse to start a transfer that would
-        // cross the reserve floor. Without this the only signal was a
-        // failed write mid-pull, leaving both a broken response and a
-        // leaked temp file. Metadata is already known, so the client gets
-        // a clean error instead of a truncated body.
+        // Last-resort capacity backstop (P56): the caller has already made
+        // room (`Cache::make_room_for`) against this same probe, so this
+        // only fires when the disk filled in the window between the two.
+        // Kept because the alternative — a mid-pull write failure — leaves a
+        // truncated body AND a leaked temp file; a flight cannot switch to
+        // serving-without-caching after it has promised bytes.
         if !store::has_room_for(&config.cache_dir, meta.size_bytes, DISK_RESERVE_BYTES) {
             let free = store::free_bytes(&config.cache_dir).unwrap_or(0);
             tracing::warn!(
@@ -2124,7 +2335,7 @@ async fn drive_flight<C: Clock>(
 
     match outcome {
         Ok(meta) => {
-            insert_meta(&state, &config, &meta_store, &entry_key, &upstream_id, &meta, clock.now_millis(), 0).await;
+            insert_meta(&state, &config, &meta_store, &entry_key, &upstream_id, &meta, clock.now_millis(), 0, oversize).await;
             let _ = flight.progress_tx.send(FlightProgress::Done);
         }
         Err(e) => {
@@ -2143,6 +2354,10 @@ async fn insert_meta(
     now: u64,
     // 0 = no hold. Set only by the promotion path.
     hold_until_millis: u64,
+    // Whether this entry was admitted as a resident stray (ADR-0014):
+    // larger than the whole magazine budget, so the byte budget neither
+    // counts it nor evicts it.
+    oversize: bool,
 ) {
     // C3 lock discipline: the state write guard never spans a redb commit
     // or a file delete. Order: build the entry under a read, persist
@@ -2169,6 +2384,7 @@ async fn insert_meta(
             last_revalidated_millis: Some(now),
             negative_until_millis: None,
             hold_until_millis,
+            oversize,
         };
         (old_size, entry)
     };
@@ -2237,6 +2453,19 @@ fn reap_collect(state: &mut CacheState, ttl_ms: u64, now: u64) -> Vec<(String, u
     out
 }
 
+/// Bytes the magazine's byte budget governs: everything except resident
+/// strays, which the budget neither counts nor evicts (ADR-0014).
+fn resident_bytes(state: &CacheState) -> u64 {
+    state.total_bytes.saturating_sub(
+        state
+            .entries
+            .values()
+            .filter(|m| m.oversize)
+            .map(|m| m.size_bytes)
+            .sum::<u64>(),
+    )
+}
+
 /// Max-size LRU victim selection — memory only; deletes happen guard-free
 /// via [`remove_entries`] (C3 lock discipline).
 fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
@@ -2244,7 +2473,17 @@ fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
     // roughly 500 B of RAM each (key stored twice plus five Strings), and
     // max_size_bytes alone let millions of small objects exhaust memory on
     // a 10.9 GB node while sitting far under the byte cap.
-    let over_bytes = state.total_bytes > config.max_size_bytes;
+    //
+    // Resident strays are outside the byte budget (ADR-0014). They must be
+    // excluded from BOTH sides of it: counting them would make the cache
+    // permanently "over budget" (so every insert would evict someone else),
+    // and evicting them would let one oversized pull take the whole magazine
+    // down with it — the self-destruct this rule exists to prevent. An
+    // object that alone exceeds the budget is never brought into budget by
+    // evicting others; it leaves on the inactivity clock or under disk
+    // pressure (`pick_strays_for_pressure`).
+    let resident = resident_bytes(state);
+    let over_bytes = resident > config.max_size_bytes;
     let over_entries = config.max_entries > 0 && state.entries.len() > config.max_entries;
     if !over_bytes && !over_entries {
         return Vec::new();
@@ -2254,7 +2493,7 @@ fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
     // shape called `min_by_key` inside the eviction loop, so a sweep of k
     // victims rescanned the whole entry map k times: O(entries x victims)
     // under the state write guard, which blocks every hit.
-    let bytes_over = state.total_bytes.saturating_sub(config.max_size_bytes);
+    let bytes_over = resident.saturating_sub(config.max_size_bytes);
     let entries_over = if over_entries {
         state.entries.len().saturating_sub(config.max_entries)
     } else {
@@ -2262,13 +2501,14 @@ fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
     };
 
     // Collect evictable rows (negative tombstones are not LRU-eligible:
-    // they hold no file and expire on their own clock), ordered oldest
-    // first. `sort_unstable_by_key` on the eligibility timestamp gives the
-    // same victim order as repeated `min_by_key` did.
+    // they hold no file and expire on their own clock; resident strays are
+    // not byte-budget-eligible), ordered oldest first.
+    // `sort_unstable_by_key` on the eligibility timestamp gives the same
+    // victim order as repeated `min_by_key` did.
     let mut candidates: Vec<(u64, String)> = state
         .entries
         .iter()
-        .filter(|(_, m)| m.negative_until_millis.is_none())
+        .filter(|(_, m)| m.negative_until_millis.is_none() && !m.oversize)
         .map(|(k, m)| (m.eligible_at(config.inactive_ttl_secs), k.clone()))
         .collect();
     candidates.sort_unstable_by_key(|(eligible, _)| *eligible);
@@ -2279,6 +2519,48 @@ fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
         // Stop once BOTH budgets are satisfied: whatever drove the sweep is
         // now back under its cap.
         if freed >= bytes_over && out.len() >= entries_over {
+            break;
+        }
+        if let Some(m) = state.entries.remove(&key) {
+            state.total_bytes = state.total_bytes.saturating_sub(m.size_bytes);
+            freed = freed.saturating_add(m.size_bytes);
+            out.push((key, m.size_bytes));
+        }
+    }
+    out
+}
+
+/// Disk-pressure victim selection: resident strays only, oldest-touched
+/// first, until `need_bytes` are freed. Memory only; deletes happen
+/// guard-free via [`remove_entries`].
+///
+/// Strays are the only population this may take. They sit outside the
+/// magazine's byte budget (ADR-0014), so they are what the disk was never
+/// promised, and evicting them cannot make the magazine's own members
+/// re-fetch. A held entry yields here like anywhere else: a hold is a
+/// deadline, not immortality.
+///
+/// Pure in its inputs (a `need_bytes` computed by the caller from a real
+/// `statvfs` probe) so it can be tested without a synthetic filesystem.
+fn pick_strays_for_pressure(
+    state: &mut CacheState,
+    config: &Config,
+    need_bytes: u64,
+) -> Vec<(String, u64)> {
+    if need_bytes == 0 {
+        return Vec::new();
+    }
+    let mut candidates: Vec<(u64, String)> = state
+        .entries
+        .iter()
+        .filter(|(_, m)| m.oversize)
+        .map(|(k, m)| (m.eligible_at(config.inactive_ttl_secs), k.clone()))
+        .collect();
+    candidates.sort_unstable_by_key(|(eligible, _)| *eligible);
+    let mut out = Vec::new();
+    let mut freed = 0u64;
+    for (_, key) in candidates {
+        if freed >= need_bytes {
             break;
         }
         if let Some(m) = state.entries.remove(&key) {
@@ -2393,6 +2675,7 @@ mod tests {
                     last_revalidated_millis: None,
                     negative_until_millis: None,
                     hold_until_millis: 0,
+                    oversize: false,
                 })
                 .await
                 .unwrap();
@@ -2544,7 +2827,7 @@ mod tests {
 
         let meta = ObjectMeta { size_bytes: 10, etag: None, last_modified: None, mime_hint: None };
         // As the promotion path writes it: a deadline 100 s out.
-        insert_meta(&cache.state, &cfg, &cache.meta, "held.bin", "primary", &meta, 0, 100_000).await;
+        insert_meta(&cache.state, &cfg, &cache.meta, "held.bin", "primary", &meta, 0, 100_000, false).await;
 
         clock.advance(20_000); // past the inactivity TTL, well inside the hold
         cache.tick().await;
@@ -2581,6 +2864,7 @@ mod tests {
                 last_revalidated_millis: None,
                 negative_until_millis: None,
                 hold_until_millis: hold_until,
+                oversize: false,
             }
         }
         let mut cfg = Config::default();
@@ -2607,6 +2891,115 @@ mod tests {
             "when it is the only way back under budget, the hold yields"
         );
         assert_eq!(st.total_bytes, 0, "the cap is honoured, never violated");
+    }
+
+    /// A resident stray is outside the byte budget in both directions
+    /// (ADR-0014): it never pushes the magazine over, and the byte budget
+    /// never picks it. The shape this replaces let a single oversized object
+    /// take the whole cache down with it -- its own size was the overshoot,
+    /// so the sweep evicted every other entry AND the object itself, leaving
+    /// a 50 GB pull standing on an empty cache.
+    #[tokio::test]
+    async fn a_resident_stray_never_evicts_the_magazine() {
+        fn row(key: &str, size: u64, last_access: u64, oversize: bool) -> EntryMeta {
+            EntryMeta {
+                version: 1,
+                upstream_id: "primary".into(),
+                key: key.into(),
+                size_bytes: size,
+                etag: None,
+                last_modified: None,
+                content_type: None,
+                created_at_millis: last_access,
+                last_access_millis: last_access,
+                last_revalidated_millis: None,
+                negative_until_millis: None,
+                hold_until_millis: 0,
+                oversize,
+            }
+        }
+        let mut cfg = Config::default();
+        cfg.max_size_bytes = 1_000;
+        cfg.inactive_ttl_secs = 1200;
+
+        let mut st = CacheState::default();
+        st.entries.insert("small.bin".into(), row("small.bin", 100, 10, false));
+        st.entries.insert("stray.bin".into(), row("stray.bin", 5_000, 5, true));
+        st.total_bytes = 5_100;
+        assert_eq!(resident_bytes(&st), 100, "the stray is not part of the magazine's bytes");
+
+        // Over the budget only because of the stray: nobody is evicted.
+        assert!(
+            evict_pick(&mut st, &cfg).is_empty(),
+            "a stray must not make the magazine look over budget"
+        );
+        assert!(st.entries.contains_key("small.bin"), "the member survives");
+        assert!(st.entries.contains_key("stray.bin"), "and so does the stray");
+
+        // A second MEMBER pushes the magazine over: it is the member that
+        // goes, never the stray.
+        st.entries.insert("small2.bin".into(), row("small2.bin", 950, 20, false));
+        st.total_bytes += 950;
+        let victims = evict_pick(&mut st, &cfg);
+        assert_eq!(
+            victims.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["small.bin"],
+            "the byte budget picks only the rows it governs"
+        );
+        assert!(st.entries.contains_key("stray.bin"));
+        assert!(st.entries.contains_key("small2.bin"));
+    }
+
+    /// Disk pressure reclaims resident strays, oldest-touched first, and
+    /// touches nothing else: the magazine's own members leave on their clock,
+    /// and the disk is not a second silent eviction budget for them.
+    #[test]
+    fn strays_are_reclaimed_under_disk_pressure_oldest_first() {
+        fn row(key: &str, size: u64, last_access: u64, oversize: bool) -> EntryMeta {
+            EntryMeta {
+                version: 1,
+                upstream_id: "primary".into(),
+                key: key.into(),
+                size_bytes: size,
+                etag: None,
+                last_modified: None,
+                content_type: None,
+                created_at_millis: last_access,
+                last_access_millis: last_access,
+                last_revalidated_millis: None,
+                negative_until_millis: None,
+                hold_until_millis: 0,
+                oversize,
+            }
+        }
+        let mut cfg = Config::default();
+        cfg.inactive_ttl_secs = 1200;
+
+        let mut st = CacheState::default();
+        st.entries.insert("stray-cold.bin".into(), row("stray-cold.bin", 3_000, 10, true));
+        st.entries.insert("stray-warm.bin".into(), row("stray-warm.bin", 3_000, 900, true));
+        st.entries.insert("member.bin".into(), row("member.bin", 3_000, 5, false));
+        st.total_bytes = 9_000;
+
+        assert!(
+            pick_strays_for_pressure(&mut st, &cfg, 0).is_empty(),
+            "nothing to free when nothing is needed"
+        );
+        let victims = pick_strays_for_pressure(&mut st, &cfg, 3_000);
+        assert_eq!(
+            victims,
+            vec![("stray-cold.bin".to_string(), 3_000)],
+            "the colder stray goes first, even though a member is colder still"
+        );
+        assert!(st.entries.contains_key("stray-warm.bin"), "the warmer stray stays");
+        assert!(st.entries.contains_key("member.bin"), "pressure never takes a member");
+        assert_eq!(st.total_bytes, 6_000);
+        assert_eq!(resident_bytes(&st), 3_000, "the member is untouched and still counted");
+
+        let victims = pick_strays_for_pressure(&mut st, &cfg, 99_000);
+        assert_eq!(victims.len(), 1, "only one stray is left to take");
+        assert!(st.entries.contains_key("member.bin"));
+        assert_eq!(st.total_bytes, 3_000);
     }
 
     #[tokio::test]
