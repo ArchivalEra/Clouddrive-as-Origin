@@ -23,12 +23,15 @@
 //! would drag `tempfile` — a dev-dependency — into the shipped lib.
 #![doc(hidden)]
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::backend::{
     BackendError, ByteRange, DirectUrl, Key, ListEntry, ObjectMeta, StreamSource, StorageBackend,
 };
+use crate::cache::cache::Cache;
+use crate::cache::flight::BodyStream;
 
 /// The one mock backend: fixed bytes, optional failure, optional Tier-1 link,
 /// optional listing, and call counters.
@@ -286,6 +289,252 @@ impl<C: crate::clock::Clock + Clone> CacheTestExt<C> for crate::cache::cache::Ca
     async fn head_by_key(&self, key: &str) -> Result<crate::cache::cache::HitMeta, BackendError> {
         let rk = self.resolve(key).expect("test key must resolve");
         self.head_resolved(&rk).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Behaviour fakes: four small backends, each answering a question a plain
+// MockBackend cannot. One home, so a new test picks a behaviour instead of
+// copying a trait impl. They stay plain `pub` (no tempfile dependency), like
+// MockBackend.
+// ---------------------------------------------------------------------------
+
+/// Collect a body into bytes (the test-side shape of `flight::drain`).
+pub async fn collect(body: &mut BodyStream) -> Vec<u8> {
+    use futures::StreamExt;
+    let mut out = Vec::new();
+    while let Some(chunk) = body.next().await {
+        out.extend_from_slice(&chunk.unwrap());
+    }
+    out
+}
+
+/// Collect a body, allowing a terminal Err: returns (bytes, errored).
+pub async fn collect_allow_error(body: BodyStream) -> (Vec<u8>, bool) {
+    use futures::StreamExt;
+    let mut body = body;
+    let mut out = Vec::new();
+    let mut errored = false;
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(b) => out.extend_from_slice(&b[..]),
+            Err(_) => {
+                errored = true;
+                break;
+            }
+        }
+    }
+    (out, errored)
+}
+
+/// Wait until the driver task has installed the metadata row for `key`.
+pub async fn wait_entry(cache: &Cache<impl crate::clock::Clock>, key: &str) {
+    for _ in 0..200 {
+        if cache.state.read().await.entries.contains_key(key) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("entry {key} never installed");
+}
+
+/// Storm-suite backend: counts stat+open calls, delays a real open so
+/// readers join an in-flight download, and can be switched to fail / panic
+/// / undershoot on open to exercise flight failure propagation.
+pub struct StormBackend {
+    payload: Vec<u8>,
+    calls: Arc<AtomicUsize>,
+    mode: Arc<std::sync::Mutex<StormMode>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum StormMode {
+    Good,
+    FailOpen,
+    PanicOpen,
+    ShortBody,
+}
+
+impl StormBackend {
+    pub fn new(payload: &[u8], calls: Arc<AtomicUsize>, mode: Arc<std::sync::Mutex<StormMode>>) -> Self {
+        Self { payload: payload.to_vec(), calls, mode }
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for StormBackend {
+    async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ObjectMeta {
+            size_bytes: self.payload.len() as u64,
+            etag: Some("v1".into()),
+            last_modified: None,
+            mime_hint: None,
+        })
+    }
+    async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mode = *self.mode.lock().unwrap();
+        match mode {
+            StormMode::FailOpen => Err(BackendError::ServerError("open refused".into())),
+            StormMode::PanicOpen => panic!("storm open boom"),
+            StormMode::ShortBody => {
+                let cut = self.payload.len() / 2;
+                Ok(StreamSource {
+                    stream: Box::new(std::io::Cursor::new(self.payload[..cut].to_vec())),
+                    total_len: Some(self.payload.len() as u64),
+                })
+            }
+            StormMode::Good => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let len = self.payload.len() as u64;
+                Ok(StreamSource {
+                    stream: Box::new(std::io::Cursor::new(self.payload.clone())),
+                    total_len: Some(len),
+                })
+            }
+        }
+    }
+    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    async fn list(&self, _prefix: &str, _recursive: bool) -> Result<Vec<ListEntry>, BackendError> {
+        Ok(vec![])
+    }
+    fn id(&self) -> &str {
+        "storm"
+    }
+}
+
+/// A backend whose `open` blocks until the test releases it: the shape for
+/// asserting what happens while a transfer is mid-flight.
+pub struct BlockingOpenBackend {
+    bytes: Vec<u8>,
+    release: Arc<tokio::sync::Notify>,
+    opened: Arc<AtomicUsize>,
+}
+
+impl BlockingOpenBackend {
+    pub fn new(bytes: &[u8], release: Arc<tokio::sync::Notify>, opened: Arc<AtomicUsize>) -> Self {
+        Self { bytes: bytes.to_vec(), release, opened }
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for BlockingOpenBackend {
+    async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
+        Ok(ObjectMeta {
+            size_bytes: self.bytes.len() as u64,
+            etag: Some("v1".into()),
+            last_modified: None,
+            mime_hint: None,
+        })
+    }
+    async fn open(&self, _key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
+        self.opened.fetch_add(1, Ordering::SeqCst);
+        // Hold the transfer open until the test releases it.
+        self.release.notified().await;
+        // Honour the range like a real upstream: the 206 body must end at
+        // the requested length, or a staged serve would overshoot it.
+        let total = self.bytes.len() as u64;
+        let (start, end) = match range {
+            None => (0, total),
+            Some(r) => {
+                if r.offset >= total {
+                    return Err(BackendError::RangeNotSatisfiable);
+                }
+                (r.offset, r.length.map_or(total, |l| (r.offset + l).min(total)))
+            }
+        };
+        Ok(StreamSource {
+            stream: Box::new(std::io::Cursor::new(self.bytes[start as usize..end as usize].to_vec())),
+            total_len: Some(total),
+        })
+    }
+    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    fn id(&self) -> &str {
+        "blocking"
+    }
+}
+
+/// A backend whose reported size depends on the key: one node can hold an
+/// object the magazine can keep and one it cannot. Bodies are generated by
+/// position (`byte = offset % 251`), so a reported size far beyond any
+/// allocation is still servable for a small range.
+pub struct SizedBackend {
+    sizes: HashMap<String, u64>,
+    opens: Arc<AtomicUsize>,
+}
+
+impl SizedBackend {
+    pub fn new(sizes: &[(&str, u64)], opens: Arc<AtomicUsize>) -> Self {
+        Self { sizes: sizes.iter().map(|(k, v)| (k.to_string(), *v)).collect(), opens }
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for SizedBackend {
+    async fn stat(&self, key: &Key) -> Result<ObjectMeta, BackendError> {
+        let size = *self.sizes.get(key.as_str()).ok_or(BackendError::NotFound)?;
+        Ok(ObjectMeta { size_bytes: size, etag: Some("v1".into()), last_modified: None, mime_hint: None })
+    }
+    async fn open(&self, key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        let total = *self.sizes.get(key.as_str()).ok_or(BackendError::NotFound)?;
+        let (start, end) = match range {
+            None => (0, total),
+            Some(r) => {
+                if r.offset >= total {
+                    return Err(BackendError::RangeNotSatisfiable);
+                }
+                (r.offset, r.length.map_or(total, |l| (r.offset + l).min(total)))
+            }
+        };
+        let bytes: Vec<u8> = (start..end).map(|i| (i % 251) as u8).collect();
+        Ok(StreamSource { stream: Box::new(std::io::Cursor::new(bytes)), total_len: Some(total) })
+    }
+    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    fn id(&self) -> &str {
+        "sized"
+    }
+}
+
+/// A backend whose content and etag change when the test bumps the version:
+/// the revalidation / forced-refetch shapes.
+pub struct VersionedBackend {
+    pub version: Arc<AtomicUsize>,
+    pub mime: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for VersionedBackend {
+    async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
+        let v = self.version.load(Ordering::SeqCst);
+        let bytes = format!("bytes-v{v}").into_bytes();
+        Ok(ObjectMeta {
+            size_bytes: bytes.len() as u64,
+            etag: Some(format!("v{v}")),
+            last_modified: None,
+            mime_hint: self.mime.clone(),
+        })
+    }
+    async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
+        let v = self.version.load(Ordering::SeqCst);
+        let bytes = format!("bytes-v{v}").into_bytes();
+        Ok(StreamSource {
+            stream: Box::new(std::io::Cursor::new(bytes)),
+            total_len: Some(7),
+        })
+    }
+    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    fn id(&self) -> &str {
+        "versioned"
     }
 }
 

@@ -1883,14 +1883,7 @@ mod tests {
     use tempfile::tempdir;
 
 
-    async fn read_body(body: &mut BodyStream) -> Vec<u8> {
-        use futures::StreamExt;
-        let mut out = Vec::new();
-        while let Some(chunk) = body.next().await {
-            out.extend_from_slice(&chunk.unwrap());
-        }
-        out
-    }
+
 
     fn test_cache(
         dir: std::path::PathBuf,
@@ -1980,7 +1973,7 @@ mod tests {
         let (_cfg, _clock, cache, _calls) = test_cache(dir.path().to_path_buf(), b"hello", Some("v1"), None);
         let mut hit = cache.get_by_key("a.png", None).await.unwrap();
         assert_eq!(hit.outcome, CacheOutcome::Miss);
-        let b = read_body(&mut hit.body).await;
+        let b = crate::testsupport::collect(&mut hit.body).await;
         assert_eq!(b, b"hello");
         // wait for the driver to seal + install
         for _ in 0..100 {
@@ -1991,7 +1984,7 @@ mod tests {
         }
         let mut hit2 = cache.get_by_key("a.png", None).await.unwrap();
         assert_eq!(hit2.outcome, CacheOutcome::Hit);
-        let b2 = read_body(&mut hit2.body).await;
+        let b2 = crate::testsupport::collect(&mut hit2.body).await;
         assert_eq!(b2, b"hello");
     }
 
@@ -2020,7 +2013,7 @@ mod tests {
             "the first read is pulled through the flight"
         );
         let mut body = plan.body;
-        assert_eq!(read_body(&mut body).await, b"hello");
+        assert_eq!(crate::testsupport::collect(&mut body).await, b"hello");
         for _ in 0..100 {
             if cache.state.read().await.entries.contains_key("a.png") {
                 break;
@@ -2107,7 +2100,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (cfg, clock, cache, _calls) = test_cache(dir.path().to_path_buf(), b"cached", Some("v1"), None);
         let mut hit = cache.get_by_key("a.png", None).await.unwrap();
-        assert_eq!(read_body(&mut hit.body).await, b"cached");
+        assert_eq!(crate::testsupport::collect(&mut hit.body).await, b"cached");
         for _ in 0..100 {
             if cache.state.read().await.entries.contains_key("a.png") {
                 break;
@@ -2131,7 +2124,7 @@ mod tests {
         clock.advance(61_000);
         let mut hit2 = cache2.get_by_key("a.png", None).await.unwrap();
         assert_eq!(hit2.outcome, CacheOutcome::Stale);
-        assert_eq!(read_body(&mut hit2.body).await, b"cached");
+        assert_eq!(crate::testsupport::collect(&mut hit2.body).await, b"cached");
     }
 
     #[tokio::test]
@@ -2151,7 +2144,7 @@ mod tests {
         );
         let cache = Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots));
         let mut hit = cache.get_by_key("a.png", None).await.unwrap();
-        read_body(&mut hit.body).await;
+        crate::testsupport::collect(&mut hit.body).await;
         for _ in 0..100 {
             if cache.state.read().await.entries.contains_key("a.png") {
                 break;

@@ -4,12 +4,15 @@ use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc};
 use tempfile::tempdir;
 
 // The mock lives in the lib now: one implementation for the whole tree.
-use origin_cache::testsupport::{CacheTestExt, MockBackend as CountingBackend};
+use origin_cache::testsupport::{
+    collect, collect_allow_error, BlockingOpenBackend, CacheTestExt, MockBackend as CountingBackend,
+    SizedBackend, StormBackend, StormMode, VersionedBackend, wait_entry,
+};
 
 use origin_cache::{
-    backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, Key, ListEntry, ObjectMeta, StreamSource, StorageBackend},
+    backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, ListEntry, StreamSource, StorageBackend},
     cache::cache::{Cache, CacheOutcome},
-    cache::flight::{BodyStream, FlightProgress},
+    cache::flight::FlightProgress,
     clock::{Clock, MockClock},
     config::Config,
     key::KeyError,
@@ -32,24 +35,16 @@ fn registry_with(backend: Arc<dyn StorageBackend>) -> BackendRegistry {
     BackendRegistry::new(slots)
 }
 
-async fn read_body(body: &mut BodyStream) -> Vec<u8> {
-    use futures::StreamExt;
-    let mut out = Vec::new();
-    while let Some(chunk) = body.next().await {
-        out.extend_from_slice(&chunk.unwrap());
-    }
-    out
-}
-
-/// Wait until the driver task has installed the metadata row for `key`.
-async fn wait_installed(cache: &Cache<MockClock>, key: &str) {
+/// Wait until every flight has left the map (an admission round keeps the
+/// map as its coalescing key-set, and these tests assert on its drain).
+async fn wait_map_empty(cache: &Cache<MockClock>) {
     for _ in 0..200 {
-        if cache.state.read().await.entries.contains_key(key) {
+        if cache.flights.active().await == 0 {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    panic!("entry {key} never installed");
+    panic!("flight map never emptied");
 }
 
 #[tokio::test]
@@ -117,8 +112,8 @@ async fn inactive_ttl_expiry_removes_file_and_meta() {
     let backend = CountingBackend::counting(b"x".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, Arc::clone(&clock), registry_with(Arc::new(backend)));
     let mut hit = cache.get_by_key("a.png", None).await.unwrap();
-    read_body(&mut hit.body).await;
-    wait_installed(&cache, "a.png").await;
+    collect(&mut hit.body).await;
+    wait_entry(&cache, "a.png").await;
     assert!(dir.path().join("a.png").exists());
     clock.advance(2000);
     cache.tick().await;
@@ -140,8 +135,8 @@ async fn max_size_evicts_lru_order() {
     let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend)));
     for k in ["a.png", "b.png", "c.png"] {
         let mut hit = cache.get_by_key(k, None).await.unwrap();
-        read_body(&mut hit.body).await;
-        wait_installed(&cache, k).await;
+        collect(&mut hit.body).await;
+        wait_entry(&cache, k).await;
         clock.advance(10);
     }
     let remaining = cache.state.read().await.entries.len();
@@ -161,61 +156,30 @@ async fn revalidation_uses_stat_and_serves_updated_content() {
     let clock = Arc::new(MockClock::new(0));
     let version = Arc::new(AtomicUsize::new(1));
 
-    struct VersionedBackend {
-        version: Arc<AtomicUsize>,
-    }
-    #[async_trait::async_trait]
-    impl StorageBackend for VersionedBackend {
-        async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
-            let v = self.version.load(Ordering::SeqCst);
-            let bytes = format!("bytes-v{v}").into_bytes();
-            Ok(ObjectMeta {
-                size_bytes: bytes.len() as u64,
-                etag: Some(format!("v{v}")),
-                last_modified: None,
-                mime_hint: Some("image/png".into()),
-            })
-        }
-        async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
-            let v = self.version.load(Ordering::SeqCst);
-            let bytes = format!("bytes-v{v}").into_bytes();
-            Ok(StreamSource {
-                stream: Box::new(std::io::Cursor::new(bytes)),
-                total_len: Some(7),
-            })
-        }
-        async fn refresh_if_needed(&self) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn id(&self) -> &str {
-            "versioned"
-        }
-    }
-
     let cache = Cache::new(
         Arc::clone(&cfg),
         Arc::clone(&clock),
-        registry_with(Arc::new(VersionedBackend { version: Arc::clone(&version) })),
+        registry_with(Arc::new(VersionedBackend { version: Arc::clone(&version), mime: None })),
     );
 
     let hit = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
     let mut hit = hit;
-    assert_eq!(read_body(&mut hit.body).await, b"bytes-v1");
-    wait_installed(&cache, "a.png").await;
+    assert_eq!(collect(&mut hit.body).await, b"bytes-v1");
+    wait_entry(&cache, "a.png").await;
 
     version.store(2, Ordering::SeqCst);
     clock.advance(2000); // past revalidate ttl
 
     let mut hit2 = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit2.outcome, CacheOutcome::Miss); // stat: v2 != cached v1 -> refetch
-    assert_eq!(read_body(&mut hit2.body).await, b"bytes-v2");
-    wait_installed(&cache, "a.png").await;
+    assert_eq!(collect(&mut hit2.body).await, b"bytes-v2");
+    wait_entry(&cache, "a.png").await;
 
     // Third get within ttl: fresh hit, no upstream.
     let mut hit3 = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit3.outcome, CacheOutcome::Hit);
-    assert_eq!(read_body(&mut hit3.body).await, b"bytes-v2");
+    assert_eq!(collect(&mut hit3.body).await, b"bytes-v2");
 }
 
 #[tokio::test]
@@ -232,12 +196,12 @@ async fn revalidation_not_modified_serves_revalidated() {
     let cache = Cache::new(cfg, Arc::clone(&clock), registry_with(Arc::new(backend)));
     let mut hit = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
-    assert_eq!(read_body(&mut hit.body).await, b"stable");
-    wait_installed(&cache, "a.png").await;
+    assert_eq!(collect(&mut hit.body).await, b"stable");
+    wait_entry(&cache, "a.png").await;
     clock.advance(2000);
     let mut hit2 = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit2.outcome, CacheOutcome::Revalidated);
-    assert_eq!(read_body(&mut hit2.body).await, b"stable");
+    assert_eq!(collect(&mut hit2.body).await, b"stable");
 }
 
 #[tokio::test]
@@ -274,8 +238,8 @@ async fn range_on_cached_file_slices_and_reports_content_range() {
     let backend = CountingBackend::counting(b"0123456789".to_vec(), Some("v1".into()), Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
     let mut full = cache.get_by_key("a.png", None).await.unwrap();
-    read_body(&mut full.body).await;
-    wait_installed(&cache, "a.png").await;
+    collect(&mut full.body).await;
+    wait_entry(&cache, "a.png").await;
 
     // Cached-file Range: sliced via file seek, no upstream traffic.
     let before = calls.load(Ordering::SeqCst);
@@ -285,7 +249,7 @@ async fn range_on_cached_file_slices_and_reports_content_range() {
         .unwrap();
     assert_eq!(part.outcome, CacheOutcome::Hit);
     assert_eq!(part.content_range.as_ref().map(|c| c.header_value()).as_deref(), Some("bytes 2-5/10"));
-    assert_eq!(read_body(&mut part.body).await, b"2345");
+    assert_eq!(collect(&mut part.body).await, b"2345");
     assert_eq!(calls.load(Ordering::SeqCst), before);
 }
 
@@ -303,8 +267,8 @@ async fn range_cold_miss_offset_zero_streams_full_with_content_range() {
         .unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
     assert_eq!(hit.content_range.as_ref().map(|c| c.header_value()).as_deref(), Some("bytes 0-9/10"));
-    assert_eq!(read_body(&mut hit.body).await, b"0123456789");
-    wait_installed(&cache, "a.png").await;
+    assert_eq!(collect(&mut hit.body).await, b"0123456789");
+    wait_entry(&cache, "a.png").await;
 }
 
 #[tokio::test]
@@ -324,8 +288,8 @@ async fn range_cold_miss_dual_channel_passthrough_and_background_fill() {
         .unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
     assert_eq!(hit.content_range.as_ref().map(|c| c.header_value()).as_deref(), Some("bytes 3-9/10"));
-    assert_eq!(read_body(&mut hit.body).await, b"3456789");
-    wait_installed(&cache, "a.png").await;
+    assert_eq!(collect(&mut hit.body).await, b"3456789");
+    wait_entry(&cache, "a.png").await;
     assert_eq!(
         std::fs::read(dir.path().join("a.png")).unwrap(),
         b"0123456789".to_vec(),
@@ -335,7 +299,7 @@ async fn range_cold_miss_dual_channel_passthrough_and_background_fill() {
     // Next access is a full disk hit.
     let mut hit2 = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit2.outcome, CacheOutcome::Hit);
-    assert_eq!(read_body(&mut hit2.body).await, b"0123456789");
+    assert_eq!(collect(&mut hit2.body).await, b"0123456789");
 }
 
 #[tokio::test]
@@ -347,8 +311,8 @@ async fn unsatisfiable_range_rejected() {
     let backend = CountingBackend::counting(b"short".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
     let mut hit = cache.get_by_key("a.png", None).await.unwrap();
-    read_body(&mut hit.body).await;
-    wait_installed(&cache, "a.png").await;
+    collect(&mut hit.body).await;
+    wait_entry(&cache, "a.png").await;
 
     let err = match cache
         .get_by_key("a.png", Some(ByteRange::from_offset(99)))
@@ -370,7 +334,7 @@ async fn mime_fallback_overrides_octet_stream() {
     let backend = CountingBackend::counting(b"id3".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
     let mut hit = cache.get_by_key("music/dazbee.flac", None).await.unwrap();
-    read_body(&mut hit.body).await;
+    collect(&mut hit.body).await;
     assert_eq!(hit.meta.content_type.as_deref(), Some("audio/flac"));
 }
 
@@ -387,8 +351,8 @@ async fn cache_entries_and_access_clock_survive_restart() {
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
     cache.load_and_start().await;
     let mut hit = cache.get_by_key("a.png", None).await.unwrap();
-    assert_eq!(read_body(&mut hit.body).await, b"persisted");
-    wait_installed(&cache, "a.png").await;
+    assert_eq!(collect(&mut hit.body).await, b"persisted");
+    wait_entry(&cache, "a.png").await;
     clock.advance(5000); // last_access moved; eviction order must persist too
     // flush the coalesced access-clock bump to redb
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
@@ -410,7 +374,7 @@ async fn cache_entries_and_access_clock_survive_restart() {
     // still within revalidate ttl, so a plain disk hit with zero upstream.
     let mut hit2 = cache2.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit2.outcome, CacheOutcome::Hit);
-    assert_eq!(read_body(&mut hit2.body).await, b"persisted");
+    assert_eq!(collect(&mut hit2.body).await, b"persisted");
     assert_eq!(calls2.load(Ordering::SeqCst), 0, "restart hit must not touch upstream");
 }
 
@@ -432,8 +396,8 @@ async fn spawned_reaper_expires_entries_without_manual_tick() {
     cache.load_and_start_with(std::time::Duration::from_millis(50)).await;
 
     let mut hit = cache.get_by_key("old.png", None).await.unwrap();
-    assert_eq!(read_body(&mut hit.body).await, b"ttl");
-    wait_installed(&cache, "old.png").await;
+    assert_eq!(collect(&mut hit.body).await, b"ttl");
+    wait_entry(&cache, "old.png").await;
 
     // Default inactive_ttl is 1200 s; step past it and give the reaper a
     // real-time moment to fire (the loop interval is wall time, the TTL is
@@ -454,95 +418,6 @@ async fn spawned_reaper_expires_entries_without_manual_tick() {
 // whose breakdown motivated the refactor (audit findings C1/B2/B3).
 // ---------------------------------------------------------------------------
 
-/// Storm-suite backend: counts stat+open calls, delays a real open so
-/// readers join an in-flight download, and can be switched to fail / panic
-/// / undershoot on open to exercise flight failure propagation.
-struct StormBackend {
-    payload: Vec<u8>,
-    calls: Arc<AtomicUsize>,
-    mode: Arc<std::sync::Mutex<StormMode>>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum StormMode {
-    Good,
-    FailOpen,
-    PanicOpen,
-    ShortBody,
-}
-
-#[async_trait::async_trait]
-impl StorageBackend for StormBackend {
-    async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ObjectMeta {
-            size_bytes: self.payload.len() as u64,
-            etag: Some("v1".into()),
-            last_modified: None,
-            mime_hint: None,
-        })
-    }
-    async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let mode = *self.mode.lock().unwrap();
-        match mode {
-            StormMode::FailOpen => Err(BackendError::ServerError("open refused".into())),
-            StormMode::PanicOpen => panic!("storm open boom"),
-            StormMode::ShortBody => {
-                let cut = self.payload.len() / 2;
-                Ok(StreamSource {
-                    stream: Box::new(std::io::Cursor::new(self.payload[..cut].to_vec())),
-                    total_len: Some(self.payload.len() as u64),
-                })
-            }
-            StormMode::Good => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let len = self.payload.len() as u64;
-                Ok(StreamSource {
-                    stream: Box::new(std::io::Cursor::new(self.payload.clone())),
-                    total_len: Some(len),
-                })
-            }
-        }
-    }
-    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
-        Ok(())
-    }
-    async fn list(&self, _prefix: &str, _recursive: bool) -> Result<Vec<origin_cache::backend::ListEntry>, BackendError> {
-        Ok(vec![])
-    }
-    fn id(&self) -> &str {
-        "storm"
-    }
-}
-
-/// Collect a body, allowing a terminal Err: returns (bytes, errored).
-async fn read_body_allow_error(body: BodyStream) -> (Vec<u8>, bool) {
-    use futures::StreamExt;
-    let mut body = body;
-    let mut out = Vec::new();
-    let mut errored = false;
-    while let Some(chunk) = body.next().await {
-        match chunk {
-            Ok(b) => out.extend_from_slice(&b),
-            Err(_) => {
-                errored = true;
-                break;
-            }
-        }
-    }
-    (out, errored)
-}
-
-async fn wait_map_empty(cache: &Cache<MockClock>) {
-    for _ in 0..200 {
-        if cache.flights.active().await == 0 {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    panic!("flight map never emptied");
-}
 
 /// The storm core: 20 concurrent ranged cold misses on ONE key must share
 /// exactly one upstream stat + one open (ADR-0003 acceptance, ranged), and
@@ -554,11 +429,7 @@ async fn ranged_cold_misses_on_one_key_coalesce() {
     let clock = Arc::new(MockClock::new(0));
     let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = StormBackend {
-        payload: payload.clone(),
-        calls: Arc::clone(&calls),
-        mode: Arc::new(std::sync::Mutex::new(StormMode::Good)),
-    };
+    let backend = StormBackend::new(&payload, Arc::clone(&calls), Arc::new(std::sync::Mutex::new(StormMode::Good)));
     let cache = Arc::new(Cache::new(
         test_config(dir.path().to_path_buf()),
         Arc::clone(&clock),
@@ -575,7 +446,7 @@ async fn ranged_cold_misses_on_one_key_coalesce() {
                 .get_by_key("storm.bin", Some(ByteRange::bounded(offset, 64)))
                 .await
                 .expect("ranged cold miss must succeed");
-            let body = read_body(&mut hit.body).await;
+            let body = collect(&mut hit.body).await;
             (offset, body)
         }));
     }
@@ -584,14 +455,14 @@ async fn ranged_cold_misses_on_one_key_coalesce() {
         assert_eq!(body, payload[offset as usize..(offset + 64) as usize], "seek @{offset} bytes must be exact");
     }
     assert_eq!(calls.load(Ordering::SeqCst), 2, "1 stat + 1 open for 20 ranged cold misses");
-    wait_installed(&cache, "storm.bin").await;
+    wait_entry(&cache, "storm.bin").await;
 
     // Second wave: same seeks served from disk as hits, bytes still exact.
     for i in 0..20u64 {
         let offset = (i * 173) % 4096;
         let mut hit = cache.get_by_key("storm.bin", Some(ByteRange::bounded(offset, 64))).await.unwrap();
         assert_eq!(hit.outcome, CacheOutcome::Hit);
-        assert_eq!(read_body(&mut hit.body).await, payload[offset as usize..(offset + 64) as usize]);
+        assert_eq!(collect(&mut hit.body).await, payload[offset as usize..(offset + 64) as usize]);
     }
 }
 
@@ -603,11 +474,7 @@ async fn flight_failure_reaches_attached_readers_and_clears_map() {
     let clock = Arc::new(MockClock::new(0));
     let payload: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
     let mode = Arc::new(std::sync::Mutex::new(StormMode::FailOpen));
-    let backend = StormBackend {
-        payload: payload.clone(),
-        calls: Arc::new(AtomicUsize::new(0)),
-        mode: Arc::clone(&mode),
-    };
+    let backend = StormBackend::new(&payload, Arc::new(AtomicUsize::new(0)), Arc::clone(&mode));
     let cache = Arc::new(Cache::new(
         test_config(dir.path().to_path_buf()),
         Arc::clone(&clock),
@@ -623,7 +490,7 @@ async fn flight_failure_reaches_attached_readers_and_clears_map() {
             // failure reaching the client; neither may hang.
             match cache.get_by_key("flaky.bin", None).await {
                 Err(_) => (Vec::new(), true),
-                Ok(hit) => read_body_allow_error(hit.body).await,
+                Ok(hit) => collect_allow_error(hit.body).await,
             }
         }));
     }
@@ -636,7 +503,7 @@ async fn flight_failure_reaches_attached_readers_and_clears_map() {
 
     *mode.lock().unwrap() = StormMode::Good;
     let mut hit = cache.get_by_key("flaky.bin", None).await.unwrap();
-    assert_eq!(read_body(&mut hit.body).await, payload, "retry after failure must succeed");
+    assert_eq!(collect(&mut hit.body).await, payload, "retry after failure must succeed");
 }
 
 /// A driver panic must not leave a zombie flight: readers error out, the
@@ -647,11 +514,7 @@ async fn panicked_driver_fails_flight_and_releases_key() {
     let clock = Arc::new(MockClock::new(0));
     let payload: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
     let mode = Arc::new(std::sync::Mutex::new(StormMode::PanicOpen));
-    let backend = StormBackend {
-        payload: payload.clone(),
-        calls: Arc::new(AtomicUsize::new(0)),
-        mode: Arc::clone(&mode),
-    };
+    let backend = StormBackend::new(&payload, Arc::new(AtomicUsize::new(0)), Arc::clone(&mode));
     let cache = Arc::new(Cache::new(
         test_config(dir.path().to_path_buf()),
         Arc::clone(&clock),
@@ -668,7 +531,7 @@ async fn panicked_driver_fails_flight_and_releases_key() {
     // surfacing is fine; hanging forever is not.
     let errored = match outcome {
         Err(_) => true,
-        Ok(hit) => read_body_allow_error(hit.body).await.1,
+        Ok(hit) => collect_allow_error(hit.body).await.1,
     };
     assert!(errored, "panic must surface as an error");
     wait_map_empty(&cache).await;
@@ -676,7 +539,7 @@ async fn panicked_driver_fails_flight_and_releases_key() {
 
     *mode.lock().unwrap() = StormMode::Good;
     let mut hit = cache.get_by_key("panic.bin", None).await.unwrap();
-    assert_eq!(read_body(&mut hit.body).await, payload, "key must be retryable after a panic");
+    assert_eq!(collect(&mut hit.body).await, payload, "key must be retryable after a panic");
 }
 
 /// A short upstream body must never be sealed into the cache: the flight
@@ -687,11 +550,7 @@ async fn short_upstream_body_is_never_sealed() {
     let clock = Arc::new(MockClock::new(0));
     let payload: Vec<u8> = (0..100u32).map(|i| (i % 251) as u8).collect();
     let mode = Arc::new(std::sync::Mutex::new(StormMode::ShortBody));
-    let backend = StormBackend {
-        payload: payload.clone(),
-        calls: Arc::new(AtomicUsize::new(0)),
-        mode: Arc::clone(&mode),
-    };
+    let backend = StormBackend::new(&payload, Arc::new(AtomicUsize::new(0)), Arc::clone(&mode));
     let cache = Arc::new(Cache::new(
         test_config(dir.path().to_path_buf()),
         Arc::clone(&clock),
@@ -700,7 +559,7 @@ async fn short_upstream_body_is_never_sealed() {
 
     let (out, errored) = match cache.get_by_key("short.bin", None).await {
         Err(_) => (Vec::new(), true),
-        Ok(hit) => read_body_allow_error(hit.body).await,
+        Ok(hit) => collect_allow_error(hit.body).await,
     };
     assert!(errored, "short body must surface as an error");
     assert!(out.len() <= 50, "at most the bytes that did land reach the reader");
@@ -713,7 +572,7 @@ async fn short_upstream_body_is_never_sealed() {
 
     *mode.lock().unwrap() = StormMode::Good;
     let mut hit = cache.get_by_key("short.bin", None).await.unwrap();
-    assert_eq!(read_body(&mut hit.body).await, payload, "retry must pull the full object");
+    assert_eq!(collect(&mut hit.body).await, payload, "retry must pull the full object");
 }
 
 // ---------------------------------------------------------------------------
@@ -743,8 +602,8 @@ async fn concurrent_hits_stamp_access_without_state_write_lock() {
     // then cold-fill and hammer the hot key concurrently.
     clock.advance(5000);
     let mut first = cache.get_by_key("hot.bin", None).await.unwrap();
-    assert_eq!(read_body(&mut first.body).await, payload);
-    wait_installed(&cache, "hot.bin").await;
+    assert_eq!(collect(&mut first.body).await, payload);
+    wait_entry(&cache, "hot.bin").await;
 
     let mut tasks = Vec::new();
     for _ in 0..32 {
@@ -754,7 +613,7 @@ async fn concurrent_hits_stamp_access_without_state_write_lock() {
             for _ in 0..8 {
                 let mut hit = cache.get_by_key("hot.bin", None).await.unwrap();
                 assert_eq!(hit.outcome, CacheOutcome::Hit);
-                assert_eq!(read_body(&mut hit.body).await, expect);
+                assert_eq!(collect(&mut hit.body).await, expect);
             }
         }));
     }
@@ -779,54 +638,6 @@ async fn concurrent_hits_stamp_access_without_state_write_lock() {
 // 22 ms, and 14.2 s while three cold pulls held the single shared gate.
 // ---------------------------------------------------------------------------
 
-/// Backend whose `open` blocks until released, so a transfer can be held
-/// open while a metadata call is attempted.
-struct BlockingOpenBackend {
-    bytes: Vec<u8>,
-    release: Arc<tokio::sync::Notify>,
-    opened: Arc<AtomicUsize>,
-}
-
-#[async_trait::async_trait]
-impl StorageBackend for BlockingOpenBackend {
-    async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
-        Ok(ObjectMeta {
-            size_bytes: self.bytes.len() as u64,
-            etag: Some("v1".into()),
-            last_modified: None,
-            mime_hint: None,
-        })
-    }
-    async fn open(&self, _key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
-        self.opened.fetch_add(1, Ordering::SeqCst);
-        // Hold the transfer open until the test releases it.
-        self.release.notified().await;
-        // Honour the range like a real upstream: the 206 body must end at
-        // the requested length, or a staged serve would overshoot it.
-        let total = self.bytes.len() as u64;
-        let (start, end) = match range {
-            None => (0, total),
-            Some(r) => {
-                if r.offset >= total {
-                    return Err(BackendError::RangeNotSatisfiable);
-                }
-                (r.offset, r.length.map_or(total, |l| (r.offset + l).min(total)))
-            }
-        };
-        Ok(StreamSource {
-            stream: Box::new(std::io::Cursor::new(
-                self.bytes[start as usize..end as usize].to_vec(),
-            )),
-            total_len: Some(total),
-        })
-    }
-    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
-        Ok(())
-    }
-    fn id(&self) -> &str {
-        "blocking"
-    }
-}
 
 /// With the stream gate saturated, a metadata stat must still complete
 /// promptly (B1). Under the old single gate it queued behind the transfer.
@@ -837,11 +648,7 @@ async fn head_not_starved_by_saturated_stream_gate() {
     let cfg = test_config(dir.path().to_path_buf());
     let release = Arc::new(tokio::sync::Notify::new());
     let opened = Arc::new(AtomicUsize::new(0));
-    let backend = Arc::new(BlockingOpenBackend {
-        bytes: vec![7u8; 4096],
-        release: Arc::clone(&release),
-        opened: Arc::clone(&opened),
-    });
+    let backend = Arc::new(BlockingOpenBackend::new(&vec![7u8; 4096], Arc::clone(&release), Arc::clone(&opened)));
 
     // Deliberately saturate the STREAM gate (2 permits) with two held
     // transfers on distinct keys.
@@ -886,63 +693,6 @@ async fn head_not_starved_by_saturated_stream_gate() {
     release.notify_waiters();
 }
 
-/// A backend whose reported size depends on the key: one node can hold an
-/// object the magazine can keep and one it cannot. Bodies are generated by
-/// position, so a reported size far beyond any allocation is still servable
-/// for a small range.
-struct SizedBackend {
-    sizes: HashMap<String, u64>,
-    opens: Arc<AtomicUsize>,
-}
-
-#[async_trait::async_trait]
-impl StorageBackend for SizedBackend {
-    async fn stat(&self, key: &Key) -> Result<ObjectMeta, BackendError> {
-        let size = *self.sizes.get(key.as_str()).ok_or(BackendError::NotFound)?;
-        Ok(ObjectMeta { size_bytes: size, etag: Some("v1".into()), last_modified: None, mime_hint: None })
-    }
-    async fn open(&self, key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
-        self.opens.fetch_add(1, Ordering::SeqCst);
-        let total = *self.sizes.get(key.as_str()).ok_or(BackendError::NotFound)?;
-        let (start, end) = match range {
-            None => (0, total),
-            Some(r) => {
-                if r.offset >= total {
-                    return Err(BackendError::RangeNotSatisfiable);
-                }
-                (r.offset, r.length.map_or(total, |l| (r.offset + l).min(total)))
-            }
-        };
-        let bytes: Vec<u8> = (start..end).map(|i| (i % 251) as u8).collect();
-        Ok(StreamSource { stream: Box::new(std::io::Cursor::new(bytes)), total_len: Some(total) })
-    }
-    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
-        Ok(())
-    }
-    fn id(&self) -> &str {
-        "sized"
-    }
-}
-
-fn sized_cache(
-    dir: &std::path::Path,
-    sizes: &[(&str, u64)],
-    max_size_bytes: u64,
-    concurrency: usize,
-) -> (Arc<Cache<MockClock>>, Arc<MockClock>, Arc<AtomicUsize>) {
-    let mut cfg = Config { cache_dir: dir.to_path_buf(), ..Config::default() };
-    cfg.max_size_bytes = max_size_bytes;
-    let clock = Arc::new(MockClock::new(0));
-    let opens = Arc::new(AtomicUsize::new(0));
-    let backend = Arc::new(SizedBackend {
-        sizes: sizes.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-        opens: Arc::clone(&opens),
-    });
-    let mut slots = HashMap::new();
-    slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, concurrency)));
-    let cache = Arc::new(Cache::new(Arc::new(cfg), Arc::clone(&clock), BackendRegistry::new(slots)));
-    (cache, clock, opens)
-}
 
 /// An object larger than the magazine is admitted as a RESIDENT STRAY
 /// (ADR-0014): cached, because one upstream stream then serves every later
@@ -951,15 +701,22 @@ fn sized_cache(
 #[tokio::test]
 async fn an_object_larger_than_the_magazine_is_cached_as_a_stray() {
     let dir = tempdir().unwrap();
-    let (cache, _clock, opens) = sized_cache(dir.path(), &[("member.bin", 100), ("stray.bin", 4_000)], 1_000, 3);
+    let clock = Arc::new(MockClock::new(0));
+    let opens = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(SizedBackend::new(&[("member.bin", 100), ("stray.bin", 4_000)], Arc::clone(&opens)));
+    let mut slots = HashMap::new();
+    slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
+    let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+    cfg.max_size_bytes = 1_000;
+    let cache = Arc::new(Cache::new(Arc::new(cfg), Arc::clone(&clock), BackendRegistry::new(slots)));
 
     let mut hit = cache.get_by_key("member.bin", None).await.unwrap();
-    read_body(&mut hit.body).await;
-    wait_installed(&cache, "member.bin").await;
+    collect(&mut hit.body).await;
+    wait_entry(&cache, "member.bin").await;
 
     let mut hit = cache.get_by_key("stray.bin", None).await.unwrap();
-    read_body(&mut hit.body).await;
-    wait_installed(&cache, "stray.bin").await;
+    collect(&mut hit.body).await;
+    wait_entry(&cache, "stray.bin").await;
 
     {
         let s = cache.state.read().await;
@@ -983,7 +740,7 @@ async fn an_object_larger_than_the_magazine_is_cached_as_a_stray() {
         .get_by_key("stray.bin", Some(ByteRange::bounded(0, 10)))
         .await
         .unwrap();
-    let body = read_body(&mut hit.body).await;
+    let body = collect(&mut hit.body).await;
     assert_eq!(body, (0..10u64).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
     assert_eq!(
         opens.load(Ordering::SeqCst),
@@ -1000,7 +757,12 @@ async fn a_cold_pull_the_disk_cannot_hold_is_served_without_caching() {
     use origin_cache::cache::cache::{BodySource, ServeOutcome};
 
     let dir = tempdir().unwrap();
-    let (cache, _clock, opens) = sized_cache(dir.path(), &[("huge.bin", u64::MAX / 4)], 1_000, 3);
+    let opens = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(SizedBackend::new(&[("huge.bin", u64::MAX / 4)], Arc::clone(&opens)));
+    let mut slots = HashMap::new();
+    slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
+    let clock = Arc::new(MockClock::new(0));
+    let cache = Arc::new(Cache::new(test_config(dir.path().to_path_buf()), Arc::clone(&clock), BackendRegistry::new(slots)));
 
     let rk = cache.resolve("huge.bin").unwrap();
     let out = cache
@@ -1014,7 +776,7 @@ async fn a_cold_pull_the_disk_cannot_hold_is_served_without_caching() {
     assert_eq!(plan.source, BodySource::Upstream, "the bytes came straight from upstream");
     let mut body = plan.body;
     assert_eq!(
-        read_body(&mut body).await,
+        collect(&mut body).await,
         (0..8u64).map(|i| (i % 251) as u8).collect::<Vec<u8>>()
     );
     assert_eq!(cache.flights.active().await, 0, "no flight for an object that cannot be kept");
@@ -1049,11 +811,7 @@ async fn efficient_passthrough_waits_for_a_stream_permit() {
 
     let release = Arc::new(tokio::sync::Notify::new());
     let opened = Arc::new(AtomicUsize::new(0));
-    let backend = Arc::new(BlockingOpenBackend {
-        bytes: vec![7u8; 4096],
-        release: Arc::clone(&release),
-        opened: Arc::clone(&opened),
-    });
+    let backend = Arc::new(BlockingOpenBackend::new(&vec![7u8; 4096], Arc::clone(&release), Arc::clone(&opened)));
     let mut slots = HashMap::new();
     // Two stream permits; the test holds both, so no transfer can start.
     let slot = Arc::new(BackendSlot::new(backend, 2));
@@ -1112,7 +870,7 @@ async fn efficient_passthrough_waits_for_a_stream_permit() {
     );
 
     let mut body = plan.body;
-    assert_eq!(read_body(&mut body).await, vec![7u8; 64]);
+    assert_eq!(collect(&mut body).await, vec![7u8; 64]);
     assert_eq!(
         slot.stream_gate.available_permits(),
         2,
@@ -1186,8 +944,8 @@ async fn entry_count_cap_evicts_lru_even_under_byte_budget() {
     for (i, key) in ["k1", "k2", "k3", "k4", "k5"].iter().enumerate() {
         clock.advance(1000);
         let mut hit = cache.get_by_key(key, None).await.unwrap();
-        let _ = read_body(&mut hit.body).await;
-        wait_installed(&cache, key).await;
+        let _ = collect(&mut hit.body).await;
+        wait_entry(&cache, key).await;
         let _ = i;
     }
 
@@ -1345,8 +1103,8 @@ async fn metadata_loss_rebuilds_rows_from_the_object_tree() {
         let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend.clone()))));
         cache.load_and_start().await;
         let mut hit = cache.get_by_key("kept.bin", None).await.unwrap();
-        assert_eq!(read_body(&mut hit.body).await, b"payload");
-        wait_installed(&cache, "kept.bin").await;
+        assert_eq!(collect(&mut hit.body).await, b"payload");
+        wait_entry(&cache, "kept.bin").await;
     }
 
     // Simulate metadata loss: wipe the store's rows by removing redb.db
@@ -1387,8 +1145,8 @@ async fn eviction_picks_lru_victims_in_order() {
     for (i, k) in ["k1", "k2", "k3", "k4", "k5"].iter().enumerate() {
         clock.advance(1000 * (i as u64 + 1));
         let mut hit = cache.get_by_key(k, None).await.unwrap();
-        let _ = read_body(&mut hit.body).await;
-        wait_installed(&cache, k).await;
+        let _ = collect(&mut hit.body).await;
+        wait_entry(&cache, k).await;
     }
 
     let s = cache.state.read().await;
