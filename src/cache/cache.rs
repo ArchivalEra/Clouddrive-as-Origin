@@ -107,6 +107,8 @@ pub struct CacheHit {
     pub content_range: Option<ContentRange>,
     pub content_length: Option<u64>,
     pub body: BodyStream,
+    /// Where the body's bytes come from (metric label).
+    pub source: BodySource,
 }
 
 /// C-path / nocache response: origin bytes with the streaming
@@ -145,6 +147,33 @@ pub enum ServeOutcome {
 /// paths disagree on purpose: nocache and the cached path answer 206 only
 /// when a content-range is present, while the efficient passthrough always
 /// answers 206.
+/// Where a response's bytes actually come from. Carried on the plan (and on
+/// every `CacheHit`) so the metric label is taken from the path that
+/// produced the bytes rather than re-derived from the outcome — `Miss`, for
+/// one, is upstream bytes when the flight is still filling and disk bytes
+/// when a late attacher finds the sealed file.
+///
+/// The distinction is the product question this node exists to answer: a
+/// range served from this node's disk costs no upstream round trip, and the
+/// measured per-open cost is what makes a sequential shard walk slow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodySource {
+    /// A complete object file on this node.
+    Disk,
+    /// A live upstream stream: a cold-miss flight, a nocache water-pipe, or
+    /// an efficient passthrough.
+    Upstream,
+}
+
+impl BodySource {
+    pub fn label(self) -> &'static str {
+        match self {
+            BodySource::Disk => "disk",
+            BodySource::Upstream => "upstream",
+        }
+    }
+}
+
 pub struct StreamPlan {
     pub status: axum::http::StatusCode,
     pub meta: HitMeta,
@@ -153,6 +182,8 @@ pub struct StreamPlan {
     pub body: BodyStream,
     /// Only the cached path reports this: a stale serve adds `Warning: 110`.
     pub stale: bool,
+    /// Where the bytes come from — the label for the body metrics.
+    pub source: BodySource,
 }
 
 pub struct CacheState {
@@ -1132,6 +1163,7 @@ impl<C: Clock + Clone> Cache<C> {
                     content_length: hit.content_length,
                     body: hit.body,
                     stale: false,
+                    source: BodySource::Upstream,
                 }));
             }
         }
@@ -1151,6 +1183,7 @@ impl<C: Clock + Clone> Cache<C> {
                     content_length: hit.content_length,
                     body: hit.body,
                     stale: false,
+                    source: BodySource::Upstream,
                 }));
             }
         }
@@ -1160,6 +1193,7 @@ impl<C: Clock + Clone> Cache<C> {
         tracing::info!(
             key = %rk.cache_key,
             outcome = ?hit.outcome,
+            source = hit.source.label(),
             size = hit.meta.size,
             "cache response"
         );
@@ -1174,6 +1208,7 @@ impl<C: Clock + Clone> Cache<C> {
             content_length: hit.content_length,
             body: hit.body,
             stale: hit.outcome == CacheOutcome::Stale,
+            source: hit.source,
         }))
     }
 
@@ -1306,6 +1341,7 @@ impl<C: Clock + Clone> Cache<C> {
             content_range,
             content_length: Some(len),
             body: flight::file_body(path, offset, len),
+            source: BodySource::Disk,
         }))
     }
 
@@ -1363,6 +1399,7 @@ impl<C: Clock + Clone> Cache<C> {
                                 content_range: None,
                                 content_length: Some(meta.size_bytes),
                                 body: flight::growing_reader(flight),
+                                source: BodySource::Upstream,
                             });
                         }
                         Some(r) => {
@@ -1395,6 +1432,7 @@ impl<C: Clock + Clone> Cache<C> {
                                 }),
                                 content_length: Some(want),
                                 body: flight::growing_reader_from(flight, r.offset, Some(want)),
+                                source: BodySource::Upstream,
                             });
                         }
                     }
@@ -2401,6 +2439,49 @@ mod tests {
         assert_eq!(hit2.outcome, CacheOutcome::Hit);
         let b2 = read_body(&mut hit2.body).await;
         assert_eq!(b2, b"hello");
+    }
+
+    /// The byte-source label comes from the path that produced the bytes,
+    /// not from the outcome: a cold miss is a live upstream stream, and the
+    /// same key's next read is this node's disk. This is the label the body
+    /// metrics carry, and the only fact a "how much do we serve ourselves"
+    /// question needs.
+    #[tokio::test]
+    async fn serve_labels_the_bytes_with_their_source() {
+        let dir = tempdir().unwrap();
+        let (_cfg, _clock, cache, _calls) = test_cache(dir.path().to_path_buf(), b"hello", Some("v1"), None);
+        let cache = Arc::new(cache);
+        let rk = cache.resolve("a.png").unwrap();
+        assert!(
+            !cache.state.read().await.entries.contains_key("a.png"),
+            "the first serve must really be a miss, or this test proves nothing"
+        );
+        let plan = match cache.serve(&rk, None, None).await.unwrap() {
+            ServeOutcome::Stream(plan) => plan,
+            _ => panic!("a cold miss must stream, not redirect"),
+        };
+        assert_eq!(
+            plan.source,
+            BodySource::Upstream,
+            "the first read is pulled through the flight"
+        );
+        let mut body = plan.body;
+        assert_eq!(read_body(&mut body).await, b"hello");
+        for _ in 0..100 {
+            if cache.state.read().await.entries.contains_key("a.png") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let plan2 = match cache.serve(&rk, None, None).await.unwrap() {
+            ServeOutcome::Stream(plan) => plan,
+            _ => panic!("a hit must stream"),
+        };
+        assert_eq!(
+            plan2.source,
+            BodySource::Disk,
+            "the second read is served from the file on this node"
+        );
     }
 
     /// A promoted entry carries a hold, armed only by the promotion path.

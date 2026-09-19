@@ -12,7 +12,9 @@
 use std::sync::LazyLock;
 use std::time::Instant;
 
-use prometheus::{register_histogram_vec, HistogramVec};
+use prometheus::{
+    register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
+};
 
 /// Same bucket span as the front plane (1 ms through 3 min).
 pub const LATENCY_BUCKETS: &[f64] = &[
@@ -33,17 +35,61 @@ pub static BACKEND_CALL: LazyLock<HistogramVec> = LazyLock::new(|| {
     .expect("register backend_call_duration_seconds")
 });
 
-/// Time the cache layer spent serving a request, by outcome. `outcome`
+/// Time the cache layer spent BUILDING a response, by outcome. `outcome`
 /// values are the `CacheOutcome` variants plus the two non-cache serve
 /// modes (`nocache`, `passthrough`).
+///
+/// Read this as "how long until the headers were ready", not as how long
+/// the viewer waited: every observed function returns an unconsumed body,
+/// so the byte transfer is not inside the sample. [`BODY_TTFB`] is the
+/// instrument for the viewer's actual wait.
 pub static CACHE_SERVE: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "cache_serve_duration_seconds",
-        "cache serve duration by outcome",
+        "cache response construction duration by outcome",
         &["outcome"],
         LATENCY_BUCKETS.to_vec()
     )
     .expect("register cache_serve_duration_seconds")
+});
+
+/// Responses by where their bytes come from (`disk` or `upstream`), counted
+/// when the response is built. This is the counter that answers "how much of
+/// this workload are we serving ourselves?" — the question that decides
+/// whether a bigger local read path is worth building.
+pub static SERVE_SOURCE: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cache_serve_source_total",
+        "cache responses by byte source",
+        &["source"]
+    )
+    .expect("register cache_serve_source_total")
+});
+
+/// Time from the request entering the handler to the FIRST body byte
+/// reaching the viewer, by source. This — not `cache_serve_duration_seconds`
+/// — is what says whether seeking is smooth: a seek served from disk or from
+/// staged sidecars costs no upstream round trip, while one served from
+/// upstream pays the per-open cost.
+pub static BODY_TTFB: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "cache_body_ttfb_seconds",
+        "time from request entry to the first body byte, by source",
+        &["source"],
+        LATENCY_BUCKETS.to_vec()
+    )
+    .expect("register cache_body_ttfb_seconds")
+});
+
+/// Bytes actually delivered to viewers, by source: the bandwidth ledger that
+/// pairs with [`SERVE_SOURCE`].
+pub static BODY_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cache_body_bytes_total",
+        "body bytes delivered to viewers, by source",
+        &["source"]
+    )
+    .expect("register cache_body_bytes_total")
 });
 
 /// Observe one backend call. The closure runs the actual call; we time
@@ -66,6 +112,23 @@ pub fn observe_serve(outcome: &str, start: Instant) {
     CACHE_SERVE
         .with_label_values(&[outcome])
         .observe(start.elapsed().as_secs_f64());
+}
+
+/// Record one built response against its byte source.
+pub fn observe_source(source: &str) {
+    SERVE_SOURCE.with_label_values(&[source]).inc();
+}
+
+/// Record the wait for the first body byte of one response.
+pub fn observe_body_ttfb(source: &str, start: Instant) {
+    BODY_TTFB
+        .with_label_values(&[source])
+        .observe(start.elapsed().as_secs_f64());
+}
+
+/// Record bytes delivered to a viewer.
+pub fn observe_body_bytes(source: &str, bytes: u64) {
+    BODY_BYTES.with_label_values(&[source]).inc_by(bytes);
 }
 
 #[cfg(test)]
@@ -106,5 +169,18 @@ mod tests {
                 assert!(!line.contains(forbidden), "high-cardinality {forbidden} in {line}");
             }
         }
+    }
+
+    /// The body metrics exist and carry only the closed source label set.
+    #[test]
+    fn body_metrics_are_exposed_by_source() {
+        observe_source("disk");
+        observe_body_bytes("upstream", 4096);
+        observe_body_ttfb("upstream", Instant::now());
+        let text = rendered();
+        assert!(text.contains(r#"cache_serve_source_total{source="disk"}"#));
+        assert!(text.contains(r#"cache_body_bytes_total{source="upstream"}"#));
+        assert!(text.contains(r#"cache_body_ttfb_seconds_count{source="upstream"}"#));
+        assert!(text.contains("cache_body_ttfb_seconds_bucket"));
     }
 }
