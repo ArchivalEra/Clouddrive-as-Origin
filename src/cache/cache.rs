@@ -440,6 +440,7 @@ impl<C: Clock + Clone> Cache<C> {
                         last_access_millis: now,
                         last_revalidated_millis: None,
                         negative_until_millis: None,
+                        hold_until_millis: 0,
                     });
                 }
                 let meta_store = Arc::clone(&self.meta);
@@ -1466,6 +1467,7 @@ impl<C: Clock + Clone> Cache<C> {
             last_access_millis: now,
             last_revalidated_millis: None,
             negative_until_millis: Some(until),
+            hold_until_millis: 0,
         };
         let _ = self.meta.insert(&entry).await;
         let mut s = self.state.write().await;
@@ -1731,7 +1733,14 @@ async fn maybe_promote(
                 entry.decay(now_millis, window_ms);
             }
         }
-        cov.get(key).and_then(|c| c.ratio()).is_some_and(|r| r >= prof.coverage_threshold)
+        let c = cov.get(key);
+        // Ratio met AND the object can be kept: assembling something larger
+        // than the whole budget would consume the staged segments and hand
+        // the magazine an entry it must immediately eject -- the merge would
+        // destroy warmth it could have kept as segments.
+        let fits = c.is_some_and(|c| c.total > 0 && c.total <= config.max_size_bytes);
+        let ready = c.and_then(|c| c.ratio()).is_some_and(|r| r >= prof.coverage_threshold) && fits;
+        ready
     };
     if !ready {
         return;
@@ -1814,7 +1823,16 @@ async fn promote_key(
         let _ = std::fs::remove_file(&tmp);
         return;
     }
-    insert_meta(state, config, meta_store, key, upstream_id, &live, now_millis).await;
+    // The hold is armed here and only here: a promotion is the one write that
+    // paid for many upstream fetches to assemble something, and the inactivity
+    // clock cannot see that. 0 (the default off switch) leaves the deadline at
+    // zero, which `is_held` reads as "no hold".
+    let hold_until_millis = if config.promoted_hold_secs == 0 {
+        0
+    } else {
+        now_millis.saturating_add(config.promoted_hold_secs.saturating_mul(1000))
+    };
+    insert_meta(state, config, meta_store, key, upstream_id, &live, now_millis, hold_until_millis).await;
     // History is now redundant: drop sidecars + ledger row.
     reset_coverage(coverage, state, cache_dir, key).await;
 }
@@ -1997,7 +2015,7 @@ async fn drive_flight<C: Clock>(
 
     match outcome {
         Ok(meta) => {
-            insert_meta(&state, &config, &meta_store, &entry_key, &upstream_id, &meta, clock.now_millis()).await;
+            insert_meta(&state, &config, &meta_store, &entry_key, &upstream_id, &meta, clock.now_millis(), 0).await;
             let _ = flight.progress_tx.send(FlightProgress::Done);
         }
         Err(e) => {
@@ -2014,6 +2032,8 @@ async fn insert_meta(
     upstream_id: &str,
     meta: &ObjectMeta,
     now: u64,
+    // 0 = no hold. Set only by the promotion path.
+    hold_until_millis: u64,
 ) {
     // C3 lock discipline: the state write guard never spans a redb commit
     // or a file delete. Order: build the entry under a read, persist
@@ -2039,6 +2059,7 @@ async fn insert_meta(
             last_access_millis: now,
             last_revalidated_millis: Some(now),
             negative_until_millis: None,
+            hold_until_millis,
         };
         (old_size, entry)
     };
@@ -2087,7 +2108,11 @@ fn reap_collect(state: &mut CacheState, ttl_ms: u64, now: u64) -> Vec<(String, u
         .iter()
         .filter(|(_, m)| {
             m.negative_until_millis.map_or_else(
-                || now.saturating_sub(m.last_access_millis) >= ttl_ms,
+                // A held entry is not expired by inactivity: the merge that
+                // built it is recent by construction, and the 20-minute clock
+                // has no way to know that. The hold is a deadline, not an
+                // exemption -- once it passes, normal TTL rules apply again.
+                || !m.is_held(now) && now.saturating_sub(m.last_access_millis) >= ttl_ms,
                 |until| now >= until,
             )
         })
@@ -2258,6 +2283,7 @@ mod tests {
                     last_access_millis: 0,
                     last_revalidated_millis: None,
                     negative_until_millis: None,
+                    hold_until_millis: 0,
                 })
                 .await
                 .unwrap();
@@ -2343,6 +2369,92 @@ mod tests {
         assert_eq!(hit2.outcome, CacheOutcome::Hit);
         let b2 = read_body(&mut hit2.body).await;
         assert_eq!(b2, b"hello");
+    }
+
+    /// A promoted entry carries a hold, armed only by the promotion path.
+    /// It is immune to the inactivity TTL while the hold runs, and normal TTL
+    /// rules resume when it expires -- otherwise pausing a video long enough
+    /// to look elsewhere would sweep the merge that was just paid for.
+    #[tokio::test]
+    async fn a_promoted_entry_is_held_against_inactivity_expiry() {
+        let dir = tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.cache_dir = dir.path().to_path_buf();
+        cfg.inactive_ttl_secs = 10;
+        cfg.promoted_hold_secs = 100;
+        let cfg = Arc::new(cfg);
+        let clock = Arc::new(MockClock::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = crate::testsupport::MockBackend::counting(vec![], None, Arc::clone(&calls), None);
+        let mut slots = HashMap::new();
+        slots.insert("primary".to_string(), Arc::new(BackendSlot::new(Arc::new(backend), 3)));
+        let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), BackendRegistry::new(slots));
+
+        let meta = ObjectMeta { size_bytes: 10, etag: None, last_modified: None, mime_hint: None };
+        // As the promotion path writes it: a deadline 100 s out.
+        insert_meta(&cache.state, &cfg, &cache.meta, "held.bin", "primary", &meta, 0, 100_000).await;
+
+        clock.advance(20_000); // past the inactivity TTL, well inside the hold
+        cache.tick().await;
+        assert!(
+            cache.state.read().await.entries.contains_key("held.bin"),
+            "the hold must survive the inactivity TTL"
+        );
+
+        clock.advance(100_000); // past the hold itself
+        cache.tick().await;
+        assert!(
+            !cache.state.read().await.entries.contains_key("held.bin"),
+            "after the hold, normal TTL rules apply again"
+        );
+    }
+
+    /// A held entry sorts LAST in the eviction order, but it is not immortal:
+    /// when nothing else can bring the cache back under budget the hold
+    /// yields, so a protected entry can never leave the magazine permanently
+    /// over its cap -- which is what "immune" would mean if it were absolute.
+    #[tokio::test]
+    async fn a_held_entry_is_evicted_last_and_the_hold_yields_when_it_is_alone() {
+        fn row(key: &str, size: u64, last_access: u64, hold_until: u64) -> EntryMeta {
+            EntryMeta {
+                version: 1,
+                upstream_id: "primary".into(),
+                key: key.into(),
+                size_bytes: size,
+                etag: None,
+                last_modified: None,
+                content_type: None,
+                created_at_millis: last_access,
+                last_access_millis: last_access,
+                last_revalidated_millis: None,
+                negative_until_millis: None,
+                hold_until_millis: hold_until,
+            }
+        }
+        let mut cfg = Config::default();
+        cfg.inactive_ttl_secs = 1200;
+
+        let mut st = CacheState::default();
+        // The held row is NEWER, so LRU alone would already spare it; the
+        // interesting part is that it stays last even when it is older.
+        st.entries.insert("held.bin".into(), row("held.bin", 100, 1_000, 9_999_999));
+        st.entries.insert("old.bin".into(), row("old.bin", 100, 2_000, 0));
+        st.total_bytes = 200;
+
+        // Over by 50: the unheld (older-by-hold) row goes first.
+        cfg.max_size_bytes = 150;
+        let victims: Vec<String> = evict_pick(&mut st, &cfg).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(victims, vec!["old.bin".to_string()], "the hold sorts last");
+
+        // Now the budget is below the held row alone: the hold yields.
+        cfg.max_size_bytes = 50;
+        let victims: Vec<String> = evict_pick(&mut st, &cfg).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            victims,
+            vec!["held.bin".to_string()],
+            "when it is the only way back under budget, the hold yields"
+        );
+        assert_eq!(st.total_bytes, 0, "the cap is honoured, never violated");
     }
 
     #[tokio::test]

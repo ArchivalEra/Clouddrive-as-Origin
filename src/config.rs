@@ -72,6 +72,15 @@ fn default_min_file_size() -> u64 {
     64 * 1024 * 1024
 }
 
+/// How long a freshly promoted entry is held (immune to the inactivity TTL
+/// and to being picked as an eviction victim). Assembling a large object
+/// costs many upstream fetches, and the 20-minute inactivity clock has no way
+/// to know that: pause a video to look at something else and the merge you
+/// just paid for is swept. 0 disables the hold.
+fn default_promoted_hold_secs() -> u64 {
+    1800
+}
+
 fn default_coverage_window_secs() -> u64 {
     3600
 }
@@ -206,6 +215,9 @@ pub struct RawConfig {
     pub revalidate_ttl_secs: u64,
     #[serde(default = "default_negative_ttl")]
     pub negative_ttl_secs: u64,
+    /// Hold window for a freshly promoted entry; 0 disables it.
+    #[serde(default = "default_promoted_hold_secs")]
+    pub promoted_hold_secs: u64,
     #[serde(default = "default_concurrency")]
     #[serde(alias = "graph_concurrency_per_upstream")]
     pub concurrency_per_upstream: usize,
@@ -271,6 +283,9 @@ pub struct Config {
     pub inactive_ttl_secs: u64,
     pub revalidate_ttl_secs: u64,
     pub negative_ttl_secs: u64,
+    /// Hold window granted to a freshly promoted entry (see
+    /// [`default_promoted_hold_secs`]); 0 disables it.
+    pub promoted_hold_secs: u64,
     pub concurrency_per_upstream: usize,
     pub retry_max_attempts: u32,
     pub retry_base_ms: u64,
@@ -463,6 +478,7 @@ impl Config {
             inactive_ttl_secs: raw.inactive_ttl_secs,
             revalidate_ttl_secs: raw.revalidate_ttl_secs,
             negative_ttl_secs: raw.negative_ttl_secs,
+            promoted_hold_secs: raw.promoted_hold_secs,
             concurrency_per_upstream: raw.concurrency_per_upstream,
             retry_max_attempts: raw.retry_max_attempts,
             retry_base_ms: raw.retry_base_ms,
@@ -494,6 +510,7 @@ impl Default for Config {
             inactive_ttl_secs: default_inactive_ttl(),
             revalidate_ttl_secs: default_revalidate_ttl(),
             negative_ttl_secs: default_negative_ttl(),
+            promoted_hold_secs: default_promoted_hold_secs(),
             concurrency_per_upstream: default_concurrency(),
             retry_max_attempts: default_retry_max(),
             retry_base_ms: default_retry_base(),

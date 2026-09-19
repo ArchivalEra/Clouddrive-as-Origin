@@ -335,6 +335,7 @@ pub struct FixtureBuilder {
     redirect: bool,
     profile: Option<String>,
     coverage: Option<(f64, u64)>,
+    max_size_bytes: Option<u64>,
     mime: Option<String>,
     last_modified: Option<String>,
 }
@@ -350,6 +351,7 @@ impl FixtureBuilder {
             redirect: false,
             profile: None,
             coverage: None,
+            max_size_bytes: None,
             mime: None,
             last_modified: None,
         }
@@ -383,6 +385,12 @@ impl FixtureBuilder {
         self.profile = Some(profile.into());
         self
     }
+    /// Shrink the byte budget, to test what the magazine refuses to keep.
+    pub fn max_size_bytes(mut self, bytes: u64) -> Self {
+        self.max_size_bytes = Some(bytes);
+        self
+    }
+
     /// Efficient-profile knobs; implies `profile("efficient")`.
     pub fn coverage(mut self, threshold: f64, min_file_size: u64) -> Self {
         self.profile = Some("efficient".into());
@@ -401,6 +409,9 @@ impl FixtureBuilder {
     pub fn build(self) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+        if let Some(cap) = self.max_size_bytes {
+            cfg.max_size_bytes = cap;
+        }
         if self.redirect {
             cfg.upstreams[0].cold_miss = ColdMiss::Redirect;
         }
