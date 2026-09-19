@@ -730,6 +730,69 @@ impl<C: Clock + Clone> Cache<C> {
         Ok(())
     }
 
+    /// Stream a byte range straight from the origin: the one water pipe
+    /// behind every path that serves bytes without holding them.
+    ///
+    /// It owns the per-upstream STREAM gate (ADR-0004) and holds it for as
+    /// long as the body can move bytes — that budget is what bounds
+    /// bandwidth-bound upstream work, and a passthrough that skipped it left
+    /// upstream pressure set by the client count: the same range requested
+    /// twice opened two upstream streams. The permit is moved INTO the body
+    /// rather than held in this scope, so it lives exactly as long as the
+    /// transfer does and not one request longer.
+    ///
+    /// Callers own the metadata protocol (single-flight stat, negative
+    /// tombstones, whether a refused request may still be served): this owns
+    /// the gate, the open, and the read loop.
+    async fn serve_upstream_range(
+        &self,
+        slot: &Arc<BackendSlot>,
+        rk: &ResolvedKey,
+        range: Option<crate::backend::ByteRange>,
+        meta: crate::backend::ObjectMeta,
+    ) -> Result<PassthroughHit, BackendError> {
+        let bkey = Key::from_validated(rk.backend_key.clone());
+        let total = meta.size_bytes;
+        let (start, end) = match range {
+            None => (0, total),
+            Some(r) => {
+                if r.offset >= total {
+                    return Err(BackendError::RangeNotSatisfiable);
+                }
+                (r.offset, r.length.map_or(total, |l| (r.offset + l).min(total)))
+            }
+        };
+        let stream_permit = Arc::clone(&slot.stream_gate).acquire_owned().await;
+        let src = slot.backend.open(&bkey, range).await?;
+        let content_range = range.map(|_| ContentRange { first: start, last: end.saturating_sub(1), total });
+        let content_length = Some(end.saturating_sub(start));
+        let mut src_stream = src.stream;
+        let body: BodyStream = Box::pin(async_stream::try_stream! {
+            // The gate is held by the transfer itself.
+            let _stream_permit = stream_permit;
+            // Read straight into a fresh BytesMut and freeze it (P8): the
+            // served bytes are handed over with no copy step.
+            use tokio::io::AsyncReadExt;
+            let mut buf = bytes::BytesMut::with_capacity(256 * 1024);
+            loop {
+                buf.clear();
+                let n = src_stream.read_buf(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                yield buf.split().freeze();
+            }
+        });
+        Ok(PassthroughHit {
+            meta: hit_meta_remote(&rk.cache_key, &meta),
+            etag: meta.etag,
+            total,
+            content_range,
+            content_length,
+            body,
+        })
+    }
+
     /// Nocache profile (small-footprint nodes): pure water-pipe — stat for
     /// headers, ranged open, bytes stream origin-to-viewer with **zero
     /// disk writes**: no entries, no segments, no redb rows, no negative
@@ -757,47 +820,11 @@ impl<C: Clock + Clone> Cache<C> {
             .ok_or_else(|| BackendError::Other(format!("unknown upstream {}", rk.upstream_id)))?;
         let bkey = Key::from_validated(rk.backend_key.clone());
         let meta = {
+            // stat is metadata; the transfer below is a stream (B1).
             let _permit = slot.gate.acquire().await;
             slot.backend.stat(&bkey).await?
         };
-        // The staged transfer below is a stream (B1).
-        let _stream_permit = slot.stream_gate.acquire().await;
-        let total = meta.size_bytes;
-        let (start, end) = match range {
-            None => (0, total),
-            Some(r) => {
-                if r.offset >= total {
-                    return Err(BackendError::RangeNotSatisfiable);
-                }
-                (r.offset, r.length.map_or(total, |l| (r.offset + l).min(total)))
-            }
-        };
-        let src = slot.backend.open(&bkey, range).await?;
-        let content_range = range.map(|_| ContentRange { first: start, last: end.saturating_sub(1), total });
-        let content_length = Some(end.saturating_sub(start));
-        let mut src_stream = src.stream;
-        let body: BodyStream = Box::pin(async_stream::try_stream! {
-            // Read straight into a fresh BytesMut and freeze it (P8): the
-            // served bytes are handed over with no copy step.
-            use tokio::io::AsyncReadExt;
-            let mut buf = bytes::BytesMut::with_capacity(256 * 1024);
-            loop {
-                buf.clear();
-                let n = src_stream.read_buf(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                yield buf.split().freeze();
-            }
-        });
-        Ok(PassthroughHit {
-            meta: hit_meta_remote(&rk.cache_key, &meta),
-            etag: meta.etag,
-            total,
-            content_range,
-            content_length,
-            body,
-        })
+        self.serve_upstream_range(&slot, rk, range, meta).await
     }
 
     /// C-path response (efficientcache): origin bytes streamed straight to
@@ -866,7 +893,6 @@ impl<C: Clock + Clone> Cache<C> {
             }
             Err(e) => return Err(e),
         };
-        let _permit = slot.gate.acquire().await;
         // Version gate: a flipped object restarts staged history BEFORE
         // serving, so new bytes land on a clean ledger (finalize keeps a
         // same-file backstop for races).
@@ -892,6 +918,10 @@ impl<C: Clock + Clone> Cache<C> {
                 (r.offset, r.length.map_or(meta.size_bytes, |l| (r.offset + l).min(meta.size_bytes)))
             }
         };
+        // The open and the transfer below are a stream, not metadata (B1):
+        // this used to take the METADATA gate, which is the head-of-line
+        // class ADR-0004 split off, and it released it before a byte moved.
+        let stream_permit = Arc::clone(&slot.stream_gate).acquire_owned().await;
         let src = match slot.backend.open(&bkey, range).await {
             Ok(s) => s,
             Err(BackendError::NotFound) => {
@@ -948,7 +978,6 @@ impl<C: Clock + Clone> Cache<C> {
             let etag = etag.clone();
             let total = total;
             let start = start;
-            let end = end;
             tokio::spawn(async move {
                 // Wait for the segpart to appear and stop growing (viewer
                 // gone or transfer done), then seal it.
@@ -1013,6 +1042,9 @@ impl<C: Clock + Clone> Cache<C> {
             })
         };
         let body: BodyStream = Box::pin(async_stream::try_stream! {
+            // The upstream stream gate is held by the transfer itself, not
+            // by the request that built it.
+            let _stream_permit = stream_permit;
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut file: Option<tokio::fs::File> = None;
             let mut written: u64 = 0;
