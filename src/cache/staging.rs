@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     backend::{BackendRegistry, Key},
+    cache::flight::BodyStream,
     cache::{magazine::Magazine, store},
     config::Config,
 };
@@ -258,6 +259,15 @@ impl Staging {
         });
     }
 
+/// A read touched this key: refresh the row's age so an actively watched
+/// window is not swept for inactivity (the per-interval read times are
+/// untouched — window decay stays a function of when bytes were SERVED).
+pub(crate) async fn touch(&self, key: &str, now_millis: u64) {
+    if let Some(entry) = self.coverage.lock().await.get_mut(key) {
+        entry.last_touch_millis = now_millis;
+    }
+}
+
     /// Assemble a promoted entry: re-verify the version by fresh stat (abort +
     /// reset on ANY drift — never a mixed-version file), copy covered slices
     /// from sidecars, fetch gaps by exact Range, seal, install, clean staged
@@ -320,6 +330,71 @@ impl Staging {
         // History is now redundant: drop sidecars + ledger row.
         self.reset(key).await;
     }
+}
+
+/// The staged pieces of `[start, end)` that exist on disk, in order, and the
+/// first byte the ledger+disk cannot serve. `pieces` are contiguous from
+/// `start`; each is (path, offset-in-file, length). Built from a fresh disk
+/// scan (`segments_for_key`), so a file that vanished is simply not covered
+/// and the gap falls back upstream — the ledger is never trusted over disk.
+pub(crate) struct StagedPlan {
+    pub(crate) pieces: Vec<(std::path::PathBuf, u64, u64)>,
+    pub(crate) frontier: u64,
+}
+
+/// Walk the key's sorted segment files and plan `[start, end)`.
+pub(crate) fn plan_staged(
+    segs: &[(u64, u64, std::path::PathBuf)],
+    start: u64,
+    end: u64,
+) -> StagedPlan {
+    let mut pieces = Vec::new();
+    let mut cursor = start;
+    for (s, e, path) in segs {
+        if cursor >= end {
+            break;
+        }
+        if *e <= cursor {
+            continue; // wholly before the cursor
+        }
+        if *s > cursor {
+            break; // a gap: stop at the frontier
+        }
+        let piece_end = (*e).min(end);
+        // The file offset is relative to the span's own start: the file
+        // holds [s, e), and we want [cursor, piece_end) of it.
+        pieces.push((path.clone(), cursor - s, piece_end - cursor));
+        cursor = piece_end;
+    }
+    StagedPlan { pieces, frontier: cursor }
+}
+
+/// Serve the planned pieces straight from the sidecar files. No upstream, no
+/// stream gate, no magazine admission: a read touches nothing.
+pub(crate) fn staged_body(pieces: Vec<(std::path::PathBuf, u64, u64)>) -> BodyStream {
+    Box::pin(async_stream::try_stream! {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        for (path, off, len) in pieces {
+            let mut f = tokio::fs::File::open(&path).await?;
+            f.seek(std::io::SeekFrom::Start(off)).await?;
+            let mut remaining = len;
+            while remaining > 0 {
+                let want = (256 * 1024).min(remaining as usize);
+                let mut buf = bytes::BytesMut::with_capacity(want);
+                let n = f.read_buf(&mut buf).await?;
+                if n == 0 {
+                    // The ledger said covered and the scan said present; a
+                    // file that shrank since is a broken sidecar, and a short
+                    // response is the honest failure.
+                    Err(std::io::Error::other(
+                        "staged segment is shorter than the ledger's range",
+                    ))?;
+                }
+                remaining -= n as u64;
+                yield buf.freeze();
+            }
+        }
+    })
 }
 
 /// Fill `tmp` with the full object: covered slices copied from sidecars,
