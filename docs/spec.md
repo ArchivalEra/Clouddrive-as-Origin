@@ -90,7 +90,7 @@ repo** — it is injected at runtime via an environment variable (e.g.
     this check.
   - `key` must reject path traversal (`..`, backslash, absolute path,
     NUL byte, percent-encoded variants such as `%2e%2e%2f`) and must
-    never resolve outside the configured `drive_root_path` of the
+    never resolve outside the configured `root_path` of the
     selected upstream.
   - Credential handling: client secrets and refresh tokens are **only**
     supplied via environment variables (or a secret service) at boot.
@@ -125,7 +125,7 @@ repo** — it is injected at runtime via an environment variable (e.g.
    minutes pass with no access, delete the file and its metadata.
    Any access resets the clock.
 
-4. **max_size eviction (magazine):** when total cached bytes exceed
+4. **max_size eviction:** when total cached bytes exceed
    `max_size` (default 100 GiB, configurable), evict entries in order
    of **earliest expiry = earliest last-access** until usage is back
    within the limit — i.e. LRU. Eviction must remove metadata and, if
@@ -133,8 +133,10 @@ repo** — it is injected at runtime via an environment variable (e.g.
 
 5. **Revalidation on access (no background polling):** an entry that is
    present but older than a short TTL (default 60 s, configurable)
-   triggers a conditional Graph request (`If-None-Match` / `ETag` or
-   `lastModified`) before serving from disk. Not modified → reset the
+   triggers a revalidation before serving from disk: a `stat` is compared
+   against the stored etag (or mtime). Providers behind OpenList are
+   provider-uniform here — Drive answers no `304`, so a conditional request
+   would buy nothing and cost a round trip. Unchanged → reset the
    20 min clock and serve from disk. Modified → treat as cold miss and
    atomically replace (temp file + `rename`; in-flight readers keep
    serving the old file).
@@ -298,7 +300,8 @@ Per-upstream persisted state (all `0600`, under the data directory):
 ## 5. Multi-upstream routing
 
 - `upstreams` is a list; each entry has its own `client_id` (env
-  reference), `drive_root_path`, token file, and concurrency limit.
+  reference), `base_url` / `root_path`, credential env names, and
+  concurrency limit.
 - Routing is a first-match prefix table over `key` (longest-prefix
   wins, empty prefix = default). Adding a new upstream is a config-only
   change — no URL migration.
@@ -321,15 +324,29 @@ pub trait StorageBackend: Send + Sync {
         -> Result<StreamSource, BackendError>;
     /// Credential rotation + health probe (OAuth refresh, quota check).
     async fn refresh_if_needed(&self) -> Result<(), BackendError>;
+    /// The provider's own link to the object, when it can offer one
+    /// (the relief valve's 307 path); `Err` means "proxy instead".
+    async fn direct_url(&self, key: &Key, viewer_ua: Option<&str>)
+        -> Result<DirectUrl, BackendError>;
+    /// One directory walk for the listing path (no cache semantics).
+    async fn list(&self, folder: &str, recursive: bool)
+        -> Result<Vec<ListEntry>, BackendError>;
+    /// The configured upstream id this adapter serves.
+    fn id(&self) -> &str;
 }
 ```
 
 - `StreamSource` = a byte stream (`AsyncRead`) with a known-or-unknown
   length; `ByteRange = (offset, Option<length>)`.
-- `BackendError` is a unified enum (NotFound / RateLimited / ServerError
-  / Auth / Other) so cache semantics (negative cache, stale-if-error,
-  backoff) are provider-agnostic.
-- v1 provider: `src/backend/openlist.rs` — WebDAV against OpenList
+- `BackendError` is a unified enum (NotFound / RateLimited / ServerError /
+  AuthRequired / RangeNotSatisfiable / Other) so cache semantics (negative
+  cache, stale-if-error, backoff) are provider-agnostic. It carries upstream
+  faults only: a client-side key error is answered at the resolve seam and
+  has no variant here.
+- v1 provider: `src/backend/openlist.rs` — WebDAV against OpenList.
+  Its Tier-1 / Tier-2 / Tier-3 vocabulary for link handling lives in that
+  module's comments, not here; `efficientcache` is the older name for the
+  efficient profile and survives in code comments only.
   instances (native-proxy policy). The former hand-written cloud
   providers (GoogleDrive direct, OneDrive Graph) were dropped when the
   project pivoted to OpenList adaptation (2026-09-06); OpenList fronts
@@ -445,11 +462,13 @@ retry_base_ms = 200
 retry_max_ms = 30000
 
 [[upstreams]]
-id = "primary"
-drive_root_path = "/drive/root:/assets"
-client_id_env = "ONEDRIVE_PRIMARY_CLIENT_ID"
-client_secret_env = "ONEDRIVE_PRIMARY_CLIENT_SECRET"
-refresh_token_env = "ONEDRIVE_PRIMARY_REFRESH_TOKEN"
+id = "primary"                        # must equal the first URL path segment
+type = "openlist"                     # v1 supports this one type
+base_url = "http://127.0.0.1:5244/dav"
+root_path = "assets"                  # provider-side path; keys append to it
+username_env = "OPENLIST_USERNAME"
+password_env = "OPENLIST_PASSWORD"
+# cache_profile = "standard"          # or "efficient" / "nocache"
 
 [[routes]]
 prefix = ""                            # default (catch-all)
