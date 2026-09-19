@@ -283,7 +283,6 @@ mod tests {
             last_access_millis: last_access,
             last_revalidated_millis: None,
             negative_until_millis: None,
-            hold_until_millis: 0,
             oversize: false,
         }
     }

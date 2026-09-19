@@ -17,15 +17,6 @@ pub struct EntryMeta {
     pub last_revalidated_millis: Option<u64>,
     /// If Some, this is a negative 404 tombstone until that timestamp.
     pub negative_until_millis: Option<u64>,
-    /// A promoted entry's hold, in the clock domain: until this timestamp the
-    /// entry is immune to both the inactivity TTL and being chosen as an
-    /// eviction victim. 0 = no hold.
-    ///
-    /// `serde(default)` is load-bearing: rows written before this field
-    /// existed have no such key, and without a default the whole store would
-    /// fail to deserialize on the first start after an upgrade.
-    #[serde(default)]
-    pub hold_until_millis: u64,
     /// This entry was admitted KNOWING it is larger than the whole magazine
     /// budget. Such an entry cannot be brought into budget by evicting
     /// anyone — its own size is the overshoot — so the byte budget neither
@@ -45,18 +36,11 @@ impl EntryMeta {
         self.negative_until_millis.map_or(false, |until| now_millis < until)
     }
 
-    /// When this entry becomes eligible for eviction. A held entry reports
-    /// its hold deadline instead, so it sorts LAST in the eviction order --
-    /// protected, but not immortal: when nothing else can bring the cache
-    /// back under budget, the hold yields rather than letting the magazine
-    /// run permanently over its cap.
+    /// When this entry becomes eligible for eviction: last access plus the
+    /// inactivity TTL. Aged out by reads stopping, kept alive by reads
+    /// landing — there is no other clock.
     pub fn eligible_at(&self, inactive_ttl_secs: u64) -> u64 {
-        (self.last_access_millis + inactive_ttl_secs * 1000).max(self.hold_until_millis)
-    }
-
-    /// Whether the hold is still running.
-    pub fn is_held(&self, now_millis: u64) -> bool {
-        self.hold_until_millis > 0 && now_millis < self.hold_until_millis
+        self.last_access_millis + inactive_ttl_secs * 1000
     }
 }
 
@@ -78,7 +62,6 @@ mod tests {
             last_access_millis: 0,
             last_revalidated_millis: None,
             negative_until_millis: Some(5000),
-            hold_until_millis: 0,
             oversize: false,
         };
         assert!(m.is_negative(4999));
@@ -86,13 +69,12 @@ mod tests {
         assert!(!m.is_negative(6000));
     }
 
-    /// A row written before `hold_until_millis` existed must still load. The
-    /// field is `#[serde(default)]` for exactly this reason: the store is
-    /// deserialized at every start, and a missing key would fail the load --
-    /// losing every row and rebuilding from the object tree on the first start
-    /// after an upgrade. The JSON here is the pre-hold shape.
+    /// A row written when the hold field existed must still load now that
+    /// the field is gone. serde ignores unknown fields by default, so the
+    /// store survives a schema that loses a member in either direction —
+    /// pinned here because the whole redb store deserializes at every start.
     #[test]
-    fn a_row_written_before_the_hold_field_still_loads() {
+    fn a_row_written_with_a_hold_field_still_loads_without_it() {
         let old = r#"{
             "version": 1,
             "upstream_id": "primary",
@@ -104,14 +86,12 @@ mod tests {
             "created_at_millis": 1000,
             "last_access_millis": 2000,
             "last_revalidated_millis": null,
-            "negative_until_millis": null
+            "negative_until_millis": null,
+            "hold_until_millis": 999999
         }"#;
         let m: EntryMeta = serde_json::from_str(old).expect("a pre-hold row must deserialize");
-        assert_eq!(m.hold_until_millis, 0, "an absent hold means no hold");
-        assert!(!m.oversize, "an absent oversize flag means the magazine governs the row");
-        assert!(!m.is_held(0));
-        assert!(!m.is_held(u64::MAX), "0 is never a live hold");
         assert_eq!(m.eligible_at(1200), 2000 + 1200 * 1000, "TTL rules unchanged");
+        assert!(!m.oversize);
     }
 
     #[test]
@@ -128,7 +108,6 @@ mod tests {
             last_access_millis: 1000,
             last_revalidated_millis: None,
             negative_until_millis: None,
-            hold_until_millis: 0,
             oversize: false,
         };
         assert_eq!(m.eligible_at(1200), 1000 + 1200 * 1000);

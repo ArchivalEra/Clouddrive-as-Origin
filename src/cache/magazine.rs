@@ -176,11 +176,7 @@ fn reap_collect(state: &mut CacheState, ttl_ms: u64, now: u64) -> Vec<(String, u
         .iter()
         .filter(|(_, m)| {
             m.negative_until_millis.map_or_else(
-                // A held entry is not expired by inactivity: the merge that
-                // built it is recent by construction, and the 20-minute clock
-                // has no way to know that. The hold is a deadline, not an
-                // exemption -- once it passes, normal TTL rules apply again.
-                || !m.is_held(now) && now.saturating_sub(m.last_access_millis) >= ttl_ms,
+                || now.saturating_sub(m.last_access_millis) >= ttl_ms,
                 |until| now >= until,
             )
         })
@@ -242,8 +238,6 @@ impl Magazine {
         upstream_id: &str,
         meta: &ObjectMeta,
         now: u64,
-        // 0 = no hold. Set only by the promotion path.
-        hold_until_millis: u64,
         // Whether this entry was admitted as a resident stray (ADR-0014):
         // larger than the whole magazine budget, so the byte budget neither
         // counts it nor evicts it.
@@ -267,7 +261,6 @@ impl Magazine {
                 last_access_millis: now,
                 last_revalidated_millis: Some(now),
                 negative_until_millis: None,
-                hold_until_millis,
                 oversize,
             };
             (old_size, entry)
@@ -299,7 +292,6 @@ impl Magazine {
             last_access_millis: now,
             last_revalidated_millis: None,
             negative_until_millis: Some(until),
-            hold_until_millis: 0,
             oversize: false,
         };
         let _ = self.meta.insert(&entry).await;
@@ -457,7 +449,6 @@ mod tests {
             last_access_millis: last_access,
             last_revalidated_millis: None,
             negative_until_millis: None,
-            hold_until_millis: 0,
             oversize,
         }
     }
@@ -537,54 +528,6 @@ mod tests {
         assert_eq!(st.total_bytes, 3_000);
     }
 
-/// A held entry sorts LAST in the eviction order, but it is not immortal:
-/// when nothing else can bring the cache back under budget the hold
-/// yields, so a protected entry can never leave the magazine permanently
-/// over its cap -- which is what "immune" would mean if it were absolute.
-#[test]
-fn a_held_entry_is_evicted_last_and_the_hold_yields_when_it_is_alone() {
-    fn held_row(key: &str, size: u64, last_access: u64, hold_until: u64) -> EntryMeta {
-        EntryMeta {
-            version: 1,
-            upstream_id: "primary".into(),
-            key: key.into(),
-            size_bytes: size,
-            etag: None,
-            last_modified: None,
-            content_type: None,
-            created_at_millis: last_access,
-            last_access_millis: last_access,
-            last_revalidated_millis: None,
-            negative_until_millis: None,
-            hold_until_millis: hold_until,
-            oversize: false,
-        }
-    }
-    let mut cfg = Config::default();
-    cfg.inactive_ttl_secs = 1200;
-
-    let mut st = CacheState::default();
-    // The held row is NEWER, so LRU alone would already spare it; the
-    // interesting part is that it stays last even when it is older.
-    st.entries.insert("held.bin".into(), held_row("held.bin", 100, 1_000, 9_999_999));
-    st.entries.insert("old.bin".into(), held_row("old.bin", 100, 2_000, 0));
-    st.total_bytes = 200;
-
-    // Over by 50: the unheld (older-by-hold) row goes first.
-    cfg.max_size_bytes = 150;
-    let victims: Vec<String> = evict_pick(&mut st, &cfg).into_iter().map(|(k, _)| k).collect();
-    assert_eq!(victims, vec!["old.bin".to_string()], "the hold sorts last");
-
-    // Now the budget is below the held row alone: the hold yields.
-    cfg.max_size_bytes = 50;
-    let victims: Vec<String> = evict_pick(&mut st, &cfg).into_iter().map(|(k, _)| k).collect();
-    assert_eq!(
-        victims,
-        vec!["held.bin".to_string()],
-        "when it is the only way back under budget, the hold yields"
-    );
-    assert_eq!(st.total_bytes, 0, "the cap is honoured, never violated");
-}
 
 
     /// Last-resort guard on the single deletion site: even if a store key

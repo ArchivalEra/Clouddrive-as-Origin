@@ -497,7 +497,6 @@ where
     let (count, bytes, segment_bytes, stray_bytes) =
         (snap.entries, snap.total_bytes, snap.segment_bytes, snap.stray_bytes);
     let flights = snap.flights_active;
-    let promotions = snap.promotions_active;
     let dirty_access = snap.dirty_access_pending;
     let (coverage_keys, coverage_intervals) = (snap.coverage_keys, snap.coverage_intervals);
     // Per-upstream view: profile + gate depth, so a saturated or
@@ -553,7 +552,6 @@ where
             "segment_bytes": segment_bytes,
             "stray_bytes": stray_bytes,
             "flights_active": flights,
-            "promotions_active": promotions,
             "dirty_access_flushes": dirty_access,
             "coverage_keys": coverage_keys,
             "coverage_intervals": coverage_intervals,
@@ -736,8 +734,8 @@ mod tests {
 
     /// Efficient-profile fixture: primary serves `cache_profile =
     /// "efficient"` with the given threshold/min_file_size.
-    fn fixture_efficient(bytes: &[u8], threshold: f64, min_file_size: u64) -> Fixture {
-        base(bytes).etag(Some("v1")).coverage(threshold, min_file_size).build()
+    fn fixture_efficient(bytes: &[u8], min_file_size: u64) -> Fixture {
+        base(bytes).etag(Some("v1")).coverage(min_file_size).build()
     }
 
     /// Nocache-profile fixture: primary serves `cache_profile = "nocache"`
@@ -1169,7 +1167,7 @@ mod tests {
 
     #[tokio::test]
     async fn efficient_ranged_miss_passthrough_and_stages() {
-        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let fx = fixture_efficient(b"0123456789", 4);
         let resp = get_key(
             State(fx.state.clone()),
             Path("a.bin".into()),
@@ -1198,7 +1196,7 @@ mod tests {
 
     #[tokio::test]
     async fn efficient_second_pull_merges_ledger() {
-        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let fx = fixture_efficient(b"0123456789", 4);
         for range in ["bytes=0-1", "bytes=4-5"] {
             let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", range)]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
             let (status, _, _) = body_text(resp).await;
@@ -1217,7 +1215,7 @@ mod tests {
 
     #[tokio::test]
     async fn efficient_full_get_still_waterpipes() {
-        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let fx = fixture_efficient(b"0123456789", 4);
         let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
@@ -1233,7 +1231,7 @@ mod tests {
     /// reason staged bytes exist at all once promotion is off the table.
     #[tokio::test]
     async fn a_fully_covered_seek_is_served_from_stage_without_upstream() {
-        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let fx = fixture_efficient(b"0123456789", 4);
         // Stage the whole object in two pulls.
         for range in ["bytes=0-4", "bytes=5-9"] {
             let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", range)]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
@@ -1290,7 +1288,7 @@ mod tests {
     /// ends fully covered and promotion can fire off it.
     #[tokio::test]
     async fn a_partially_covered_range_needs_one_open_and_stages_the_rest() {
-        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let fx = fixture_efficient(b"0123456789", 4);
         let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", "bytes=0-4")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
@@ -1312,13 +1310,15 @@ mod tests {
             1,
             "the remainder is one exact-Range open, not one per gap"
         );
-        {
-            let cov = fx.state.cache.coverage.lock().await;
-            eprintln!("DEBUG ledger: {:?}", cov.get("a.bin"));
-        }
-        eprintln!("DEBUG entries: {:?} segment_bytes: {}", fx.state.cache.state.read().await.entries.keys().collect::<Vec<_>>(), fx.state.cache.state.read().await.segment_bytes);
-        wait_installed(&fx, "a.bin").await;
-        assert!(staged_segments(&fx, "a.bin").is_empty(), "promotion consumed the sidecars");
+        assert_eq!(
+            staged_segments(&fx, "a.bin"),
+            vec![(0, 5), (5, 10)],
+            "both spans stay staged: the ledger is now fully covered"
+        );
+        assert!(
+            fx.state.cache.state.read().await.entries.is_empty(),
+            "no promotion: the staged spans ARE the cache"
+        );
     }
 
     /// An object we already hold must keep serving ranges after the
@@ -1329,7 +1329,7 @@ mod tests {
     /// minute.
     #[tokio::test]
     async fn efficient_complete_entry_keeps_serving_ranges_after_the_revalidate_window() {
-        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let fx = fixture_efficient(b"0123456789", 4);
         prime(&fx, "a.bin").await;
         fx.state.cache.clock.advance(61_000);
         reset(&fx);
@@ -1363,7 +1363,7 @@ mod tests {
 
     #[tokio::test]
     async fn efficient_min_size_bypass_goes_waterpipe() {
-        let fx = fixture_efficient(b"0123456789", 0.8, 64);
+        let fx = fixture_efficient(b"0123456789", 64);
         let resp = get_key(
             State(fx.state.clone()),
             Path("a.bin".into()),
@@ -1399,7 +1399,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_sweeps_old_segments() {
-        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let fx = fixture_efficient(b"0123456789", 4);
         let resp = get_key(
             State(fx.state.clone()),
             Path("a.bin".into()),
@@ -1420,7 +1420,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_reports_segment_bytes() {
-        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let fx = fixture_efficient(b"0123456789", 4);
         let resp = get_key(
             State(fx.state.clone()),
             Path("a.bin".into()),
@@ -1434,7 +1434,6 @@ mod tests {
         let (_, _, body) = body_text(resp).await;
         assert!(body.contains("\"segment_bytes\":4"), "{body}");
         assert!(body.contains("\"flights_active\":"), "{body}");
-        assert!(body.contains("\"promotions_active\":"), "{body}");
         assert!(body.contains("\"dirty_access_flushes\":"), "{body}");
         assert!(body.contains("\"sigv4_enabled\":false"), "{body}");
         assert!(body.contains("\"profile\":\"efficient\""), "{body}");
@@ -1469,165 +1468,12 @@ mod tests {
         assert!(body.contains("\"entries\":0"), "{body}");
     }
 
-    /// Pull two disjoint halves (union 80% >= 0.75): promotion assembles
-    /// from sidecars + fetches exactly the missing tail — then full GET
-    /// hits disk with byte-exact content.
-    #[tokio::test]
-    async fn promotion_assembles_from_segments_plus_gap() {
-        let bytes: Vec<u8> = (0..100u8).collect();
-        let fx = fixture_efficient(&bytes, 0.75, 4);
-        for range in ["bytes=0-49", "bytes=50-79"] {
-            let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", range)]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
-            let (status, _, _) = body_text(resp).await;
-            assert_eq!(status, StatusCode::PARTIAL_CONTENT);
-        }
-        // Background promotion installs the entry.
-        wait_installed(&fx, "f.bin").await;
-        // Gap fetch was exactly [80,100): no full re-download.
-        let opens = fx.opens.lock().unwrap().clone();
-        assert!(opens.contains(&(80, Some(20))), "{opens:?}");
-        assert!(!opens.iter().any(|(o, l)| *o == 0 && l.is_none()), "{opens:?}");
-        // Assembled bytes are exact: sidecar copies + fetched gap.
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
-        let (status, _, body) = body_text(resp).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.as_bytes(), bytes.as_slice());
-        // Staged history cleaned up after promotion.
-        assert!(staged_segments(&fx, "f.bin").is_empty());
-        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 0);
-    }
-
-    /// Threshold 1.0: partial pulls never promote; the completing pull
-    /// promotes with zero gap fetches.
-    #[tokio::test]
-    async fn promotion_at_full_coverage_needs_no_gap_fetch() {
-        let bytes: Vec<u8> = (0..100u8).collect();
-        let fx = fixture_efficient(&bytes, 1.0, 4);
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
-        body_text(resp).await;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-99")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
-        body_text(resp).await;
-        wait_installed(&fx, "f.bin").await;
-        // Only the two viewer pulls opened the backend — no gap fetch.
-        assert_eq!(fx.opens.lock().unwrap().len(), 2);
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
-        let (status, _, body) = body_text(resp).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.as_bytes(), bytes.as_slice());
-    }
-
-    /// Below threshold: staged, never promoted.
-    #[tokio::test]
-    async fn below_threshold_stays_staged() {
-        let bytes: Vec<u8> = (0..100u8).collect();
-        let fx = fixture_efficient(&bytes, 0.9, 4);
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
-        body_text(resp).await;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
-        assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
-    }
-
-    /// Staging admission (ADR-0013): an object the magazine cannot hold is
-    /// never staged. Staged segments have exactly one reader — promotion —
-    /// and promotion's fit guard refuses this object, so staging it would
-    /// write bytes nobody can ever read back on every single seek. It is
-    /// served by the pipe instead, and its bytes are still correct.
-    #[tokio::test]
-    async fn an_object_larger_than_the_cache_is_never_staged() {
-        let bytes: Vec<u8> = (0..100u8).collect();
-        let fx = base(&bytes).etag(Some("v1")).coverage(0.8, 4).max_size_bytes(50).build();
-        let resp = get_key(
-            State(fx.state.clone()),
-            Path("f.bin".into()),
-            headers(&[("range", "bytes=0-99")]),
-            RawQuery(None),
-            OriginalUri(DEFAULT_TEST_URI.clone()),
-        )
-        .await;
-        let (status, h, body) = body_text(resp).await;
-        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
-        assert_eq!(body.len(), 100, "the viewer still gets every byte asked for");
-        assert_eq!(h.get("content-range").unwrap(), "bytes 0-99/100");
-        assert!(
-            !fx.state.cache.state.read().await.entries.contains_key("f.bin"),
-            "an object bigger than the whole budget is never merged into an entry"
-        );
-        assert!(
-            staged_segments(&fx, "f.bin").is_empty(),
-            "and it is never staged: nothing could ever read those bytes back"
-        );
-        assert_eq!(
-            fx.state.cache.state.read().await.segment_bytes,
-            0,
-            "no staged bytes are accounted"
-        );
-        assert!(
-            fx.state.cache.coverage.lock().await.is_empty(),
-            "and no ledger row is created for it"
-        );
-    }
-
-    /// Window decay: staged intervals older than the coverage
-    /// window stop counting — a 60% read, a window expiry, then a 20% read
-    /// must NOT promote (coverage decayed to 20%).
-    #[tokio::test]
-    async fn coverage_window_expiry_blocks_promotion() {
-        let bytes: Vec<u8> = (0..100u8).collect();
-        let fx = fixture_efficient(&bytes, 0.8, 4);
-        // 60% staged at t=0.
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-59")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
-        body_text(resp).await;
-        assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 60)]);
-        // Advance past the 3600s window: intervals decay out of the ledger.
-        fx.state.cache.clock.advance(3_601_000);
-        // 20% more read at t=3601s: coverage is now 20%, not 80%.
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=60-79")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
-        body_text(resp).await;
-        // No promotion: entry must not exist.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
-        // Ledger holds only the fresh interval.
-        let cov = fx.state.cache.coverage.lock().await;
-        let c = cov.get("f.bin").unwrap();
-        assert_eq!(c.intervals.len(), 1);
-        assert_eq!((c.intervals[0].0, c.intervals[0].1), (60, 80));
-    }
-
-    /// Window decay backstop: a key with no recent writes must not promote
-    /// on stale intervals even if the threshold was met long ago. The
-    /// promotion task races the clock, so this asserts the deterministic
-    /// half: the ledger decays when the window passes (the expiry test
-    /// covers the promotion-blocking half).
-    #[tokio::test]
-    async fn coverage_window_backstop_blocks_stale_promotion() {
-        let bytes: Vec<u8> = (0..100u8).collect();
-        let fx = fixture_efficient(&bytes, 0.8, 4);
-        // 80% staged at t=0 — threshold met, promotion task may spawn.
-        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-79")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
-        body_text(resp).await;
-        // Advance past the window: the ledger must decay regardless of
-        // what the promotion task does (it may have already installed a
-        // valid entry — that is fine; stale intervals must not survive).
-        fx.state.cache.clock.advance(3_601_000);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let cov = fx.state.cache.coverage.lock().await;
-        match cov.get("f.bin") {
-            // Promotion cleaned up: nothing left to decay — acceptable.
-            None => {}
-            // Ledger still present: every interval must be decayed away.
-            Some(c) => assert!(c.intervals.is_empty(), "stale intervals must decay: {:?}", c.intervals),
-        }
-    }
-
     /// Version flip between staging and promotion: history resets, no
     /// mixed-version entry is ever installed.
     #[tokio::test]
     async fn etag_flip_resets_staged_history() {
         let bytes: Vec<u8> = (0..100u8).collect();
-        let fx = fixture_efficient(&bytes, 0.75, 4);
+        let fx = fixture_efficient(&bytes, 4);
         let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         body_text(resp).await;
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
