@@ -449,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_backend_roundtrip() {
-        let b = MockBackend::new(b"hello", Some("abc".into()), Some("text/plain".into()));
+        let b = crate::testsupport::MockBackend::new(b"hello", Some("abc".into()), Some("text/plain".into()));
         let key = Key::from_validated("a.txt".into());
         let meta = b.stat(&key).await.unwrap();
         assert_eq!(meta.size_bytes, 5);
@@ -462,92 +462,7 @@ mod tests {
         assert_eq!(buf, b"ello");
     }
 
-    /// Reference mock used by cache tests until wiremock integration
-    /// (also serves as the documentation example for implementors).
-    pub struct MockBackend {
-        bytes: Vec<u8>,
-        etag: Option<String>,
-        mime: Option<String>,
-        listing: Vec<ListEntry>,
-    }
-
-    impl MockBackend {
-        pub fn new(bytes: &[u8], etag: Option<String>, mime: Option<String>) -> Self {
-            Self { bytes: bytes.to_vec(), etag, mime, listing: Vec::new() }
-        }
-
-        /// Seed an in-memory listing for `list()` tests.
-        pub fn with_listing(mut self, listing: Vec<ListEntry>) -> Self {
-            self.listing = listing;
-            self
-        }
-    }
-
-    #[async_trait]
-    impl StorageBackend for MockBackend {
-        async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
-            Ok(ObjectMeta {
-                size_bytes: self.bytes.len() as u64,
-                etag: self.etag.clone(),
-                last_modified: None,
-                mime_hint: self.mime.clone(),
-            })
-        }
-
-        async fn open(&self, _key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
-            let slice: Vec<u8> = match range {
-                None => self.bytes.clone(),
-                Some(r) => {
-                    let start = r.offset as usize;
-                    if start > self.bytes.len() {
-                        return Err(BackendError::Other("range out of bounds".into()));
-                    }
-                    match r.length {
-                        None => self.bytes[start..].to_vec(),
-                        Some(len) => {
-                            let end = (start + len as usize).min(self.bytes.len());
-                            self.bytes[start..end].to_vec()
-                        }
-                    }
-                }
-            };
-            Ok(StreamSource {
-                stream: Box::new(std::io::Cursor::new(slice)),
-                total_len: Some(self.bytes.len() as u64),
-            })
-        }
-
-        async fn refresh_if_needed(&self) -> Result<(), BackendError> {
-            Ok(())
-        }
-
-        async fn list(&self, folder: &str, recursive: bool) -> Result<Vec<ListEntry>, BackendError> {
-            Ok(self
-                .listing
-                .iter()
-                .filter_map(|e| {
-                    let rest = e.key.strip_prefix(folder)?;
-                    // The folder itself is the PROPFIND self entity, never
-                    // a child.
-                    if rest.is_empty() {
-                        return None;
-                    }
-                    (recursive || !rest.trim_end_matches('/').contains('/')).then(|| e.clone())
-                })
-                .collect())
-        }
-
-        fn id(&self) -> &str {
-            "mock"
-        }
-    }
 }
-
-// Re-export the mock for integration tests (cfg(test) modules in other
-// crates cannot see it; integration tests use the lib target).
-#[doc(hidden)]
-#[cfg(test)]
-pub use self::tests::MockBackend as TestMockBackend;
 
 use std::collections::HashMap;
 use std::sync::Arc;
