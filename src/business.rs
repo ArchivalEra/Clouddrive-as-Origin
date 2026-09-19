@@ -725,6 +725,7 @@ mod tests {
         clock::MockClock,
     };
 
+    use crate::testsupport::CacheTestExt;
     use crate::testsupport::{
         assert_no_backend_calls, body_text, headers, reset, staged_segments, stray_cache_files,
         wait_installed, Fixture, FixtureBuilder, DEFAULT_TEST_URI,
@@ -789,7 +790,7 @@ mod tests {
     /// Prime below the business plane (bypasses the relief valve): for
     /// redirect-enabled fixtures where GET would 307 instead of filling.
     async fn prime_cache(fx: &Fixture, key: &str) {
-        let mut hit = fx.state.cache.get(key, None).await.unwrap();
+        let mut hit = fx.state.cache.get_by_key(key, None).await.unwrap();
         crate::cache::flight::drain(&mut hit.body).await.unwrap();
         wait_installed(fx, key).await;
     }

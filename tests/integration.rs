@@ -5,7 +5,7 @@ use tokio::sync::Semaphore;
 use tempfile::tempdir;
 
 // The mock lives in the lib now: one implementation for the whole tree.
-use origin_cache::testsupport::MockBackend as CountingBackend;
+use origin_cache::testsupport::{CacheTestExt, MockBackend as CountingBackend};
 
 use origin_cache::{
     backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, Key, ListEntry, ObjectMeta, StreamSource, StorageBackend},
@@ -66,7 +66,7 @@ async fn single_flight_20_concurrent_same_key_one_fetch() {
     for _ in 0..20 {
         let c = Arc::clone(&cache);
         handles.push(tokio::spawn(async move {
-            let mut hit = c.get("same.png", None).await?;
+            let mut hit = c.get_by_key("same.png", None).await?;
             let mut body = hit.body;
             origin_cache::cache::flight::drain(&mut body)
                 .await
@@ -117,7 +117,7 @@ async fn inactive_ttl_expiry_removes_file_and_meta() {
     let calls = Arc::new(AtomicUsize::new(0));
     let backend = CountingBackend::counting(b"x".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, Arc::clone(&clock), registry_with(Arc::new(backend)));
-    let mut hit = cache.get("a.png", None).await.unwrap();
+    let mut hit = cache.get_by_key("a.png", None).await.unwrap();
     read_body(&mut hit.body).await;
     wait_installed(&cache, "a.png").await;
     assert!(dir.path().join("a.png").exists());
@@ -140,7 +140,7 @@ async fn max_size_evicts_lru_order() {
     let backend = CountingBackend::counting(b"12345".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend)));
     for k in ["a.png", "b.png", "c.png"] {
-        let mut hit = cache.get(k, None).await.unwrap();
+        let mut hit = cache.get_by_key(k, None).await.unwrap();
         read_body(&mut hit.body).await;
         wait_installed(&cache, k).await;
         clock.advance(10);
@@ -199,7 +199,7 @@ async fn revalidation_uses_stat_and_serves_updated_content() {
         registry_with(Arc::new(VersionedBackend { version: Arc::clone(&version) })),
     );
 
-    let hit = cache.get("a.png", None).await.unwrap();
+    let hit = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
     let mut hit = hit;
     assert_eq!(read_body(&mut hit.body).await, b"bytes-v1");
@@ -208,13 +208,13 @@ async fn revalidation_uses_stat_and_serves_updated_content() {
     version.store(2, Ordering::SeqCst);
     clock.advance(2000); // past revalidate ttl
 
-    let mut hit2 = cache.get("a.png", None).await.unwrap();
+    let mut hit2 = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit2.outcome, CacheOutcome::Miss); // stat: v2 != cached v1 -> refetch
     assert_eq!(read_body(&mut hit2.body).await, b"bytes-v2");
     wait_installed(&cache, "a.png").await;
 
     // Third get within ttl: fresh hit, no upstream.
-    let mut hit3 = cache.get("a.png", None).await.unwrap();
+    let mut hit3 = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit3.outcome, CacheOutcome::Hit);
     assert_eq!(read_body(&mut hit3.body).await, b"bytes-v2");
 }
@@ -231,40 +231,39 @@ async fn revalidation_not_modified_serves_revalidated() {
     let calls = Arc::new(AtomicUsize::new(0));
     let backend = CountingBackend::counting(b"stable".to_vec(), Some("same".into()), Arc::clone(&calls), None);
     let cache = Cache::new(cfg, Arc::clone(&clock), registry_with(Arc::new(backend)));
-    let mut hit = cache.get("a.png", None).await.unwrap();
+    let mut hit = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
     assert_eq!(read_body(&mut hit.body).await, b"stable");
     wait_installed(&cache, "a.png").await;
     clock.advance(2000);
-    let mut hit2 = cache.get("a.png", None).await.unwrap();
+    let mut hit2 = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit2.outcome, CacheOutcome::Revalidated);
     assert_eq!(read_body(&mut hit2.body).await, b"stable");
 }
 
 #[tokio::test]
-async fn traversal_payloads_are_400_via_fetch_error() {
+async fn traversal_payloads_are_400_via_the_resolve_seam() {
     let dir = tempdir().unwrap();
     let cfg = test_config(dir.path().to_path_buf());
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend::counting(vec![], None, Arc::clone(&calls), None);
+    let backend = CountingBackend::counting(
+        vec![],
+        None,
+        Arc::clone(&calls),
+        None,
+    );
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
-    let err = match cache.get("../etc/passwd", None).await {
-        Err(e) => e,
-        Ok(_) => panic!("traversal key must not resolve"),
-    };
-    assert!(
-        matches!(err, BackendError::InvalidKey(KeyError::Traversal)),
-        "traversal must arrive typed, not as an opaque backend error: {err:?}"
-    );
-    let err2 = match cache.get("%2e%2e%2fetc/passwd", None).await {
-        Err(e) => e,
-        Ok(_) => panic!("encoded traversal key must not resolve"),
-    };
-    assert!(
-        matches!(err2, BackendError::InvalidKey(KeyError::Traversal)),
-        "encoded traversal must arrive typed too: {err2:?}"
-    );
+
+    // Traversal never reaches the cache: the resolve seam rejects it, which is
+    // now the ONLY way a key error leaves this layer, because BackendError can
+    // no longer carry a client fault at all.
+    for key in ["../etc/passwd", "%2e%2e%2fetc/passwd"] {
+        match cache.resolve(key) {
+            Err(KeyError::Traversal) => {}
+            other => panic!("{key} must be rejected as traversal, got {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -275,14 +274,14 @@ async fn range_on_cached_file_slices_and_reports_content_range() {
     let calls = Arc::new(AtomicUsize::new(0));
     let backend = CountingBackend::counting(b"0123456789".to_vec(), Some("v1".into()), Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
-    let mut full = cache.get("a.png", None).await.unwrap();
+    let mut full = cache.get_by_key("a.png", None).await.unwrap();
     read_body(&mut full.body).await;
     wait_installed(&cache, "a.png").await;
 
     // Cached-file Range: sliced via file seek, no upstream traffic.
     let before = calls.load(Ordering::SeqCst);
     let mut part = cache
-        .get("a.png", Some(ByteRange::bounded(2, 4)))
+        .get_by_key("a.png", Some(ByteRange::bounded(2, 4)))
         .await
         .unwrap();
     assert_eq!(part.outcome, CacheOutcome::Hit);
@@ -300,7 +299,7 @@ async fn range_cold_miss_offset_zero_streams_full_with_content_range() {
     let backend = CountingBackend::counting(b"0123456789".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
     let mut hit = cache
-        .get("a.png", Some(ByteRange::from_offset(0)))
+        .get_by_key("a.png", Some(ByteRange::from_offset(0)))
         .await
         .unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
@@ -321,7 +320,7 @@ async fn range_cold_miss_dual_channel_passthrough_and_background_fill() {
     // Cold miss seeking to byte 3: client gets bytes 3.. immediately
     // (passthrough), while the full flight fills the cache in background.
     let mut hit = cache
-        .get("a.png", Some(ByteRange::from_offset(3)))
+        .get_by_key("a.png", Some(ByteRange::from_offset(3)))
         .await
         .unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
@@ -335,7 +334,7 @@ async fn range_cold_miss_dual_channel_passthrough_and_background_fill() {
     );
 
     // Next access is a full disk hit.
-    let mut hit2 = cache.get("a.png", None).await.unwrap();
+    let mut hit2 = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit2.outcome, CacheOutcome::Hit);
     assert_eq!(read_body(&mut hit2.body).await, b"0123456789");
 }
@@ -348,12 +347,12 @@ async fn unsatisfiable_range_rejected() {
     let calls = Arc::new(AtomicUsize::new(0));
     let backend = CountingBackend::counting(b"short".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
-    let mut hit = cache.get("a.png", None).await.unwrap();
+    let mut hit = cache.get_by_key("a.png", None).await.unwrap();
     read_body(&mut hit.body).await;
     wait_installed(&cache, "a.png").await;
 
     let err = match cache
-        .get("a.png", Some(ByteRange::from_offset(99)))
+        .get_by_key("a.png", Some(ByteRange::from_offset(99)))
         .await
     {
         Err(e) => e,
@@ -371,7 +370,7 @@ async fn mime_fallback_overrides_octet_stream() {
     // CountingBackend always hints application/octet-stream.
     let backend = CountingBackend::counting(b"id3".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
-    let mut hit = cache.get("music/dazbee.flac", None).await.unwrap();
+    let mut hit = cache.get_by_key("music/dazbee.flac", None).await.unwrap();
     read_body(&mut hit.body).await;
     assert_eq!(hit.meta.content_type.as_deref(), Some("audio/flac"));
 }
@@ -388,7 +387,7 @@ async fn cache_entries_and_access_clock_survive_restart() {
     let backend = CountingBackend::counting(b"persisted".to_vec(), Some("v1".into()), Arc::clone(&calls), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
     cache.load_and_start().await;
-    let mut hit = cache.get("a.png", None).await.unwrap();
+    let mut hit = cache.get_by_key("a.png", None).await.unwrap();
     assert_eq!(read_body(&mut hit.body).await, b"persisted");
     wait_installed(&cache, "a.png").await;
     clock.advance(5000); // last_access moved; eviction order must persist too
@@ -410,7 +409,7 @@ async fn cache_entries_and_access_clock_survive_restart() {
 
     // Entry reloaded from redb: fresh clock (now=5000) vs last_access —
     // still within revalidate ttl, so a plain disk hit with zero upstream.
-    let mut hit2 = cache2.get("a.png", None).await.unwrap();
+    let mut hit2 = cache2.get_by_key("a.png", None).await.unwrap();
     assert_eq!(hit2.outcome, CacheOutcome::Hit);
     assert_eq!(read_body(&mut hit2.body).await, b"persisted");
     assert_eq!(calls2.load(Ordering::SeqCst), 0, "restart hit must not touch upstream");
@@ -433,7 +432,7 @@ async fn spawned_reaper_expires_entries_without_manual_tick() {
     // 50 ms production-style reaper loop instead of the 60 s default.
     cache.load_and_start_with(std::time::Duration::from_millis(50)).await;
 
-    let mut hit = cache.get("old.png", None).await.unwrap();
+    let mut hit = cache.get_by_key("old.png", None).await.unwrap();
     assert_eq!(read_body(&mut hit.body).await, b"ttl");
     wait_installed(&cache, "old.png").await;
 
@@ -574,7 +573,7 @@ async fn ranged_cold_misses_on_one_key_coalesce() {
         tasks.push(tokio::spawn(async move {
             let offset = (i * 173) % 4096;
             let mut hit = cache
-                .get("storm.bin", Some(ByteRange::bounded(offset, 64)))
+                .get_by_key("storm.bin", Some(ByteRange::bounded(offset, 64)))
                 .await
                 .expect("ranged cold miss must succeed");
             let body = read_body(&mut hit.body).await;
@@ -591,7 +590,7 @@ async fn ranged_cold_misses_on_one_key_coalesce() {
     // Second wave: same seeks served from disk as hits, bytes still exact.
     for i in 0..20u64 {
         let offset = (i * 173) % 4096;
-        let mut hit = cache.get("storm.bin", Some(ByteRange::bounded(offset, 64))).await.unwrap();
+        let mut hit = cache.get_by_key("storm.bin", Some(ByteRange::bounded(offset, 64))).await.unwrap();
         assert_eq!(hit.outcome, CacheOutcome::Hit);
         assert_eq!(read_body(&mut hit.body).await, payload[offset as usize..(offset + 64) as usize]);
     }
@@ -623,7 +622,7 @@ async fn flight_failure_reaches_attached_readers_and_clears_map() {
             // A fast-failing flight may publish Failed before Meta is ever
             // observed — then get() itself errors. Either surfacing is the
             // failure reaching the client; neither may hang.
-            match cache.get("flaky.bin", None).await {
+            match cache.get_by_key("flaky.bin", None).await {
                 Err(_) => (Vec::new(), true),
                 Ok(mut hit) => read_body_allow_error(hit.body).await,
             }
@@ -637,7 +636,7 @@ async fn flight_failure_reaches_attached_readers_and_clears_map() {
     wait_map_empty(&cache).await;
 
     *mode.lock().unwrap() = StormMode::Good;
-    let mut hit = cache.get("flaky.bin", None).await.unwrap();
+    let mut hit = cache.get_by_key("flaky.bin", None).await.unwrap();
     assert_eq!(read_body(&mut hit.body).await, payload, "retry after failure must succeed");
 }
 
@@ -662,7 +661,7 @@ async fn panicked_driver_fails_flight_and_releases_key() {
 
     let cache2 = Arc::clone(&cache);
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
-        cache2.get("panic.bin", None).await
+        cache2.get_by_key("panic.bin", None).await
     })
     .await
     .expect("must not hang on a panicking driver");
@@ -677,7 +676,7 @@ async fn panicked_driver_fails_flight_and_releases_key() {
     assert!(cache.state.read().await.entries.is_empty(), "a panicked flight installs nothing");
 
     *mode.lock().unwrap() = StormMode::Good;
-    let mut hit = cache.get("panic.bin", None).await.unwrap();
+    let mut hit = cache.get_by_key("panic.bin", None).await.unwrap();
     assert_eq!(read_body(&mut hit.body).await, payload, "key must be retryable after a panic");
 }
 
@@ -700,7 +699,7 @@ async fn short_upstream_body_is_never_sealed() {
         registry_with(Arc::new(backend)),
     ));
 
-    let (out, errored) = match cache.get("short.bin", None).await {
+    let (out, errored) = match cache.get_by_key("short.bin", None).await {
         Err(_) => (Vec::new(), true),
         Ok(mut hit) => read_body_allow_error(hit.body).await,
     };
@@ -714,7 +713,7 @@ async fn short_upstream_body_is_never_sealed() {
     );
 
     *mode.lock().unwrap() = StormMode::Good;
-    let mut hit = cache.get("short.bin", None).await.unwrap();
+    let mut hit = cache.get_by_key("short.bin", None).await.unwrap();
     assert_eq!(read_body(&mut hit.body).await, payload, "retry must pull the full object");
 }
 
@@ -744,7 +743,7 @@ async fn concurrent_hits_stamp_access_without_state_write_lock() {
     // Move the clock so the access stamps carry a distinguishable value,
     // then cold-fill and hammer the hot key concurrently.
     clock.advance(5000);
-    let mut first = cache.get("hot.bin", None).await.unwrap();
+    let mut first = cache.get_by_key("hot.bin", None).await.unwrap();
     assert_eq!(read_body(&mut first.body).await, payload);
     wait_installed(&cache, "hot.bin").await;
 
@@ -754,7 +753,7 @@ async fn concurrent_hits_stamp_access_without_state_write_lock() {
         let expect = payload.clone();
         tasks.push(tokio::spawn(async move {
             for _ in 0..8 {
-                let mut hit = cache.get("hot.bin", None).await.unwrap();
+                let mut hit = cache.get_by_key("hot.bin", None).await.unwrap();
                 assert_eq!(hit.outcome, CacheOutcome::Hit);
                 assert_eq!(read_body(&mut hit.body).await, expect);
             }
@@ -841,7 +840,7 @@ async fn head_not_starved_by_saturated_stream_gate() {
     for key in ["a.bin", "b.bin"] {
         let c = Arc::clone(&cache);
         tokio::spawn(async move {
-            let _ = c.get(key, None).await; // blocks in open()
+            let _ = c.get_by_key(key, None).await; // blocks in open()
         });
     }
     // Wait until both transfers have reached open() (both stream permits held).
@@ -859,7 +858,7 @@ async fn head_not_starved_by_saturated_stream_gate() {
     let started = std::time::Instant::now();
     let meta = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        cache.head_meta("c.bin"),
+        cache.head_by_key("c.bin"),
     )
     .await
     .expect("HEAD must not queue behind the saturated stream gate")
@@ -934,7 +933,7 @@ async fn entry_count_cap_evicts_lru_even_under_byte_budget() {
     // Fill 5 distinct keys, advancing the clock so recency is ordered.
     for (i, key) in ["k1", "k2", "k3", "k4", "k5"].iter().enumerate() {
         clock.advance(1000);
-        let mut hit = cache.get(key, None).await.unwrap();
+        let mut hit = cache.get_by_key(key, None).await.unwrap();
         let _ = read_body(&mut hit.body).await;
         wait_installed(&cache, key).await;
         let _ = i;
@@ -1093,7 +1092,7 @@ async fn metadata_loss_rebuilds_rows_from_the_object_tree() {
     {
         let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend.clone()))));
         cache.load_and_start().await;
-        let mut hit = cache.get("kept.bin", None).await.unwrap();
+        let mut hit = cache.get_by_key("kept.bin", None).await.unwrap();
         assert_eq!(read_body(&mut hit.body).await, b"payload");
         wait_installed(&cache, "kept.bin").await;
     }
@@ -1135,7 +1134,7 @@ async fn eviction_picks_lru_victims_in_order() {
     // Five keys, each accessed later than the last, so recency is strict.
     for (i, k) in ["k1", "k2", "k3", "k4", "k5"].iter().enumerate() {
         clock.advance(1000 * (i as u64 + 1));
-        let mut hit = cache.get(k, None).await.unwrap();
+        let mut hit = cache.get_by_key(k, None).await.unwrap();
         let _ = read_body(&mut hit.body).await;
         wait_installed(&cache, k).await;
     }
