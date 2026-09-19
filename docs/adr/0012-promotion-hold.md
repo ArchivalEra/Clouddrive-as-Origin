@@ -43,9 +43,13 @@ were already providing.
 - The cache can be over budget for up to the reaper interval (60 s) after a
   promotion, as it already could after any insert; the magazine then ejects
   the least-recently-touched rows, held ones last.
-- An object larger than `max_size_bytes` is never promoted, so an object that
-  can never be cached whole stays a set of segments, which is what serves a
-  seek anyway.
+- An object larger than `max_size_bytes` is never promoted. Staged segments
+  feed promotion and nothing else — no serving path reads a `.seg` file — so
+  for an object that can never be promoted, staging was pure cost. That is
+  now fixed at admission rather than here: such an object is never staged
+  (ADR-0013), and it is served as a resident stray when the disk can hold it
+  (ADR-0014). The sentence this replaces ("stays a set of segments, which is
+  what serves a seek anyway") was wrong: segments served no seek at all.
 - `hold_until_millis` is `#[serde(default)]`: rows written before this field
   existed have no such key, and without the default the store would fail to
   deserialize on the first start after an upgrade.

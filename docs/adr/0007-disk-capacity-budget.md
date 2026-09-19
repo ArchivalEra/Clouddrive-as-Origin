@@ -75,3 +75,18 @@ Whether staged bytes deserve their own budget separate from entry bytes
 (a single shared budget means a heavy scrub can evict completed entries).
 Observed traffic has not shown that pressure; if it does, split the budget
 rather than changing the eviction order.
+
+## Amendment (2026-09-19): "staged bytes share the budget" means the magazine's budget
+
+The shared budget is `resident_bytes + segment_bytes > max_size_bytes`, where
+`resident_bytes` excludes resident strays (ADR-0014). A stray is an object the
+magazine cannot hold at all, so counting it would leave the cache permanently
+"over budget" and make every insert evict someone else for a cap that object
+was never subject to.
+
+The disk side of this ADR is unchanged and now has a counterpart: the tick
+reclaims strays when free space falls below a working floor (reserve + 2 GiB),
+oldest-touched first, and cold-pull admission makes room the same way before it
+concludes a request cannot be cached (ADR-0013). Strays are the only population
+either mechanism takes, because the byte budget already governs the magazine's
+own members.

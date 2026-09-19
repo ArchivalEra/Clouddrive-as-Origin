@@ -50,3 +50,22 @@ Cold ranged misses still fetch the whole object, so a seek holds a stream
 permit for the full pull. Whether the pull should start at the requested offset
 is tracked separately in `docs/notes/c5-pump-start-options.md`; it needs
 EdgeOne cold-request ordering data before it can graduate.
+
+## Amendment (2026-09-19): the passthrough holds the stream gate for the transfer
+
+"nocache/passthrough staging" was listed as stream-gated from the start, and
+the efficient passthrough did not honour it: it took a **metadata** permit —
+the head-of-line class this ADR split off, taken for an operation that is not
+metadata — and released it as soon as the response was constructed, so the
+stream budget saw neither the open nor the transfer. Two viewers of the same
+range opened two upstream streams and nothing bounded them.
+
+The permit is now taken from `stream_gate` and moved **into the body**, so it
+is held for exactly as long as bytes can move. That is what "long-lived,
+bandwidth-bound" means here, and it bounds upstream pressure by the configured
+budget rather than by the client count.
+
+The cost is stated plainly: a client that parks a range connection open holds
+one permit until it disconnects. That is what a per-upstream concurrency budget
+is for, and it is the same exposure the cold-miss pump has always had (which
+holds a permit for the whole download).

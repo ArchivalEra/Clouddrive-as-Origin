@@ -90,3 +90,18 @@ Reaper (inactive): range `by_last_access[..now - inactive_ttl]` in chunks 500–
 - Sidecar-per-entry JSON (no DB): rejected per R1 — 10k+ entries would scan the whole tree on reaper/evictor/healthz; redb's ordered index is O(n) page walk.
 - Separate `MultimapTableDefinition` for `by_last_access`: rejected — composite key in a regular table keeps keys unique and deletion of the old index row trivial.
 - `Durability::None` batching: rejected — `Immediate` with coalesced last_access flush is durable enough (≤1 s loss is OK, OneDrive is source of truth).
+
+## Amendment (2026-09-19): the stall budget measures inactivity
+
+The single-flight reader's watch-wait budget is documented as "inactivity, not
+total time — a slow-but-flowing pull never trips it", and the offset wait now
+behaves that way: every progress event re-arms the full budget, so a reader
+parked ahead of the writer waits as long as the pull keeps advancing.
+
+It did not, until this round. The offset wait built one deadline covering the
+whole wait, so at the measured 27 MB/s a reader roughly 800 MB ahead was killed
+mid-body with `flight stalled` while the pull was flowing perfectly — the code
+contradicted the contract its own type documented. Re-arming cannot spin: the
+watermark only grows, so an event means `written` rose and the loop exits as
+soon as it passes the reader's offset, while a pull that genuinely stops
+publishing still trips the budget exactly as before.

@@ -135,6 +135,22 @@ repo** — it is injected at runtime via an environment variable (e.g.
    magazine ejects whichever was touched longest ago. Eviction must remove
    metadata and, if the parent directory becomes empty, prune it.
 
+   **An object larger than the whole magazine is resident, not evicted
+   (ADR-0014).** Evicting others cannot bring it into budget — its own
+   size is the overshoot — so the byte budget neither counts it nor picks
+   it: the row is admitted with `oversize` set, it leaves on the 20-minute
+   clock like anything else, and the reaper reclaims strays (oldest
+   touched first) when free space falls below reserve + 2 GiB. Disk
+   pressure takes strays only; the byte budget already governs the
+   magazine's own members. `stray_bytes` in healthz reports the part of
+   `bytes` the budget does not govern.
+
+   **A request the cache cannot hold is served, not refused (ADR-0013).**
+   The size is established by one coalesced `stat` before any flight
+   exists, room is made by evicting strays, and a request that still does
+   not fit is answered through the per-upstream pipe: no flight, no entry,
+   no disk write, no error. The cache refuses to cache.
+
 5. **Revalidation on access (no background polling):** an entry that is
    present but older than a short TTL (default 60 s, configurable)
    triggers a revalidation before serving from disk: a `stat` is compared
@@ -162,12 +178,18 @@ repo** — it is injected at runtime via an environment variable (e.g.
      file seek (zero upstream traffic) — audio/video seek must be
      milliseconds.
    - **Cold miss with `Range`:** NEVER download-then-serve, and never
-     write a partial file into the cache. Dual-channel: the client
-     stream passes through immediately from the backend at the
-     requested offset (minimum TTFB), while a full-file fetch — sharing
-     the same single-flight window — populates the complete cache in
-     the background. The visitor hears the music while the cache
-     quietly becomes complete; subsequent visitors are 100% disk hits.
+     write a partial file into the cache. Amended 2026-09-19 to match the
+     implementation: the reader **converges on the flight's growing file**
+     rather than opening its own upstream stream. Every upstream open pays
+     a ~640 ms fixed cost and N concurrent ranges used to mean N opens
+     (measured: 5 → 5), so the reader follows the one shared download and
+     waits for the writer to reach its offset — normally zero wait, since
+     EdgeOne delivers shards in ascending order. The wait is bounded by
+     **inactivity, not total time**: every progress event re-arms the
+     budget, so a reader far ahead of a flowing writer is not killed
+     mid-body (ADR-0002 amendment).
+     The `nocache` and `efficient` profiles serve a ranged miss straight
+     from the backend instead (§3.11 C, §3.12).
    - Backend `open(key, range)` must pass the range through to the
      source when supported (Graph `downloadUrl` and Drive `alt=media`
      both honor `Range`).
@@ -210,6 +232,20 @@ repo** — it is injected at runtime via an environment variable (e.g.
     staged history. Files below `min_file_size` (default 64 MiB) fill
     whole via B. Segments count separately (`segment_bytes` in
     healthz), age-sweep with `inactive_ttl`, rebuild from disk on restart.
+
+    **Staging admission (ADR-0013):** segments have exactly one reader —
+    promotion — so the profile stages only what promotion could accept:
+    an object larger than `max_size` is never staged (it is served as a
+    resident stray instead when the disk can hold it, or through the pipe
+    otherwise), and neither is an interval the disk has no room for. A
+    refused staged request is served by the same pipe, byte for byte.
+
+    **Ledger ceiling:** one key's ledger holds at most
+    `MAX_INTERVALS_PER_KEY` (4096) intervals. Touching spans merge first
+    (exact — `[a,b) + [b,c) = [a,c)`, and that is what a sequential scrub
+    produces); if gaps remain, the coldest spans are dropped, because
+    merging across a gap would claim bytes the node does not hold. Decay
+    and the coverage count are one pass.
 
     **Coverage window:** each staged interval carries its read
     timestamp; intervals older than `coverage_window_secs` (default
@@ -504,7 +540,7 @@ text no longer matched called out rather than dropped.
   `HB` means the checker itself stopped.
 - `/healthz` exposes the same counters plus per-upstream token state. —
   **counters yes, token state no.** healthz reports `entries`, `bytes`,
-  `segment_bytes`, `flights_active`, `promotions_active`,
+  `segment_bytes`, `stray_bytes`, `flights_active`, `promotions_active`,
   `dirty_access_flushes`, `coverage_keys`, `coverage_intervals`,
   `prewarm_inflight`, `store.state`, `rebuilt_rows`, `disk_free_bytes`,
   `disk_reserve_bytes`, and per upstream `id` / `profile` / `cold_miss` /
@@ -516,6 +552,34 @@ text no longer matched called out rather than dropped.
   the metrics endpoint. Candidate ticket; not implemented here.
 - `/_internal/healthz` additionally reports `segment_bytes` (staged,
   unpromoted efficientcache sidecars). — holds.
+- `/_internal/healthz` reports `stray_bytes` (2026-09-19): the part of
+  `bytes` that belongs to resident strays, which the magazine's byte budget
+  neither counts nor evicts (ADR-0014). It is the field that explains a
+  `bytes` total above `max_size_bytes`.
+
+### Can a seek be watched, not just guessed (2026-09-19)
+
+`cache_serve_duration_seconds` observes functions that return an **unconsumed
+body**, so it measures response construction and stops before the transfer —
+it was documented as "time the cache layer spent serving a request", which
+overstated it. The transfer now has its own instruments, on the shared
+registry, visible at the front plane's `/metrics` (both planes register into
+the same default registry):
+
+- `cache_serve_source_total{source}` — responses by where their bytes came
+  from (`disk` or `upstream`). The label is carried on the plan and the hit
+  from the path that produced the bytes, not re-derived from the outcome: a
+  `Miss` is upstream bytes while the flight is filling and disk bytes when a
+  late attacher finds the sealed file.
+- `cache_body_ttfb_seconds{source}` — request entry to the **first body
+  byte**. This is the seek-smoothness number: a range served from this node's
+  disk costs no upstream round trip, and a range served from upstream pays the
+  measured per-open cost.
+- `cache_body_bytes_total{source}` — bytes actually delivered, by source.
+
+The label set is closed at those two values; no placeholder exists for a read
+path that does not exist yet. The watchdog's report schema is a closed
+whitelist agreed with the status page, so none of this is added there.
 
 
 ## 9. Non-goals (v1 explicitly out of scope)
@@ -609,4 +673,37 @@ match the implementation and one was retired as vacuous.
       **Retired 2026-09-17**: only one backend type exists (`openlist`;
       `main.rs` refuses any other), so the cross-provider half of this line
       cannot fail. Reinstate it if a second type lands.
+
+### Added 2026-09-19 (the admission round; each line was reverse-verified by
+disabling its fix and watching the named test fail)
+
+- [x] An object larger than the magazine is a **resident stray**: admitted,
+      served from disk for later ranges, and it evicts nothing on the way in.
+      — `an_object_larger_than_the_magazine_is_cached_as_a_stray`,
+      `cache::cache::tests::a_resident_stray_never_evicts_the_magazine`.
+- [x] An object that can never be promoted is **never staged**: no sidecar, no
+      ledger row, no staged bytes, and the viewer still gets every byte.
+      — `business::tests::an_object_larger_than_the_cache_is_never_staged`.
+- [x] A request the cache cannot hold is **served, not refused**: no flight,
+      no entry, no disk write, no 502.
+      — `a_cold_pull_the_disk_cannot_hold_is_served_without_caching`.
+- [x] Disk pressure reclaims resident strays, oldest-touched first, and
+      nothing else.
+      — `cache::cache::tests::strays_are_reclaimed_under_disk_pressure_oldest_first`.
+- [x] A complete entry keeps serving ranges past the revalidate window: one
+      stat, no bytes, no upstream open.
+      — `business::tests::efficient_complete_entry_keeps_serving_ranges_after_the_revalidate_window`.
+- [x] A reader parked ahead of a flowing writer survives a wait longer than
+      one stall budget; a genuinely stalled pull still errors inside it.
+      — `cache::flight::tests::far_ahead_reader_survives_a_flowing_writer_beyond_one_budget`,
+      `stalled_flight_ends_reader_within_budget`.
+- [x] The passthrough holds the **stream** gate for its transfer.
+      — `tests/integration.rs::efficient_passthrough_waits_for_a_stream_permit`.
+- [x] One key's ledger is bounded without losing coverage.
+      — `cache::store::tests::a_sequential_walk_is_bounded_and_loses_no_coverage`,
+      `a_gapped_ledger_is_bounded_by_dropping_the_coldest_spans`.
+- [x] A response's byte source and its first-byte latency are measurable.
+      — `cache::cache::tests::serve_labels_the_bytes_with_their_source`,
+      `business::tests::http_get_records_its_byte_source`,
+      `business::tests::instrument_body_delivers_every_byte_and_counts_it`.
 

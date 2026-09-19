@@ -316,6 +316,57 @@ the problem is OpenList or the provider — not this service. If the whole
 path is fast from the node but slow from a client, the time is in the edge
 segment (see `docs/notes/` for the EdgeOne findings).
 
+### Is seeking smooth? (added 2026-09-19)
+
+`cache_serve_duration_seconds` stops at response construction, so it cannot
+answer this. Three newer metrics can, on the front plane's `/metrics`:
+
+```sh
+curl -s http://127.0.0.1:9090/metrics | grep -E 'cache_serve_source_total|cache_body_ttfb_seconds_count|cache_body_bytes_total'
+```
+
+- `cache_serve_source_total{source}` — how many responses were served from
+  this node's disk versus pulled from upstream. If almost everything is
+  `upstream`, the local cache is not buying anything for that workload.
+- `cache_body_ttfb_seconds{source}` — request entry to the first body byte,
+  split by source. Compare the two histograms: the gap between
+  `source="disk"` and `source="upstream"` is the per-open upstream cost
+  (~640 ms measured) that a local read avoids.
+- `cache_body_bytes_total{source}` — bandwidth actually spent upstream.
+
+A seek that lands on already-cached bytes shows up as a `disk` sample with a
+much smaller TTFB. If seeks are slow *and* mostly `upstream`, the object is
+not being kept — check `stray_bytes` and `bytes` in healthz (below) before
+reaching for a config change.
+
+### resident strays: an object larger than the magazine
+
+`max_size_bytes` is a policy bound, not a disk bound. An object larger than it
+cannot be brought into budget by evicting anyone, so since ADR-0014 the node
+keeps it as a **resident stray**: cached while the disk allows, outside the
+byte budget, reclaimed by the 20-minute inactivity clock or when free space
+falls below reserve + 2 GiB.
+
+```sh
+# How much of the cache the byte budget does not govern
+curl -s http://127.0.0.1:8080/_internal/healthz | jq '{bytes, stray_bytes, segment_bytes, entries}'
+```
+
+Two operational consequences:
+
+- `bytes` can legitimately exceed `max_size_bytes` by `stray_bytes`. That is
+  not a bug, and the watchdog's disk watermarks (85% / 95%) still cover the
+  disk itself.
+- `inactive_ttl_secs` now decides how long a large object survives between
+  viewing sessions. Re-pulling one costs a full upstream stream (~18 minutes
+  for 30 GB at the measured 27.4 MB/s), so raise the TTL if viewers come back
+  after long gaps.
+
+An efficient-profile object larger than the magazine is never staged at all
+(ADR-0013): staged segments feed promotion only, and this object can never be
+promoted. It is served as a stray when the disk can hold it, and through the
+pipe otherwise.
+
 ## Test data cleanup
 
 The 3 GiB coverage test file lives in googledrive1 (`coverage-test-3g.bin`).
