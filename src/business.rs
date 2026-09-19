@@ -336,7 +336,15 @@ fn stream_response(
 /// function returns an unconsumed body), so the transfer needs its own
 /// instrument: this records the time to the first byte — the seek-smoothness
 /// number — and the bytes delivered, both labelled by where the bytes came
-/// from. A body that never yields still reports zero bytes.
+/// from.
+///
+/// Bytes are counted **as they are yielded**, not after the loop. Every
+/// response here carries a `content-length`, and hyper stops polling a body
+/// once that length is satisfied: it DROPS the stream rather than driving the
+/// generator to completion, so a tail that ran after the last chunk never ran
+/// at all. The node showed it — `cache_body_ttfb_seconds` had samples and
+/// `cache_body_bytes_total` did not exist. Per-chunk counting also reports the
+/// bytes actually delivered when a client disconnects mid-body.
 fn instrument_body(
     body: crate::cache::flight::BodyStream,
     source: &'static str,
@@ -346,17 +354,15 @@ fn instrument_body(
     Box::pin(async_stream::try_stream! {
         let mut body = body;
         let mut first = true;
-        let mut delivered: u64 = 0;
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
             if first {
                 first = false;
                 crate::metrics::observe_body_ttfb(source, started);
             }
-            delivered += chunk.len() as u64;
+            crate::metrics::observe_body_bytes(source, chunk.len() as u64);
             yield chunk;
         }
-        crate::metrics::observe_body_bytes(source, delivered);
     })
 }
 
@@ -1897,6 +1903,31 @@ mod tests {
         assert!(
             body_bytes("upstream") - before >= 5.0,
             "every delivered byte must be counted against its source"
+        );
+    }
+
+    /// hyper stops polling a body once its declared length is satisfied, so a
+    /// length-known response is DROPPED rather than driven to completion.
+    /// Counting at the end of the stream therefore never ran, and the counter
+    /// was absent from the node's /metrics while its sibling histogram was
+    /// there. Bytes are counted as they are yielded.
+    #[tokio::test]
+    async fn instrument_body_counts_bytes_even_when_the_stream_is_dropped() {
+        use futures::StreamExt;
+
+        let before = body_bytes("disk");
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+            Ok(bytes::Bytes::from_static(b"abcd")),
+            Ok(bytes::Bytes::from_static(b"efgh")),
+        ];
+        let body: crate::cache::flight::BodyStream = Box::pin(futures::stream::iter(chunks));
+        let mut wrapped = instrument_body(body, "disk", std::time::Instant::now());
+        let first = wrapped.next().await.unwrap().unwrap();
+        assert_eq!(&first[..], b"abcd");
+        drop(wrapped); // exactly what hyper does once content-length is met
+        assert!(
+            body_bytes("disk") - before >= 4.0,
+            "bytes delivered before the drop must already be counted"
         );
     }
 
