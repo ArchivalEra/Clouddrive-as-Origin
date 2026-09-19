@@ -757,7 +757,6 @@ mod tests {
         response::request_ids,
     };
     use std::{collections::HashMap, sync::Arc};
-    use tokio::sync::Semaphore;
 
     fn entry(key: &str, size: u64, is_dir: bool) -> ListEntry {
         ListEntry {
@@ -992,7 +991,6 @@ mod tests {
 
     /// P9: the list trigger is a cheap substring probe, not a full parse,
     /// and it must not fire on unrelated queries.
-    #[test]
     /// The listing dispatch must key on whole parameter NAMES. A substring
     /// probe routed `?xprefix=1` (it contains `prefix=`) into the listing
     /// handler, so an object GET with an unrelated parameter was answered

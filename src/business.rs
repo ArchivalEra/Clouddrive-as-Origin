@@ -685,10 +685,10 @@ where
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     use crate::{
-        backend::{BackendRegistry, BackendSlot, DirectUrl, Key, ObjectMeta, StreamSource, StorageBackend},
+        backend::{BackendRegistry, BackendSlot},
         clock::MockClock,
     };
 

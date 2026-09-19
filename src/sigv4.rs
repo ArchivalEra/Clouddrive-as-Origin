@@ -728,10 +728,7 @@ fn verify_presigned(
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    /// Test-only date parser (the production type is module-private).
-    pub(crate) use super::AmzDate;
-}
+
 
 #[cfg(test)]
 mod tests {

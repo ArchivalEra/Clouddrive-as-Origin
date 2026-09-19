@@ -5,7 +5,9 @@ use crate::{
     backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, ContentRange, DirectUrl, Key, ObjectMeta},
     cache::{
         flight::{self, BodyStream, FlightProgress, FlightShared},
+        magazine::{self, Magazine},
         meta::EntryMeta,
+        staging::{FinalizedSpan, Staging},
         store,
     },
     clock::Clock,
@@ -24,39 +26,6 @@ pub enum CacheOutcome {
     Revalidated,
 }
 
-/// Disk headroom held back from cold pulls (P56): the node must keep room
-/// for logs, the redb file, and an operator's emergency shell even when the
-/// cache is at its configured maximum.
-const DISK_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Free-space floor the tick reclaims resident strays down to (ADR-0014).
-/// The reserve alone is too tight to be a working margin: strays sit outside
-/// the magazine's byte budget, so nothing else bounds how much of the disk
-/// they take, and a cold pull that finds less than its own size free would
-/// have to either refuse (which the cache never does) or evict a stray in a
-/// hurry. Keeping this much free at all times makes the admission path's
-/// "make room" step rare instead of routine.
-const DISK_PRESSURE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// Never evict a staging ledger row younger than this (P56): an active
-/// transfer's row is touched continuously and must not be yanked mid-flight.
-const STAGE_MIN_AGE_MS: u64 = 60_000;
-
-/// Whether the magazine can hold an object of this size at all. An object
-/// that cannot fit is never made to fit by evicting anyone, so the byte
-/// budget cannot govern it — such an object is admitted as a *resident
-/// stray* instead (ADR-0014): cached while the disk allows it, refused by
-/// the byte budget neither as a victim nor as pressure.
-///
-/// One predicate, three call sites that must agree: promotion's fit guard
-/// (assembling something the magazine must immediately eject would consume
-/// the staged segments and hand the magazine an entry it cannot keep),
-/// staging admission (staged bytes only ever feed promotion, so staging an
-/// un-promotable object writes bytes nobody can read back), and cold-pull
-/// admission (which decides `EntryMeta::oversize`).
-fn fits_magazine(size_bytes: u64, config: &Config) -> bool {
-    size_bytes > 0 && size_bytes <= config.max_size_bytes
-}
 
 /// Static metric label for an outcome (P7): keeps the hot path
 /// allocation-free.
@@ -102,6 +71,24 @@ impl From<&EntryMeta> for HitMeta {
 }
 
 /// Build response headers' metadata with MIME fallback applied (§3.9).
+/// Resolve a client Range against an object of `total` bytes into
+/// `[start, end)`, `end` exclusive. One construction site (C3): the same
+/// arithmetic used to live in four places, and two of them had drifted.
+pub(crate) fn resolve_range(
+    range: Option<crate::backend::ByteRange>,
+    total: u64,
+) -> Result<(u64, u64), BackendError> {
+    match range {
+        None => Ok((0, total)),
+        Some(r) => {
+            if r.offset >= total {
+                return Err(BackendError::RangeNotSatisfiable);
+            }
+            Ok((r.offset, r.length.map_or(total, |l| (r.offset + l).min(total))))
+        }
+    }
+}
+
 fn hit_meta_remote(key: &str, m: &ObjectMeta) -> HitMeta {
     HitMeta {
         size: m.size_bytes,
@@ -189,6 +176,34 @@ pub enum ServeOutcome {
 /// paths disagree on purpose: nocache and the cached path answer 206 only
 /// when a content-range is present, while the efficient passthrough always
 /// answers 206.
+/// The one construction site for a streaming answer (C3): the status
+/// follows the content-range — 206 when a range was honoured, 200 otherwise
+/// — except where a path overrides it (the efficient passthrough always
+/// answers 206, and its hit always carries one). Before this, `Cache::serve`
+/// built the plan three times with the same fields reshuffled.
+fn stream_plan(
+    meta: HitMeta,
+    content_range: Option<ContentRange>,
+    content_length: Option<u64>,
+    body: BodyStream,
+    stale: bool,
+    source: BodySource,
+) -> StreamPlan {
+    StreamPlan {
+        status: if content_range.is_some() {
+            axum::http::StatusCode::PARTIAL_CONTENT
+        } else {
+            axum::http::StatusCode::OK
+        },
+        meta,
+        content_range,
+        content_length,
+        body,
+        stale,
+        source,
+    }
+}
+
 /// Where a response's bytes actually come from. Carried on the plan (and on
 /// every `CacheHit`) so the metric label is taken from the path that
 /// produced the bytes rather than re-derived from the outcome — `Miss`, for
@@ -252,7 +267,7 @@ impl Default for CacheState {
 /// Lag bound: a hit's timestamp is visible to the reaper/evictor within
 /// one flush tick (<= ~1 s). Both readers use the value only against a
 /// 1200 s TTL (reap) or for relative LRU ordering, so sub-second lag is
-/// invisible — verified in the audit (readers: `reap_collect`,
+/// invisible — verified in the audit (readers: the magazine's reaper and
 /// `eligible_at`).
 #[derive(Debug, Default)]
 pub struct AccessClock {
@@ -373,6 +388,12 @@ pub struct Cache<C: Clock> {
     /// Keys with a promotion task in flight (P2-b single-flight: threshold
     /// re-hits while promoting attach to nothing — the task re-verifies).
     pub promotions: Arc<Mutex<HashSet<String>>>,
+    /// The magazine: every byte-budget decision (admission, eviction,
+    /// pressure reclaim, install, delete) lives behind this receiver.
+    pub(crate) magazine: Magazine,
+    /// The staging ledger: the efficient profile's transfer history,
+    /// promotion and assembly, behind this receiver.
+    pub(crate) staging: Staging,
     pub(crate) reval_inflight: Inflight<StatData, BackendError>,
     /// Rows rebuilt from the object tree after metadata loss (C1). Read by
     /// healthz so a rebuild is visible without reading logs.
@@ -394,20 +415,34 @@ impl<C: Clock + Clone> Cache<C> {
         let routes = config.routes.clone();
         let meta = Arc::new(crate::cache::persist::MetaStore::open(&config.cache_dir.join(store::META_STORE_FILE)).expect("open redb metadata store"));
         let dirty_access = Arc::new(AccessClock::new());
+        let state = Arc::new(RwLock::new(CacheState::default()));
+        let coverage = Arc::new(Mutex::new(HashMap::new()));
+        let promotions = Arc::new(Mutex::new(HashSet::new()));
+        let magazine = Magazine::new(Arc::clone(&state), Arc::clone(&config), Arc::clone(&meta));
+        let staging = Staging::new(
+            Arc::clone(&coverage),
+            Arc::clone(&state),
+            Arc::clone(&config),
+            backends.clone(),
+            Arc::clone(&promotions),
+            magazine.clone(),
+        );
         Self {
             config,
             clock,
             backends,
-            state: Arc::new(RwLock::new(CacheState::default())),
+            state,
             meta,
             dirty_access,
             flights: crate::cache::flight::Flights::new(crate::cache::flight::DEFAULT_STALL_BUDGET),
-            coverage: Arc::new(Mutex::new(HashMap::new())),
-            promotions: Arc::new(Mutex::new(HashSet::new())),
+            coverage,
+            promotions,
+            staging,
             reval_inflight: Inflight::new(),
             rebuilt_rows: std::sync::atomic::AtomicUsize::new(0),
             prewarm_inflight: std::sync::atomic::AtomicUsize::new(0),
             routes,
+            magazine,
         }
     }
 
@@ -522,12 +557,11 @@ impl<C: Clock + Clone> Cache<C> {
                         // size rule is the only information available: a
                         // rebuilt row larger than the budget is admitted as
                         // a stray, exactly as it would be on a cold pull.
-                        oversize: !fits_magazine(size, &self.config),
+                        oversize: !self.magazine.fits(size),
                     });
                 }
-                let meta_store = Arc::clone(&self.meta);
                 let n = rebuilt.len();
-                rebuild_entries(&meta_store, &self.state, rebuilt, loaded).await;
+                self.magazine.rebuild(rebuilt, loaded).await;
                 self.rebuilt_rows.store(n, std::sync::atomic::Ordering::Relaxed);
             }
         }
@@ -585,20 +619,12 @@ impl<C: Clock + Clone> Cache<C> {
     /// Owned view of the live machinery for healthz: operators read a
     /// snapshot, never the internals (C4).
     pub async fn snapshot(&self) -> CacheSnapshot {
-        let (entries, total_bytes, segment_bytes, stray_bytes) = {
+        let (entries, total_bytes, segment_bytes) = {
             let s = self.state.read().await;
-            let strays: u64 = s
-                .entries
-                .values()
-                .filter(|m| m.oversize)
-                .map(|m| m.size_bytes)
-                .sum();
-            (s.entries.len(), s.total_bytes, s.segment_bytes, strays)
+            (s.entries.len(), s.total_bytes, s.segment_bytes)
         };
-        let (coverage_keys, coverage_intervals) = {
-            let cov = self.coverage.lock().await;
-            (cov.len(), cov.values().map(|c| c.intervals.len()).sum())
-        };
+        let stray_bytes = self.magazine.strays_bytes().await;
+        let (coverage_keys, coverage_intervals) = self.staging.summary().await;
         CacheSnapshot {
             entries,
             total_bytes,
@@ -613,7 +639,7 @@ impl<C: Clock + Clone> Cache<C> {
             rebuilt_rows: self.rebuilt_rows.load(std::sync::atomic::Ordering::Relaxed),
             prewarm_inflight: self.prewarm_inflight.load(std::sync::atomic::Ordering::Relaxed),
             disk_free_bytes: store::free_bytes(&self.config.cache_dir),
-            disk_reserve_bytes: DISK_RESERVE_BYTES,
+            disk_reserve_bytes: magazine::DISK_RESERVE_BYTES,
         }
     }
 
@@ -706,7 +732,9 @@ impl<C: Clock + Clone> Cache<C> {
                 Ok(hit_meta_remote(&key, &m))
             }
             Err(BackendError::NotFound) => {
-                self.install_negative(&key, &upstream_id).await;
+                self.magazine
+                    .install_negative(&key, &upstream_id, self.clock.now_millis())
+                    .await;
                 Err(BackendError::NotFound)
             }
             Err(e) => Err(e),
@@ -811,32 +839,6 @@ impl<C: Clock + Clone> Cache<C> {
     /// way to make room; the magazine's own members leave on their clock.
     /// The tick reclaims strays down to the same floor on its own schedule,
     /// which keeps this path's eviction step rare.
-    async fn make_room_for(&self, want: u64) -> bool {
-        if store::has_room_for(&self.config.cache_dir, want, DISK_RESERVE_BYTES) {
-            return true;
-        }
-        let free = store::free_bytes(&self.config.cache_dir).unwrap_or(0);
-        let need = DISK_RESERVE_BYTES
-            .saturating_add(want)
-            .saturating_sub(free);
-        let victims = {
-            let mut s = self.state.write().await;
-            pick_strays_for_pressure(&mut s, &self.config, need)
-        };
-        if !victims.is_empty() {
-            tracing::warn!(
-                want,
-                free,
-                victims = victims.len(),
-                "making room for a cold pull by evicting resident strays"
-            );
-            remove_entries(&self.config, &self.meta, &victims).await;
-        }
-        // A second probe, not arithmetic on the first: the deletes above are
-        // asynchronous and the accounting is the filesystem's, not ours.
-        store::has_room_for(&self.config.cache_dir, want, DISK_RESERVE_BYTES)
-    }
-
     /// Background fill: full fetch + drain, no client attached. Powers the
     /// A relief valve (307 now, bytes later) and shares the prewarm path —
     /// one primitive, two callers. Nocache upstreams have nothing to fill
@@ -873,15 +875,7 @@ impl<C: Clock + Clone> Cache<C> {
     ) -> Result<PassthroughHit, BackendError> {
         let bkey = Key::from_validated(rk.backend_key.clone());
         let total = meta.size_bytes;
-        let (start, end) = match range {
-            None => (0, total),
-            Some(r) => {
-                if r.offset >= total {
-                    return Err(BackendError::RangeNotSatisfiable);
-                }
-                (r.offset, r.length.map_or(total, |l| (r.offset + l).min(total)))
-            }
-        };
+        let (start, end) = resolve_range(range, total)?;
         let stream_permit = Arc::clone(&slot.stream_gate).acquire_owned().await;
         let src = slot.backend.open(&bkey, range).await?;
         let content_range = range.map(|_| ContentRange { first: start, last: end.saturating_sub(1), total });
@@ -997,7 +991,9 @@ impl<C: Clock + Clone> Cache<C> {
         let meta = match self.stat_coalesced(&slot, &rk.cache_key, &bkey).await {
             Ok(m) => m,
             Err(BackendError::NotFound) => {
-                self.install_negative(&rk.cache_key, &rk.upstream_id).await;
+                self.magazine
+                    .install_negative(&rk.cache_key, &rk.upstream_id, self.clock.now_millis())
+                    .await;
                 return Err(BackendError::NotFound);
             }
             Err(e) => return Err(e),
@@ -1005,23 +1001,15 @@ impl<C: Clock + Clone> Cache<C> {
         if meta.size_bytes < min_file_size {
             return Err(BackendError::Other("below min_file_size".into()));
         }
-        let (start, end) = match range {
-            None => (0, meta.size_bytes),
-            Some(r) => {
-                if r.offset >= meta.size_bytes {
-                    return Err(BackendError::RangeNotSatisfiable);
-                }
-                (r.offset, r.length.map_or(meta.size_bytes, |l| (r.offset + l).min(meta.size_bytes)))
-            }
-        };
+        let (start, end) = resolve_range(range, meta.size_bytes)?;
         // Staging admission (ADR-0013). Staged segments have exactly one
         // reader - promotion - and promotion is refused for an object the
         // magazine cannot hold, so staging such an object writes bytes
         // nobody can ever read back: pure cost, paid on every seek. The disk
         // gets the same question the cold-pull path asks, because a staged
         // stream is a disk write like any other.
-        if !fits_magazine(meta.size_bytes, &self.config)
-            || !store::has_room_for(&self.config.cache_dir, end - start, DISK_RESERVE_BYTES)
+        if !self.magazine.fits(meta.size_bytes)
+            || !store::has_room_for(&self.config.cache_dir, end - start, magazine::DISK_RESERVE_BYTES)
         {
             tracing::info!(
                 key = %rk.cache_key,
@@ -1035,13 +1023,13 @@ impl<C: Clock + Clone> Cache<C> {
         // same-file backstop for races). Only the staging path needs it -
         // this is the only place new bytes can enter the ledger.
         {
-            let known = self.coverage.lock().await.get(&rk.cache_key).and_then(|e| e.etag.clone());
+            let known = self.staging.known_etag(&rk.cache_key).await;
             let changed = match (known.as_deref(), meta.etag.as_deref()) {
                 (Some(a), Some(b)) => a != b,
                 _ => false,
             };
             if changed {
-                reset_coverage(&self.coverage, &self.state, &self.config.cache_dir, &rk.cache_key).await;
+                self.staging.reset(&rk.cache_key).await;
             }
         }
         // The open and the transfer below are a stream, not metadata (B1):
@@ -1051,7 +1039,9 @@ impl<C: Clock + Clone> Cache<C> {
         let src = match slot.backend.open(&bkey, range).await {
             Ok(s) => s,
             Err(BackendError::NotFound) => {
-                self.install_negative(&rk.cache_key, &rk.upstream_id).await;
+                self.magazine
+                    .install_negative(&rk.cache_key, &rk.upstream_id, self.clock.now_millis())
+                    .await;
                 return Err(BackendError::NotFound);
             }
             Err(e) => return Err(e),
@@ -1064,13 +1054,8 @@ impl<C: Clock + Clone> Cache<C> {
 
         // Staged streaming: chunk → segpart file → viewer. Ledger merge +
         // seal rename happen only on exhaustion, so aborts are sweep-safe.
-        let coverage = Arc::clone(&self.coverage);
-        let state = Arc::clone(&self.state);
         let clock = Arc::clone(&self.clock);
-        let config = Arc::clone(&self.config);
-        let backends = self.backends.clone();
-        let meta_store = Arc::clone(&self.meta);
-        let promotions = Arc::clone(&self.promotions);
+        let staging = self.staging.clone();
         let cache_dir = self.config.cache_dir.clone();
         let cache_key = rk.cache_key.clone();
         let backend_key = rk.backend_key.clone();
@@ -1090,13 +1075,8 @@ impl<C: Clock + Clone> Cache<C> {
         let watcher = {
             let segpart = segpart.clone();
             let seg = store::seg_path(&cache_dir, &cache_key, start, end);
-            let coverage = Arc::clone(&coverage);
-            let state = Arc::clone(&state);
             let clock = Arc::clone(&clock);
-            let config = Arc::clone(&config);
-            let backends = backends.clone();
-            let meta_store = Arc::clone(&meta_store);
-            let promotions = Arc::clone(&promotions);
+            let staging = staging.clone();
             let cache_dir = cache_dir.clone();
             let cache_key = cache_key.clone();
             let backend_key = backend_key.clone();
@@ -1124,40 +1104,20 @@ impl<C: Clock + Clone> Cache<C> {
                             }
                             // Seal it here.
                             let _ = tokio::fs::rename(&segpart, &seg).await;
-                            let now = clock.now_millis();
-                            let span = FinalizedSpan {
-                                cache_dir: cache_dir.clone(),
-                                key: cache_key.clone(),
-                                backend_key: backend_key.clone(),
-                                upstream_id: upstream_id.clone(),
-                                etag: etag.clone(),
-                                total,
-                                start,
-                                end: start + size,
-                                bytes: size,
-                                now_millis: now,
-                            };
-                            let covered = finalize_coverage(
-                                &coverage,
-                                &state,
-                                span,
-                                window_millis_for(&config, &upstream_id),
-                            )
-                            .await;
-                            maybe_promote(
-                                &coverage,
-                                &config,
-                                &backends,
-                                &meta_store,
-                                &promotions,
-                                &state,
-                                &cache_dir,
-                                &cache_key,
-                                &upstream_id,
-                                now,
-                                covered,
-                            )
-                            .await;
+                            staging
+                                .seal_and_maybe_promote(FinalizedSpan {
+                                    cache_dir,
+                                    key: cache_key,
+                                    backend_key,
+                                    upstream_id,
+                                    etag,
+                                    total,
+                                    start,
+                                    end: start + size,
+                                    bytes: size,
+                                    now_millis: clock.now_millis(),
+                                })
+                                .await;
                             return;
                         }
                     } else {
@@ -1198,37 +1158,20 @@ impl<C: Clock + Clone> Cache<C> {
                 drop(file);
                 let seg = store::seg_path(&cache_dir, &cache_key, start, start + written);
                 let _ = tokio::fs::rename(&segpart, &seg).await;
-                let now = clock.now_millis();
-                let span = FinalizedSpan {
-                    cache_dir: cache_dir.clone(),
-                    key: cache_key.clone(),
-                    backend_key: backend_key.clone(),
-                    upstream_id: upstream_id.clone(),
-                    etag,
-                    total,
-                    start,
-                    end: start + written,
-                    bytes: written,
-                    now_millis: now,
-                };
-                let covered =
-                    finalize_coverage(&coverage, &state, span, window_millis_for(&config, &upstream_id)).await;
-                // Coverage-triggered promotion (P2-b): threshold met →
-                // background assemble + seal. Fire-and-forget by design.
-                maybe_promote(
-                    &coverage,
-                    &config,
-                    &backends,
-                    &meta_store,
-                    &promotions,
-                    &state,
-                    &cache_dir,
-                    &cache_key,
-                    &upstream_id,
-                    now,
-                    covered,
-                )
-                .await;
+                staging
+                    .seal_and_maybe_promote(FinalizedSpan {
+                        cache_dir,
+                        key: cache_key,
+                        backend_key,
+                        upstream_id,
+                        etag,
+                        total,
+                        start,
+                        end: start + written,
+                        bytes: written,
+                        now_millis: clock.now_millis(),
+                    })
+                    .await;
             } else if file.is_some() {
                 let _ = tokio::fs::remove_file(&segpart).await;
             }
@@ -1318,20 +1261,14 @@ impl<C: Clock + Clone> Cache<C> {
         if prof.nocache {
             if let Ok(hit) = self.serve_nocache(rk, range).await {
                 tracing::info!(key = %rk.cache_key, size = hit.meta.size, "nocache passthrough response");
-                return Ok(ServeOutcome::Stream(StreamPlan {
-                    // 206 only when a range was actually honoured.
-                    status: if hit.content_range.is_some() {
-                        axum::http::StatusCode::PARTIAL_CONTENT
-                    } else {
-                        axum::http::StatusCode::OK
-                    },
-                    meta: hit.meta,
-                    content_range: hit.content_range,
-                    content_length: hit.content_length,
-                    body: hit.body,
-                    stale: false,
-                    source: BodySource::Upstream,
-                }));
+                return Ok(ServeOutcome::Stream(stream_plan(
+                    hit.meta,
+                    hit.content_range,
+                    hit.content_length,
+                    hit.body,
+                    false,
+                    BodySource::Upstream,
+                )));
             }
         }
 
@@ -1343,15 +1280,16 @@ impl<C: Clock + Clone> Cache<C> {
         if prof.efficient && range.is_some() && !self.has_durable_entry(&rk.cache_key).await {
             if let Ok(hit) = self.serve_passthrough(rk, range, prof.min_file_size).await {
                 tracing::info!(key = %rk.cache_key, size = hit.meta.size, "passthrough response");
-                return Ok(ServeOutcome::Stream(StreamPlan {
-                    status: axum::http::StatusCode::PARTIAL_CONTENT,
-                    meta: hit.meta,
-                    content_range: hit.content_range,
-                    content_length: hit.content_length,
-                    body: hit.body,
-                    stale: false,
-                    source: BodySource::Upstream,
-                }));
+                // Always 206: this path only runs with a range, and its hit
+                // always carries the honoured content-range.
+                return Ok(ServeOutcome::Stream(stream_plan(
+                    hit.meta,
+                    hit.content_range,
+                    hit.content_length,
+                    hit.body,
+                    false,
+                    BodySource::Upstream,
+                )));
             }
         }
 
@@ -1364,19 +1302,14 @@ impl<C: Clock + Clone> Cache<C> {
             size = hit.meta.size,
             "cache response"
         );
-        Ok(ServeOutcome::Stream(StreamPlan {
-            status: if hit.content_range.is_some() {
-                axum::http::StatusCode::PARTIAL_CONTENT
-            } else {
-                axum::http::StatusCode::OK
-            },
-            meta: hit.meta,
-            content_range: hit.content_range,
-            content_length: hit.content_length,
-            body: hit.body,
-            stale: hit.outcome == CacheOutcome::Stale,
-            source: hit.source,
-        }))
+        Ok(ServeOutcome::Stream(stream_plan(
+            hit.meta,
+            hit.content_range,
+            hit.content_length,
+            hit.body,
+            hit.outcome == CacheOutcome::Stale,
+            hit.source,
+        )))
     }
 
     async fn get_resolved_inner(
@@ -1452,7 +1385,7 @@ impl<C: Clock + Clone> Cache<C> {
                     // the same admission: an object that has grown past what
                     // the disk can hold must not be fetched into nothing.
                     let live = stat.meta;
-                    if !self.make_room_for(live.size_bytes).await {
+                    if !self.magazine.make_room(live.size_bytes).await {
                         tracing::warn!(
                             key = %key,
                             want = live.size_bytes,
@@ -1463,13 +1396,13 @@ impl<C: Clock + Clone> Cache<C> {
                             .await?
                             .into_cache_hit(CacheOutcome::Miss));
                     }
-                    let oversize = !fits_magazine(live.size_bytes, &self.config);
-                    return self
-                        .forced_fetch(slot, key, backend_key, upstream_id, range, live, oversize)
-                        .await;
+                    let oversize = !self.magazine.fits(live.size_bytes);
+                    return self.forced_fetch(slot, rk, range, live, oversize).await;
                 }
                 Err(BackendError::NotFound) => {
-                    self.install_negative(&key, &upstream_id).await;
+                    self.magazine
+                    .install_negative(&key, &upstream_id, self.clock.now_millis())
+                    .await;
                     return Err(BackendError::NotFound);
                 }
                 Err(e) => {
@@ -1491,12 +1424,14 @@ impl<C: Clock + Clone> Cache<C> {
         let meta = match self.stat_coalesced(&slot, &key, &bkey).await {
             Ok(m) => m,
             Err(BackendError::NotFound) => {
-                self.install_negative(&key, &upstream_id).await;
+                self.magazine
+                    .install_negative(&key, &upstream_id, self.clock.now_millis())
+                    .await;
                 return Err(BackendError::NotFound);
             }
             Err(e) => return Err(e),
         };
-        if !self.make_room_for(meta.size_bytes).await {
+        if !self.magazine.make_room(meta.size_bytes).await {
             tracing::warn!(
                 key = %key,
                 want = meta.size_bytes,
@@ -1510,7 +1445,7 @@ impl<C: Clock + Clone> Cache<C> {
         // Too big for the magazine is not too big to keep: it is admitted as
         // a resident stray, which is the only way a large object gets a
         // single upstream stream instead of one open per shard (ADR-0014).
-        let oversize = !fits_magazine(meta.size_bytes, &self.config);
+        let oversize = !self.magazine.fits(meta.size_bytes);
         let flight = self
             .attach_or_start(&key, bkey, &upstream_id, Arc::clone(&slot), meta, oversize)
             .await;
@@ -1534,20 +1469,9 @@ impl<C: Clock + Clone> Cache<C> {
             return Ok(None);
         }
         let size = m.size_bytes;
-        let (offset, len, content_range) = match range {
-            None => (0, size, None),
-            Some(r) => {
-                if r.offset >= size {
-                    return Err(BackendError::RangeNotSatisfiable);
-                }
-                let end = r.length.map_or(size, |l| (r.offset + l).min(size));
-                (
-                    r.offset,
-                    end - r.offset,
-                    Some(ContentRange { first: r.offset, last: end - 1, total: size }),
-                )
-            }
-        };
+        let (offset, end) = resolve_range(range, size)?;
+        let len = end - offset;
+        let content_range = range.map(|_| ContentRange { first: offset, last: end - 1, total: size });
         Ok(Some(CacheHit {
             outcome,
             meta: hit_meta_entry(key, &m),
@@ -1573,8 +1497,7 @@ impl<C: Clock + Clone> Cache<C> {
         let entry_key = key.to_string();
         let driver_up = upstream_id.to_string();
         let cfg = Arc::clone(&self.config);
-        let state = Arc::clone(&self.state);
-        let meta_store = Arc::clone(&self.meta);
+        let magazine = self.magazine.clone();
         let clock = Arc::clone(&self.clock);
         self.flights
             .join_or_start(
@@ -1582,9 +1505,18 @@ impl<C: Clock + Clone> Cache<C> {
                 store::tmp_path(&self.config.cache_dir, key),
                 store::file_path(&self.config.cache_dir, key),
                 move |f| {
-                    drive_flight(
-                        f, slot, backend_key, entry_key, driver_up, cfg, state, meta_store, clock, meta, oversize,
-                    )
+                    drive_flight(ColdPullDriver {
+                        flight: f,
+                        slot,
+                        backend_key,
+                        entry_key,
+                        upstream_id: driver_up,
+                        config: cfg,
+                        magazine,
+                        clock,
+                        meta,
+                        oversize,
+                    })
                 },
             )
             .await
@@ -1671,7 +1603,9 @@ impl<C: Clock + Clone> Cache<C> {
                         None => {}
                     }
                     if matches!(e, BackendError::NotFound) {
-                        self.install_negative(key, upstream_id).await;
+                        self.magazine
+                            .install_negative(key, upstream_id, self.clock.now_millis())
+                            .await;
                     }
                     return Err(e);
                 }
@@ -1699,34 +1633,40 @@ impl<C: Clock + Clone> Cache<C> {
     /// Revalidation found a changed etag: refetch on a private flight (no
     /// map entry) while the old file keeps serving everyone else; the seal
     /// rename swaps it atomically.
-    #[allow(clippy::too_many_arguments)]
     async fn forced_fetch(
         &self,
         slot: Arc<BackendSlot>,
-        key: String,
-        backend_key: String,
-        upstream_id: String,
+        rk: &ResolvedKey,
         range: Option<crate::backend::ByteRange>,
         meta: ObjectMeta,
         oversize: bool,
     ) -> Result<CacheHit, BackendError> {
-        let driver_up = upstream_id.clone();
+        let key = rk.cache_key.clone();
         let entry_key = key.clone();
-        let backend_key = Key::from_validated(backend_key);
+        let backend_key = Key::from_validated(rk.backend_key.clone());
+        let upstream_id = rk.upstream_id.clone();
         let cfg = Arc::clone(&self.config);
-        let state = Arc::clone(&self.state);
-        let meta_store = Arc::clone(&self.meta);
+        let magazine = self.magazine.clone();
         let clock = Arc::clone(&self.clock);
         let flight = self.flights.spawn_solo(
             store::tmp_path(&self.config.cache_dir, &key),
             store::file_path(&self.config.cache_dir, &key),
             move |f| {
-                drive_flight(
-                    f, slot, backend_key, entry_key, driver_up, cfg, state, meta_store, clock, meta, oversize,
-                )
+                drive_flight(ColdPullDriver {
+                    flight: f,
+                    slot,
+                    backend_key,
+                    entry_key,
+                    upstream_id,
+                    config: cfg,
+                    magazine,
+                    clock,
+                    meta,
+                    oversize,
+                })
             },
         );
-        self.await_flight(flight, &key, &upstream_id, range).await
+        self.await_flight(flight, &key, &rk.upstream_id, range).await
     }
 
     /// Header-relevant slice of an entry row (P1): avoids cloning the long
@@ -1748,29 +1688,6 @@ impl<C: Clock + Clone> Cache<C> {
         self.dirty_access.touch(key, self.clock.now_millis()).await;
     }
 
-    async fn install_negative(&self, key: &str, upstream_id: &str) {
-        let now = self.clock.now_millis();
-        let until = now + self.config.negative_ttl_secs * 1000;
-        let entry = EntryMeta {
-            version: 1,
-            upstream_id: upstream_id.to_string(),
-            key: key.to_string(),
-            size_bytes: 0,
-            etag: None,
-            last_modified: None,
-            content_type: None,
-            created_at_millis: now,
-            last_access_millis: now,
-            last_revalidated_millis: None,
-            negative_until_millis: Some(until),
-            hold_until_millis: 0,
-            oversize: false,
-        };
-        let _ = self.meta.insert(&entry).await;
-        let mut s = self.state.write().await;
-        s.entries.insert(key.to_string(), entry);
-    }
-
     /// Drive both reapers: inactive expiry + max_size LRU. Called by `tick()`.
     /// Lock discipline is ORDERING, not exclusion: the coverage mutex is
     /// always taken BEFORE any state guard, and never the reverse. Every
@@ -1788,11 +1705,7 @@ impl<C: Clock + Clone> Cache<C> {
             now.saturating_sub(s.segment_sweep_at_millis) >= ttl_ms
         };
         let expired: Vec<String> = if do_sweep {
-            let cov = self.coverage.lock().await;
-            cov.iter()
-                .filter(|(_, c)| now.saturating_sub(c.last_touch_millis) >= ttl_ms)
-                .map(|(k, _)| k.clone())
-                .collect()
+            self.staging.expired(ttl_ms, now).await
         } else {
             Vec::new()
         };
@@ -1801,38 +1714,10 @@ impl<C: Clock + Clone> Cache<C> {
         //     efficient-profile scrub session could stage far more than
         //     max_size_bytes while total_bytes stayed at zero. Pick the
         //     oldest-touched ledger rows first, same LRU shape as entries.
-        let over_budget = {
-            let s = self.state.read().await;
-            resident_bytes(&s).saturating_add(s.segment_bytes) > self.config.max_size_bytes
-        };
-        let stage_victims: Vec<(String, u64)> = if over_budget {
-            let cov = self.coverage.lock().await;
-            let mut rows: Vec<(u64, String)> =
-                cov.iter().map(|(k, c)| (c.last_touch_millis, k.clone())).collect();
-            rows.sort();
-            let mut over = {
-                let s = self.state.read().await;
-                resident_bytes(&s)
-                    .saturating_add(s.segment_bytes)
-                    .saturating_sub(self.config.max_size_bytes)
-            };
-            let mut picked = Vec::new();
-            for (_, k) in rows {
-                if over == 0 {
-                    break;
-                }
-                let sz = cov.get(&k).map(|c| c.covered_bytes()).unwrap_or(0);
-                // Never evict a row that is actively staging right now.
-                if sz == 0 || now.saturating_sub(cov[&k].last_touch_millis) < STAGE_MIN_AGE_MS {
-                    continue;
-                }
-                over = over.saturating_sub(sz);
-                picked.push((k, sz));
-            }
-            picked
-        } else {
-            Vec::new()
-        };
+        let overrun = self.magazine.staged_overrun(self.state.read().await.segment_bytes).await;
+        let over_budget = overrun > 0;
+        let stage_victims: Vec<(String, u64)> =
+            if over_budget { self.staging.over_budget_rows(overrun, now).await } else { Vec::new() };
 
         // 2. Filesystem deletes hold no locks — and run off the async
         // runtime (blocking read_dir/remove_file in spawn_blocking).
@@ -1875,26 +1760,21 @@ impl<C: Clock + Clone> Cache<C> {
         };
         // 3. State mutation — memory only, no awaits under the write
         // guard (C3); deletes for reaped/evicted rows run guard-free.
-        let reaped = {
+        let reaped = self.magazine.reap(ttl_ms, now).await;
+        // `freed` covers BOTH the age-expired rows and any rows evicted
+        // to bring staged bytes under budget, so it must be applied
+        // whenever either path ran — not only on the age sweep. A short
+        // write of its own: no redb or filesystem work inside (C3).
+        if do_sweep || !stage_victims.is_empty() {
             let mut s = self.state.write().await;
-            let reaped = reap_collect(&mut s, ttl_ms, now);
-            // `freed` covers BOTH the age-expired rows and any rows evicted
-            // to bring staged bytes under budget, so it must be applied
-            // whenever either path ran — not only on the age sweep.
             if do_sweep {
                 s.segment_sweep_at_millis = now;
             }
-            if do_sweep || !stage_victims.is_empty() {
-                s.segment_bytes = s.segment_bytes.saturating_sub(freed.max(stage_freed));
-            }
-            reaped
-        };
-        remove_entries(&self.config, &self.meta, &reaped).await;
-        let evicted = {
-            let mut s = self.state.write().await;
-            evict_pick(&mut s, &self.config)
-        };
-        remove_entries(&self.config, &self.meta, &evicted).await;
+            s.segment_bytes = s.segment_bytes.saturating_sub(freed.max(stage_freed));
+        }
+        self.magazine.delete(&reaped).await;
+        let evicted = self.magazine.evict_budget().await;
+        self.magazine.delete(&evicted).await;
         // 3b. Disk pressure (ADR-0014). Resident strays sit outside the byte
         //     budget, so nothing else bounds how much of the disk they take;
         //     without this the only signal would be a cold pull that cannot
@@ -1902,407 +1782,51 @@ impl<C: Clock + Clone> Cache<C> {
         //     touched first. Strays only: the byte budget already governs
         //     the magazine's own members, and freeing resident bytes would
         //     make the disk a second, silent eviction budget for them.
-        let pressure_victims = {
-            let free = store::free_bytes(&self.config.cache_dir).unwrap_or(u64::MAX);
-            let floor = DISK_RESERVE_BYTES.saturating_add(DISK_PRESSURE_BYTES);
-            if free >= floor {
-                Vec::new()
-            } else {
-                let mut s = self.state.write().await;
-                pick_strays_for_pressure(&mut s, &self.config, floor - free)
-            }
-        };
-        if !pressure_victims.is_empty() {
-            tracing::warn!(
-                victims = pressure_victims.len(),
-                "evicting resident strays: free space is below the working floor"
-            );
-        }
-        remove_entries(&self.config, &self.meta, &pressure_victims).await;
+        let pressure_victims = self.magazine.reclaim_under_pressure().await;
+        self.magazine.delete(&pressure_victims).await;
         // 4. Ledger removal (coverage only): expired rows plus any row
         //    evicted to bring staged bytes back under budget.
         if do_sweep || !stage_victims.is_empty() {
-            let mut cov = self.coverage.lock().await;
-            for key in expired.iter().chain(stage_victims.iter().map(|(k, _)| k)) {
-                cov.remove(key);
-            }
+            let keys: Vec<String> =
+                expired.iter().chain(stage_victims.iter().map(|(k, _)| k)).cloned().collect();
+            self.staging.drop_rows(&keys).await;
         }
     }
 }
 
-/// Coverage window in millis for an upstream: 0 = no decay.
-fn window_millis_for(config: &Config, upstream_id: &str) -> u64 {
-    config.cache_profile(upstream_id).coverage_window_secs * 1000
-}
 
-/// Merge one completed staged interval into the coverage ledger (the only
-/// writer besides the startup scan). Etag-locked: a version change with
-/// history present resets (drops staged files + ledger) so promotion can
-/// never assemble a mixed-version file. Unknown etags adopt; totals adopt
-/// when known. Best-effort fs ops — the scan heals any gap.
-struct FinalizedSpan {
-    cache_dir: std::path::PathBuf,
-    key: String,
-    backend_key: String,
-    upstream_id: String,
-    etag: Option<String>,
-    total: u64,
-    start: u64,
-    end: u64,
-    bytes: u64,
-    now_millis: u64,
-}
 
-async fn finalize_coverage(
-    coverage: &Arc<Mutex<HashMap<String, store::Coverage>>>,
-    state: &Arc<RwLock<CacheState>>,
-    span: FinalizedSpan,
-    window_millis: u64,
-) -> u64 {
-    let covered = {
-        let mut cov = coverage.lock().await;
-        let entry = cov.entry(span.key.clone()).or_default();
-        let version_changed = match (&entry.etag, &span.etag) {
-            (Some(a), Some(b)) => a != b,
-            _ => false,
-        };
-        if version_changed {
-            // New bytes already sealed above: keep this file, drop the rest.
-            let fresh = store::seg_path(&span.cache_dir, &span.key, span.start, span.end);
-            store::remove_key_segments(&span.cache_dir, &span.key, Some(&fresh));
-            *entry = store::Coverage::default();
-        }
-        if span.etag.is_some() {
-            entry.etag = span.etag.clone();
-        }
-        if span.total != 0 {
-            entry.total = span.total;
-        }
-        if !span.backend_key.is_empty() {
-            entry.backend_key = span.backend_key.clone();
-        }
-        if !span.upstream_id.is_empty() {
-            entry.upstream_id = span.upstream_id.clone();
-        }
-        entry.add_interval(span.start, span.end, span.now_millis);
-        entry.last_touch_millis = span.now_millis;
-        // Window decay: drop intervals whose last read is older than the
-        // coverage window, so stale staged bytes stop counting toward
-        // promotion. Disk sidecars stay for the sweep. One pass returns the
-        // surviving coverage, which is what the promotion check needs —
-        // it used to walk the same vector twice more.
-        entry.decay_and_covered(span.now_millis, window_millis)
-    };
-    let meta = store::SegMeta {
-        etag: span.etag.clone(),
-        total: span.total,
-        backend_key: span.backend_key.clone(),
-        upstream_id: span.upstream_id.clone(),
-    };
-    if let Ok(b) = serde_json::to_vec(&meta) {
-        let _ = tokio::fs::write(store::segmeta_path(&span.cache_dir, &span.key), b).await;
-    }
-    state.write().await.segment_bytes += span.bytes;
-    covered
-}
-
-/// Full history reset for one key: drop staged files + version marker +
-/// ledger row + accounting. Used on version drift (serve pre-check,
-/// finalize backstop, promotion verify) — never assembles mixed versions.
-async fn reset_coverage(
-    coverage: &Arc<Mutex<HashMap<String, store::Coverage>>>,
-    state: &Arc<RwLock<CacheState>>,
-    cache_dir: &std::path::Path,
-    key: &str,
-) {
-    let mut freed = 0u64;
-    for path in store::key_segment_files(cache_dir, key) {
-        freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let _ = std::fs::remove_file(&path);
-    }
-    let _ = std::fs::remove_file(store::segmeta_path(cache_dir, key));
-    coverage.lock().await.remove(key);
-    {
-        let mut s = state.write().await;
-        s.segment_bytes = s.segment_bytes.saturating_sub(freed);
-    }
-}
-
-/// Coverage-triggered promotion check (P2-b): runs at the end of every
-/// staged C transfer. Threshold met → spawn exactly one promotion task
-/// per key (single-flight via `promotions`); anything else → no-op.
-/// Lock discipline: no lock held across the spawn.
-#[allow(clippy::too_many_arguments)]
-async fn maybe_promote(
-    coverage: &Arc<Mutex<HashMap<String, store::Coverage>>>,
-    config: &Arc<Config>,
-    backends: &BackendRegistry,
-    meta_store: &Arc<crate::cache::persist::MetaStore>,
-    promotions: &Arc<Mutex<HashSet<String>>>,
-    state: &Arc<RwLock<CacheState>>,
-    cache_dir: &std::path::Path,
-    key: &str,
-    upstream_id: &str,
-    now_millis: u64,
-    covered_bytes: u64,
-) {
-    let prof = config.cache_profile(upstream_id);
-    if !prof.efficient {
-        return;
-    }
-    let ready = {
-        let cov = coverage.lock().await;
-        let c = cov.get(key);
-        // Ratio met AND the object can be kept: assembling something larger
-        // than the whole budget would consume the staged segments and hand
-        // the magazine an entry it must immediately eject -- the merge would
-        // destroy warmth it could have kept as segments.
-        //
-        // `covered_bytes` comes from the caller's decay pass, which ran
-        // immediately before this with the same window and the same clock —
-        // a second decay here would walk the same vector for nothing.
-        let fits = c.is_some_and(|c| c.total > 0 && c.total <= config.max_size_bytes);
-        let ready = c.and_then(|c| c.ratio_of(covered_bytes)).is_some_and(|r| r >= prof.coverage_threshold) && fits;
-        ready
-    };
-    if !ready {
-        return;
-    }
-    {
-        let mut p = promotions.lock().await;
-        if !p.insert(key.to_string()) {
-            return;
-        }
-    }
-    let (backends, meta_store, state, coverage, config, cache_dir, key, upstream_id, promotions) = (
-        backends.clone(),
-        Arc::clone(meta_store),
-        Arc::clone(state),
-        Arc::clone(coverage),
-        Arc::clone(config),
-        cache_dir.to_path_buf(),
-        key.to_string(),
-        upstream_id.to_string(),
-        Arc::clone(promotions),
-    );
-    tokio::spawn(async move {
-        promote_key(&backends, &meta_store, &state, &coverage, &config, &cache_dir, &key, &upstream_id, now_millis).await;
-        promotions.lock().await.remove(&key);
-    });
-}
-
-/// Assemble a promoted entry: re-verify the version by fresh stat (abort +
-/// reset on ANY drift — never a mixed-version file), copy covered slices
-/// from sidecars, fetch gaps by exact Range, seal, install, clean staged
-/// history. All failures abort silently (segments stay for a later retry).
-#[allow(clippy::too_many_arguments)]
-async fn promote_key(
-    backends: &BackendRegistry,
-    meta_store: &Arc<crate::cache::persist::MetaStore>,
-    state: &Arc<RwLock<CacheState>>,
-    coverage: &Arc<Mutex<HashMap<String, store::Coverage>>>,
-    config: &Arc<Config>,
-    cache_dir: &std::path::Path,
-    key: &str,
-    upstream_id: &str,
-    now_millis: u64,
-) {
-    // Snapshot the ledger (unknown version/size or unmapped keys wait for
-    // fresh transfers — conservative by design).
-    let cov = {
-        match coverage.lock().await.get(key).cloned() {
-            Some(c) if !c.backend_key.is_empty() && c.total != 0 && c.etag.is_some() => c,
-            _ => return,
-        }
-    };
-    let etag = cov.etag.clone().unwrap();
-    let total = cov.total;
-    let slot = match backends.get(upstream_id) {
-        Some(s) => s,
-        None => return,
-    };
-    let bkey = Key::from_validated(cov.backend_key.clone());
-    let live = {
-        let _permit = slot.gate.acquire().await;
-        match slot.backend.stat(&bkey).await {
-            Ok(m) => m,
-            Err(_) => return,
-        }
-    };
-    // Assembly fetches bytes: a stream (B1).
-    let _stream_permit = slot.stream_gate.acquire().await;
-    if live.etag != Some(etag) || live.size_bytes != total {
-        // Drifted under us: drop staged history, start over.
-        reset_coverage(coverage, state, cache_dir, key).await;
-        return;
-    }
-    let tmp = store::tmp_path(cache_dir, key);
-    if !assemble_file(&slot, &bkey, cache_dir, key, &cov, &tmp).await {
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    let dest = store::file_path(cache_dir, key);
-    if store::install_tmp(&tmp, &dest, cache_dir).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    // The hold is armed here and only here: a promotion is the one write that
-    // paid for many upstream fetches to assemble something, and the inactivity
-    // clock cannot see that. 0 (the default off switch) leaves the deadline at
-    // zero, which `is_held` reads as "no hold".
-    let hold_until_millis = if config.promoted_hold_secs == 0 {
-        0
-    } else {
-        now_millis.saturating_add(config.promoted_hold_secs.saturating_mul(1000))
-    };
-    // Promotion never produces a stray: its fit guard refuses an object the
-    // magazine cannot hold, so the entry it installs is a magazine member.
-    insert_meta(state, config, meta_store, key, upstream_id, &live, now_millis, hold_until_millis, false).await;
-    // History is now redundant: drop sidecars + ledger row.
-    reset_coverage(coverage, state, cache_dir, key).await;
-}
-
-/// Fill `tmp` with the full object: covered slices copied from sidecars,
-/// gaps fetched by exact Range. Walks the merged intervals in order; every
-/// write is an absolute seek, so order is a courtesy, not a requirement.
-async fn assemble_file(
-    slot: &Arc<BackendSlot>,
-    bkey: &Key,
-    cache_dir: &std::path::Path,
-    key: &str,
-    cov: &store::Coverage,
-    tmp: &std::path::Path,
-) -> bool {
-    use tokio::io::AsyncWriteExt;
-    // Index segment files by interval; the store parses the names so the
-    // filename shape is not re-derived here.
-    let segs = store::segments_for_key(cache_dir, key);
-    let mut out = match tokio::fs::File::create(tmp).await {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut pos = 0u64;
-    for &(s, e, _) in cov.intervals.iter() {
-        if pos < s && !fetch_gap(slot, bkey, &mut out, &mut buf, pos, s).await {
-            return false;
-        }
-        if !copy_span(&mut out, &segs, &mut buf, s.max(pos), e).await {
-            return false;
-        }
-        pos = pos.max(e);
-    }
-    if pos < cov.total && !fetch_gap(slot, bkey, &mut out, &mut buf, pos, cov.total).await {
-        return false;
-    }
-    out.flush().await.is_ok()
-}
-
-/// Copy one covered span `[a, b)` from whichever sidecars hold it.
-async fn copy_span(
-    out: &mut tokio::fs::File,
-    segs: &[(u64, u64, std::path::PathBuf)],
-    buf: &mut [u8],
-    mut a: u64,
-    b: u64,
-) -> bool {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-    while a < b {
-        let holder = segs.iter().find(|(s, e, _)| *s <= a && a < *e);
-        let (fs, fe, path) = match holder {
-            Some(h) => h,
-            None => return false,
-        };
-        let n = (*fe).min(b) - a;
-        let mut f = match tokio::fs::File::open(path).await {
-            Ok(f) => f,
-            Err(_) => return false,
-        };
-        if f.seek(std::io::SeekFrom::Start(a - fs)).await.is_err() {
-            return false;
-        }
-        let mut remaining = n;
-        out.seek(std::io::SeekFrom::Start(a)).await.ok();
-        while remaining > 0 {
-            let want = remaining.min(buf.len() as u64) as usize;
-            let r = match f.read(&mut buf[..want]).await {
-                Ok(0) => return false,
-                Ok(r) => r,
-                Err(_) => return false,
-            };
-            if out.write_all(&buf[..r]).await.is_err() {
-                return false;
-            }
-            remaining -= r as u64;
-            a += r as u64;
-        }
-    }
-    true
-}
-
-/// Fetch one missing span by exact Range into `out` at absolute `start`.
-async fn fetch_gap(
-    slot: &Arc<BackendSlot>,
-    bkey: &Key,
-    out: &mut tokio::fs::File,
-    buf: &mut [u8],
-    start: u64,
-    end: u64,
-) -> bool {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-    let src = match slot.backend.open(bkey, Some(crate::backend::ByteRange::bounded(start, end - start))).await {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let mut stream = src.stream;
-    if out.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-        return false;
-    }
-    let mut remaining = end - start;
-    while remaining > 0 {
-        let want = remaining.min(buf.len() as u64) as usize;
-        let n = match stream.read(&mut buf[..want]).await {
-            Ok(0) => return false, // short backend read: do not seal a short file
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        if out.write_all(&buf[..n]).await.is_err() {
-            return false;
-        }
-        remaining -= n as u64;
-    }
-    true
-}
-
-/// One cold-miss download driver: gate → stat → publish Meta → pump to
-/// temp file → seal (rename) → install metadata row (disk + redb) → Done.
-/// Detached from its creator so a disconnecting client never kills the
-/// download.
-async fn drive_flight<C: Clock>(
+/// Everything one cold-miss driver needs, as one receiver: the flight it
+/// pumps, where the bytes go, and the metadata the caller's stat produced
+/// (admission is decided before a flight exists, ADR-0013, so the GET is
+/// issued exactly once).
+struct ColdPullDriver<C: Clock> {
     flight: Arc<FlightShared>,
     slot: Arc<BackendSlot>,
     backend_key: Key,
     entry_key: String,
     upstream_id: String,
     config: Arc<Config>,
-    state: Arc<RwLock<CacheState>>,
-    meta_store: Arc<crate::cache::persist::MetaStore>,
+    magazine: Magazine,
     clock: Arc<C>,
-    // The caller's coalesced stat. Admission (the magazine's fit, the disk's
-    // room) is decided there, BEFORE a flight exists, because a flight can
-    // only refuse by failing its readers.
     meta: ObjectMeta,
     oversize: bool,
+}
+
+/// One cold-miss download, driven to completion: capacity backstop → pump →
+/// install.
+async fn drive_flight<C: Clock>(
+    ColdPullDriver { flight, slot, backend_key, entry_key, upstream_id, config, magazine, clock, meta, oversize }: ColdPullDriver<C>,
 ) {
     let outcome = async {
         let _stream_permit = slot.stream_gate.acquire().await;
         // Last-resort capacity backstop (P56): the caller has already made
-        // room (`Cache::make_room_for`) against this same probe, so this
-        // only fires when the disk filled in the window between the two.
-        // Kept because the alternative — a mid-pull write failure — leaves a
+        // room (`magazine::make_room`) against this same probe, so this only
+        // fires when the disk filled in the window between the two. Kept
+        // because the alternative — a mid-pull write failure — leaves a
         // truncated body AND a leaked temp file; a flight cannot switch to
         // serving-without-caching after it has promised bytes.
-        if !store::has_room_for(&config.cache_dir, meta.size_bytes, DISK_RESERVE_BYTES) {
+        if !store::has_room_for(&config.cache_dir, meta.size_bytes, magazine::DISK_RESERVE_BYTES) {
             let free = store::free_bytes(&config.cache_dir).unwrap_or(0);
             tracing::warn!(
                 key = %entry_key,
@@ -2339,7 +1863,9 @@ async fn drive_flight<C: Clock>(
 
     match outcome {
         Ok(meta) => {
-            insert_meta(&state, &config, &meta_store, &entry_key, &upstream_id, &meta, clock.now_millis(), 0, oversize).await;
+            magazine
+                .install(&entry_key, &upstream_id, &meta, clock.now_millis(), 0, oversize)
+                .await;
             let _ = flight.progress_tx.send(FlightProgress::Done);
         }
         Err(e) => {
@@ -2348,271 +1874,11 @@ async fn drive_flight<C: Clock>(
     }
 }
 
-async fn insert_meta(
-    state: &RwLock<CacheState>,
-    config: &Config,
-    meta_store: &crate::cache::persist::MetaStore,
-    key: &str,
-    upstream_id: &str,
-    meta: &ObjectMeta,
-    now: u64,
-    // 0 = no hold. Set only by the promotion path.
-    hold_until_millis: u64,
-    // Whether this entry was admitted as a resident stray (ADR-0014):
-    // larger than the whole magazine budget, so the byte budget neither
-    // counts it nor evicts it.
-    oversize: bool,
-) {
-    // C3 lock discipline: the state write guard never spans a redb commit
-    // or a file delete. Order: build the entry under a read, persist
-    // guard-free, then one await-free write stretch for accounting +
-    // victim selection; the deletes run after the guard drops. Persist
-    // first: on crash between redb and memory, startup rebuilds memory
-    // from redb; the reverse order would lose the row.
-    let (old_size, entry) = {
-        let s = state.read().await;
-        let old_size = s.entries.get(key).map(|m| m.size_bytes).unwrap_or(0);
-        let entry = EntryMeta {
-            version: 1,
-            upstream_id: upstream_id.to_string(),
-            key: key.to_string(),
-            size_bytes: meta.size_bytes,
-            etag: meta.etag.clone(),
-            last_modified: meta.last_modified.clone(),
-            // Raw provider hint: MIME resolution happens once, at read time
-            // (hit_meta_*), never at write. Old rows holding resolved
-            // values re-resolve idempotently (resolve passes specifics through).
-            content_type: meta.mime_hint.clone(),
-            created_at_millis: s.entries.get(key).map(|m| m.created_at_millis).unwrap_or(now),
-            last_access_millis: now,
-            last_revalidated_millis: Some(now),
-            negative_until_millis: None,
-            hold_until_millis,
-            oversize,
-        };
-        (old_size, entry)
-    };
-    if let Err(e) = meta_store.insert(&entry).await {
-        tracing::error!(key = %key, error = %e, "redb insert failed");
-    }
-    let evicted = {
-        let mut s = state.write().await;
-        s.total_bytes = s.total_bytes.saturating_sub(old_size) + entry.size_bytes;
-        s.entries.insert(key.to_string(), entry);
-        evict_pick(&mut s, config)
-    };
-    remove_entries(config, meta_store, &evicted).await;
-}
-
-/// Persist rebuilt rows and install them into memory (ticket #57).
-/// Persist-guard-free-then-one-write-stretch, matching the C3 discipline
-/// used by `insert_meta`.
-async fn rebuild_entries(
-    meta_store: &crate::cache::persist::MetaStore,
-    state: &Arc<RwLock<CacheState>>,
-    rebuilt: Vec<EntryMeta>,
-    loaded: usize,
-) {
-    for entry in &rebuilt {
-        if let Err(e) = meta_store.insert(entry).await {
-            tracing::error!(key = %entry.key, error = %e, "rebuild: redb insert failed");
-        }
-    }
-    {
-        let mut s = state.write().await;
-        for entry in rebuilt {
-            s.total_bytes += entry.size_bytes;
-            s.entries.insert(entry.key.clone(), entry);
-        }
-    }
-    let n = state.read().await.entries.len();
-    tracing::info!(rows = n, loaded, "entry rows rebuilt");
-}
-
-/// Inactive-expiry collection — memory only. Persistence and file
-/// deletes happen guard-free via [`remove_entries`] (C3 lock discipline).
-fn reap_collect(state: &mut CacheState, ttl_ms: u64, now: u64) -> Vec<(String, u64)> {
-    let expired: Vec<String> = state
-        .entries
-        .iter()
-        .filter(|(_, m)| {
-            m.negative_until_millis.map_or_else(
-                // A held entry is not expired by inactivity: the merge that
-                // built it is recent by construction, and the 20-minute clock
-                // has no way to know that. The hold is a deadline, not an
-                // exemption -- once it passes, normal TTL rules apply again.
-                || !m.is_held(now) && now.saturating_sub(m.last_access_millis) >= ttl_ms,
-                |until| now >= until,
-            )
-        })
-        .map(|(k, _)| k.clone())
-        .collect();
-    let mut out = Vec::with_capacity(expired.len());
-    for k in expired {
-        if let Some(m) = state.entries.remove(&k) {
-            state.total_bytes = state.total_bytes.saturating_sub(m.size_bytes);
-            out.push((k, m.size_bytes));
-        }
-    }
-    out
-}
-
-/// Bytes the magazine's byte budget governs: everything except resident
-/// strays, which the budget neither counts nor evicts (ADR-0014).
-fn resident_bytes(state: &CacheState) -> u64 {
-    state.total_bytes.saturating_sub(
-        state
-            .entries
-            .values()
-            .filter(|m| m.oversize)
-            .map(|m| m.size_bytes)
-            .sum::<u64>(),
-    )
-}
-
-/// Max-size LRU victim selection — memory only; deletes happen guard-free
-/// via [`remove_entries`] (C3 lock discipline).
-fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
-    // Two independent budgets (P10): bytes AND entry count. Entry rows cost
-    // roughly 500 B of RAM each (key stored twice plus five Strings), and
-    // max_size_bytes alone let millions of small objects exhaust memory on
-    // a 10.9 GB node while sitting far under the byte cap.
-    //
-    // Resident strays are outside the byte budget (ADR-0014). They must be
-    // excluded from BOTH sides of it: counting them would make the cache
-    // permanently "over budget" (so every insert would evict someone else),
-    // and evicting them would let one oversized pull take the whole magazine
-    // down with it — the self-destruct this rule exists to prevent. An
-    // object that alone exceeds the budget is never brought into budget by
-    // evicting others; it leaves on the inactivity clock or under disk
-    // pressure (`pick_strays_for_pressure`).
-    let resident = resident_bytes(state);
-    let over_bytes = resident > config.max_size_bytes;
-    let over_entries = config.max_entries > 0 && state.entries.len() > config.max_entries;
-    if !over_bytes && !over_entries {
-        return Vec::new();
-    }
-
-    // How far over we are, then ONE pass ordered by LRU (O2). The previous
-    // shape called `min_by_key` inside the eviction loop, so a sweep of k
-    // victims rescanned the whole entry map k times: O(entries x victims)
-    // under the state write guard, which blocks every hit.
-    let bytes_over = resident.saturating_sub(config.max_size_bytes);
-    let entries_over = if over_entries {
-        state.entries.len().saturating_sub(config.max_entries)
-    } else {
-        0
-    };
-
-    // Collect evictable rows (negative tombstones are not LRU-eligible:
-    // they hold no file and expire on their own clock; resident strays are
-    // not byte-budget-eligible), ordered oldest first.
-    // `sort_unstable_by_key` on the eligibility timestamp gives the same
-    // victim order as repeated `min_by_key` did.
-    let mut candidates: Vec<(u64, String)> = state
-        .entries
-        .iter()
-        .filter(|(_, m)| m.negative_until_millis.is_none() && !m.oversize)
-        .map(|(k, m)| (m.eligible_at(config.inactive_ttl_secs), k.clone()))
-        .collect();
-    candidates.sort_unstable_by_key(|(eligible, _)| *eligible);
-
-    let mut out = Vec::new();
-    let mut freed = 0u64;
-    for (_, key) in candidates {
-        // Stop once BOTH budgets are satisfied: whatever drove the sweep is
-        // now back under its cap.
-        if freed >= bytes_over && out.len() >= entries_over {
-            break;
-        }
-        if let Some(m) = state.entries.remove(&key) {
-            state.total_bytes = state.total_bytes.saturating_sub(m.size_bytes);
-            freed = freed.saturating_add(m.size_bytes);
-            out.push((key, m.size_bytes));
-        }
-    }
-    out
-}
-
-/// Disk-pressure victim selection: resident strays only, oldest-touched
-/// first, until `need_bytes` are freed. Memory only; deletes happen
-/// guard-free via [`remove_entries`].
-///
-/// Strays are the only population this may take. They sit outside the
-/// magazine's byte budget (ADR-0014), so they are what the disk was never
-/// promised, and evicting them cannot make the magazine's own members
-/// re-fetch. A held entry yields here like anywhere else: a hold is a
-/// deadline, not immortality.
-///
-/// Pure in its inputs (a `need_bytes` computed by the caller from a real
-/// `statvfs` probe) so it can be tested without a synthetic filesystem.
-fn pick_strays_for_pressure(
-    state: &mut CacheState,
-    config: &Config,
-    need_bytes: u64,
-) -> Vec<(String, u64)> {
-    if need_bytes == 0 {
-        return Vec::new();
-    }
-    let mut candidates: Vec<(u64, String)> = state
-        .entries
-        .iter()
-        .filter(|(_, m)| m.oversize)
-        .map(|(k, m)| (m.eligible_at(config.inactive_ttl_secs), k.clone()))
-        .collect();
-    candidates.sort_unstable_by_key(|(eligible, _)| *eligible);
-    let mut out = Vec::new();
-    let mut freed = 0u64;
-    for (_, key) in candidates {
-        if freed >= need_bytes {
-            break;
-        }
-        if let Some(m) = state.entries.remove(&key) {
-            state.total_bytes = state.total_bytes.saturating_sub(m.size_bytes);
-            freed = freed.saturating_add(m.size_bytes);
-            out.push((key, m.size_bytes));
-        }
-    }
-    out
-}
-
-/// redb row removal + cache-file deletion for victims collected under a
-/// state guard. Never call this while holding the guard (C3).
-async fn remove_entries(
-    config: &Config,
-    meta_store: &crate::cache::persist::MetaStore,
-    victims: &[(String, u64)],
-) {
-    if victims.is_empty() {
-        return;
-    }
-    // One redb transaction for the whole victim batch (P5), then the file
-    // deletes.
-    let keys: Vec<String> = victims.iter().map(|(k, _)| k.clone()).collect();
-    if let Err(e) = meta_store.remove_batch(&keys).await {
-        tracing::warn!(error = %e, "batched redb remove failed");
-    }
-    for (k, _) in victims {
-        let path = store::file_path(&config.cache_dir, k);
-        // Last-resort guard: this is the only place a key is turned back
-        // into a deletion, so a row that names infrastructure is refused
-        // here even if it somehow reached the victim list. Losing a reaped
-        // object costs a re-fetch; deleting the metadata store costs every
-        // row.
-        if store::is_meta_store_path(&config.cache_dir, &path) {
-            tracing::warn!(key = %k, "refusing to reap a metadata store path");
-            continue;
-        }
-        let _ = tokio::fs::remove_file(&path).await;
-        store::prune_empty_parents(&config.cache_dir, &path);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{backend::StorageBackend, clock::MockClock, config::Config};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::{clock::MockClock, config::Config};
+    use std::sync::atomic::AtomicUsize;
     use crate::testsupport::CacheTestExt;
     use tempfile::tempdir;
 
@@ -2708,44 +1974,6 @@ mod tests {
         }
     }
 
-    /// Last-resort guard on the single deletion site: even if a store key
-    /// reaches the victim list, the reaper must refuse it.
-    #[tokio::test]
-    async fn reaper_refuses_to_delete_a_store_path() {
-        let dir = tempdir().unwrap();
-        let mut cfg = Config::default();
-        cfg.cache_dir = dir.path().to_path_buf();
-        let cfg = Arc::new(cfg);
-        let live = dir.path().join(store::META_STORE_FILE);
-        std::fs::write(&live, b"database bytes").unwrap();
-        // A real object alongside it, so the refusal is specific rather
-        // than "nothing is ever deleted".
-        let victim = dir.path().join("a.bin");
-        std::fs::write(&victim, b"obj").unwrap();
-        // A nested object that happens to share the store's file name: the
-        // node's log showed this being protected too, which leaked disk
-        // instead of protecting the database.
-        let nested = dir.path().join("bucket/redb.db");
-        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
-        std::fs::write(&nested, b"nested object").unwrap();
-        let meta = crate::cache::persist::MetaStore::open(&live).unwrap();
-
-        remove_entries(
-            &cfg,
-            &meta,
-            &[
-                (store::META_STORE_FILE.to_string(), 14),
-                ("bucket/redb.db".to_string(), 13),
-                ("a.bin".to_string(), 3),
-            ],
-        )
-        .await;
-
-        assert!(live.exists(), "the reaper must not delete the metadata store");
-        assert!(!nested.exists(), "a nested object of the same name must still be reaped");
-        assert!(!victim.exists(), "ordinary victims are still reaped");
-    }
-
     #[tokio::test]
     async fn miss_then_hit() {
         let dir = tempdir().unwrap();
@@ -2831,7 +2059,10 @@ mod tests {
 
         let meta = ObjectMeta { size_bytes: 10, etag: None, last_modified: None, mime_hint: None };
         // As the promotion path writes it: a deadline 100 s out.
-        insert_meta(&cache.state, &cfg, &cache.meta, "held.bin", "primary", &meta, 0, 100_000, false).await;
+        cache
+            .magazine
+            .install("held.bin", "primary", &meta, 0, 100_000, false)
+            .await;
 
         clock.advance(20_000); // past the inactivity TTL, well inside the hold
         cache.tick().await;
@@ -2846,164 +2077,6 @@ mod tests {
             !cache.state.read().await.entries.contains_key("held.bin"),
             "after the hold, normal TTL rules apply again"
         );
-    }
-
-    /// A held entry sorts LAST in the eviction order, but it is not immortal:
-    /// when nothing else can bring the cache back under budget the hold
-    /// yields, so a protected entry can never leave the magazine permanently
-    /// over its cap -- which is what "immune" would mean if it were absolute.
-    #[tokio::test]
-    async fn a_held_entry_is_evicted_last_and_the_hold_yields_when_it_is_alone() {
-        fn row(key: &str, size: u64, last_access: u64, hold_until: u64) -> EntryMeta {
-            EntryMeta {
-                version: 1,
-                upstream_id: "primary".into(),
-                key: key.into(),
-                size_bytes: size,
-                etag: None,
-                last_modified: None,
-                content_type: None,
-                created_at_millis: last_access,
-                last_access_millis: last_access,
-                last_revalidated_millis: None,
-                negative_until_millis: None,
-                hold_until_millis: hold_until,
-                oversize: false,
-            }
-        }
-        let mut cfg = Config::default();
-        cfg.inactive_ttl_secs = 1200;
-
-        let mut st = CacheState::default();
-        // The held row is NEWER, so LRU alone would already spare it; the
-        // interesting part is that it stays last even when it is older.
-        st.entries.insert("held.bin".into(), row("held.bin", 100, 1_000, 9_999_999));
-        st.entries.insert("old.bin".into(), row("old.bin", 100, 2_000, 0));
-        st.total_bytes = 200;
-
-        // Over by 50: the unheld (older-by-hold) row goes first.
-        cfg.max_size_bytes = 150;
-        let victims: Vec<String> = evict_pick(&mut st, &cfg).into_iter().map(|(k, _)| k).collect();
-        assert_eq!(victims, vec!["old.bin".to_string()], "the hold sorts last");
-
-        // Now the budget is below the held row alone: the hold yields.
-        cfg.max_size_bytes = 50;
-        let victims: Vec<String> = evict_pick(&mut st, &cfg).into_iter().map(|(k, _)| k).collect();
-        assert_eq!(
-            victims,
-            vec!["held.bin".to_string()],
-            "when it is the only way back under budget, the hold yields"
-        );
-        assert_eq!(st.total_bytes, 0, "the cap is honoured, never violated");
-    }
-
-    /// A resident stray is outside the byte budget in both directions
-    /// (ADR-0014): it never pushes the magazine over, and the byte budget
-    /// never picks it. The shape this replaces let a single oversized object
-    /// take the whole cache down with it -- its own size was the overshoot,
-    /// so the sweep evicted every other entry AND the object itself, leaving
-    /// a 50 GB pull standing on an empty cache.
-    #[tokio::test]
-    async fn a_resident_stray_never_evicts_the_magazine() {
-        fn row(key: &str, size: u64, last_access: u64, oversize: bool) -> EntryMeta {
-            EntryMeta {
-                version: 1,
-                upstream_id: "primary".into(),
-                key: key.into(),
-                size_bytes: size,
-                etag: None,
-                last_modified: None,
-                content_type: None,
-                created_at_millis: last_access,
-                last_access_millis: last_access,
-                last_revalidated_millis: None,
-                negative_until_millis: None,
-                hold_until_millis: 0,
-                oversize,
-            }
-        }
-        let mut cfg = Config::default();
-        cfg.max_size_bytes = 1_000;
-        cfg.inactive_ttl_secs = 1200;
-
-        let mut st = CacheState::default();
-        st.entries.insert("small.bin".into(), row("small.bin", 100, 10, false));
-        st.entries.insert("stray.bin".into(), row("stray.bin", 5_000, 5, true));
-        st.total_bytes = 5_100;
-        assert_eq!(resident_bytes(&st), 100, "the stray is not part of the magazine's bytes");
-
-        // Over the budget only because of the stray: nobody is evicted.
-        assert!(
-            evict_pick(&mut st, &cfg).is_empty(),
-            "a stray must not make the magazine look over budget"
-        );
-        assert!(st.entries.contains_key("small.bin"), "the member survives");
-        assert!(st.entries.contains_key("stray.bin"), "and so does the stray");
-
-        // A second MEMBER pushes the magazine over: it is the member that
-        // goes, never the stray.
-        st.entries.insert("small2.bin".into(), row("small2.bin", 950, 20, false));
-        st.total_bytes += 950;
-        let victims = evict_pick(&mut st, &cfg);
-        assert_eq!(
-            victims.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-            vec!["small.bin"],
-            "the byte budget picks only the rows it governs"
-        );
-        assert!(st.entries.contains_key("stray.bin"));
-        assert!(st.entries.contains_key("small2.bin"));
-    }
-
-    /// Disk pressure reclaims resident strays, oldest-touched first, and
-    /// touches nothing else: the magazine's own members leave on their clock,
-    /// and the disk is not a second silent eviction budget for them.
-    #[test]
-    fn strays_are_reclaimed_under_disk_pressure_oldest_first() {
-        fn row(key: &str, size: u64, last_access: u64, oversize: bool) -> EntryMeta {
-            EntryMeta {
-                version: 1,
-                upstream_id: "primary".into(),
-                key: key.into(),
-                size_bytes: size,
-                etag: None,
-                last_modified: None,
-                content_type: None,
-                created_at_millis: last_access,
-                last_access_millis: last_access,
-                last_revalidated_millis: None,
-                negative_until_millis: None,
-                hold_until_millis: 0,
-                oversize,
-            }
-        }
-        let mut cfg = Config::default();
-        cfg.inactive_ttl_secs = 1200;
-
-        let mut st = CacheState::default();
-        st.entries.insert("stray-cold.bin".into(), row("stray-cold.bin", 3_000, 10, true));
-        st.entries.insert("stray-warm.bin".into(), row("stray-warm.bin", 3_000, 900, true));
-        st.entries.insert("member.bin".into(), row("member.bin", 3_000, 5, false));
-        st.total_bytes = 9_000;
-
-        assert!(
-            pick_strays_for_pressure(&mut st, &cfg, 0).is_empty(),
-            "nothing to free when nothing is needed"
-        );
-        let victims = pick_strays_for_pressure(&mut st, &cfg, 3_000);
-        assert_eq!(
-            victims,
-            vec![("stray-cold.bin".to_string(), 3_000)],
-            "the colder stray goes first, even though a member is colder still"
-        );
-        assert!(st.entries.contains_key("stray-warm.bin"), "the warmer stray stays");
-        assert!(st.entries.contains_key("member.bin"), "pressure never takes a member");
-        assert_eq!(st.total_bytes, 6_000);
-        assert_eq!(resident_bytes(&st), 3_000, "the member is untouched and still counted");
-
-        let victims = pick_strays_for_pressure(&mut st, &cfg, 99_000);
-        assert_eq!(victims.len(), 1, "only one stray is left to take");
-        assert!(st.entries.contains_key("member.bin"));
-        assert_eq!(st.total_bytes, 3_000);
     }
 
     #[tokio::test]

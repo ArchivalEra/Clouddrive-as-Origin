@@ -304,7 +304,7 @@ mod fixture_support {
     use axum::http::{HeaderMap, StatusCode};
 
     use super::MockBackend;
-    use crate::backend::{BackendError, BackendRegistry, BackendSlot, ListEntry, StorageBackend};
+    use crate::backend::{BackendRegistry, BackendSlot, StorageBackend};
     use crate::business::AppState;
     use crate::cache::cache::Cache;
     use crate::clock::MockClock;
