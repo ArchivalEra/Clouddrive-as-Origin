@@ -560,10 +560,6 @@ impl<C: Clock + Clone> Cache<C> {
     /// stat, but bytes never move: no flights, no file reads, no file-row
     /// installs; a confirmed absence installs a negative tombstone so
     /// HEAD 404s share the negative-cache window with GET).
-    pub async fn head_meta(&self, raw_key: &str) -> Result<HitMeta, BackendError> {
-        let rk = self.resolve(raw_key)?;
-        self.head_resolved(&rk).await
-    }
 
     /// [`Cache::head_meta`] for a pre-resolved key (no re-validation:
     /// [`ResolvedKey`] is valid by construction).
@@ -1023,14 +1019,6 @@ impl<C: Clock + Clone> Cache<C> {
     /// reader converges on the flight's growing temp file and waits for the
     /// writer to reach its offset (single stream — every upstream open pays
     /// a ~800 ms fixed cost).
-    pub async fn get(
-        &self,
-        raw_key: &str,
-        range: Option<crate::backend::ByteRange>,
-    ) -> Result<CacheHit, BackendError> {
-        let rk = self.resolve(raw_key)?;
-        self.get_resolved(&rk, range).await
-    }
 
     /// [`Cache::get`] for a pre-resolved key (no re-validation).
     ///
@@ -2106,6 +2094,7 @@ mod tests {
     use super::*;
     use crate::{backend::StorageBackend, clock::MockClock, config::Config};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::testsupport::CacheTestExt;
     use tempfile::tempdir;
 
 
@@ -2240,7 +2229,7 @@ mod tests {
     async fn miss_then_hit() {
         let dir = tempdir().unwrap();
         let (_cfg, _clock, cache, _calls) = test_cache(dir.path().to_path_buf(), b"hello", Some("v1"), None);
-        let mut hit = cache.get("a.png", None).await.unwrap();
+        let mut hit = cache.get_by_key("a.png", None).await.unwrap();
         assert_eq!(hit.outcome, CacheOutcome::Miss);
         let b = read_body(&mut hit.body).await;
         assert_eq!(b, b"hello");
@@ -2251,7 +2240,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let mut hit2 = cache.get("a.png", None).await.unwrap();
+        let mut hit2 = cache.get_by_key("a.png", None).await.unwrap();
         assert_eq!(hit2.outcome, CacheOutcome::Hit);
         let b2 = read_body(&mut hit2.body).await;
         assert_eq!(b2, b"hello");
@@ -2273,18 +2262,18 @@ mod tests {
             Arc::new(BackendSlot::new(Arc::new(backend), 3)),
         );
         let cache = Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots));
-        assert!(matches!(cache.get("missing.png", None).await, Err(BackendError::NotFound)));
-        assert!(matches!(cache.get("missing.png", None).await, Err(BackendError::NotFound)));
+        assert!(matches!(cache.get_by_key("missing.png", None).await, Err(BackendError::NotFound)));
+        assert!(matches!(cache.get_by_key("missing.png", None).await, Err(BackendError::NotFound)));
         clock.advance(3000);
         cache.tick().await;
-        assert!(matches!(cache.get("missing.png", None).await, Err(BackendError::NotFound)));
+        assert!(matches!(cache.get_by_key("missing.png", None).await, Err(BackendError::NotFound)));
     }
 
     #[tokio::test]
     async fn stale_if_error_serves_cached() {
         let dir = tempdir().unwrap();
         let (cfg, clock, cache, _calls) = test_cache(dir.path().to_path_buf(), b"cached", Some("v1"), None);
-        let mut hit = cache.get("a.png", None).await.unwrap();
+        let mut hit = cache.get_by_key("a.png", None).await.unwrap();
         assert_eq!(read_body(&mut hit.body).await, b"cached");
         for _ in 0..100 {
             if cache.state.read().await.entries.contains_key("a.png") {
@@ -2307,7 +2296,7 @@ mod tests {
             *s2 = std::mem::take(&mut *state.write().await);
         }
         clock.advance(61_000);
-        let mut hit2 = cache2.get("a.png", None).await.unwrap();
+        let mut hit2 = cache2.get_by_key("a.png", None).await.unwrap();
         assert_eq!(hit2.outcome, CacheOutcome::Stale);
         assert_eq!(read_body(&mut hit2.body).await, b"cached");
     }
@@ -2328,7 +2317,7 @@ mod tests {
             Arc::new(BackendSlot::new(Arc::new(backend), 3)),
         );
         let cache = Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots));
-        let mut hit = cache.get("a.png", None).await.unwrap();
+        let mut hit = cache.get_by_key("a.png", None).await.unwrap();
         read_body(&mut hit.body).await;
         for _ in 0..100 {
             if cache.state.read().await.entries.contains_key("a.png") {

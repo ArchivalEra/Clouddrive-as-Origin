@@ -210,17 +210,10 @@ pub(crate) fn error_response(
             }
             resp
         }
-        // Typed, not text-matched: the client's key failed validation, so
-        // the answer is 400 whatever the error says.
-        BackendError::InvalidKey(ke) => {
-            warn!(key = %key, error = %ke, "invalid request key");
-            let body = if head_only {
-                Body::empty()
-            } else {
-                Body::from(xml("InvalidRequest", "The request key is invalid."))
-            };
-            with_ids(StatusCode::BAD_REQUEST, body)
-        }
+        // No key-validation arm: a client key error cannot reach this
+        // function at all any more. It is answered at the resolve seam
+        // (`invalid_key_response`) before any cache call, and `BackendError`
+        // no longer has a variant that could carry it.
         other => {
             warn!(key = %key, error = %other, "cache fetch error");
             (StatusCode::BAD_GATEWAY, Json(json!({"error": "upstream error"}))).into_response()
@@ -241,44 +234,28 @@ mod tests {
     }
 
     /// Every KeyError variant must map to 400 through the generic error
-    /// path too, not only through the typed handler seam: a key that is
-    /// rejected inside the cache layer reaches `error_response` as
-    /// `Other("invalid key: ...")` and must never surface as a 502
-    /// upstream failure. Pins all six variants, because the previous
-    /// case-sensitive match on the Display text caught only `traversal`.
+    /// The mapping table for the faults that can still reach this function.
+    ///
+    /// There is no key-validation arm any more, and no test for one: a client
+    /// key error is answered at the resolve seam before any cache call, so it
+    /// cannot arrive here, and `BackendError` no longer has a variant that
+    /// could carry it. The six-variant coverage that used to live here now
+    /// lives where the seam is — `business::tests::invalid_object_keys_*`
+    /// drives every variant through the router and the handler.
     #[tokio::test]
-    async fn every_key_error_maps_to_400_not_backend_failure() {
-        let variants = [
-            KeyError::Empty,
-            KeyError::Absolute,
-            KeyError::Traversal,
-            KeyError::Nul,
-            KeyError::Backslash,
-            KeyError::BadPercent,
-            KeyError::ReservedName,
-        ];
-        for ke in variants {
-            let label = format!("{ke:?}");
-            let resp = error_response(
-                BackendError::from(ke),
-                "some/key",
-                "req-1",
-                "host-1",
-                false,
-                None,
-            );
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{label} must be 400");
-            assert_eq!(resp.headers().get("content-type").unwrap(), "application/xml");
+    async fn upstream_faults_keep_their_own_statuses() {
+        for (err, want, label) in [
+            (BackendError::NotFound, StatusCode::NOT_FOUND, "not found"),
+            (BackendError::RangeNotSatisfiable, StatusCode::RANGE_NOT_SATISFIABLE, "range"),
+            (BackendError::RateLimited { retry_after_millis: None }, StatusCode::SERVICE_UNAVAILABLE, "throttled"),
+            (BackendError::AuthRequired, StatusCode::BAD_GATEWAY, "auth (a backend failure, not a client one)"),
+            (BackendError::Other("token rejected".into()), StatusCode::BAD_GATEWAY, "opaque backend error"),
+        ] {
+            let resp = error_response(err, "some/key", "req-1", "host-1", false, None);
+            assert_eq!(resp.status(), want, "{label}");
         }
-        let head = error_response(
-            BackendError::from(KeyError::Empty),
-            "some/key",
-            "req-1",
-            "host-1",
-            true,
-            None,
-        );
-        assert_eq!(head.status(), StatusCode::BAD_REQUEST);
+        // A HEAD error carries no body.
+        let head = error_response(BackendError::NotFound, "some/key", "req-1", "host-1", true, None);
         assert!(
             head.headers().get("content-length").is_none_or(|v| v == "0"),
             "a HEAD error must not carry a body: {:?}",
@@ -288,20 +265,8 @@ mod tests {
             axum::body::to_bytes(head.into_body(), 1024).await.unwrap().is_empty(),
             "HEAD must answer with an empty body"
         );
-        // The SSRF/malformed-response class must keep its backend-failure
-        // status: it is not a client key error.
-        let resp = error_response(
-            BackendError::Other("backend error: token rejected".into()),
-            "some/key",
-            "req-1",
-            "host-1",
-            false,
-            None,
-        );
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        // Text must no longer decide the status: an `Other` that merely
-        // looks like a key error is still a backend failure, and a typed
-        // key error is 400 however it is worded.
+        // Text must not decide a status: a message that LOOKS like a key
+        // error is still whatever variant it actually is.
         let resp = error_response(
             BackendError::Other("invalid key: empty key".into()),
             "some/key",

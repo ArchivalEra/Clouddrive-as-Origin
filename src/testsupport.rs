@@ -253,6 +253,42 @@ impl StorageBackend for MockBackend {
     }
 }
 
+/// The raw-key convenience the production interface deliberately does not
+/// offer.
+///
+/// `Cache::get` and `Cache::head_meta` used to take a raw key and validate it
+/// internally, which put a client fault (`KeyError`) into `BackendError` and
+/// gave the cache a second entry point no request path ever used. They are
+/// gone; this keeps the ergonomics for tests, which resolve first (a test key
+/// is a fixture, so an unresolvable one is a bug in the test) and then take
+/// the same resolved-key path production uses. A test that wants an invalid
+/// key calls `resolve` itself and sees the `KeyError` for what it is.
+#[async_trait::async_trait]
+pub trait CacheTestExt<C: crate::clock::Clock + Clone> {
+    async fn get_by_key(
+        &self,
+        key: &str,
+        range: Option<ByteRange>,
+    ) -> Result<crate::cache::cache::CacheHit, BackendError>;
+    async fn head_by_key(&self, key: &str) -> Result<crate::cache::cache::HitMeta, BackendError>;
+}
+
+#[async_trait::async_trait]
+impl<C: crate::clock::Clock + Clone> CacheTestExt<C> for crate::cache::cache::Cache<C> {
+    async fn get_by_key(
+        &self,
+        key: &str,
+        range: Option<ByteRange>,
+    ) -> Result<crate::cache::cache::CacheHit, BackendError> {
+        let rk = self.resolve(key).expect("test key must resolve");
+        self.get_resolved(&rk, range).await
+    }
+    async fn head_by_key(&self, key: &str) -> Result<crate::cache::cache::HitMeta, BackendError> {
+        let rk = self.resolve(key).expect("test key must resolve");
+        self.head_resolved(&rk).await
+    }
+}
+
 /// Everything below needs a temp cache dir and a live `AppState`, so it is
 /// `#[cfg(test)]`: visible to this crate's test modules, invisible to the
 /// binary, and free to use dev-dependencies.
