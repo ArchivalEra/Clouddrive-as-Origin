@@ -637,9 +637,16 @@ impl<C: Clock + Clone> Cache<C> {
         Some(m.size_bytes)
     }
 
-    /// Whether a fresh (no revalidation due) memory entry exists: the
-    /// hit-first gate for the A relief valve. Pure peek — no upstream,
-    /// no mutation, no flights.
+    /// Whether a fresh (no revalidation due) memory entry exists. A pure
+    /// peek — no upstream, no mutation, no flights.
+    ///
+    /// This is the relief valve's gate and only its gate, and the freshness
+    /// clock is the point there: the valve exists for upstreams whose
+    /// operator asked for `cold_miss = redirect`, i.e. "hand the viewer to
+    /// my CDN rather than proxy the bytes". Something we hold but have not
+    /// revalidated is exactly what that operator wants redirected. The
+    /// efficient profile deliberately does NOT use this gate — see
+    /// [`Cache::has_durable_entry`].
     pub(crate) async fn memory_hit_fresh(&self, raw_key: &str) -> bool {
         let key = match validate_key(raw_key) {
             Ok(k) => k,
@@ -654,6 +661,29 @@ impl<C: Clock + Clone> Cache<C> {
             }
             _ => false,
         }
+    }
+
+    /// Whether we already hold this object at all: any row for the key, a
+    /// negative tombstone included (an answer is an answer — the ordinary
+    /// path renders it 404).
+    ///
+    /// Deliberately NOT a freshness check. The efficient profile's whole
+    /// purpose is to serve bytes it holds, and gating that on the 60 s
+    /// revalidate clock meant a complete promoted entry stopped serving
+    /// ranged reads a minute after its promotion — which also capped the
+    /// promotion hold's value at that same minute. Whether the bytes need
+    /// revalidating is the ordinary path's business: it stats, compares
+    /// etags and either serves the file or refetches it.
+    ///
+    /// Pure peek: no upstream call, no mutation, no flights, and no
+    /// filesystem call — a row whose file vanished falls through the
+    /// ordinary path's own disk check.
+    pub(crate) async fn has_durable_entry(&self, raw_key: &str) -> bool {
+        let key = match validate_key(raw_key) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        self.state.read().await.entries.contains_key(&key)
     }
 
     /// Background fill: full fetch + drain, no client attached. Powers the
@@ -1108,8 +1138,10 @@ impl<C: Clock + Clone> Cache<C> {
 
         // 3. Efficient profile: a ranged miss streams origin bytes while the
         // served interval is staged. Always 206 (this path only runs with a
-        // range); a fresh entry is served from disk instead.
-        if prof.efficient && range.is_some() && !self.memory_hit_fresh(&rk.cache_key).await {
+        // range). An object we already hold goes to the ordinary path
+        // instead, so a promoted entry keeps serving ranges for its whole
+        // life rather than only for the revalidate window.
+        if prof.efficient && range.is_some() && !self.has_durable_entry(&rk.cache_key).await {
             if let Ok(hit) = self.serve_passthrough(rk, range, prof.min_file_size).await {
                 tracing::info!(key = %rk.cache_key, size = hit.meta.size, "passthrough response");
                 return Ok(ServeOutcome::Stream(StreamPlan {

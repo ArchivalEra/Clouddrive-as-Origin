@@ -1179,6 +1179,46 @@ mod tests {
         assert!(staged_segments(&fx, "a.bin").is_empty());
     }
 
+    /// An object we already hold must keep serving ranges after the
+    /// revalidate window. The efficient gate used to be the 60 s freshness
+    /// clock, so a complete entry stopped being served a minute after it was
+    /// filled and every ranged request went back upstream for bytes already
+    /// on disk — which also capped the promotion hold's value at that same
+    /// minute.
+    #[tokio::test]
+    async fn efficient_complete_entry_keeps_serving_ranges_after_the_revalidate_window() {
+        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        prime(&fx, "a.bin").await;
+        fx.state.cache.clock.advance(61_000);
+        reset(&fx);
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=2-5")]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let (status, h, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, "2345");
+        assert_eq!(h.get("content-range").unwrap(), "bytes 2-5/10");
+        assert_eq!(
+            fx.open_calls.load(Ordering::SeqCst),
+            0,
+            "a complete entry must serve the range it already holds, not re-pull it"
+        );
+        assert_eq!(
+            fx.stat_calls.load(Ordering::SeqCst),
+            1,
+            "stale means one revalidation stat and no bytes"
+        );
+        assert!(
+            staged_segments(&fx, "a.bin").is_empty(),
+            "nothing to stage: the bytes are already in one file"
+        );
+    }
+
     #[tokio::test]
     async fn efficient_min_size_bypass_goes_waterpipe() {
         let fx = fixture_efficient(b"0123456789", 0.8, 64);
