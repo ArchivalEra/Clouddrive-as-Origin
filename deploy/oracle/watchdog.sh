@@ -13,17 +13,25 @@
 #           sudo systemctl daemon-reload && sudo systemctl enable --now origin-cache-watchdog.timer
 set -u
 
-UNITS="origin-cache-standard origin-cache-nocache"
+# Everything the watchdog knows about the deployment is overridable, and the
+# node's unit declares no EnvironmentFile, so the defaults below ARE the
+# production behaviour. Overrides exist because this script has already been
+# burned once by hardcoded deployment facts: it probed a TLS port in plaintext
+# for weeks and logged 94 FAILs while the service was healthy. A fact that
+# lives in two places drifts in one of them.
+UNITS="${UNITS:-origin-cache-standard origin-cache-nocache}"
 # State files, kept together so a test can point them at a scratch directory.
-# The node's watchdog unit declares no EnvironmentFile, so on the node these
-# defaults are what runs (same reasoning as REPORT_URL below).
 STATE_DIR="${STATE_DIR:-/opt/origin-cache}"
 LOG="$STATE_DIR/watchdog.log"
 STATE="$STATE_DIR/watchdog.state"
 HEARTBEAT="$STATE_DIR/watchdog.heartbeat"
 DOWN_STAMP="$STATE_DIR/notify-down.stamp"
-DISK_WARN_PCT=85
-DISK_CRIT_PCT=95
+DISK_WARN_PCT="${DISK_WARN_PCT:-85}"
+DISK_CRIT_PCT="${DISK_CRIT_PCT:-95}"
+# The business plane answers on its own loopback port; `listen_addr` in the
+# node's config is the authority, and these are the shipped values.
+HEALTHZ_STANDARD_URL="${HEALTHZ_STANDARD_URL:-http://127.0.0.1:8080/_internal/healthz}"
+HEALTHZ_NOCACHE_URL="${HEALTHZ_NOCACHE_URL:-http://127.0.0.1:8081/_internal/healthz}"
 
 # Reporting endpoints. Overridable so the local dry-run can point at a
 # loopback receiver: the watchdog unit declares no EnvironmentFile, so on
@@ -170,11 +178,11 @@ probe() { # name, url
     note "$name degraded${why:+: $why}"
   fi
 }
-probe "healthz standard (:8080)" http://127.0.0.1:8080/_internal/healthz
+probe "healthz standard" "$HEALTHZ_STANDARD_URL"
 STD_BODY="$LAST_BODY"
 STD_PROBE_OK=0
 [ -n "$STD_BODY" ] && STD_PROBE_OK=1
-probe "healthz nocache (:8081)"  http://127.0.0.1:8081/_internal/healthz
+probe "healthz nocache"  "$HEALTHZ_NOCACHE_URL"
 
 # --- report: transitions + a daily heartbeat (D3) ---------------------------
 # Silent-per-run logging made "healthy all along" indistinguishable from

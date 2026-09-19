@@ -32,6 +32,7 @@ STUB="$ROOT/bin"
 mkdir -p "$STUB" "$ROOT/state"
 RECEIVED="$ROOT/received.jsonl"
 HEADERS="$ROOT/headers.txt"
+PROBED="$ROOT/probed.txt"
 
 PASS=0
 FAIL=0
@@ -92,6 +93,10 @@ if [ "\$head" = 1 ]; then
 fi
 status=ok; degraded=false; reasons='[]'
 if [ "\${FAKE_DEGRADED:-0}" = 1 ]; then status=degraded; degraded=true; reasons='["disk_below_reserve"]'; fi
+# Record the probe target: the watchdog's URL is configurable, and a stub that
+# ignores it cannot tell a correct probe from a wrong one -- the failure that
+# produced 94 FAILs on the node was exactly a wrong target.
+printf '%s\n' "\$url" >> "$PROBED"
 doc=\$(jq -nc --arg status "\$status" --argjson degraded "\$degraded" --argjson reasons "\$reasons" \\
   --argjson entries "\${FAKE_ENTRIES:-7}" --argjson bytes "\${FAKE_BYTES:-2048}" --arg version "9.9.9" \\
   '{status:\$status,degraded:\$degraded,degraded_reasons:\$reasons,entries:\$entries,bytes:\$bytes,version:\$version,
@@ -113,7 +118,7 @@ run_down() { # systemd result vars as args
     "$@" bash "$WATCHDOG" --down origin-cache-standard.service >/dev/null 2>&1
 }
 
-reset_reports() { : > "$RECEIVED"; : > "$HEADERS"; rm -f "$ROOT/state/notify-down.stamp"; }
+reset_reports() { : > "$RECEIVED"; : > "$HEADERS"; : > "$PROBED"; rm -f "$ROOT/state/notify-down.stamp"; }
 reports() { cat "$RECEIVED"; }
 report_count() { [ -s "$RECEIVED" ] && wc -l < "$RECEIVED" | tr -d ' ' || echo 0; }
 field() { head -n1 "$RECEIVED" | jq -r "$1" 2>/dev/null; }
@@ -254,6 +259,37 @@ if [ "$(field .service)" = origin-cache-standard ]; then
   ok "a down event names the unit that died"
 else
   bad "a down event names the unit that died" "$(reports)"
+fi
+
+# --- 3b. the probe target ---------------------------------------------------
+# A watchdog that probes the wrong port reports an outage that is not there.
+# The node's unit sets no environment, so these defaults are production.
+reset_reports
+run_watchdog
+if grep -q "http://127.0.0.1:8080/_internal/healthz" "$PROBED" \
+   && grep -q "http://127.0.0.1:8081/_internal/healthz" "$PROBED"; then
+  ok "the default probe targets are the business plane's two ports"
+else
+  bad "the default probe targets are the business plane's two ports" "$(cat "$PROBED")"
+fi
+
+reset_reports
+env PATH="$STUB:$PATH" STATE_DIR="$ROOT/state" REPORT_URL="http://receiver.invalid/report" \
+  HEALTHZ_STANDARD_URL="http://127.0.0.1:9999/_internal/healthz" \
+  bash "$WATCHDOG" >/dev/null 2>&1
+if grep -q "http://127.0.0.1:9999/_internal/healthz" "$PROBED"; then
+  ok "an overridden probe target is the one used"
+else
+  bad "an overridden probe target is the one used" "$(cat "$PROBED")"
+fi
+
+reset_reports
+env PATH="$STUB:$PATH" STATE_DIR="$ROOT/state" REPORT_URL="http://receiver.invalid/report" \
+  UNITS="origin-cache-standard" DISK_WARN_PCT=1 bash "$WATCHDOG" >/dev/null 2>&1
+if [ "$(field .status)" = degraded ]; then
+  ok "overridden thresholds and unit list are honoured"
+else
+  bad "overridden thresholds and unit list are honoured" "$(reports)"
 fi
 
 # --- 4. throttle ------------------------------------------------------------
