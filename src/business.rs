@@ -1227,6 +1227,100 @@ mod tests {
         assert!(staged_segments(&fx, "a.bin").is_empty());
     }
 
+    /// Staged reads: a seek whose bytes are already staged is answered from the
+    /// sidecars with NO upstream open. This is the seek-back case - the
+    /// reader returns to bytes an earlier request already paid for - and the
+    /// reason staged bytes exist at all once promotion is off the table.
+    #[tokio::test]
+    async fn a_fully_covered_seek_is_served_from_stage_without_upstream() {
+        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        // Stage the whole object in two pulls.
+        for range in ["bytes=0-4", "bytes=5-9"] {
+            let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", range)]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+            let (status, _, _) = body_text(resp).await;
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        }
+        reset(&fx);
+        fx.state.cache.clock.advance(5_000);
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=2-7")]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let (status, h, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, "234567");
+        assert_eq!(h.get("content-range").unwrap(), "bytes 2-7/10");
+        {
+            let cov = fx.state.cache.coverage.lock().await;
+            assert_eq!(
+                cov.get("a.bin").unwrap().last_touch_millis,
+                5_000,
+                "a staged read refreshes the row's age, so a watched window is not swept"
+            );
+        }
+        assert_eq!(
+            fx.open_calls.load(Ordering::SeqCst),
+            0,
+            "a covered seek must not open upstream"
+        );
+        let before = source_total("stage");
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=3-4")]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let (status, _, _) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert!(
+            source_total("stage") - before >= 1.0,
+            "the response must be labelled stage"
+        );
+    }
+
+    /// A partially covered range serves its covered prefix from stage and
+    /// opens upstream ONCE for the remainder - one open regardless of how
+    /// many sidecars rode along - and the remainder is staged, so the ledger
+    /// ends fully covered and promotion can fire off it.
+    #[tokio::test]
+    async fn a_partially_covered_range_needs_one_open_and_stages_the_rest() {
+        let fx = fixture_efficient(b"0123456789", 0.8, 4);
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", "bytes=0-4")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        let (status, _, _) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        reset(&fx);
+
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=0-9")]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, "0123456789");
+        assert_eq!(
+            fx.open_calls.load(Ordering::SeqCst),
+            1,
+            "the remainder is one exact-Range open, not one per gap"
+        );
+        {
+            let cov = fx.state.cache.coverage.lock().await;
+            eprintln!("DEBUG ledger: {:?}", cov.get("a.bin"));
+        }
+        eprintln!("DEBUG entries: {:?} segment_bytes: {}", fx.state.cache.state.read().await.entries.keys().collect::<Vec<_>>(), fx.state.cache.state.read().await.segment_bytes);
+        wait_installed(&fx, "a.bin").await;
+        assert!(staged_segments(&fx, "a.bin").is_empty(), "promotion consumed the sidecars");
+    }
+
     /// An object we already hold must keep serving ranges after the
     /// revalidate window. The efficient gate used to be the 60 s freshness
     /// clock, so a complete entry stopped being served a minute after it was
@@ -1864,6 +1958,21 @@ mod tests {
     /// Read one counter's current value for a source label. The registry is
     /// process-global and the tests share it, so callers assert on the
     /// INCREASE, which concurrent increments can only make larger.
+    fn source_total(source: &str) -> f64 {
+        prometheus::gather()
+            .iter()
+            .find(|f| f.get_name() == "cache_serve_source_total")
+            .and_then(|f| {
+                f.get_metric().iter().find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.get_name() == "source" && l.get_value() == source)
+                })
+            })
+            .map(|m| m.get_counter().get_value())
+            .unwrap_or(0.0)
+    }
+
     fn body_bytes(source: &str) -> f64 {
         prometheus::gather()
             .iter()

@@ -7,7 +7,7 @@ use crate::{
         flight::{self, BodyStream, FlightProgress, FlightShared},
         magazine::{self, Magazine},
         meta::EntryMeta,
-        staging::{FinalizedSpan, Staging},
+        staging::{self, FinalizedSpan, Staging},
         store,
     },
     clock::Clock,
@@ -133,6 +133,10 @@ pub struct PassthroughHit {
     pub content_range: Option<ContentRange>,
     pub content_length: Option<u64>,
     pub body: BodyStream,
+    /// Where the bytes came from: the metric label. "stage" means every byte
+    /// came from this node's sidecars; any upstream open makes it
+    /// "upstream", even when the first byte was served from stage.
+    pub source: BodySource,
 }
 
 impl PassthroughHit {
@@ -217,8 +221,11 @@ fn stream_plan(
 pub enum BodySource {
     /// A complete object file on this node.
     Disk,
+    /// Staged sidecars of this key (the efficient profile): the request was
+    /// answered without opening upstream at all.
+    Stage,
     /// A live upstream stream: a cold-miss flight, a nocache water-pipe, or
-    /// an efficient passthrough.
+    /// an efficient passthrough that needed bytes.
     Upstream,
 }
 
@@ -226,6 +233,7 @@ impl BodySource {
     pub fn label(self) -> &'static str {
         match self {
             BodySource::Disk => "disk",
+            BodySource::Stage => "stage",
             BodySource::Upstream => "upstream",
         }
     }
@@ -904,6 +912,7 @@ impl<C: Clock + Clone> Cache<C> {
             content_range,
             content_length,
             body,
+            source: BodySource::Upstream,
         })
     }
 
@@ -1002,26 +1011,10 @@ impl<C: Clock + Clone> Cache<C> {
             return Err(BackendError::Other("below min_file_size".into()));
         }
         let (start, end) = resolve_range(range, meta.size_bytes)?;
-        // Staging admission (ADR-0013). Staged segments have exactly one
-        // reader - promotion - and promotion is refused for an object the
-        // magazine cannot hold, so staging such an object writes bytes
-        // nobody can ever read back: pure cost, paid on every seek. The disk
-        // gets the same question the cold-pull path asks, because a staged
-        // stream is a disk write like any other.
-        if !self.magazine.fits(meta.size_bytes)
-            || !store::has_room_for(&self.config.cache_dir, end - start, magazine::DISK_RESERVE_BYTES)
-        {
-            tracing::info!(
-                key = %rk.cache_key,
-                size = meta.size_bytes,
-                "passthrough without staging: the magazine cannot hold this object"
-            );
-            return self.serve_upstream_range(&slot, rk, range, meta).await;
-        }
         // Version gate: a flipped object restarts staged history BEFORE
         // serving, so new bytes land on a clean ledger (finalize keeps a
-        // same-file backstop for races). Only the staging path needs it -
-        // this is the only place new bytes can enter the ledger.
+        // same-file backstop for races). It gates the staged READ below too:
+        // a drifted ledger must not serve old bytes.
         {
             let known = self.staging.known_etag(&rk.cache_key).await;
             let changed = match (known.as_deref(), meta.etag.as_deref()) {
@@ -1032,11 +1025,64 @@ impl<C: Clock + Clone> Cache<C> {
                 self.staging.reset(&rk.cache_key).await;
             }
         }
+        // Staged reads: plan `[start, end)` against the ledger AND
+        // a fresh disk scan. The scan is the authority - a span whose file
+        // vanished simply is not covered, and the gap falls back upstream
+        // instead of trusting the ledger over disk.
+        let segs = store::segments_for_key(&self.config.cache_dir, &rk.cache_key);
+        let plan = staging::plan_staged(&segs, start, end);
+        if plan.frontier >= end {
+            // Fully covered: answered from this node's sidecars with no
+            // upstream open, no stream gate and no disk write.
+            tracing::info!(key = %rk.cache_key, from = start, to = end, "served from staged sidecars");
+            self.staging.touch(&rk.cache_key, self.clock.now_millis()).await;
+            return Ok(PassthroughHit {
+                meta: hit_meta_remote(&rk.cache_key, &meta),
+                etag: meta.etag,
+                total: meta.size_bytes,
+                content_range: range
+                    .map(|_| ContentRange { first: start, last: end - 1, total: meta.size_bytes }),
+                content_length: Some(end - start),
+                body: staging::staged_body(plan.pieces),
+                source: BodySource::Stage,
+            });
+        }
+        let staged_prefix = !plan.pieces.is_empty();
+        // Staging admission (ADR-0013). Staged segments have exactly one
+        // reader - promotion - and promotion is refused for an object the
+        // magazine cannot hold, so staging such an object writes bytes
+        // nobody can ever read back: pure cost, paid on every seek. The disk
+        // gets the same question the cold-pull path asks, because a staged
+        // stream is a disk write like any other. A staged PREFIX changes the
+        // fetch to `[frontier, end)`, so that is the write the disk is asked
+        // about.
+        if !self.magazine.fits(meta.size_bytes)
+            || !store::has_room_for(
+                &self.config.cache_dir,
+                end - plan.frontier,
+                magazine::DISK_RESERVE_BYTES,
+            )
+        {
+            tracing::info!(
+                key = %rk.cache_key,
+                size = meta.size_bytes,
+                "passthrough without staging: the magazine cannot hold this object"
+            );
+            return self.serve_upstream_range(&slot, rk, range, meta).await;
+        }
         // The open and the transfer below are a stream, not metadata (B1):
         // this used to take the METADATA gate, which is the head-of-line
         // class ADR-0004 split off, and it released it before a byte moved.
         let stream_permit = Arc::clone(&slot.stream_gate).acquire_owned().await;
-        let src = match slot.backend.open(&bkey, range).await {
+        // Fetch only the uncovered remainder, at ONE exact Range: a staged
+        // prefix rides along in the response and the open count stays at one
+        // per request regardless of how many sidecars it rode on.
+        let fetch_start = plan.frontier;
+        let src = match slot
+            .backend
+            .open(&bkey, Some(ByteRange::bounded(fetch_start, end - fetch_start)))
+            .await
+        {
             Ok(s) => s,
             Err(BackendError::NotFound) => {
                 self.magazine
@@ -1051,6 +1097,9 @@ impl<C: Clock + Clone> Cache<C> {
         let meta_out = hit_meta_remote(&rk.cache_key, &meta);
         let content_range = range.map(|_| ContentRange { first: start, last: end.saturating_sub(1), total });
         let content_length = Some(end.saturating_sub(start));
+        // First byte from a staged prefix counts as stage-sourced; any
+        // upstream open still shows up in the bytes ledger as upstream.
+        let source = if staged_prefix { BodySource::Stage } else { BodySource::Upstream };
 
         // Staged streaming: chunk → segpart file → viewer. Ledger merge +
         // seal rename happen only on exhaustion, so aborts are sweep-safe.
@@ -1060,13 +1109,13 @@ impl<C: Clock + Clone> Cache<C> {
         let cache_key = rk.cache_key.clone();
         let backend_key = rk.backend_key.clone();
         let upstream_id = rk.upstream_id.clone();
-        let segpart = store::segpart_path(&cache_dir, &cache_key, start, end);
+        let segpart = store::segpart_path(&cache_dir, &cache_key, fetch_start, end);
         let mut src_stream = src.stream;
         // The upstream 206 stream may not signal EOF at the Content-Length
         // boundary (keep-alive reuse, e.g. rclone serve webdav): read at
         // most `end - start` bytes, then seal. Waiting for EOF would hang
         // the staging loop and leave the segpart unsealed forever.
-        let want = end.saturating_sub(start);
+        let want = end.saturating_sub(fetch_start);
         // Viewer disconnect drops the whole body stream (axum drops the
         // async block), so the seal code below never runs on abort. A
         // detached watcher polls the segpart and seals it once it stops
@@ -1074,7 +1123,8 @@ impl<C: Clock + Clone> Cache<C> {
         // (segmented downloads are separate connections).
         let watcher = {
             let segpart = segpart.clone();
-            let seg = store::seg_path(&cache_dir, &cache_key, start, end);
+            let fetch_start = fetch_start;
+            let seg = store::seg_path(&cache_dir, &cache_key, fetch_start, end);
             let clock = Arc::clone(&clock);
             let staging = staging.clone();
             let cache_dir = cache_dir.clone();
@@ -1083,7 +1133,6 @@ impl<C: Clock + Clone> Cache<C> {
             let upstream_id = upstream_id.clone();
             let etag = etag.clone();
             let total = total;
-            let start = start;
             tokio::spawn(async move {
                 // Wait for the segpart to appear and stop growing (viewer
                 // gone or transfer done), then seal it.
@@ -1112,8 +1161,8 @@ impl<C: Clock + Clone> Cache<C> {
                                     upstream_id,
                                     etag,
                                     total,
-                                    start,
-                                    end: start + size,
+                                    start: fetch_start,
+                                    end: fetch_start + size,
                                     bytes: size,
                                     now_millis: clock.now_millis(),
                                 })
@@ -1131,7 +1180,27 @@ impl<C: Clock + Clone> Cache<C> {
             // The upstream stream gate is held by the transfer itself, not
             // by the request that built it.
             let _stream_permit = stream_permit;
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+            // The staged prefix goes first: the viewer starts on local bytes
+            // while the upstream remainder is fetched. It is served from the
+            // planned sidecars, exactly as the staged-read path would.
+            for (path, off, len) in plan.pieces {
+                let mut f = tokio::fs::File::open(&path).await?;
+                f.seek(std::io::SeekFrom::Start(off)).await?;
+                let mut remaining = len;
+                while remaining > 0 {
+                    let want_read = (256 * 1024).min(remaining as usize);
+                    let mut piece = bytes::BytesMut::with_capacity(want_read);
+                    let n = f.read_buf(&mut piece).await?;
+                    if n == 0 {
+                        Err(std::io::Error::other(
+                            "staged segment is shorter than the ledger's range",
+                        ))?;
+                    }
+                    remaining -= n as u64;
+                    yield piece.freeze();
+                }
+            }
             let mut file: Option<tokio::fs::File> = None;
             let mut written: u64 = 0;
             while written < want {
@@ -1156,7 +1225,7 @@ impl<C: Clock + Clone> Cache<C> {
             }
             if written > 0 {
                 drop(file);
-                let seg = store::seg_path(&cache_dir, &cache_key, start, start + written);
+                let seg = store::seg_path(&cache_dir, &cache_key, fetch_start, fetch_start + written);
                 let _ = tokio::fs::rename(&segpart, &seg).await;
                 staging
                     .seal_and_maybe_promote(FinalizedSpan {
@@ -1166,8 +1235,8 @@ impl<C: Clock + Clone> Cache<C> {
                         upstream_id,
                         etag,
                         total,
-                        start,
-                        end: start + written,
+                        start: fetch_start,
+                        end: fetch_start + written,
                         bytes: written,
                         now_millis: clock.now_millis(),
                     })
@@ -1177,7 +1246,15 @@ impl<C: Clock + Clone> Cache<C> {
             }
         });
         let _ = watcher;
-        Ok(PassthroughHit { meta: meta_out, etag: meta.etag, total, content_range, content_length, body })
+        Ok(PassthroughHit {
+            meta: meta_out,
+            etag: meta.etag,
+            total,
+            content_range,
+            content_length,
+            body,
+            source,
+        })
     }
 
     /// Main entry: `GET /<key>` — streaming response. Cold misses attach
@@ -1281,14 +1358,16 @@ impl<C: Clock + Clone> Cache<C> {
             if let Ok(hit) = self.serve_passthrough(rk, range, prof.min_file_size).await {
                 tracing::info!(key = %rk.cache_key, size = hit.meta.size, "passthrough response");
                 // Always 206: this path only runs with a range, and its hit
-                // always carries the honoured content-range.
+                // always carries the honoured content-range. The source is
+                // the hit's own: stage when every byte was local, upstream
+                // when any open happened.
                 return Ok(ServeOutcome::Stream(stream_plan(
                     hit.meta,
                     hit.content_range,
                     hit.content_length,
                     hit.body,
                     false,
-                    BodySource::Upstream,
+                    hit.source,
                 )));
             }
         }
