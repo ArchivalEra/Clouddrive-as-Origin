@@ -2108,48 +2108,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
-    #[derive(Clone)]
-    struct CountingBackend {
-        bytes: Vec<u8>,
-        etag: Option<String>,
-        calls: Arc<AtomicUsize>,
-        fail: Option<BackendError>,
-    }
-
-    #[async_trait::async_trait]
-    impl StorageBackend for CountingBackend {
-        async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(e) = &self.fail {
-                return Err(e.clone());
-            }
-            Ok(ObjectMeta {
-                size_bytes: self.bytes.len() as u64,
-                etag: self.etag.clone(),
-                last_modified: None,
-                mime_hint: Some("image/png".into()),
-            })
-        }
-
-        async fn open(&self, _key: &Key, _range: Option<crate::backend::ByteRange>) -> Result<crate::backend::StreamSource, BackendError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(e) = &self.fail {
-                return Err(e.clone());
-            }
-            Ok(crate::backend::StreamSource {
-                stream: Box::new(std::io::Cursor::new(self.bytes.clone())),
-                total_len: Some(self.bytes.len() as u64),
-            })
-        }
-
-        async fn refresh_if_needed(&self) -> Result<(), BackendError> {
-            Ok(())
-        }
-
-        fn id(&self) -> &str {
-            "test"
-        }
-    }
 
     async fn read_body(body: &mut BodyStream) -> Vec<u8> {
         use futures::StreamExt;
@@ -2171,12 +2129,8 @@ mod tests {
         let cfg = Arc::new(cfg);
         let clock = Arc::new(MockClock::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
-        let backend = CountingBackend {
-            bytes: bytes.to_vec(),
-            etag: etag.map(|s| s.to_string()),
-            calls: Arc::clone(&calls),
-            fail,
-        };
+        let backend =
+            crate::testsupport::MockBackend::counting(bytes.to_vec(), etag.map(|s| s.to_string()), Arc::clone(&calls), fail);
         let mut slots = HashMap::new();
         slots.insert(
             "primary".to_string(),
@@ -2312,12 +2266,7 @@ mod tests {
         let cfg = Arc::new(cfg);
         let clock = Arc::new(MockClock::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
-        let backend = CountingBackend {
-            bytes: vec![],
-            etag: None,
-            calls: Arc::clone(&calls),
-            fail: Some(BackendError::NotFound),
-        };
+        let backend = crate::testsupport::MockBackend::counting(vec![], None, Arc::clone(&calls), Some(BackendError::NotFound));
         let mut slots = HashMap::new();
         slots.insert(
             "primary".to_string(),
@@ -2346,12 +2295,7 @@ mod tests {
         // Swap state into a cache whose backend 500s (same dir + clock).
         let state = RwLock::new(std::mem::take(&mut *cache.state.write().await));
         let calls2 = Arc::new(AtomicUsize::new(0));
-        let backend2 = CountingBackend {
-            bytes: b"ignored".to_vec(),
-            etag: None,
-            calls: Arc::clone(&calls2),
-            fail: Some(BackendError::ServerError("boom".into())),
-        };
+        let backend2 = crate::testsupport::MockBackend::counting(b"ignored".to_vec(), None, Arc::clone(&calls2), Some(BackendError::ServerError("boom".into())));
         let mut slots = HashMap::new();
         slots.insert(
             "primary".to_string(),
@@ -2377,12 +2321,7 @@ mod tests {
         let cfg = Arc::new(cfg);
         let clock = Arc::new(MockClock::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
-        let backend = CountingBackend {
-            bytes: b"x".to_vec(),
-            etag: None,
-            calls: Arc::clone(&calls),
-            fail: None,
-        };
+        let backend = crate::testsupport::MockBackend::counting(b"x".to_vec(), None, Arc::clone(&calls), None);
         let mut slots = HashMap::new();
         slots.insert(
             "primary".to_string(),

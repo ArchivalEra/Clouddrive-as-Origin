@@ -4,6 +4,9 @@ use tokio::sync::Semaphore;
 
 use tempfile::tempdir;
 
+// The mock lives in the lib now: one implementation for the whole tree.
+use origin_cache::testsupport::MockBackend as CountingBackend;
+
 use origin_cache::{
     backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, Key, ListEntry, ObjectMeta, StreamSource, StorageBackend},
     cache::cache::{Cache, CacheOutcome},
@@ -14,66 +17,6 @@ use origin_cache::{
     routing::{RouteRule, RouteTable},
 };
 
-/// Test backend: fixed bytes, injectable failures, call counter on open+stat.
-#[derive(Clone)]
-struct CountingBackend {
-    bytes: Vec<u8>,
-    etag: Option<String>,
-    calls: Arc<AtomicUsize>,
-    fail: Option<BackendError>,
-}
-
-#[async_trait::async_trait]
-impl StorageBackend for CountingBackend {
-    async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(e) = &self.fail {
-            return Err(e.clone());
-        }
-        Ok(ObjectMeta {
-            size_bytes: self.bytes.len() as u64,
-            etag: self.etag.clone(),
-            last_modified: None,
-            mime_hint: Some("application/octet-stream".into()),
-        })
-    }
-
-    async fn open(&self, _key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(e) = &self.fail {
-            return Err(e.clone());
-        }
-        let bytes: Vec<u8> = match range {
-            None => self.bytes.clone(),
-            Some(r) => {
-                let start = r.offset as usize;
-                if start > self.bytes.len() {
-                    return Err(BackendError::RangeNotSatisfiable);
-                }
-                match r.length {
-                    None => self.bytes[start..].to_vec(),
-                    Some(len) => {
-                        let end = (start + len as usize).min(self.bytes.len());
-                        self.bytes[start..end].to_vec()
-                    }
-                }
-            }
-        };
-        Ok(StreamSource {
-            stream: Box::new(std::io::Cursor::new(bytes)),
-            // total_len = FULL object length (trait contract), not the slice.
-            total_len: Some(self.bytes.len() as u64),
-        })
-    }
-
-    async fn refresh_if_needed(&self) -> Result<(), BackendError> {
-        Ok(())
-    }
-
-    fn id(&self) -> &str {
-        "test"
-    }
-}
 
 fn test_config(dir: std::path::PathBuf) -> Arc<Config> {
     let mut cfg = Config::default();
@@ -116,12 +59,7 @@ async fn single_flight_20_concurrent_same_key_one_fetch() {
     let cfg = test_config(dir.path().to_path_buf());
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend {
-        bytes: b"payload".to_vec(),
-        etag: Some("v1".into()),
-        calls: Arc::clone(&calls),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"payload".to_vec(), Some("v1".into()), Arc::clone(&calls), None);
     let cache = Arc::new(Cache::new(cfg, Arc::clone(&clock), registry_with(Arc::new(backend))));
 
     let mut handles = Vec::new();
@@ -177,12 +115,7 @@ async fn inactive_ttl_expiry_removes_file_and_meta() {
     let cfg = Arc::new(cfg);
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend {
-        bytes: b"x".to_vec(),
-        etag: None,
-        calls: Arc::clone(&calls),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"x".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, Arc::clone(&clock), registry_with(Arc::new(backend)));
     let mut hit = cache.get("a.png", None).await.unwrap();
     read_body(&mut hit.body).await;
@@ -204,12 +137,7 @@ async fn max_size_evicts_lru_order() {
     let cfg = Arc::new(cfg);
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend {
-        bytes: b"12345".to_vec(),
-        etag: None,
-        calls: Arc::clone(&calls),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"12345".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend)));
     for k in ["a.png", "b.png", "c.png"] {
         let mut hit = cache.get(k, None).await.unwrap();
@@ -301,12 +229,7 @@ async fn revalidation_not_modified_serves_revalidated() {
     let cfg = Arc::new(cfg);
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend {
-        bytes: b"stable".to_vec(),
-        etag: Some("same".into()),
-        calls: Arc::clone(&calls),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"stable".to_vec(), Some("same".into()), Arc::clone(&calls), None);
     let cache = Cache::new(cfg, Arc::clone(&clock), registry_with(Arc::new(backend)));
     let mut hit = cache.get("a.png", None).await.unwrap();
     assert_eq!(hit.outcome, CacheOutcome::Miss);
@@ -324,12 +247,7 @@ async fn traversal_payloads_are_400_via_fetch_error() {
     let cfg = test_config(dir.path().to_path_buf());
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend {
-        bytes: vec![],
-        etag: None,
-        calls: Arc::clone(&calls),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(vec![], None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
     let err = match cache.get("../etc/passwd", None).await {
         Err(e) => e,
@@ -355,12 +273,7 @@ async fn range_on_cached_file_slices_and_reports_content_range() {
     let cfg = test_config(dir.path().to_path_buf());
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend {
-        bytes: b"0123456789".to_vec(),
-        etag: Some("v1".into()),
-        calls: Arc::clone(&calls),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"0123456789".to_vec(), Some("v1".into()), Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
     let mut full = cache.get("a.png", None).await.unwrap();
     read_body(&mut full.body).await;
@@ -384,12 +297,7 @@ async fn range_cold_miss_offset_zero_streams_full_with_content_range() {
     let cfg = test_config(dir.path().to_path_buf());
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend {
-        bytes: b"0123456789".to_vec(),
-        etag: None,
-        calls: Arc::clone(&calls),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"0123456789".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
     let mut hit = cache
         .get("a.png", Some(ByteRange::from_offset(0)))
@@ -407,12 +315,7 @@ async fn range_cold_miss_dual_channel_passthrough_and_background_fill() {
     let cfg = test_config(dir.path().to_path_buf());
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend {
-        bytes: b"0123456789".to_vec(),
-        etag: None,
-        calls: Arc::clone(&calls),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"0123456789".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
 
     // Cold miss seeking to byte 3: client gets bytes 3.. immediately
@@ -443,12 +346,7 @@ async fn unsatisfiable_range_rejected() {
     let cfg = test_config(dir.path().to_path_buf());
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend {
-        bytes: b"short".to_vec(),
-        etag: None,
-        calls: Arc::clone(&calls),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"short".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
     let mut hit = cache.get("a.png", None).await.unwrap();
     read_body(&mut hit.body).await;
@@ -471,12 +369,7 @@ async fn mime_fallback_overrides_octet_stream() {
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
     // CountingBackend always hints application/octet-stream.
-    let backend = CountingBackend {
-        bytes: b"id3".to_vec(),
-        etag: None,
-        calls: Arc::clone(&calls),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"id3".to_vec(), None, Arc::clone(&calls), None);
     let cache = Cache::new(cfg, clock, registry_with(Arc::new(backend)));
     let mut hit = cache.get("music/dazbee.flac", None).await.unwrap();
     read_body(&mut hit.body).await;
@@ -492,12 +385,7 @@ async fn cache_entries_and_access_clock_survive_restart() {
     let cfg = test_config(dir.path().to_path_buf());
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend {
-        bytes: b"persisted".to_vec(),
-        etag: Some("v1".into()),
-        calls: Arc::clone(&calls),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"persisted".to_vec(), Some("v1".into()), Arc::clone(&calls), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
     cache.load_and_start().await;
     let mut hit = cache.get("a.png", None).await.unwrap();
@@ -511,12 +399,7 @@ async fn cache_entries_and_access_clock_survive_restart() {
     // ever contacted (proving the restart hit is served from disk+redb).
     drop(cache);
     let calls2 = Arc::new(AtomicUsize::new(0));
-    let backend2 = CountingBackend {
-        bytes: vec![],
-        etag: None,
-        calls: Arc::clone(&calls2),
-        fail: Some(BackendError::ServerError("must not be contacted".into())),
-    };
+    let backend2 = CountingBackend::counting(vec![], None, Arc::clone(&calls2), Some(BackendError::ServerError("must not be contacted".into())));
     let clock2 = Arc::new(MockClock::new(5000));
     let cache2 = Arc::new(Cache::new(
         test_config(dir.path().to_path_buf()),
@@ -541,12 +424,7 @@ async fn spawned_reaper_expires_entries_without_manual_tick() {
     let dir = tempdir().unwrap();
     let cfg = test_config(dir.path().to_path_buf());
     let clock = Arc::new(MockClock::new(0));
-    let backend = CountingBackend {
-        bytes: b"ttl".to_vec(),
-        etag: Some("v1".into()),
-        calls: Arc::new(AtomicUsize::new(0)),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"ttl".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(
         Arc::clone(&cfg),
         Arc::clone(&clock),
@@ -855,12 +733,7 @@ async fn concurrent_hits_stamp_access_without_state_write_lock() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
     let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
-    let backend = CountingBackend {
-        bytes: payload.clone(),
-        etag: Some("v1".into()),
-        calls: Arc::new(AtomicUsize::new(0)),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(payload.clone(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(
         test_config(dir.path().to_path_buf()),
         Arc::clone(&clock),
@@ -1013,12 +886,7 @@ async fn listing_snapshot_is_reused_then_expires() {
     let cache = Arc::new(Cache::new(
         test_config(dir.path().to_path_buf()),
         Arc::clone(&clock),
-        registry_with(Arc::new(CountingBackend {
-            bytes: b"x".to_vec(),
-            etag: None,
-            calls: Arc::new(AtomicUsize::new(0)),
-            fail: None,
-        })),
+        registry_with(Arc::new(CountingBackend::counting(b"x".to_vec(), None, Arc::new(AtomicUsize::new(0)), None))),
     ));
 
     let entries = vec![
@@ -1060,12 +928,7 @@ async fn entry_count_cap_evicts_lru_even_under_byte_budget() {
     cfg.max_entries = 3; // the count cap is the only active budget
     let cfg = Arc::new(cfg);
 
-    let backend = CountingBackend {
-        bytes: b"tiny".to_vec(),
-        etag: Some("v1".into()),
-        calls: Arc::new(AtomicUsize::new(0)),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"tiny".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
 
     // Fill 5 distinct keys, advancing the clock so recency is ordered.
@@ -1106,12 +969,7 @@ async fn staged_segment_bytes_join_the_disk_budget() {
     cfg.max_size_bytes = 4096; // tiny: staged bytes alone exceed it
     let cfg = Arc::new(cfg);
 
-    let backend = CountingBackend {
-        bytes: b"x".to_vec(),
-        etag: Some("v1".into()),
-        calls: Arc::new(AtomicUsize::new(0)),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
 
     // Simulate staged sidecars whose ledger rows were touched well in the
@@ -1229,12 +1087,7 @@ async fn metadata_loss_rebuilds_rows_from_the_object_tree() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
     let cfg = test_config(dir.path().to_path_buf());
-    let backend = CountingBackend {
-        bytes: b"payload".to_vec(),
-        etag: Some("v1".into()),
-        calls: Arc::new(AtomicUsize::new(0)),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"payload".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
 
     // First cache: store an object normally.
     {
@@ -1276,12 +1129,7 @@ async fn eviction_picks_lru_victims_in_order() {
     cfg.max_entries = 3; // count budget drives the sweep
     let cfg = Arc::new(cfg);
 
-    let backend = CountingBackend {
-        bytes: b"x".to_vec(),
-        etag: Some("v".into()),
-        calls: Arc::new(AtomicUsize::new(0)),
-        fail: None,
-    };
+    let backend = CountingBackend::counting(b"x".to_vec(), Some("v".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
 
     // Five keys, each accessed later than the last, so recency is strict.

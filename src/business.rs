@@ -725,100 +725,26 @@ mod tests {
         clock::MockClock,
     };
 
-    /// Counting backend: fixed bytes per upstream id, call counters on
-    /// stat/open — proves HEAD never opens flights and alias pins upstreams.
-    /// `etag` is interior-mutable (version-flip tests); `opens` records
-    /// every open's (offset, length) for gap-fetch assertions.
-    struct ProbeBackend {
-        id: String,
-        bytes: Vec<u8>,
-        etag: Arc<std::sync::Mutex<Option<String>>>,
-        always_missing: bool,
-        direct: Option<String>,
-        stat_calls: Arc<AtomicUsize>,
-        open_calls: Arc<AtomicUsize>,
-        direct_calls: Arc<AtomicUsize>,
-        opens: Arc<std::sync::Mutex<Vec<(u64, Option<u64>)>>>,
-    }
+    use crate::testsupport::{
+        assert_no_backend_calls, body_text, headers, reset, staged_segments, stray_cache_files,
+        wait_installed, Fixture, FixtureBuilder, DEFAULT_TEST_URI,
+    };
 
-    #[async_trait::async_trait]
-    impl StorageBackend for ProbeBackend {
-        async fn stat(&self, _key: &Key) -> Result<ObjectMeta, BackendError> {
-            self.stat_calls.fetch_add(1, Ordering::SeqCst);
-            if self.always_missing {
-                return Err(BackendError::NotFound);
-            }
-            Ok(ObjectMeta {
-                size_bytes: self.bytes.len() as u64,
-                etag: self.etag.lock().unwrap().clone(),
-                last_modified: Some("Wed, 01 Jan 2025 00:00:00 GMT".into()),
-                mime_hint: Some("application/octet-stream".into()),
-            })
-        }
+    /// The mock's fixed last-modified, as the backend it replaced returned.
+    const FIXTURE_LAST_MODIFIED: &str = "Wed, 01 Jan 2025 00:00:00 GMT";
 
-        async fn open(&self, _key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
-            self.open_calls.fetch_add(1, Ordering::SeqCst);
-            if self.always_missing {
-                return Err(BackendError::NotFound);
-            }
-            if let Some(r) = range {
-                self.opens.lock().unwrap().push((r.offset, r.length));
-            } else {
-                self.opens.lock().unwrap().push((0, None));
-            }
-            let bytes: Vec<u8> = match range {
-                None => self.bytes.clone(),
-                Some(r) => {
-                    let start = r.offset as usize;
-                    if start > self.bytes.len() {
-                        return Err(BackendError::RangeNotSatisfiable);
-                    }
-                    match r.length {
-                        None => self.bytes[start..].to_vec(),
-                        Some(len) => {
-                            let end = (start + len as usize).min(self.bytes.len());
-                            self.bytes[start..end].to_vec()
-                        }
-                    }
-                }
-            };
-            Ok(StreamSource {
-                stream: Box::new(std::io::Cursor::new(bytes)),
-                total_len: Some(self.bytes.len() as u64),
-            })
-        }
-
-        async fn refresh_if_needed(&self) -> Result<(), BackendError> {
-            Ok(())
-        }
-
-        async fn direct_url(&self, _key: &Key, _viewer_ua: Option<&str>) -> Result<DirectUrl, BackendError> {
-            self.direct_calls.fetch_add(1, Ordering::SeqCst);
-            self.direct
-                .clone()
-                .map(|url| DirectUrl { url })
-                .ok_or_else(|| BackendError::Other("no link".into()))
-        }
-
-        fn id(&self) -> &str {
-            &self.id
-        }
-    }
-
-    struct Fixture {
-        _dir: tempfile::TempDir,
-        state: AppState<MockClock>,
-        stat_calls: Arc<AtomicUsize>,
-        open_calls: Arc<AtomicUsize>,
-        direct_calls: Arc<AtomicUsize>,
-        etag: Arc<std::sync::Mutex<Option<String>>>,
-        opens: Arc<std::sync::Mutex<Vec<(u64, Option<u64>)>>>,
+    /// The knobs every fixture shares, set to what the replaced mocks
+    /// returned: an octet-stream hint and a fixed last-modified.
+    fn base(bytes: &[u8]) -> FixtureBuilder {
+        FixtureBuilder::new(bytes)
+            .mime(Some("application/octet-stream"))
+            .last_modified(Some(FIXTURE_LAST_MODIFIED))
     }
 
     /// Single-upstream ("primary") fixture. `extra` adds more upstreams
     /// (used for the bucket-alias test). `missing` makes every key absent.
     fn fixture(bytes: &[u8], etag: Option<&str>, extra: Vec<(&str, Vec<u8>)>, missing: bool) -> Fixture {
-        fixture_full(bytes, etag, extra, missing, None, false)
+        base(bytes).etag(etag).extra(extra).missing(missing).build()
     }
 
     /// Full fixture: `direct` is the Tier 1 link the backend offers
@@ -832,159 +758,24 @@ mod tests {
         direct: Option<&str>,
         redirect: bool,
     ) -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+        let builder = base(bytes).etag(etag).extra(extra).missing(missing).direct(direct);
         if redirect {
-            cfg.upstreams[0].cold_miss = ColdMiss::Redirect;
-        }
-        let stat_calls = Arc::new(AtomicUsize::new(0));
-        let open_calls = Arc::new(AtomicUsize::new(0));
-        let direct_calls = Arc::new(AtomicUsize::new(0));
-        let etag = Arc::new(std::sync::Mutex::new(etag.map(|s| s.into())));
-        let opens = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut slots = HashMap::new();
-        let mk = |id: &str, b: Vec<u8>| ProbeBackend {
-            id: id.into(),
-            bytes: b,
-            etag: Arc::clone(&etag),
-            always_missing: missing,
-            direct: direct.map(|s| s.into()),
-            stat_calls: Arc::clone(&stat_calls),
-            open_calls: Arc::clone(&open_calls),
-            direct_calls: Arc::clone(&direct_calls),
-            opens: Arc::clone(&opens),
-        };
-        slots.insert(
-            "primary".to_string(),
-            Arc::new(BackendSlot::new(Arc::new(mk("primary", bytes.to_vec())), 3)),
-        );
-        for (id, b) in extra {
-            slots.insert(
-                id.to_string(),
-                Arc::new(BackendSlot::new(Arc::new(mk(id, b)), 3)),
-            );
-        }
-        let cache = Arc::new(Cache::new(Arc::new(cfg.clone()), Arc::new(MockClock::new(0)), BackendRegistry::new(slots)));
-        Fixture {
-            _dir: dir,
-            state: AppState { cache, config: Arc::new(cfg), sigv4_config: None },
-            stat_calls,
-            open_calls,
-            direct_calls,
-            etag,
-            opens,
+            builder.redirect().build()
+        } else {
+            builder.build()
         }
     }
 
     /// Efficient-profile fixture: primary serves `cache_profile =
     /// "efficient"` with the given threshold/min_file_size.
     fn fixture_efficient(bytes: &[u8], threshold: f64, min_file_size: u64) -> Fixture {
-        use crate::config::CacheProfile;
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
-        cfg.upstreams[0].cache_profile = "efficient".into();
-        cfg.cache_profiles.insert("efficient".into(), CacheProfile { coverage_threshold: threshold, min_file_size, coverage_window_secs: 3600 });
-        let stat_calls = Arc::new(AtomicUsize::new(0));
-        let open_calls = Arc::new(AtomicUsize::new(0));
-        let direct_calls = Arc::new(AtomicUsize::new(0));
-        let etag = Arc::new(std::sync::Mutex::new(Some("v1".into())));
-        let opens = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let backend = ProbeBackend {
-            id: "primary".into(),
-            bytes: bytes.to_vec(),
-            etag: Arc::clone(&etag),
-            always_missing: false,
-            direct: None,
-            stat_calls: Arc::clone(&stat_calls),
-            open_calls: Arc::clone(&open_calls),
-            direct_calls: Arc::clone(&direct_calls),
-            opens: Arc::clone(&opens),
-        };
-        let mut slots = HashMap::new();
-        slots.insert(
-            "primary".to_string(),
-            Arc::new(BackendSlot::new(Arc::new(backend), 3)),
-        );
-        let cache = Arc::new(Cache::new(Arc::new(cfg.clone()), Arc::new(MockClock::new(0)), BackendRegistry::new(slots)));
-        Fixture {
-            _dir: dir,
-            state: AppState { cache, config: Arc::new(cfg), sigv4_config: None },
-            stat_calls,
-            open_calls,
-            direct_calls,
-            etag,
-            opens,
-        }
+        base(bytes).etag(Some("v1")).coverage(threshold, min_file_size).build()
     }
 
     /// Nocache-profile fixture: primary serves `cache_profile = "nocache"`
     /// (built-in pure water-pipe, zero disk writes).
     fn fixture_nocache(bytes: &[u8]) -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
-        cfg.upstreams[0].cache_profile = "nocache".into();
-        let stat_calls = Arc::new(AtomicUsize::new(0));
-        let open_calls = Arc::new(AtomicUsize::new(0));
-        let direct_calls = Arc::new(AtomicUsize::new(0));
-        let etag = Arc::new(std::sync::Mutex::new(Some("v1".into())));
-        let opens = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let backend = ProbeBackend {
-            id: "primary".into(),
-            bytes: bytes.to_vec(),
-            etag: Arc::clone(&etag),
-            always_missing: false,
-            direct: None,
-            stat_calls: Arc::clone(&stat_calls),
-            open_calls: Arc::clone(&open_calls),
-            direct_calls: Arc::clone(&direct_calls),
-            opens: Arc::clone(&opens),
-        };
-        let mut slots = HashMap::new();
-        slots.insert(
-            "primary".to_string(),
-            Arc::new(BackendSlot::new(Arc::new(backend), 3)),
-        );
-        let cache = Arc::new(Cache::new(Arc::new(cfg.clone()), Arc::new(MockClock::new(0)), BackendRegistry::new(slots)));
-        Fixture {
-            _dir: dir,
-            state: AppState { cache, config: Arc::new(cfg), sigv4_config: None },
-            stat_calls,
-            open_calls,
-            direct_calls,
-            etag,
-            opens,
-        }
-    }
-
-    /// Segment sidecars currently staged for `key` (test introspection).
-    /// Goes through the store rather than re-deriving the filename shape:
-    /// that rule has exactly one owner, and this helper used to be a copy.
-    fn staged_segments(fx: &Fixture, key: &str) -> Vec<(u64, u64)> {
-        crate::cache::store::segments_for_key(&fx.state.config.cache_dir, key)
-            .into_iter()
-            .map(|(start, end, _)| (start, end))
-            .collect()
-    }
-
-    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
-        use axum::http::HeaderName;
-        let mut h = HeaderMap::new();
-        for (k, v) in pairs {
-            h.insert(k.parse::<HeaderName>().unwrap(), v.parse().unwrap());
-        }
-        h
-    }
-
-    /// Test OriginalUri: a plain absolute path (no percent encoding) so
-    /// the sigv4 gate decodes it unchanged.
-    static DEFAULT_TEST_URI: std::sync::LazyLock<axum::http::Uri> =
-        std::sync::LazyLock::new(|| "/a.bin".parse().unwrap());
-
-    async fn body_text(resp: Response) -> (StatusCode, HeaderMap, String) {
-        let (mut parts, body) = resp.into_parts();
-        let bytes = axum::body::to_bytes(body, 64 * 1024 * 1024).await.unwrap();
-        let headers = std::mem::take(&mut parts.headers);
-        (parts.status, headers, String::from_utf8_lossy(&bytes).into_owned())
+        base(bytes).etag(Some("v1")).profile("nocache").build()
     }
 
     /// Prime the cache via GET miss + full drain, then wait for install.
@@ -1001,21 +792,6 @@ mod tests {
         let mut hit = fx.state.cache.get(key, None).await.unwrap();
         crate::cache::flight::drain(&mut hit.body).await.unwrap();
         wait_installed(fx, key).await;
-    }
-
-    async fn wait_installed(fx: &Fixture, key: &str) {
-        for _ in 0..200 {
-            if fx.state.cache.state.read().await.entries.contains_key(key) {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        panic!("entry {key} never installed");
-    }
-
-    fn reset(fx: &Fixture) {
-        fx.stat_calls.store(0, Ordering::SeqCst);
-        fx.open_calls.store(0, Ordering::SeqCst);
     }
 
     #[test]
@@ -1722,17 +1498,6 @@ mod tests {
         assert!(body.contains("<Code>AccessDenied</Code>"), "{body}");
     }
 
-    /// Cache directory contents minus the redb metadata database (which
-    /// exists by design even on nocache nodes — only cache OBJECT writes
-    /// are forbidden).
-    fn stray_cache_files(fx: &Fixture) -> usize {
-        std::fs::read_dir(fx.state.config.cache_dir.clone())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy() != crate::cache::store::META_STORE_FILE)
-            .count()
-    }
-
     /// Nocache full GET: correct bytes, exact stat+open calls, and the
     /// cache directory stays EMPTY (no entry, no segment, no tmp).
     #[tokio::test]
@@ -1818,18 +1583,6 @@ mod tests {
             assert!(body.is_empty(), "HEAD must not carry a body: {what} {body}");
         } else {
             assert!(body.contains("<Code>InvalidRequest</Code>"), "{what} {body}");
-        }
-    }
-
-    /// A rejected key must never reach the provider: no stat, no open, no
-    /// direct backend call.
-    fn assert_no_backend_calls(fx: &Fixture, what: &str) {
-        for (name, n) in [
-            ("stat", fx.stat_calls.load(Ordering::SeqCst)),
-            ("open", fx.open_calls.load(Ordering::SeqCst)),
-            ("direct", fx.direct_calls.load(Ordering::SeqCst)),
-        ] {
-            assert_eq!(n, 0, "{what}: {name} must not be called for a rejected key");
         }
     }
 
@@ -1921,11 +1674,11 @@ mod tests {
     /// turn a legitimate bucket listing into an error.
     #[tokio::test]
     async fn root_router_preserves_v2_and_v1_listing() {
-        use crate::backend::{ListEntry, TestMockBackend};
+        use crate::backend::ListEntry;
         use tower::ServiceExt;
 
         let fx = fixture(b"unused", None, vec![], false);
-        let backend = TestMockBackend::new(b"unused", None, None).with_listing(vec![ListEntry {
+        let backend = crate::testsupport::MockBackend::new(b"unused", None, None).with_listing(vec![ListEntry {
             key: "listed.bin".into(),
             size: 6,
             etag: None,
