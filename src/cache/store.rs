@@ -253,6 +253,17 @@ pub struct Coverage {
     pub upstream_id: String,
 }
 
+/// Ceiling on the intervals one key's ledger may hold. Adjacent staged shards
+/// are deliberately kept apart (each keeps its own read time for window
+/// decay), so a sequential scrub in 1 MiB shards grew this vector with the
+/// request count — and the vector is walked on every staged transfer under
+/// the single process-wide ledger lock.
+///
+/// Generous: a key that reaches this many spans is a key whose promotion is
+/// long past (promotion needs `coverage_threshold` of the object, and a
+/// threshold's worth of spans is far more than this for any real object).
+pub const MAX_INTERVALS_PER_KEY: usize = 4096;
+
 impl Coverage {
     /// Merge `[start, end)` (empty ranges ignored), stamped with the read
     /// time. Overlapping intervals merge and keep the max timestamp;
@@ -291,30 +302,103 @@ impl Coverage {
             self.intervals.drain(lo + 1..hi);
         }
         self.intervals[lo] = (merged_start, merged_end, merged_at);
+        self.compact();
     }
 
-    /// Drop intervals whose last read is older than `window_millis` ago.
-    /// Window expiry only removes ledger counts — the disk sidecars stay
-    /// for the natural sweep.
-    pub fn decay(&mut self, now_millis: u64, window_millis: u64) {
+    /// Keep the vector under [`MAX_INTERVALS_PER_KEY`] — exactly, or not at
+    /// all, because both steps here are lossless-then-conservative:
+    ///
+    /// 1. Merge touching pairs (`[a,b) + [b,c) = [a,c)`, read time = max),
+    ///    which changes no byte count at all — this is what a sequential
+    ///    scrub produces, so it is the step that actually fires.
+    /// 2. If spans with GAPS remain (a scrubber jumping around), merging
+    ///    them would claim coverage of bytes we do not hold, so the coldest
+    ///    spans are dropped instead. Under-reporting coverage is the safe
+    ///    direction: promotion waits for real bytes rather than assembling
+    ///    a gap it cannot fill, and this is the same trade `decay` already
+    ///    makes ("window expiry only removes ledger counts — the disk
+    ///    sidecars stay for the natural sweep").
+    fn compact(&mut self) {
+        while self.intervals.len() > MAX_INTERVALS_PER_KEY {
+            if !self.merge_touching_once() {
+                self.drop_coldest(self.intervals.len() - MAX_INTERVALS_PER_KEY);
+            }
+        }
+    }
+
+    /// One halving pass over touching neighbours. Returns whether anything
+    /// merged, so the caller can tell "no exact merge left" from "still too
+    /// long".
+    fn merge_touching_once(&mut self) -> bool {
+        let mut out: Vec<(u64, u64, u64)> = Vec::with_capacity(self.intervals.len());
+        let mut merged = false;
+        let mut i = 0;
+        while i < self.intervals.len() {
+            let (s, e, t) = self.intervals[i];
+            match self.intervals.get(i + 1).copied() {
+                Some((s2, e2, t2)) if s2 == e => {
+                    out.push((s, e2, t.max(t2)));
+                    merged = true;
+                    i += 2;
+                }
+                _ => {
+                    out.push((s, e, t));
+                    i += 1;
+                }
+            }
+        }
+        self.intervals = out;
+        merged
+    }
+
+    /// Drop the `n` spans with the oldest read time (the ones window decay
+    /// would take first anyway), then restore start order.
+    fn drop_coldest(&mut self, n: usize) {
+        self.intervals.sort_by_key(|(_, _, t)| *t);
+        self.intervals.drain(..n.min(self.intervals.len()));
+        self.intervals.sort_by_key(|(s, _, _)| *s);
+    }
+
+    /// One pass instead of three: drop intervals whose last read is older
+    /// than `window_millis` and return the bytes still covered. Callers used
+    /// to run `decay` and then `covered_bytes`, twice over, on every
+    /// completed transfer while holding the process-wide ledger lock.
+    ///
+    /// Window expiry only removes ledger counts — the disk sidecars stay for
+    /// the natural sweep.
+    pub fn decay_and_covered(&mut self, now_millis: u64, window_millis: u64) -> u64 {
         if window_millis == 0 {
-            return;
+            return self.covered_bytes();
         }
         let cutoff = now_millis.saturating_sub(window_millis);
-        self.intervals.retain(|(_, _, t)| *t >= cutoff);
+        let mut kept = 0usize;
+        let mut covered = 0u64;
+        for i in 0..self.intervals.len() {
+            let (s, e, t) = self.intervals[i];
+            if t >= cutoff {
+                self.intervals[kept] = (s, e, t);
+                kept += 1;
+                covered += e - s;
+            }
+        }
+        self.intervals.truncate(kept);
+        covered
     }
 
     pub fn covered_bytes(&self) -> u64 {
         self.intervals.iter().map(|(s, e, _)| e - s).sum()
     }
 
-    /// Staged fraction of the object, or `None` while the total is unknown
-    /// (never promotes — P2 correctness bar).
-    pub fn ratio(&self) -> Option<f64> {
+    /// Staged fraction of the object for an already-known covered-byte
+    /// count, or `None` while the total is unknown (never promotes — P2
+    /// correctness bar). Taking the count lets a caller that just computed
+    /// it (see [`Coverage::decay_and_covered`]) reuse it instead of walking
+    /// the vector again.
+    pub fn ratio_of(&self, covered_bytes: u64) -> Option<f64> {
         if self.total == 0 {
             return None;
         }
-        Some(self.covered_bytes() as f64 / self.total as f64)
+        Some(covered_bytes as f64 / self.total as f64)
     }
 }
 
@@ -828,17 +912,17 @@ mod tests {
     #[test]
     fn coverage_merges_and_ratios() {
         let mut c = Coverage::default();
-        assert_eq!(c.ratio(), None); // total unknown → never promotes
+        assert_eq!(c.ratio_of(c.covered_bytes()), None); // total unknown → never promotes
         c.total = 100;
         c.add_interval(0, 30, 1000);
         c.add_interval(50, 80, 2000);
         assert_eq!(c.covered_bytes(), 60);
-        assert!((c.ratio().unwrap() - 0.6).abs() < 1e-9);
+        assert!((c.ratio_of(c.covered_bytes()).unwrap() - 0.6).abs() < 1e-9);
         c.add_interval(20, 60, 3000); // bridges the gap (overlap)
         assert_eq!(c.intervals, vec![(0, 80, 3000)]);
         c.add_interval(80, 100, 4000); // adjacent: stays separate (own ts)
         assert_eq!(c.intervals, vec![(0, 80, 3000), (80, 100, 4000)]);
-        assert!((c.ratio().unwrap() - 1.0).abs() < 1e-9);
+        assert!((c.ratio_of(c.covered_bytes()).unwrap() - 1.0).abs() < 1e-9);
         c.add_interval(200, 200, 5000); // empty ignored
         assert_eq!(c.intervals, vec![(0, 80, 3000), (80, 100, 4000)]);
     }
@@ -850,17 +934,76 @@ mod tests {
         c.add_interval(0, 30, 1000);
         c.add_interval(50, 80, 2000);
         // Window 1000ms, now=2500: interval [0,30) read at 1000 is stale.
-        c.decay(2500, 1000);
+        // The one pass reports the surviving coverage, which is what
+        // promotion needs — it used to need a second walk for this.
+        assert_eq!(c.decay_and_covered(2500, 1000), 30);
         assert_eq!(c.intervals, vec![(50, 80, 2000)]);
         assert_eq!(c.covered_bytes(), 30);
-        // Everything stale: ledger empties, ratio 0.
-        c.decay(5000, 1000);
+        // Everything stale: ledger empties, coverage 0.
+        assert_eq!(c.decay_and_covered(5000, 1000), 0);
         assert!(c.intervals.is_empty());
         assert_eq!(c.covered_bytes(), 0);
-        // Zero window = no decay.
+        // Zero window = no decay, but coverage is still reported.
         c.add_interval(0, 10, 100);
-        c.decay(999999, 0);
+        assert_eq!(c.decay_and_covered(999999, 0), 10);
         assert_eq!(c.intervals.len(), 1);
+    }
+
+    /// A sequential scrub stages adjacent shards, which stay separate on
+    /// purpose (each keeps its own read time) — so the vector grew with the
+    /// request count and was walked under the one process-wide ledger lock.
+    /// Compaction must bound it WITHOUT changing a byte of coverage: the
+    /// spans here are contiguous, so merging them is exact.
+    #[test]
+    fn a_sequential_walk_is_bounded_and_loses_no_coverage() {
+        let mut c = Coverage::default();
+        const SHARD: u64 = 16;
+        let shards = (MAX_INTERVALS_PER_KEY as u64) + 500;
+        // The whole object is the walk, so full coverage is the expectation.
+        c.total = shards * SHARD;
+        for i in 0..shards {
+            // Contiguous 16-byte shards, each read at its own time.
+            c.add_interval(i * SHARD, (i + 1) * SHARD, i);
+        }
+        assert!(
+            c.intervals.len() <= MAX_INTERVALS_PER_KEY,
+            "the ledger must stay under its ceiling, got {}",
+            c.intervals.len()
+        );
+        assert_eq!(
+            c.covered_bytes(),
+            shards * SHARD,
+            "compaction must not lose (or invent) coverage"
+        );
+        assert!(
+            c.intervals.windows(2).all(|w| w[0].1 <= w[1].0),
+            "still sorted and non-overlapping"
+        );
+        assert_eq!(c.ratio_of(c.covered_bytes()), Some(1.0));
+    }
+
+    /// With gaps between the spans there is nothing exact left to merge:
+    /// merging across a gap would claim bytes we do not hold, so the coldest
+    /// spans are dropped. Under-reporting coverage is the safe direction —
+    /// promotion waits rather than assembling a gap it cannot fill.
+    #[test]
+    fn a_gapped_ledger_is_bounded_by_dropping_the_coldest_spans() {
+        let mut c = Coverage::default();
+        c.total = 1_000_000;
+        let n = MAX_INTERVALS_PER_KEY + 100;
+        for i in 0..n as u64 {
+            c.add_interval(i * 100, i * 100 + 10, i); // 10 read, 90 gap
+        }
+        assert!(c.intervals.len() <= MAX_INTERVALS_PER_KEY);
+        let covered = c.covered_bytes();
+        assert!(covered <= n as u64 * 10, "coverage may only be under-reported");
+        assert!(
+            c.intervals.windows(2).all(|w| w[0].1 <= w[1].0),
+            "still sorted and non-overlapping"
+        );
+        // The surviving spans are the most recently read ones.
+        let last = c.intervals.last().unwrap();
+        assert_eq!((last.0, last.1), ((n as u64 - 1) * 100, (n as u64 - 1) * 100 + 10));
     }
 
     #[test]

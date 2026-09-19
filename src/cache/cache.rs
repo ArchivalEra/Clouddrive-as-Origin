@@ -982,7 +982,13 @@ impl<C: Clock + Clone> Cache<C> {
                                 bytes: size,
                                 now_millis: now,
                             };
-                            finalize_coverage(&coverage, &state, span, window_millis_for(&config, &upstream_id)).await;
+                            let covered = finalize_coverage(
+                                &coverage,
+                                &state,
+                                span,
+                                window_millis_for(&config, &upstream_id),
+                            )
+                            .await;
                             maybe_promote(
                                 &coverage,
                                 &config,
@@ -994,6 +1000,7 @@ impl<C: Clock + Clone> Cache<C> {
                                 &cache_key,
                                 &upstream_id,
                                 now,
+                                covered,
                             )
                             .await;
                             return;
@@ -1046,7 +1053,8 @@ impl<C: Clock + Clone> Cache<C> {
                     bytes: written,
                     now_millis: now,
                 };
-                finalize_coverage(&coverage, &state, span, window_millis_for(&config, &upstream_id)).await;
+                let covered =
+                    finalize_coverage(&coverage, &state, span, window_millis_for(&config, &upstream_id)).await;
                 // Coverage-triggered promotion (P2-b): threshold met →
                 // background assemble + seal. Fire-and-forget by design.
                 maybe_promote(
@@ -1060,6 +1068,7 @@ impl<C: Clock + Clone> Cache<C> {
                     &cache_key,
                     &upstream_id,
                     now,
+                    covered,
                 )
                 .await;
             } else if file.is_some() {
@@ -1703,8 +1712,8 @@ async fn finalize_coverage(
     state: &Arc<RwLock<CacheState>>,
     span: FinalizedSpan,
     window_millis: u64,
-) {
-    {
+) -> u64 {
+    let covered = {
         let mut cov = coverage.lock().await;
         let entry = cov.entry(span.key.clone()).or_default();
         let version_changed = match (&entry.etag, &span.etag) {
@@ -1731,13 +1740,13 @@ async fn finalize_coverage(
         }
         entry.add_interval(span.start, span.end, span.now_millis);
         entry.last_touch_millis = span.now_millis;
-        // Window decay: drop intervals whose last read is
-        // older than the coverage window, so stale staged bytes stop
-        // counting toward promotion. Disk sidecars stay for the sweep.
-        if window_millis > 0 {
-            entry.decay(span.now_millis, window_millis);
-        }
-    }
+        // Window decay: drop intervals whose last read is older than the
+        // coverage window, so stale staged bytes stop counting toward
+        // promotion. Disk sidecars stay for the sweep. One pass returns the
+        // surviving coverage, which is what the promotion check needs —
+        // it used to walk the same vector twice more.
+        entry.decay_and_covered(span.now_millis, window_millis)
+    };
     let meta = store::SegMeta {
         etag: span.etag.clone(),
         total: span.total,
@@ -1748,6 +1757,7 @@ async fn finalize_coverage(
         let _ = tokio::fs::write(store::segmeta_path(&span.cache_dir, &span.key), b).await;
     }
     state.write().await.segment_bytes += span.bytes;
+    covered
 }
 
 /// Full history reset for one key: drop staged files + version marker +
@@ -1788,28 +1798,25 @@ async fn maybe_promote(
     key: &str,
     upstream_id: &str,
     now_millis: u64,
+    covered_bytes: u64,
 ) {
     let prof = config.cache_profile(upstream_id);
     if !prof.efficient {
         return;
     }
     let ready = {
-        let mut cov = coverage.lock().await;
-        // Window decay backstop: a key with no recent
-        // writes must not promote on stale intervals.
-        if let Some(entry) = cov.get_mut(key) {
-            let window_ms = prof.coverage_window_secs * 1000;
-            if window_ms > 0 {
-                entry.decay(now_millis, window_ms);
-            }
-        }
+        let cov = coverage.lock().await;
         let c = cov.get(key);
         // Ratio met AND the object can be kept: assembling something larger
         // than the whole budget would consume the staged segments and hand
         // the magazine an entry it must immediately eject -- the merge would
         // destroy warmth it could have kept as segments.
+        //
+        // `covered_bytes` comes from the caller's decay pass, which ran
+        // immediately before this with the same window and the same clock —
+        // a second decay here would walk the same vector for nothing.
         let fits = c.is_some_and(|c| c.total > 0 && c.total <= config.max_size_bytes);
-        let ready = c.and_then(|c| c.ratio()).is_some_and(|r| r >= prof.coverage_threshold) && fits;
+        let ready = c.and_then(|c| c.ratio_of(covered_bytes)).is_some_and(|r| r >= prof.coverage_threshold) && fits;
         ready
     };
     if !ready {
