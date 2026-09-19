@@ -73,6 +73,33 @@ mod tests {
         assert!(!m.is_negative(6000));
     }
 
+    /// A row written before `hold_until_millis` existed must still load. The
+    /// field is `#[serde(default)]` for exactly this reason: the store is
+    /// deserialized at every start, and a missing key would fail the load --
+    /// losing every row and rebuilding from the object tree on the first start
+    /// after an upgrade. The JSON here is the pre-hold shape.
+    #[test]
+    fn a_row_written_before_the_hold_field_still_loads() {
+        let old = r#"{
+            "version": 1,
+            "upstream_id": "primary",
+            "key": "a.png",
+            "size_bytes": 10,
+            "etag": "v1",
+            "last_modified": null,
+            "content_type": null,
+            "created_at_millis": 1000,
+            "last_access_millis": 2000,
+            "last_revalidated_millis": null,
+            "negative_until_millis": null
+        }"#;
+        let m: EntryMeta = serde_json::from_str(old).expect("a pre-hold row must deserialize");
+        assert_eq!(m.hold_until_millis, 0, "an absent hold means no hold");
+        assert!(!m.is_held(0));
+        assert!(!m.is_held(u64::MAX), "0 is never a live hold");
+        assert_eq!(m.eligible_at(1200), 2000 + 1200 * 1000, "TTL rules unchanged");
+    }
+
     #[test]
     fn eligible_at_is_last_access_plus_ttl() {
         let m = EntryMeta {
