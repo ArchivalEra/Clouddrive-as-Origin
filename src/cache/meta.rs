@@ -26,6 +26,18 @@ pub struct EntryMeta {
     /// fail to deserialize on the first start after an upgrade.
     #[serde(default)]
     pub hold_until_millis: u64,
+    /// This entry was admitted KNOWING it is larger than the whole magazine
+    /// budget. Such an entry cannot be brought into budget by evicting
+    /// anyone — its own size is the overshoot — so the byte budget neither
+    /// counts it nor evicts it: it leaves on the inactivity clock, or when
+    /// the disk itself runs short.
+    ///
+    /// Recorded at admission rather than inferred from
+    /// `size_bytes > max_size_bytes` at eviction time: an operator lowering
+    /// `max_size_bytes` must not turn every existing row into an immortal
+    /// one, which is exactly what inference would do.
+    #[serde(default)]
+    pub oversize: bool,
 }
 
 impl EntryMeta {
@@ -67,6 +79,7 @@ mod tests {
             last_revalidated_millis: None,
             negative_until_millis: Some(5000),
             hold_until_millis: 0,
+            oversize: false,
         };
         assert!(m.is_negative(4999));
         assert!(!m.is_negative(5000));
@@ -95,6 +108,7 @@ mod tests {
         }"#;
         let m: EntryMeta = serde_json::from_str(old).expect("a pre-hold row must deserialize");
         assert_eq!(m.hold_until_millis, 0, "an absent hold means no hold");
+        assert!(!m.oversize, "an absent oversize flag means the magazine governs the row");
         assert!(!m.is_held(0));
         assert!(!m.is_held(u64::MAX), "0 is never a live hold");
         assert_eq!(m.eligible_at(1200), 2000 + 1200 * 1000, "TTL rules unchanged");
@@ -115,6 +129,7 @@ mod tests {
             last_revalidated_millis: None,
             negative_until_millis: None,
             hold_until_millis: 0,
+            oversize: false,
         };
         assert_eq!(m.eligible_at(1200), 1000 + 1200 * 1000);
     }

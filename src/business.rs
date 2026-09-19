@@ -488,7 +488,8 @@ where
     // when a node misbehaves) — read through the Cache snapshot, not the
     // internals (C4).
     let snap = state.cache.snapshot().await;
-    let (count, bytes, segment_bytes) = (snap.entries, snap.total_bytes, snap.segment_bytes);
+    let (count, bytes, segment_bytes, stray_bytes) =
+        (snap.entries, snap.total_bytes, snap.segment_bytes, snap.stray_bytes);
     let flights = snap.flights_active;
     let promotions = snap.promotions_active;
     let dirty_access = snap.dirty_access_pending;
@@ -544,6 +545,7 @@ where
             "entries": count,
             "bytes": bytes,
             "segment_bytes": segment_bytes,
+            "stray_bytes": stray_bytes,
             "flights_active": flights,
             "promotions_active": promotions,
             "dirty_access_flushes": dirty_access,
@@ -1428,14 +1430,14 @@ mod tests {
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
     }
 
-    /// A staged object the magazine could never keep is not promoted.
-    /// Assembling it would consume the staged segments and hand the cache an
-    /// entry it must eject on the next tick -- destroying warmth it could have
-    /// kept as segments. Coverage is satisfied; only the byte budget says no.
+    /// Staging admission (ADR-0013): an object the magazine cannot hold is
+    /// never staged. Staged segments have exactly one reader — promotion —
+    /// and promotion's fit guard refuses this object, so staging it would
+    /// write bytes nobody can ever read back on every single seek. It is
+    /// served by the pipe instead, and its bytes are still correct.
     #[tokio::test]
-    async fn an_object_larger_than_the_cache_is_never_promoted() {
+    async fn an_object_larger_than_the_cache_is_never_staged() {
         let bytes: Vec<u8> = (0..100u8).collect();
-        // Full coverage in one read, against a 50-byte budget.
         let fx = base(&bytes).etag(Some("v1")).coverage(0.8, 4).max_size_bytes(50).build();
         let resp = get_key(
             State(fx.state.clone()),
@@ -1445,13 +1447,27 @@ mod tests {
             OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
-        body_text(resp).await;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (status, h, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body.len(), 100, "the viewer still gets every byte asked for");
+        assert_eq!(h.get("content-range").unwrap(), "bytes 0-99/100");
         assert!(
             !fx.state.cache.state.read().await.entries.contains_key("f.bin"),
-            "an object bigger than the whole budget must stay staged, never merged"
+            "an object bigger than the whole budget is never merged into an entry"
         );
-        assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 100)], "and its segments survive");
+        assert!(
+            staged_segments(&fx, "f.bin").is_empty(),
+            "and it is never staged: nothing could ever read those bytes back"
+        );
+        assert_eq!(
+            fx.state.cache.state.read().await.segment_bytes,
+            0,
+            "no staged bytes are accounted"
+        );
+        assert!(
+            fx.state.cache.coverage.lock().await.is_empty(),
+            "and no ledger row is created for it"
+        );
     }
 
     /// Window decay: staged intervals older than the coverage
