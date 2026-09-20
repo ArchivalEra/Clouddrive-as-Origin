@@ -136,6 +136,19 @@ pub enum EvictionPolicy {
     Heat,
 }
 
+/// One staged-read run fetches this much (ADR-0016).
+///
+/// Measured: an upstream `open` costs a fixed ~640 ms whatever the range
+/// length, and the node pulls ~63 MB/s from the provider, so 64 MiB is about
+/// a second of transfer. EdgeOne's sharded origin-pull asks for ascending
+/// 1 MiB shards, so a shard's offset is normally behind the run's watermark by
+/// the time it is requested (measured wait ~ 0): the window has to exceed the
+/// reader's appetite, not the object. Larger = fewer opens and more disk
+/// churn per window.
+fn default_session_window_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
 fn default_backend_type() -> String {
     "openlist".into()
 }
@@ -233,6 +246,9 @@ pub struct RawConfig {
     /// Magazine eviction policy for staged spans. Default `lru`.
     #[serde(default)]
     pub eviction_policy: EvictionPolicy,
+    /// How much one staged-read run fetches (ADR-0016). Default 64 MiB.
+    #[serde(default = "default_session_window_bytes")]
+    pub session_window_bytes: u64,
 
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
@@ -287,6 +303,9 @@ pub struct Config {
     pub negative_ttl_secs: u64,
     /// How staged spans are ejected when the budget overshoots (ADR-0015).
     pub eviction_policy: EvictionPolicy,
+    /// Bytes one staged-read run fetches (ADR-0016): one upstream `open` per
+    /// window, shared by every reader inside it.
+    pub session_window_bytes: u64,
     pub concurrency_per_upstream: usize,
     pub retry_max_attempts: u32,
     pub retry_base_ms: u64,
@@ -472,6 +491,7 @@ impl Config {
             revalidate_ttl_secs: raw.revalidate_ttl_secs,
             negative_ttl_secs: raw.negative_ttl_secs,
             eviction_policy: raw.eviction_policy,
+            session_window_bytes: raw.session_window_bytes,
             concurrency_per_upstream: raw.concurrency_per_upstream,
             retry_max_attempts: raw.retry_max_attempts,
             retry_base_ms: raw.retry_base_ms,
@@ -504,6 +524,7 @@ impl Default for Config {
             revalidate_ttl_secs: default_revalidate_ttl(),
             negative_ttl_secs: default_negative_ttl(),
             eviction_policy: EvictionPolicy::default(),
+            session_window_bytes: default_session_window_bytes(),
             concurrency_per_upstream: default_concurrency(),
             retry_max_attempts: default_retry_max(),
             retry_base_ms: default_retry_base(),

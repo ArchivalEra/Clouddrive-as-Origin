@@ -92,6 +92,31 @@ pub static BODY_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register cache_body_bytes_total")
 });
 
+/// Staged-read runs by outcome (ADR-0016). One run is one upstream `open`
+/// covering a whole window, shared by however many readers fall inside it, so
+/// this counter divided by `backend_call_duration_seconds_count{op="open"}`
+/// is the shaping account: how many requests each paid open bought.
+pub static SESSION: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cache_session_total",
+        "staged-read runs by outcome",
+        &["outcome"]
+    )
+    .expect("register cache_session_total")
+});
+
+/// How each ranged request was served: `attached` (rode a live run's
+/// watermark, no upstream open and no stream permit) or `standalone` (opened
+/// its own exact Range — no admission, a far seek, or a run already starting).
+pub static SESSION_READER: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cache_session_reader_total",
+        "ranged requests by how the run served them",
+        &["result"]
+    )
+    .expect("register cache_session_reader_total")
+});
+
 /// Observe one backend call. The closure runs the actual call; we time
 /// around it so callers stay one-line.
 pub async fn observe_backend<T, F, Fut>(op: &'static str, f: F) -> T
@@ -129,6 +154,16 @@ pub fn observe_body_ttfb(source: &str, start: Instant) {
 /// Record bytes delivered to a viewer.
 pub fn observe_body_bytes(source: &str, bytes: u64) {
     BODY_BYTES.with_label_values(&[source]).inc_by(bytes);
+}
+
+/// Record one staged-read run's outcome.
+pub fn observe_session(outcome: &str) {
+    SESSION.with_label_values(&[outcome]).inc();
+}
+
+/// Record how one ranged request was served by the run machinery.
+pub fn observe_session_reader(result: &str) {
+    SESSION_READER.with_label_values(&[result]).inc();
 }
 
 #[cfg(test)]
@@ -172,6 +207,18 @@ mod tests {
     }
 
     /// The body metrics exist and carry only the closed source label set.
+    #[test]
+    fn session_metrics_are_exposed() {
+        observe_session("sealed");
+        observe_session_reader("attached");
+        let text = prometheus::gather()
+            .iter()
+            .map(|f| f.get_name().to_string() + "\n")
+            .collect::<String>();
+        assert!(text.contains("cache_session_total"), "{text}");
+        assert!(text.contains("cache_session_reader_total"), "{text}");
+    }
+
     #[test]
     fn body_metrics_are_exposed_by_source() {
         observe_source("disk");

@@ -442,6 +442,17 @@ pub(crate) fn plan_staged(
 /// Serve the planned pieces straight from the sidecar files. No upstream, no
 /// stream gate, no magazine admission: a read touches nothing.
 pub(crate) fn staged_body(pieces: Vec<(std::path::PathBuf, u64, u64)>) -> BodyStream {
+    pieces_then(pieces, Box::pin(futures::stream::empty()))
+}
+
+/// A response's staged head followed by a tail from another source — the
+/// served spans first, then whatever produces the rest (a run's watermark, or
+/// nothing at all for a fully covered range). One shape for both, so the
+/// "short sidecar" failure below cannot be lost in a copy.
+pub(crate) fn pieces_then(
+    pieces: Vec<(std::path::PathBuf, u64, u64)>,
+    mut tail: BodyStream,
+) -> BodyStream {
     Box::pin(async_stream::try_stream! {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         for (path, off, len) in pieces {
@@ -463,6 +474,9 @@ pub(crate) fn staged_body(pieces: Vec<(std::path::PathBuf, u64, u64)>) -> BodySt
                 remaining -= n as u64;
                 yield buf.freeze();
             }
+        }
+        while let Some(chunk) = futures::StreamExt::next(&mut tail).await {
+            yield chunk?;
         }
     })
 }

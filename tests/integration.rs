@@ -871,10 +871,20 @@ async fn efficient_passthrough_waits_for_a_stream_permit() {
 
     let mut body = plan.body;
     assert_eq!(collect(&mut body).await, vec![7u8; 64]);
+    // The permit belongs to the RUN, not to this response (ADR-0016): it is
+    // held while the run's window transfers — which is what lets one open serve
+    // every request inside that window — and released when the window ends,
+    // possibly after this body is already consumed. So poll rather than sample.
+    for _ in 0..400 {
+        if slot.stream_gate.available_permits() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     assert_eq!(
         slot.stream_gate.available_permits(),
         2,
-        "consuming the body releases the stream permit"
+        "the run releases its window's permit when the window is done"
     );
 }
 
@@ -1019,6 +1029,198 @@ async fn staged_segment_bytes_join_the_disk_budget() {
     );
     assert!(cov.is_empty(), "evicted ledger rows must be dropped");
     assert!(paths.iter().all(|p| !p.exists()), "the evicted sidecar files must be gone");
+}
+
+// ---------------------------------------------------------------------------
+// Staged-read runs (ADR-0016): one upstream stream per key, shared by every
+// reader inside its window.
+// ---------------------------------------------------------------------------
+
+/// An efficient-profile cache with a small window over a paced synthetic
+/// object. Returns the upstream open counter the fake keeps.
+fn run_fixture(
+    dir: &std::path::Path,
+    object_bytes: u64,
+    window: u64,
+    pace_ms: u64,
+) -> (Arc<Cache<MockClock>>, Arc<AtomicUsize>) {
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config {
+        cache_dir: dir.to_path_buf(),
+        ..Config::default()
+    };
+    cfg.upstreams[0].cache_profile = "efficient".into();
+    cfg.cache_profiles.insert(
+        "efficient".into(),
+        origin_cache::config::CacheProfile { min_file_size: 1, coverage_window_secs: 3600 },
+    );
+    cfg.session_window_bytes = window;
+    cfg.max_size_bytes = 64 * 1024 * 1024;
+    let cfg = Arc::new(cfg);
+    let opens = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(
+        SizedBackend::new(&[("a.bin", object_bytes)], Arc::clone(&opens))
+            .paced(1024, std::time::Duration::from_millis(pace_ms)),
+    );
+    let mut slots = HashMap::new();
+    slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
+    let cache = Arc::new(Cache::new(cfg, clock, BackendRegistry::new(slots)));
+    (cache, opens)
+}
+
+/// Bytes of the synthetic object (`byte = offset % 251`), so a body can be
+/// checked without materializing the object.
+fn synthetic(offset: u64, len: u64) -> Vec<u8> {
+    (offset..offset + len).map(|i| (i % 251) as u8).collect()
+}
+
+/// One ranged GET, returning the plan and asserting it streamed.
+async fn get_range(cache: &Arc<Cache<MockClock>>, offset: u64, len: u64) -> origin_cache::cache::cache::StreamPlan {
+    use origin_cache::cache::cache::ServeOutcome;
+    let rk = cache.resolve("a.bin").unwrap();
+    match cache.serve(&rk, Some(ByteRange::bounded(offset, len)), None).await.unwrap() {
+        ServeOutcome::Stream(p) => p,
+        _ => panic!("expected a streamed passthrough from a ranged efficient miss"),
+    }
+}
+
+/// Wait until the key has exactly `bytes` staged (the seal lands after the
+/// body's last byte, so staged state is polled, never sampled).
+async fn wait_staged(cache: &Arc<Cache<MockClock>>, bytes: u64) {
+    for _ in 0..400 {
+        if cache.state.read().await.segment_bytes == bytes {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!(
+        "segment_bytes never became {bytes}; got {}",
+        cache.state.read().await.segment_bytes
+    );
+}
+
+/// The headline of ADR-0016: seeks that land inside a live run's window ride
+/// its watermark instead of opening upstream. Three requests, ONE open — the
+/// per-request open cost (~640 ms measured) is what this removes from a scrub.
+#[tokio::test]
+async fn ranged_seeks_on_one_key_share_one_upstream_open() {
+    let dir = tempdir().unwrap();
+    // 1 MiB object, 8 KiB window, body paced so the run is still live while
+    // the later seeks arrive — the overlap this mechanism exists for.
+    let (cache, opens) = run_fixture(dir.path(), 1 << 20, 8192, 10);
+
+    for offset in [0u64, 2048, 4096] {
+        let plan = get_range(&cache, offset, 1024).await;
+        assert_eq!(
+            plan.source,
+            origin_cache::cache::cache::BodySource::Stage,
+            "a run-served response reads staged bytes, not a fresh upstream stream"
+        );
+        let mut body = plan.body;
+        assert_eq!(collect(&mut body).await, synthetic(offset, 1024), "seek at {offset}");
+    }
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        1,
+        "three seeks inside one window must share one upstream open"
+    );
+}
+
+/// A seek the live run does not cover is the escape the design pins: it opens
+/// its own exact Range instead of waiting on somebody else's window, and both
+/// bodies are byte-exact.
+#[tokio::test]
+async fn a_seek_far_beyond_the_window_opens_its_own_range() {
+    let dir = tempdir().unwrap();
+    let (cache, opens) = run_fixture(dir.path(), 1 << 20, 8192, 10);
+
+    for offset in [0u64, 65536] {
+        let plan = get_range(&cache, offset, 1024).await;
+        let mut body = plan.body;
+        assert_eq!(collect(&mut body).await, synthetic(offset, 1024));
+    }
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        2,
+        "a far seek takes its own Range rather than riding the window"
+    );
+}
+
+/// Once a run has sealed, its window is a normal staged span: a later read
+/// inside it is served from disk with no upstream open and no run.
+#[tokio::test]
+async fn a_sealed_run_leaves_spans_that_serve_later_reads() {
+    let dir = tempdir().unwrap();
+    let (cache, opens) = run_fixture(dir.path(), 1 << 20, 8192, 10);
+
+    let plan = get_range(&cache, 0, 1024).await;
+    let mut body = plan.body;
+    assert_eq!(collect(&mut body).await, synthetic(0, 1024));
+    wait_staged(&cache, 8192).await;
+
+    // The next read sits inside the sealed window.
+    let plan = get_range(&cache, 1024, 1024).await;
+    assert_eq!(plan.source, origin_cache::cache::cache::BodySource::Stage);
+    let mut body = plan.body;
+    assert_eq!(collect(&mut body).await, synthetic(1024, 1024));
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        1,
+        "the sealed span answers the later read without touching upstream"
+    );
+}
+
+/// A window per open, across a walk: four windows of a 32 KiB object are four
+/// opens, not one per request (which is what a shard walk used to cost).
+#[tokio::test]
+async fn a_sequential_walk_opens_once_per_window() {
+    let dir = tempdir().unwrap();
+    let (cache, opens) = run_fixture(dir.path(), 32 * 1024, 8192, 0);
+
+    for i in 0..4u64 {
+        let offset = i * 8192;
+        let plan = get_range(&cache, offset, 1024).await;
+        let mut body = plan.body;
+        assert_eq!(collect(&mut body).await, synthetic(offset, 1024));
+    }
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        4,
+        "one open per window, not one per request"
+    );
+}
+
+/// The run's own failure reaches its readers instead of parking them: a body
+/// that already promised bytes fails rather than hanging (the flight's
+/// contract, inherited).
+#[tokio::test]
+async fn a_run_that_cannot_open_errors_its_reader_instead_of_hanging() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ..Config::default()
+    };
+    cfg.upstreams[0].cache_profile = "efficient".into();
+    cfg.cache_profiles.insert(
+        "efficient".into(),
+        origin_cache::config::CacheProfile { min_file_size: 1, coverage_window_secs: 3600 },
+    );
+    cfg.session_window_bytes = 8192;
+    let cfg = Arc::new(cfg);
+    let backend = Arc::new(StormBackend::new(
+        b"payload",
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(std::sync::Mutex::new(StormMode::FailOpen)),
+    ));
+    let mut slots = HashMap::new();
+    slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
+    let cache = Arc::new(Cache::new(cfg, clock, BackendRegistry::new(slots)));
+
+    let plan = get_range(&cache, 0, 1024).await;
+    let (bytes, errored) = collect_allow_error(plan.body).await;
+    assert!(bytes.is_empty(), "no bytes can come from a failed open");
+    assert!(errored, "the reader must see the failure, not wait forever");
 }
 
 /// The evictor takes its candidates from DISK and re-derives the row from the
