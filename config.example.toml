@@ -44,6 +44,13 @@ negative_ttl_secs = 60            # spec §3.6
 # objects larger than max_size_bytes.
 eviction_policy = "lru"
 
+# Bytes one staged-read run fetches (ADR-0016). One upstream open per window,
+# shared by every reader inside it: a viewer's shard walk rides the watermark
+# instead of opening per request (~640 ms each). Measured 63 MB/s from the
+# provider, so 64 MiB is about a second of transfer; larger means fewer opens
+# and more disk churn per window.
+session_window_bytes = 67108864    # 64 MiB
+
 # --- per-upstream throttling ---
 concurrency_per_upstream = 3
 retry_max_attempts = 4

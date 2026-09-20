@@ -7,6 +7,7 @@ use crate::{
         flight::{self, BodyStream, FlightProgress, FlightShared},
         magazine::{self, Magazine},
         meta::EntryMeta,
+        session::{self, Sessions},
         staging::{self, FinalizedSpan, Staging},
         store,
     },
@@ -372,6 +373,13 @@ pub struct CacheSnapshot {
 /// operator view (snapshot). The pub fields below are the machinery's
 /// working state — consumed by tests; production code goes through the
 /// methods, never through them.
+/// How often the session chain is evaluated (ADR-0016). Sub-second because
+/// the decision is only useful while a reader is still inside the sealed
+/// window: at the measured 63 MB/s a 64 MiB window is ~1 s of transfer, so a
+/// quarter of that leaves room to start the successor before the reader
+/// reaches the boundary.
+const SESSION_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub struct Cache<C: Clock> {
     pub config: Arc<Config>,
     pub clock: Arc<C>,
@@ -397,6 +405,10 @@ pub struct Cache<C: Clock> {
     /// The magazine: every byte-budget decision (admission, eviction,
     /// pressure reclaim, install, delete) lives behind this receiver.
     pub(crate) magazine: Magazine,
+    /// Staged-read runs (ADR-0016): one upstream stream per key, shared by
+    /// every reader inside its window. Public because the serve path and the
+    /// tests both drive it; the module owns the invariants.
+    pub(crate) sessions: Arc<Sessions<C>>,
     /// The staging ledger: the efficient profile's transfer history,
     /// promotion and assembly, behind this receiver.
     pub(crate) staging: Staging,
@@ -416,7 +428,7 @@ pub(crate) struct StatData {
     meta: ObjectMeta,
 }
 
-impl<C: Clock + Clone> Cache<C> {
+impl<C: Clock + Clone + 'static> Cache<C> {
     pub fn new(config: Arc<Config>, clock: Arc<C>, backends: BackendRegistry) -> Self {
         let routes = config.routes.clone();
         let meta = Arc::new(crate::cache::persist::MetaStore::open(&config.cache_dir.join(store::META_STORE_FILE)).expect("open redb metadata store"));
@@ -429,6 +441,13 @@ impl<C: Clock + Clone> Cache<C> {
             Arc::clone(&state),
             Arc::clone(&config),
         );
+        let flights = crate::cache::flight::Flights::new(crate::cache::flight::DEFAULT_STALL_BUDGET);
+        let sessions = Arc::new(Sessions::new(
+            Arc::clone(&config),
+            Arc::clone(&clock),
+            staging.clone(),
+            flights.clone(),
+        ));
         Self {
             config,
             clock,
@@ -436,9 +455,10 @@ impl<C: Clock + Clone> Cache<C> {
             state,
             meta,
             dirty_access,
-            flights: crate::cache::flight::Flights::new(crate::cache::flight::DEFAULT_STALL_BUDGET),
+            flights,
             coverage,
             staging,
+            sessions,
             reval_inflight: Inflight::new(),
             rebuilt_rows: std::sync::atomic::AtomicUsize::new(0),
             prewarm_inflight: std::sync::atomic::AtomicUsize::new(0),
@@ -593,6 +613,19 @@ impl<C: Clock + Clone> Cache<C> {
                 if let Err(e) = meta.bump_last_access_batch(&batch).await {
                     tracing::warn!(error = %e, "access-clock flush failed");
                 }
+            }
+        });
+
+        // Session ticker: the chain decision (ADR-0016) has to run while a
+        // reader is still consuming a sealed window — a sub-second window of
+        // opportunity that the reaper's 60 s spacing is far too coarse for.
+        // Cheap: a map scan and a few counter loads per run.
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SESSION_TICK_INTERVAL);
+            loop {
+                tick.tick().await;
+                this.sessions.tick().await;
             }
         });
 
@@ -950,7 +983,7 @@ impl<C: Clock + Clone> Cache<C> {
     /// min_file_size`) and every failure fall back to the B path in the
     /// caller — this method never serves from disk.
     pub async fn serve_passthrough(
-        &self,
+        self: &Arc<Self>,
         rk: &ResolvedKey,
         range: Option<crate::backend::ByteRange>,
         min_file_size: u64,
@@ -965,7 +998,7 @@ impl<C: Clock + Clone> Cache<C> {
     }
 
     async fn serve_passthrough_inner(
-        &self,
+        self: &Arc<Self>,
         rk: &ResolvedKey,
         range: Option<crate::backend::ByteRange>,
         min_file_size: u64,
@@ -1057,12 +1090,19 @@ impl<C: Clock + Clone> Cache<C> {
         // stream is a disk write like any other. A staged PREFIX changes the
         // fetch to `[frontier, end)`, so that is the write the disk is asked
         // about.
+        // A run writes a WINDOW, not this request's remainder (it is the
+        // read-ahead that makes one open serve many shards), so the disk is
+        // asked about what will actually be written — clamped to the object,
+        // exactly as `Sessions::start` computes it. The request's own
+        // remainder is the floor.
+        let run_len = self
+            .config
+            .session_window_bytes
+            .max(1)
+            .max(end - plan.frontier)
+            .min(meta.size_bytes.saturating_sub(plan.frontier));
         if !self.magazine.fits(meta.size_bytes)
-            || !store::has_room_for(
-                &self.config.cache_dir,
-                end - plan.frontier,
-                magazine::DISK_RESERVE_BYTES,
-            )
+            || !store::has_room_for(&self.config.cache_dir, run_len, magazine::DISK_RESERVE_BYTES)
         {
             tracing::info!(
                 key = %rk.cache_key,
@@ -1071,6 +1111,62 @@ impl<C: Clock + Clone> Cache<C> {
             );
             return self.serve_upstream_range(&slot, rk, range, meta).await;
         }
+        // One upstream stream per key (ADR-0016). An upstream `open` costs a
+        // fixed ~640 ms, so paying it per ranged request is the whole cost of a
+        // scrub: a live run whose window covers this request answers it from
+        // the watermark with NO upstream open and NO stream permit, and when no
+        // run covers it this request starts one (paying the permit itself, as
+        // it always did) and rides its watermark rather than fetching its own
+        // Range. Either way the bytes land in the same staged span the disk
+        // ledger plans against afterwards.
+        //
+        // A run one key cannot serve is the escape the design pins: the live
+        // run does not cover this offset (a far seek) or one is already
+        // starting, so the request takes its own exact Range below — never a
+        // wait on somebody else's window.
+        let session_run = match self.sessions.covering(&rk.cache_key, plan.frontier, end).await {
+            Some(run) => Some(run),
+            None => {
+                self.sessions
+                    .start(
+                        &slot,
+                        &rk.cache_key,
+                        bkey.clone(),
+                        &rk.upstream_id,
+                        meta.etag.clone(),
+                        meta.size_bytes,
+                        plan.frontier,
+                        end - plan.frontier,
+                    )
+                    .await
+            }
+        };
+        if let Some(run) = session_run {
+            crate::metrics::observe_session_reader("attached");
+            tracing::info!(
+                key = %rk.cache_key,
+                from = start,
+                to = end,
+                run = %format!("{}-{}", run.start, run.end),
+                "served from a staged-read run"
+            );
+            let total = meta.size_bytes;
+            let content_range =
+                range.map(|_| ContentRange { first: start, last: end.saturating_sub(1), total });
+            return Ok(PassthroughHit {
+                meta: hit_meta_remote(&rk.cache_key, &meta),
+                etag: meta.etag,
+                total,
+                content_range,
+                content_length: Some(end - start),
+                body: staging::pieces_then(
+                    plan.pieces,
+                    session::Sessions::<C>::reader(run, plan.frontier, end),
+                ),
+                source: BodySource::Stage,
+            });
+        }
+        crate::metrics::observe_session_reader("standalone");
         // The open and the transfer below are a stream, not metadata (B1):
         // this used to take the METADATA gate, which is the head-of-line
         // class ADR-0004 split off, and it released it before a byte moved.

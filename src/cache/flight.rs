@@ -81,6 +81,7 @@ impl FlightShared {
 /// the per-key map, insert-before-await joining, driver spawning with a
 /// panic guard, and self-removal on every exit path. The policy of what a
 /// driver does (stat → open → pump → install meta) stays with the Cache.
+#[derive(Clone)]
 pub struct Flights {
     map: std::sync::Arc<Mutex<HashMap<String, std::sync::Arc<FlightShared>>>>,
     stall_budget: std::time::Duration,
@@ -128,6 +129,17 @@ impl Flights {
             map.lock().await.remove(&map_key);
         });
         f
+    }
+
+    /// Spawn `run` as a detached, panic-guarded solo driver over a handle the
+    /// caller already built — for callers that must name their state after the
+    /// handle and before the driver can touch it (the staging sessions).
+    pub fn spawn_solo_over<F, Fut>(&self, shared: std::sync::Arc<FlightShared>, run: F)
+    where
+        F: FnOnce(std::sync::Arc<FlightShared>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(drive_guarded(shared, run));
     }
 
     /// Spawn `run` as a detached, panic-guarded solo driver: no map entry,

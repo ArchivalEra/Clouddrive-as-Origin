@@ -734,8 +734,18 @@ mod tests {
 
     /// Efficient-profile fixture: primary serves `cache_profile =
     /// "efficient"` with the given threshold/min_file_size.
-    fn fixture_efficient(bytes: &[u8], min_file_size: u64) -> Fixture {
-        base(bytes).etag(Some("v1")).coverage(min_file_size).build()
+    /// Efficient-profile fixture with the session window pinned to the span
+    /// the test means to stage. A run fetches its whole WINDOW (ADR-0016), so
+    /// the production 64 MiB default would stage this whole ten-byte fixture
+    /// on the first request and every span-count assertion here would be
+    /// about a different shape; the window's own behaviour is pinned by
+    /// `a_run_stages_its_window_not_just_the_requested_bytes`.
+    fn fixture_efficient(bytes: &[u8], session_window: u64) -> Fixture {
+        base(bytes)
+            .etag(Some("v1"))
+            .coverage(4)
+            .session_window(session_window)
+            .build()
     }
 
     /// Nocache-profile fixture: primary serves `cache_profile = "nocache"`
@@ -1167,7 +1177,7 @@ mod tests {
 
     #[tokio::test]
     async fn efficient_ranged_miss_passthrough_and_stages() {
-        let fx = fixture_efficient(b"0123456789", 4);
+        let fx = fixture_efficient(b"0123456789", 4);          // window = the 4-byte range: span (2,6)
         let resp = get_key(
             State(fx.state.clone()),
             Path("a.bin".into()),
@@ -1183,7 +1193,9 @@ mod tests {
         // No flight, no entry: pure passthrough.
         assert!(!fx.state.cache.state.read().await.entries.contains_key("a.bin"));
         assert_eq!(fx.open_calls.load(Ordering::SeqCst), 1);
-        // Served bytes staged as one sidecar; ledger merged.
+        // The run's window was staged as one sidecar (the seal lands after the
+        // last byte, hence the wait); ledger merged.
+        wait_ledger(&fx, "a.bin", &[(2, 6)]).await;
         assert_eq!(staged_segments(&fx, "a.bin"), vec![(2, 6)]);
         let cov = fx.state.cache.coverage.lock().await;
         let c = cov.get("a.bin").unwrap();
@@ -1196,18 +1208,22 @@ mod tests {
 
     #[tokio::test]
     async fn efficient_second_pull_merges_ledger() {
-        let fx = fixture_efficient(b"0123456789", 4);
+        let fx = fixture_efficient(b"0123456789", 2);          // window = 2: spans (0,2) and (4,6)
         for range in ["bytes=0-1", "bytes=4-5"] {
             let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", range)]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
             let (status, _, _) = body_text(resp).await;
             assert_eq!(status, StatusCode::PARTIAL_CONTENT);
         }
+        wait_ledger(&fx, "a.bin", &[(0, 2), (4, 6)]).await;
         assert_eq!(staged_segments(&fx, "a.bin"), vec![(0, 2), (4, 6)]);
-        let cov = fx.state.cache.coverage.lock().await;
-        let iv = &cov.get("a.bin").unwrap().intervals;
-        assert_eq!(iv.len(), 2);
-        assert_eq!((iv[0].0, iv[0].1), (0, 2));
-        assert_eq!((iv[1].0, iv[1].1), (4, 6));
+        {
+            let cov = fx.state.cache.coverage.lock().await;
+            let iv = &cov.get("a.bin").unwrap().intervals;
+            assert_eq!(iv.len(), 2);
+            assert_eq!((iv[0].0, iv[0].1), (0, 2));
+            assert_eq!((iv[1].0, iv[1].1), (4, 6));
+        }
+        wait_segment_bytes(&fx, 4).await;
         assert_eq!(fx.state.cache.state.read().await.segment_bytes, 4);
         // Still no cache entry: staging is not filling.
         assert!(!fx.state.cache.state.read().await.entries.contains_key("a.bin"));
@@ -1215,7 +1231,7 @@ mod tests {
 
     #[tokio::test]
     async fn efficient_full_get_still_waterpipes() {
-        let fx = fixture_efficient(b"0123456789", 4);
+        let fx = fixture_efficient(b"0123456789", 4);          // full GET: the water-pipe path
         let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
@@ -1231,7 +1247,7 @@ mod tests {
     /// reason staged bytes exist at all once promotion is off the table.
     #[tokio::test]
     async fn a_fully_covered_seek_is_served_from_stage_without_upstream() {
-        let fx = fixture_efficient(b"0123456789", 4);
+        let fx = fixture_efficient(b"0123456789", 4);          // fully covered read
         // Stage the whole object in two pulls.
         for range in ["bytes=0-4", "bytes=5-9"] {
             let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", range)]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
@@ -1288,7 +1304,7 @@ mod tests {
     /// ends fully covered and promotion can fire off it.
     #[tokio::test]
     async fn a_partially_covered_range_needs_one_open_and_stages_the_rest() {
-        let fx = fixture_efficient(b"0123456789", 4);
+        let fx = fixture_efficient(b"0123456789", 5);          // window = 5: spans (0,5) and (5,10)
         let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", "bytes=0-4")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
@@ -1329,7 +1345,7 @@ mod tests {
     /// minute.
     #[tokio::test]
     async fn efficient_complete_entry_keeps_serving_ranges_after_the_revalidate_window() {
-        let fx = fixture_efficient(b"0123456789", 4);
+        let fx = fixture_efficient(b"0123456789", 4);          // complete entry, later range
         prime(&fx, "a.bin").await;
         fx.state.cache.clock.advance(61_000);
         reset(&fx);
@@ -1363,7 +1379,11 @@ mod tests {
 
     #[tokio::test]
     async fn efficient_min_size_bypass_goes_waterpipe() {
-        let fx = fixture_efficient(b"0123456789", 64);
+        let fx = base(b"0123456789")
+            .etag(Some("v1"))
+            .coverage(64) // below min_file_size: the miss goes the water-pipe
+            .session_window(4)
+            .build();
         let resp = get_key(
             State(fx.state.clone()),
             Path("a.bin".into()),
@@ -1399,7 +1419,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_sweeps_old_segments() {
-        let fx = fixture_efficient(b"0123456789", 4);
+        let fx = fixture_efficient(b"0123456789", 4);          // window = the 4-byte range
         let resp = get_key(
             State(fx.state.clone()),
             Path("a.bin".into()),
@@ -1410,6 +1430,7 @@ mod tests {
         .await;
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        wait_ledger(&fx, "a.bin", &[(2, 6)]).await;
         assert_eq!(staged_segments(&fx, "a.bin"), vec![(2, 6)]);
         // Age past inactive_ttl: tick sweeps segments, zeroes accounting.
         fx.state.cache.clock.advance(1_201_000);
@@ -1420,7 +1441,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_reports_segment_bytes() {
-        let fx = fixture_efficient(b"0123456789", 4);
+        let fx = fixture_efficient(b"0123456789", 4);          // segment_bytes 4
         let resp = get_key(
             State(fx.state.clone()),
             Path("a.bin".into()),
@@ -1430,6 +1451,7 @@ mod tests {
         )
         .await;
         body_text(resp).await;
+        wait_segment_bytes(&fx, 4).await;
         let resp = healthz(State(fx.state.clone())).await.into_response();
         let (_, _, body) = body_text(resp).await;
         assert!(body.contains("\"segment_bytes\":4"), "{body}");
@@ -1473,9 +1495,10 @@ mod tests {
     #[tokio::test]
     async fn etag_flip_resets_staged_history() {
         let bytes: Vec<u8> = (0..100u8).collect();
-        let fx = fixture_efficient(&bytes, 4);
+        let fx = fixture_efficient(&bytes, 50);                // window = the 50-byte range
         let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         body_text(resp).await;
+        wait_ledger(&fx, "f.bin", &[(0, 50)]).await;
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
         // Object replaced upstream: next transfer restarts history. Wait
         // out the stat single-flight cooldown so the flip is
@@ -1805,6 +1828,7 @@ mod tests {
         let fx = base(&bytes)
             .etag(Some("v1"))
             .coverage(10)
+            .session_window(5) // two 5-byte spans, so a policy has a choice
             .max_size_bytes(10)
             .eviction(crate::config::EvictionPolicy::Heat)
             .build();
@@ -1822,6 +1846,7 @@ mod tests {
         // overshoot must come out of a.bin, under both policies.
         fx.state.cache.clock.advance(1_000);
         stage(&fx, "b.bin", "bytes=0-4").await;
+        wait_segment_bytes(&fx, 15).await;
         assert_eq!(fx.state.cache.state.read().await.segment_bytes, 15);
 
         // Age both rows past the eviction guard so they are evictable.
@@ -1847,6 +1872,7 @@ mod tests {
         let fx = base(&bytes)
             .etag(Some("v1"))
             .coverage(10)
+            .session_window(5) // two 5-byte spans, so a policy has a choice
             .max_size_bytes(10)
             .eviction(crate::config::EvictionPolicy::Lru)
             .build();
@@ -1857,6 +1883,7 @@ mod tests {
         stage(&fx, "a.bin", "bytes=0-4").await;
         fx.state.cache.clock.advance(1_000);
         stage(&fx, "b.bin", "bytes=0-4").await;
+        wait_segment_bytes(&fx, 15).await;
         assert_eq!(fx.state.cache.state.read().await.segment_bytes, 15);
 
         fx.state.cache.clock.advance(120_000);
@@ -1871,6 +1898,46 @@ mod tests {
         // Span-level: the row survives with its other span, and the byte
         // account drops by one span rather than by a whole window.
         assert_eq!(fx.state.cache.state.read().await.segment_bytes, 10);
+    }
+
+    /// Sealing is asynchronous: the run's driver renames the span and merges
+    /// the ledger entry after the body's last byte reaches the viewer, so a
+    /// test that samples staged state the instant a response returns races it
+    /// (the same discipline the lab's `wait_segment_bytes` uses). Poll for the
+    /// ledger to describe `expect` instead.
+    async fn wait_ledger(fx: &Fixture, key: &str, expect: &[(u64, u64)]) {
+        for _ in 0..400 {
+            {
+                let cov = fx.state.cache.coverage.lock().await;
+                if let Some(c) = cov.get(key) {
+                    let got: Vec<(u64, u64)> = c.intervals.iter().map(|(s, e, ..)| (*s, *e)).collect();
+                    if got == expect {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let cov = fx.state.cache.coverage.lock().await;
+        let got: Vec<(u64, u64)> = cov
+            .get(key)
+            .map(|c| c.intervals.iter().map(|(s, e, ..)| (*s, *e)).collect())
+            .unwrap_or_default();
+        panic!("ledger for {key} never became {expect:?}; got {got:?}");
+    }
+
+    /// The same wait for the staged-byte counter (healthz-level assertions).
+    async fn wait_segment_bytes(fx: &Fixture, expect: u64) {
+        for _ in 0..400 {
+            if fx.state.cache.state.read().await.segment_bytes == expect {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!(
+            "segment_bytes never became {expect}; got {}",
+            fx.state.cache.state.read().await.segment_bytes
+        );
     }
 
     /// One ranged GET, asserting it was served as a partial response. The
@@ -1906,7 +1973,12 @@ mod tests {
     #[tokio::test]
     async fn a_read_credits_every_staged_span_it_touches() {
         let bytes: Vec<u8> = (0..20u8).collect();
-        let fx = base(&bytes).etag(Some("v1")).coverage(4).max_size_bytes(4096).build();
+        let fx = base(&bytes)
+            .etag(Some("v1"))
+            .coverage(4)
+            .session_window(5) // one 5-byte span per request, as the walk reads
+            .max_size_bytes(4096)
+            .build();
 
         stage(&fx, "a.bin", "bytes=0-4").await;
         stage(&fx, "a.bin", "bytes=5-9").await;
