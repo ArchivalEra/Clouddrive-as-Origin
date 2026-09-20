@@ -13,10 +13,16 @@ negative_ttl_secs = 60
 concurrency_per_upstream = 3
 prewarm_shared_secret_env = "CDN_LAB_PREWARM_SECRET"
 
+# One upstream open per window (ADR-0016): small here so the LAB can count opens
+# against a 1 MiB object.
+session_window_bytes = 262144
 [cache_profiles.efficient]
 # (promotion is retired, ADR-0015)
 min_file_size = 4
 coverage_window_secs = 5
+
+# A small window keeps the run acceptance test cheap: one upstream open per
+# window is the claim, and the LAB object is 1 MiB (ADR-0016).
 
 [[upstreams]]
 id = "media"
