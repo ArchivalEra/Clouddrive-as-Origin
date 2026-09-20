@@ -123,6 +123,19 @@ impl EffectiveProfile {
     }
 }
 
+/// How the magazine ejects staged spans when the budget overshoots.
+/// `lru` drops whole ledger rows oldest-touched-first (the original shape);
+/// `heat` drops single spans, coldest read-count first, within a row's
+/// trailing window — the scrub workload keeps hot segments alive even when
+/// time has passed them by.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EvictionPolicy {
+    #[default]
+    Lru,
+    Heat,
+}
+
 fn default_backend_type() -> String {
     "openlist".into()
 }
@@ -217,6 +230,9 @@ pub struct RawConfig {
     pub prewarm_shared_secret_env: Option<String>,
     #[serde(default = "default_allowed_suffixes")]
     pub allowed_download_suffixes: Vec<String>,
+    /// Magazine eviction policy for staged spans. Default `lru`.
+    #[serde(default)]
+    pub eviction_policy: EvictionPolicy,
 
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
@@ -269,7 +285,8 @@ pub struct Config {
     pub inactive_ttl_secs: u64,
     pub revalidate_ttl_secs: u64,
     pub negative_ttl_secs: u64,
-    /// Hold window granted to a freshly promoted entry (see
+    /// How staged spans are ejected when the budget overshoots (ADR-0015).
+    pub eviction_policy: EvictionPolicy,
     pub concurrency_per_upstream: usize,
     pub retry_max_attempts: u32,
     pub retry_base_ms: u64,
@@ -454,6 +471,7 @@ impl Config {
             inactive_ttl_secs: raw.inactive_ttl_secs,
             revalidate_ttl_secs: raw.revalidate_ttl_secs,
             negative_ttl_secs: raw.negative_ttl_secs,
+            eviction_policy: raw.eviction_policy,
             concurrency_per_upstream: raw.concurrency_per_upstream,
             retry_max_attempts: raw.retry_max_attempts,
             retry_base_ms: raw.retry_base_ms,
@@ -485,6 +503,7 @@ impl Default for Config {
             inactive_ttl_secs: default_inactive_ttl(),
             revalidate_ttl_secs: default_revalidate_ttl(),
             negative_ttl_secs: default_negative_ttl(),
+            eviction_policy: EvictionPolicy::default(),
             concurrency_per_upstream: default_concurrency(),
             retry_max_attempts: default_retry_max(),
             retry_base_ms: default_retry_base(),

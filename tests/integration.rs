@@ -981,13 +981,21 @@ async fn staged_segment_bytes_join_the_disk_budget() {
     let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
 
-    // Simulate staged sidecars whose ledger rows were touched well in the
-    // past, so the min-age guard (60s) allows eviction.
+    // Two staged sidecars of 8 KiB each, touched well in the past so the
+    // min-age guard (60s) allows eviction. The eviction is span-level and
+    // only touches a span with a sidecar file behind it (a merged ledger
+    // interval owns no single file), so the files are written for real: a
+    // ledger row with nothing on disk is not evictable by design, and
+    // asserting on one would test nothing.
     let touched = 10_000u64;
     clock.advance(120_000);
+    let mut paths = Vec::new();
     {
         let mut cov = cache.coverage.lock().await;
         for key in ["s1.bin", "s2.bin"].iter() {
+            let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, key, 0, 8192);
+            std::fs::write(&path, vec![0u8; 8192]).unwrap();
+            paths.push(path);
             let mut c = origin_cache::cache::store::Coverage {
                 total: 8192,
                 last_touch_millis: touched,
@@ -1010,6 +1018,7 @@ async fn staged_segment_bytes_join_the_disk_budget() {
         s.segment_bytes
     );
     assert!(cov.is_empty(), "evicted ledger rows must be dropped");
+    assert!(paths.iter().all(|p| !p.exists()), "the evicted sidecar files must be gone");
 }
 
 /// A mid-write failure must not leave the temp file behind: the leak used

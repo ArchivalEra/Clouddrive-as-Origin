@@ -1791,6 +1791,139 @@ mod tests {
         assert_no_backend_calls(&fx, "root via router");
     }
 
+    /// The HEAT policy must diverge from LRU on exactly the case it exists
+    /// for: a span that is STALE by the clock but HOT by reads stays, and the
+    /// fresher-but-never-re-read span goes. With lru (the default) the same
+    /// shape ejects the hot one, which is why the policy is a choice.
+    ///
+    /// Two keys are needed to overshoot at all: admission (ADR-0013) refuses
+    /// to stage an object bigger than the magazine, so one key's staged bytes
+    /// can never exceed the budget on their own.
+    #[tokio::test]
+    async fn heat_eviction_keeps_the_hot_span_lru_would_eject() {
+        let bytes: Vec<u8> = (0..10u8).collect();
+        let fx = base(&bytes)
+            .etag(Some("v1"))
+            .coverage(10)
+            .max_size_bytes(10)
+            .eviction(crate::config::EvictionPolicy::Heat)
+            .build();
+
+        // a.bin stages two spans ([0,5) then [5,10)) — its whole 10 bytes,
+        // which is exactly the budget, so staging is admitted.
+        stage(&fx, "a.bin", "bytes=0-4").await;
+        stage(&fx, "a.bin", "bytes=5-9").await;
+        // [0,5) is re-read twice: staged FIRST, so stalest by the clock, yet
+        // hot. [5,10) was staged later and never read again.
+        stage(&fx, "a.bin", "bytes=0-4").await;
+        stage(&fx, "a.bin", "bytes=0-4").await;
+        assert_eq!(staged_segments(&fx, "a.bin"), vec![(0, 5), (5, 10)]);
+        // b.bin stages 5 more bytes, and its row is the NEWER one: the 5-byte
+        // overshoot must come out of a.bin, under both policies.
+        fx.state.cache.clock.advance(1_000);
+        stage(&fx, "b.bin", "bytes=0-4").await;
+        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 15);
+
+        // Age both rows past the eviction guard so they are evictable.
+        fx.state.cache.clock.advance(120_000);
+        fx.state.cache.tick().await;
+
+        assert_eq!(
+            staged_segments(&fx, "a.bin"),
+            vec![(0, 5)],
+            "heat keeps the span that was re-read; the colder fresh one goes"
+        );
+        assert_eq!(staged_segments(&fx, "b.bin"), vec![(0, 5)], "the newer row is untouched");
+        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 10);
+    }
+
+    /// The same shape under lru (the default): the stalest span goes, reads
+    /// irrelevant — which here means the HOT one. The two policies must
+    /// therefore disagree on this shape, and that disagreement is the whole
+    /// point of the knob. Reverse-verification for the test above.
+    #[tokio::test]
+    async fn lru_eviction_ejects_the_stale_span_even_when_it_is_hot() {
+        let bytes: Vec<u8> = (0..10u8).collect();
+        let fx = base(&bytes)
+            .etag(Some("v1"))
+            .coverage(10)
+            .max_size_bytes(10)
+            .eviction(crate::config::EvictionPolicy::Lru)
+            .build();
+
+        stage(&fx, "a.bin", "bytes=0-4").await;
+        stage(&fx, "a.bin", "bytes=5-9").await;
+        stage(&fx, "a.bin", "bytes=0-4").await;
+        stage(&fx, "a.bin", "bytes=0-4").await;
+        fx.state.cache.clock.advance(1_000);
+        stage(&fx, "b.bin", "bytes=0-4").await;
+        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 15);
+
+        fx.state.cache.clock.advance(120_000);
+        fx.state.cache.tick().await;
+
+        assert_eq!(
+            staged_segments(&fx, "a.bin"),
+            vec![(5, 10)],
+            "lru ejects by the clock: the older span goes even though it is hot"
+        );
+        assert_eq!(staged_segments(&fx, "b.bin"), vec![(0, 5)], "the newer row is untouched");
+        // Span-level: the row survives with its other span, and the byte
+        // account drops by one span rather than by a whole window.
+        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 10);
+    }
+
+    /// One ranged GET, asserting it was served as a partial response. The
+    /// staging tests below all need the same three lines.
+    async fn stage(fx: &Fixture, key: &str, range: &str) {
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path(key.into()),
+            headers(&[("range", range)]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let (status, _, _) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{key} {range}");
+    }
+
+    /// The ledger's `(start, end, reads)` triples, for the heat assertions.
+    async fn span_reads(fx: &Fixture, key: &str) -> Vec<(u64, u64, u64)> {
+        let cov = fx.state.cache.coverage.lock().await;
+        cov.get(key)
+            .map(|c| c.intervals.iter().map(|(s, e, _, r)| (*s, *e, *r)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Heat must see the reads a scrub actually makes. Two rules, both of
+    /// which the first cut got wrong by requiring one span to CONTAIN the
+    /// whole read: a read crossing two staged spans credits both, and a read
+    /// whose head is served from the stage — the partial-coverage path, which
+    /// is what every request in a cold sequential walk takes — credits the
+    /// staged head. With the old rule both recorded nothing, so heat stayed
+    /// at zero for exactly the workload the policy exists for.
+    #[tokio::test]
+    async fn a_read_credits_every_staged_span_it_touches() {
+        let bytes: Vec<u8> = (0..20u8).collect();
+        let fx = base(&bytes).etag(Some("v1")).coverage(4).max_size_bytes(4096).build();
+
+        stage(&fx, "a.bin", "bytes=0-4").await;
+        stage(&fx, "a.bin", "bytes=5-9").await;
+        // Straddles the [0,5)/[5,10) boundary: fully covered, so it is served
+        // from the stage, and it touches two spans.
+        stage(&fx, "a.bin", "bytes=3-7").await;
+        assert_eq!(span_reads(&fx, "a.bin").await, vec![(0, 5, 1), (5, 10, 1)]);
+
+        // A partial hit: [0,10) comes from the stage, [10,20) from upstream.
+        stage(&fx, "a.bin", "bytes=0-19").await;
+        assert_eq!(
+            span_reads(&fx, "a.bin").await,
+            vec![(0, 5, 2), (5, 10, 2), (10, 20, 0)],
+            "the staged head both spans contributed is credited; the freshly fetched tail is not"
+        );
+    }
+
     /// Router construction smoke test: every route path must survive
     /// matchit's pattern compiler at runtime. The integration suite
     /// calls handlers directly and never builds the Router — a blind

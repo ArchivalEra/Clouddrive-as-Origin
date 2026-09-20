@@ -35,14 +35,14 @@ max_entries = 500000              # entry-count budget (ADR-0006); 0 = bytes onl
 inactive_ttl_secs = 1200          # 20 min (spec §3.3)
 revalidate_ttl_secs = 60          # spec §3.5
 negative_ttl_secs = 60            # spec §3.6
-# Hold window for a freshly PROMOTED entry: while it runs, the entry is
-# immune to the inactivity TTL and sorts last for eviction. Assembling a large
-# object costs many upstream fetches and the inactivity clock cannot see that,
-# so without a hold, pausing a video to look elsewhere can sweep the merge you
-# just paid for. It is a deadline, not an exemption: once it passes, normal
-# rules resume, and it yields early rather than let the cache exceed
-# max_size_bytes. 0 = off.
-promoted_hold_secs = 1800         # 30 min
+# How staged .seg spans are evicted when they overshoot the budget (ADR-0015).
+# Both policies evict SPANS from the least-recently-touched key first, so an
+# overshoot trims the cold tail instead of discarding a whole key's window:
+#   "lru"  - the stalest span goes first (a plain sliding window; the default)
+#   "heat" - spans are compared by READ COUNT inside the trailing 20 spans
+# Staged reads are served from these spans, so the ledger is the cache for
+# objects larger than max_size_bytes.
+eviction_policy = "lru"
 
 # --- per-upstream throttling ---
 concurrency_per_upstream = 3
@@ -97,13 +97,13 @@ password_env = "OPENLIST_PASSWORD"
 # Fill-policy profiles (P2 efficientcache): orthogonal to cold_miss
 # (serve behavior). Upstreams opt in with `cache_profile = "<name>"`;
 # "standard" (default) = legacy full-file water-pipe on every miss.
-# An efficient profile serves ranged misses straight through (C path,
-# exact Range, no full fill) while staging served intervals as sidecars;
-# once staged coverage >= threshold the key promotes to a full entry (P2-b).
+# An efficient profile stages served intervals as .seg sidecars and serves
+# later ranged reads from them (ADR-0015), so the ledger acts as a sliding
+# window for objects the magazine cannot hold whole.
 # cache_profile = "efficient"
 # [cache_profiles.efficient]
-# coverage_threshold = 0.8   # (0, 1]; 1.0 = promote only when fully served
 # min_file_size = 67108864   # below this, miss goes B (small files fill cheap)
+# coverage_window_secs = 3600  # staged spans older than this decay out
 
 # "nocache" is a built-in profile for small-footprint nodes: pure
 # water-pipe, zero cache-object disk writes (no entries, no segments,
