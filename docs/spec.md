@@ -135,6 +135,17 @@ repo** — it is injected at runtime via an environment variable (e.g.
    magazine ejects whichever was touched longest ago. Eviction must remove
    metadata and, if the parent directory becomes empty, prune it.
 
+   **Staged spans are evicted by span, under one of two policies
+   (ADR-0015).** Staged bytes overshooting the budget are trimmed one
+   `.seg` at a time, never by throwing away a whole key's window:
+   `eviction_policy = "lru"` (default) takes the row's stalest span first,
+   `"heat"` compares spans by read count inside the trailing 20 spans and
+   widens one window back when more room is needed. Either way the rows are
+   visited least-recently-touched first, so the choice *across* keys is LRU,
+   and a row younger than 60 s is never touched. The ledger holds the read
+   counts — `add_read` credits every span a request touches, including the
+   staged head of a partial hit — so heat survives a merge as a sum.
+
    **An object larger than the whole magazine is resident, not evicted
    (ADR-0014).** Evicting others cannot bring it into budget — its own
    size is the overshoot — so the byte budget neither counts it nor picks
@@ -221,55 +232,65 @@ repo** — it is injected at runtime via an environment variable (e.g.
       full fill). Full GETs and small files still water-pipe; all
       failures fall back to B (stale-if-error included).
 
-12. **efficientcache fill policy (per-upstream `cache_profile`):**
+12. **efficient cache fill policy (per-upstream `cache_profile`):**
     orthogonal to §3.11's serve modes. Under a non-`"standard"` profile,
     ranged misses stage exactly the served bytes as `.seg` sidecars and
-    merge them into a per-key **coverage ledger** (etag-locked). When
-    staged coverage ≥ `coverage_threshold` (default 0.8, ∈ (0,1]),
-    a single-flight background task re-verifies the version by fresh
-    stat (any drift drops history, never a mixed-version file), fetches
-    only the missing gaps by exact Range, seals, installs, and cleans
-    staged history. Files below `min_file_size` (default 64 MiB) fill
-    whole via B. Segments count separately (`segment_bytes` in
-    healthz), age-sweep with `inactive_ttl`, rebuild from disk on restart.
+    merge them into a per-key **coverage ledger** (etag-locked). Files
+    below `min_file_size` (default 64 MiB) fill whole via B. Segments count
+    separately (`segment_bytes` in healthz), age-sweep with `inactive_ttl`,
+    rebuild from disk on restart.
 
-    **Staging admission (ADR-0013):** segments have exactly one reader —
-    promotion — so the profile stages only what promotion could accept:
-    an object larger than `max_size` is never staged (it is served as a
-    resident stray instead when the disk can hold it, or through the pipe
-    otherwise), and neither is an interval the disk has no room for. A
-    refused staged request is served by the same pipe, byte for byte.
+    **Staged spans are directly servable, so the ledger IS the cache for
+    objects the magazine cannot hold whole (ADR-0015).** A Range request is
+    planned against the spans on disk: the covered parts are read from their
+    sidecar files and only the uncovered remainder is fetched, as ONE exact
+    Range open (the staged prefix rides along in the same response). A
+    request whose range is fully covered opens upstream zero times. The
+    ledger is thereby a sliding window sized by the byte budget, not by the
+    object; promotion and the promotion hold are deleted, so there is no
+    threshold, no merge task and no hold deadline.
+
+    **Version gate:** the etag the ledger last saw is compared with the stat
+    the request already made; drift resets the key (spans, marker, row) and
+    the request is served fresh. A missing sidecar for an interval the ledger
+    claims means the request falls back to upstream rather than guessing at
+    a mixed-version file.
+
+    **Staging admission (ADR-0013):** an object larger than `max_size` is
+    never staged (it is served as a resident stray instead when the disk can
+    hold it, or through the pipe otherwise), and neither is an interval the
+    disk has no room for. A refused staged request is served by the same
+    pipe, byte for byte.
 
     **Ledger ceiling:** one key's ledger holds at most
     `MAX_INTERVALS_PER_KEY` (4096) intervals. Touching spans merge first
     (exact — `[a,b) + [b,c) = [a,c)`, and that is what a sequential scrub
     produces); if gaps remain, the coldest spans are dropped, because
-    merging across a gap would claim bytes the node does not hold. Decay
-    and the coverage count are one pass.
+    merging across a gap would claim bytes the node does not hold. A merge
+    sums the read counts. Decay and the coverage count are one pass.
 
-    **Coverage window:** each staged interval carries its read
-    timestamp; intervals older than `coverage_window_secs` (default
-    3600, per-profile) decay out of the ledger — stale partial reads
-    never accumulate into a promotion, so only recently-active content
-    promotes (the capacity-dimension complement to the threshold).
-    Window expiry removes ledger counts only; disk sidecars stay for
-    the natural sweep. Promotion tasks already running are not aborted.
+    **Coverage window:** each staged interval carries its read timestamp;
+    intervals older than `coverage_window_secs` (default 3600, per-profile)
+    decay out of the ledger, so the window tracks recently-active content
+    rather than everything ever watched. Window expiry removes ledger
+    entries only; disk sidecars stay for the natural sweep.
 
     **Viewer-disconnect sealing:** segmented downloads are
     separate connections; when the viewer disconnects, axum drops the
     body stream, so a detached watcher polls each `.segpart` and seals
-    it once it stops growing (3 × 100 ms stable), finalizing coverage
-    and running the promotion check. The in-stream seal path stays for
-    full-consumption transfers. The read loop is bounded by the Range
-    length — upstream 206 streams may not signal EOF at Content-Length
-    (e.g. rclone serve webdav).
+    it once it stops growing (3 × 100 ms stable), finalizing coverage.
+    The in-stream seal path stays for full-consumption transfers. Both
+    paths go through one `seal_span`, so the ledger has exactly one writer
+    shape. The read loop is bounded by the Range length — upstream 206
+    streams may not signal EOF at Content-Length (e.g. rclone serve
+    webdav).
 
-    **Live-verified 2026-09-09 (oracle node, 3 GiB file, 300 s window):**
-    5 × 600 MB ranged reads (93% coverage) → promoted (entries=1) →
-    full GET served from disk at **1.07 GB/s** vs 56 MB/s cold pull
-    (~19×). With a 30 s window the same 5 reads spanning 34 s decayed
-    the first segment and correctly did NOT promote (window semantics
-    confirmed in real traffic).
+    **Historical (retired with promotion, 2026-09-20):** five 600 MB ranged
+    reads over a 3 GiB object used to reach 93% coverage, trigger a merge,
+    and serve a later full GET from disk at **1.07 GB/s** against a 56 MB/s
+    cold pull (~19×). The same node now serves those bytes from the staged
+    spans directly — no merge, and the speedup applies to the first
+    re-read rather than to the completed merge.
 
     **Upstream fetch is a single stream (corrected 2026-09-11):** cold
     misses open ONE upstream stream and pump it to disk while the client
@@ -326,7 +347,7 @@ repo** — it is injected at runtime via an environment variable (e.g.
   our per-upstream concurrency gates (≤ `concurrency_per_upstream`, default
   3) still apply to every PROPFIND/GET we issue — as two independent
   budgets since ADR-0004: metadata lookups (stat/HEAD/list/link) and byte
-  streams (cold-miss pumps, passthrough staging, promotion assembly) no
+  streams (cold-miss pumps, passthrough staging, staged reads) no
   longer share one pool, so a long transfer cannot starve a HEAD.
 - ETag semantics: OpenList reports per-driver etags; where a driver
   yields an unstable etag, `getlastmodified` is the revalidation
@@ -540,7 +561,7 @@ text no longer matched called out rather than dropped.
   `HB` means the checker itself stopped.
 - `/healthz` exposes the same counters plus per-upstream token state. —
   **counters yes, token state no.** healthz reports `entries`, `bytes`,
-  `segment_bytes`, `stray_bytes`, `flights_active`, `promotions_active`,
+  `segment_bytes`, `stray_bytes`, `flights_active`,
   `dirty_access_flushes`, `coverage_keys`, `coverage_intervals`,
   `prewarm_inflight`, `store.state`, `rebuilt_rows`, `disk_free_bytes`,
   `disk_reserve_bytes`, and per upstream `id` / `profile` / `cold_miss` /
@@ -551,7 +572,7 @@ text no longer matched called out rather than dropped.
   `front_requests_total{status="502"}` / `backend_call_duration_seconds` on
   the metrics endpoint. Candidate ticket; not implemented here.
 - `/_internal/healthz` additionally reports `segment_bytes` (staged,
-  unpromoted efficientcache sidecars). — holds.
+  efficiently-staged sidecars). — holds.
 - `/_internal/healthz` reports `stray_bytes` (2026-09-19): the part of
   `bytes` that belongs to resident strays, which the magazine's byte budget
   neither counts nor evicts (ADR-0014). It is the field that explains a
@@ -707,3 +728,25 @@ disabling its fix and watching the named test fail)
       `business::tests::http_get_records_its_byte_source`,
       `business::tests::instrument_body_delivers_every_byte_and_counts_it`.
 
+
+### Added 2026-09-20 (the eviction round; each line was reverse-verified by
+reverting the rule and watching the named test fail)
+
+- [x] Staged spans are **directly servable**: a fully covered seek opens
+      upstream zero times, and a partly covered one opens it exactly once.
+      — `business::tests::a_fully_covered_seek_is_served_from_stage_without_upstream`,
+      `a_partially_covered_range_needs_one_open_and_stages_the_rest`.
+- [x] The two eviction policies **disagree** on the case heat exists for: a
+      span that is stale by the clock but hot by reads survives under `heat`
+      and is the first to go under `lru`. Reverting the policy flag on either
+      test flips which span lives.
+      — `business::tests::heat_eviction_keeps_the_hot_span_lru_would_eject`,
+      `lru_eviction_ejects_the_stale_span_even_when_it_is_hot`.
+- [x] Eviction is **span-level**: an overshoot trims the cold tail, the key's
+      other spans and every other key's spans stay, and the byte account drops
+      by the evicted span rather than by a whole window.
+      — the same two tests (they assert the surviving span and
+      `segment_bytes`), `tests/integration.rs::staged_segment_bytes_join_the_disk_budget`.
+- [x] A read credits **every span it touches**: one straddling two spans
+      credits both, and the staged head of a partial hit is credited.
+      — `business::tests::a_read_credits_every_staged_span_it_touches`.

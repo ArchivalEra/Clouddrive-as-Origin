@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     cache::{flight::BodyStream, store},
-    config::Config,
+    config::{Config, EvictionPolicy},
 };
 
 use super::cache::CacheState;
@@ -29,6 +29,13 @@ use super::cache::CacheState;
 /// Never evict a staging ledger row younger than this (P56): an active
 /// transfer's row is touched continuously and must not be yanked mid-flight.
 const STAGE_MIN_AGE_MS: u64 = 60_000;
+
+/// How many trailing spans the HEAT policy compares at a time: the coldest
+/// span inside the newest window goes first, and only when that window cannot
+/// cover the overshoot does the eviction widen one window back. Heat never
+/// compares spans across keys — the row order already carries the cross-key
+/// LRU.
+const HEAT_TRAILING_WINDOW: usize = 20;
 
 /// One completed staged interval, ready to merge. `now_millis` is supplied by
 /// the caller's clock domain — the ledger never reads a clock itself.
@@ -84,27 +91,113 @@ impl Staging {
             .collect()
     }
 
-    /// Ledger rows to drop when staged bytes overshoot the budget: oldest
-    /// touched first, never a row that is actively staging right now.
-    /// `overrun` is the magazine's `resident + staged - budget`.
-    pub(crate) async fn over_budget_rows(&self, overrun: u64, now: u64) -> Vec<(String, u64)> {
+    /// Evict staged spans until `need_bytes` is freed. ONE mechanism, two
+    /// orderings, chosen by `eviction_policy` (ADR-0015):
+    ///
+    /// - `lru`: the row's stalest span goes first (`t`, the time its bytes
+    ///   were staged) — a plain sliding window over what the walk wrote most
+    ///   recently;
+    /// - `heat`: spans are compared by READ COUNT inside the trailing window
+    ///   (the newest [`HEAT_TRAILING_WINDOW`] by offset, measured back from
+    ///   the walk's frontier); when that window cannot cover the need, the
+    ///   next window back enters, so the next-coldest spans go.
+    ///
+    /// Both are SPAN-level, and rows are visited least-recently-touched first
+    /// (the choice ACROSS keys is LRU under either policy). The row-level
+    /// delete this replaced discarded an entire key's window — for the
+    /// single-big-object workload that is the whole magazine — on any
+    /// overshoot.
+    ///
+    /// File deletion and the `segment_bytes` subtraction live in this module
+    /// and nowhere else: the earlier shape returned span lists to `tick`,
+    /// which fed them into the row-level delete path — undoing the span
+    /// eviction and subtracting the same bytes twice.
+    ///
+    /// Returns `(keys touched, bytes freed)`.
+    pub(crate) async fn evict_staged(&self, need_bytes: u64, now: u64) -> (usize, u64) {
+        let order = self.rows_by_age().await;
+        let mut freed_total = 0u64;
+        let mut touched = 0usize;
+        for (_, key) in order {
+            if freed_total >= need_bytes {
+                break;
+            }
+            let (age, intervals) = {
+                let cov = self.coverage.lock().await;
+                match cov.get(&key) {
+                    Some(c) => (now.saturating_sub(c.last_touch_millis), c.intervals.clone()),
+                    None => continue,
+                }
+            };
+            // Never evict a row that is actively staging right now.
+            if intervals.is_empty() || age < STAGE_MIN_AGE_MS {
+                continue;
+            }
+            let picks = self.pick_spans(&key, &intervals, need_bytes - freed_total).await;
+            let mut freed = 0u64;
+            for (start, end) in picks {
+                freed += self.drop_span(&key, start, end).await;
+            }
+            if freed == 0 {
+                continue;
+            }
+            {
+                let mut s = self.state.write().await;
+                s.segment_bytes = s.segment_bytes.saturating_sub(freed);
+            }
+            freed_total += freed;
+            touched += 1;
+            // A row that lost every span has nothing left to protect: drop it
+            // with its version marker so the next request re-stats upstream
+            // instead of gating on an etag for bytes that no longer exist.
+            self.drop_empty_row(&key).await;
+        }
+        (touched, freed_total)
+    }
+
+    /// Rows oldest-touched-first — the cross-key LRU both policies share.
+    async fn rows_by_age(&self) -> Vec<(u64, String)> {
         let cov = self.coverage.lock().await;
         let mut rows: Vec<(u64, String)> =
             cov.iter().map(|(k, c)| (c.last_touch_millis, k.clone())).collect();
         rows.sort();
-        let mut over = overrun;
+        rows
+    }
+
+    /// The spans to delete, in deletion order, until at least `need_bytes` is
+    /// covered. Only a span with an exact sidecar file is a candidate: an
+    /// interval merged out of two spans owns no single file and is left alone
+    /// rather than guessed at.
+    async fn pick_spans(
+        &self,
+        key: &str,
+        intervals: &[(u64, u64, u64, u64)],
+        need_bytes: u64,
+    ) -> Vec<(u64, u64)> {
+        let newest = intervals.len().saturating_sub(1);
+        let mut ordered: Vec<(usize, (u64, u64, u64, u64))> =
+            intervals.iter().copied().enumerate().collect();
+        match self.config.eviction_policy {
+            // Stalest first, lowest offset as the tiebreak.
+            EvictionPolicy::Lru => ordered.sort_by_key(|(_, (s, _, t, _))| (*t, *s)),
+            // Fewest reads inside the trailing window; the window index (how
+            // many windows back from the newest span) outranks the count, so
+            // an older window never jumps ahead of the trailing one.
+            EvictionPolicy::Heat => ordered.sort_by_key(|(i, (s, _, t, r))| {
+                ((newest - *i) / HEAT_TRAILING_WINDOW, *r, *t, *s)
+            }),
+        }
         let mut picked = Vec::new();
-        for (_, k) in rows {
-            if over == 0 {
+        let mut acc = 0u64;
+        for (_, (start, end, ..)) in ordered {
+            if acc >= need_bytes {
                 break;
             }
-            let sz = cov.get(&k).map(|c| c.covered_bytes()).unwrap_or(0);
-            // Never evict a row that is actively staging right now.
-            if sz == 0 || now.saturating_sub(cov[&k].last_touch_millis) < STAGE_MIN_AGE_MS {
-                continue;
+            let path = store::seg_path(&self.config.cache_dir, key, start, end);
+            if tokio::fs::metadata(&path).await.is_ok() {
+                acc += end - start;
+                picked.push((start, end));
             }
-            over = over.saturating_sub(sz);
-            picked.push((k, sz));
         }
         picked
     }
@@ -132,6 +225,64 @@ impl Staging {
         {
             let mut s = self.state.write().await;
             s.segment_bytes = s.segment_bytes.saturating_sub(freed);
+        }
+    }
+
+    /// One read of `[start, end)` landed. Every span the read actually
+    /// TOUCHED gains a count (heat is the eviction policy's input, and this
+    /// is the only place it is recorded): a read crossing two staged spans
+    /// credits both, and a read that only partly overlaps a span still
+    /// credits it. The earlier rule — credit a single span only when it
+    /// strictly contained the whole read — meant that cold sequential
+    /// playback, where every read is a partial hit against the frontier,
+    /// recorded no heat at all.
+    pub(crate) async fn add_read(&self, key: &str, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        let mut cov = self.coverage.lock().await;
+        if let Some(entry) = cov.get_mut(key) {
+            for (s, e, _, reads) in entry.intervals.iter_mut() {
+                if *s < end && start < *e {
+                    *reads = reads.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Delete ONE span: its sidecar file and its ledger interval. Returns the
+    /// bytes removed from disk (0 when the file was already gone). The caller
+    /// subtracts them from `segment_bytes` once per eviction, so the
+    /// accounting has exactly one writer.
+    async fn drop_span(&self, key: &str, start: u64, end: u64) -> u64 {
+        let path = store::seg_path(&self.config.cache_dir, key, start, end);
+        let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        let _ = tokio::fs::remove_file(&path).await;
+        {
+            let mut cov = self.coverage.lock().await;
+            if let Some(entry) = cov.get_mut(key) {
+                entry.intervals.retain(|(s, e, ..)| !(*s == start && *e == end));
+            }
+        }
+        size
+    }
+
+    /// Remove a ledger row that holds no spans any more (the eviction took
+    /// them all) together with its version marker. Leaving it would only keep
+    /// a stale etag alive to gate a request for bytes that no longer exist.
+    async fn drop_empty_row(&self, key: &str) {
+        let empty = {
+            let mut cov = self.coverage.lock().await;
+            match cov.get(key) {
+                Some(c) if c.intervals.is_empty() => {
+                    cov.remove(key);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if empty {
+            let _ = tokio::fs::remove_file(store::segmeta_path(&self.config.cache_dir, key)).await;
         }
     }
 

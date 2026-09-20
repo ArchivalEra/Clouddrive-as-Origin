@@ -13,7 +13,7 @@ concurrency_per_upstream = 3
 prewarm_shared_secret_env = "CDN_LAB_PREWARM_SECRET"
 
 [cache_profiles.efficient]
-coverage_threshold = 0.8
+# (promotion is retired, ADR-0015)
 min_file_size = 4
 coverage_window_secs = 5
 

@@ -584,6 +584,7 @@ pub struct FixtureBuilder {
     redirect: bool,
     profile: Option<String>,
     coverage: Option<u64>,
+    eviction: Option<crate::config::EvictionPolicy>,
     max_size_bytes: Option<u64>,
     mime: Option<String>,
     last_modified: Option<String>,
@@ -593,6 +594,7 @@ impl FixtureBuilder {
     pub fn new(bytes: &[u8]) -> Self {
         Self {
             bytes: bytes.to_vec(),
+            eviction: None,
             etag: None,
             extra: Vec::new(),
             missing: false,
@@ -640,6 +642,12 @@ impl FixtureBuilder {
         self
     }
 
+    /// Magazine eviction policy for staged spans.
+    pub fn eviction(mut self, policy: crate::config::EvictionPolicy) -> Self {
+        self.eviction = Some(policy);
+        self
+    }
+
     /// Efficient-profile knobs; implies `profile("efficient")`.
     pub fn coverage(mut self, min_file_size: u64) -> Self {
         self.profile = Some("efficient".into());
@@ -666,6 +674,9 @@ impl FixtureBuilder {
         }
         if let Some(profile) = &self.profile {
             cfg.upstreams[0].cache_profile = profile.clone();
+        }
+        if let Some(policy) = self.eviction {
+            cfg.eviction_policy = policy;
         }
         if let Some(min_file_size) = self.coverage {
             cfg.cache_profiles.insert(

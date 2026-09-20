@@ -376,9 +376,11 @@ Two operational consequences:
   after long gaps.
 
 An efficient-profile object larger than the magazine is never staged at all
-(ADR-0013): staged segments feed promotion only, and this object can never be
-promoted. It is served as a stray when the disk can hold it, and through the
-pipe otherwise.
+(ADR-0013): the magazine cannot hold it, so the spans it would write could
+never be evicted on terms the budget understands. It is served as a stray when
+the disk can hold it (ADR-0014), and through the pipe otherwise. Note the
+staged-byte eviction knob in the cache section: `eviction_policy = "lru"`
+(default) or `"heat"` (ADR-0015).
 
 ## Test data cleanup
 

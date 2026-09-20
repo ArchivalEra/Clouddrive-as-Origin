@@ -230,7 +230,7 @@ pub fn prune_empty_parents(cache_dir: &Path, file: &Path) {
 // ---------------------------------------------------------------------------
 // efficientcache (P2): staged segments + coverage ledger.
 // C transfers stage exactly the bytes they serve as flat sidecar files;
-// the ledger (intervals per key) decides coverage-triggered promotion.
+// the ledger (intervals per key) is what a staged read is planned against.
 // Segment files are the source of truth — the in-memory ledger is a view,
 // rebuilt by scan on startup (crash/abort-safe by construction).
 // ---------------------------------------------------------------------------
@@ -242,8 +242,10 @@ pub struct Coverage {
     pub etag: Option<String>,
     pub total: u64,
     /// Merged, sorted, non-overlapping `[start, end)` intervals, each with
-    /// the clock-domain time it was last read (window decay).
-    pub intervals: Vec<(u64, u64, u64)>,
+    /// the clock-domain time it was last read (window decay) and its READ
+    /// COUNT (heat, the eviction policy's input). Heat survives a merge as a
+    /// SUM: a merged span was served `reads` times across its whole range.
+    pub intervals: Vec<(u64, u64, u64, u64)>,
     /// Clock-domain last touch (stage or rebuild time): drives age sweep
     /// in MockClock-testable time, unlike fs mtime.
     pub last_touch_millis: u64,
@@ -259,8 +261,8 @@ pub struct Coverage {
 /// request count — and the vector is walked on every staged transfer under
 /// the single process-wide ledger lock.
 ///
-/// Generous: a key that reaches this many spans is a key whose promotion is
-/// long past (promotion needs `coverage_threshold` of the object, and a
+/// Generous: a key that reaches this many spans has staged far more than any
+/// viewer will re-read (the eviction policy trims by bytes, and a
 /// threshold's worth of spans is far more than this for any real object).
 pub const MAX_INTERVALS_PER_KEY: usize = 4096;
 
@@ -281,27 +283,28 @@ impl Coverage {
         // Overlaps can only touch the interval before and the ones after
         // the insertion point (the list is sorted and non-overlapping), so
         // merge locally instead of rebuilding the vector.
-        let idx = self.intervals.partition_point(|(s, _, _)| *s < start);
-        let (lo, merged_start, mut merged_end, mut merged_at) = if idx > 0
+        let idx = self.intervals.partition_point(|(s, ..)| *s < start);
+        let (lo, merged_start, mut merged_end, mut merged_at, mut merged_reads) = if idx > 0
             && self.intervals[idx - 1].1 > start
         {
-            let (ps, pe, pt) = self.intervals[idx - 1];
-            (idx - 1, ps, pe.max(end), pt.max(now_millis))
+            let (ps, pe, pt, pr) = self.intervals[idx - 1];
+            (idx - 1, ps, pe.max(end), pt.max(now_millis), pr)
         } else {
-            self.intervals.insert(idx, (start, end, now_millis));
-            (idx, start, end, now_millis)
+            self.intervals.insert(idx, (start, end, now_millis, 0));
+            (idx, start, end, now_millis, 0)
         };
         // Absorb every following interval the merged span now reaches.
         let mut hi = lo + 1;
         while hi < self.intervals.len() && self.intervals[hi].0 < merged_end {
             merged_end = merged_end.max(self.intervals[hi].1);
             merged_at = merged_at.max(self.intervals[hi].2);
+            merged_reads += self.intervals[hi].3;
             hi += 1;
         }
         if hi > lo + 1 {
             self.intervals.drain(lo + 1..hi);
         }
-        self.intervals[lo] = (merged_start, merged_end, merged_at);
+        self.intervals[lo] = (merged_start, merged_end, merged_at, merged_reads);
         self.compact();
     }
 
@@ -330,19 +333,19 @@ impl Coverage {
     /// merged, so the caller can tell "no exact merge left" from "still too
     /// long".
     fn merge_touching_once(&mut self) -> bool {
-        let mut out: Vec<(u64, u64, u64)> = Vec::with_capacity(self.intervals.len());
+        let mut out: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(self.intervals.len());
         let mut merged = false;
         let mut i = 0;
         while i < self.intervals.len() {
-            let (s, e, t) = self.intervals[i];
+            let (s, e, t, r) = self.intervals[i];
             match self.intervals.get(i + 1).copied() {
-                Some((s2, e2, t2)) if s2 == e => {
-                    out.push((s, e2, t.max(t2)));
+                Some((s2, e2, t2, r2)) if s2 == e => {
+                    out.push((s, e2, t.max(t2), r + r2));
                     merged = true;
                     i += 2;
                 }
                 _ => {
-                    out.push((s, e, t));
+                    out.push((s, e, t, r));
                     i += 1;
                 }
             }
@@ -354,9 +357,9 @@ impl Coverage {
     /// Drop the `n` spans with the oldest read time (the ones window decay
     /// would take first anyway), then restore start order.
     fn drop_coldest(&mut self, n: usize) {
-        self.intervals.sort_by_key(|(_, _, t)| *t);
+        self.intervals.sort_by_key(|(.., t, _)| *t);
         self.intervals.drain(..n.min(self.intervals.len()));
-        self.intervals.sort_by_key(|(s, _, _)| *s);
+        self.intervals.sort_by_key(|(s, ..)| *s);
     }
 
     /// One pass instead of three: drop intervals whose last read is older
@@ -374,9 +377,9 @@ impl Coverage {
         let mut kept = 0usize;
         let mut covered = 0u64;
         for i in 0..self.intervals.len() {
-            let (s, e, t) = self.intervals[i];
+            let (s, e, t, r) = self.intervals[i];
             if t >= cutoff {
-                self.intervals[kept] = (s, e, t);
+                self.intervals[kept] = (s, e, t, r);
                 kept += 1;
                 covered += e - s;
             }
@@ -386,7 +389,7 @@ impl Coverage {
     }
 
     pub fn covered_bytes(&self) -> u64 {
-        self.intervals.iter().map(|(s, e, _)| e - s).sum()
+        self.intervals.iter().map(|(s, e, ..)| e - s).sum()
     }
 
     /// Staged fraction of the object for an already-known covered-byte
@@ -875,25 +878,25 @@ mod tests {
         let mut c = Coverage::default();
         c.add_interval(100, 200, 10);
         c.add_interval(300, 400, 20);
-        assert_eq!(c.intervals, vec![(100, 200, 10), (300, 400, 20)]);
+        assert_eq!(c.intervals, vec![(100, 200, 10, 0), (300, 400, 20, 0)]);
 
         // Bridge the gap (overlapping both) -> one merged span, max time.
         c.add_interval(150, 350, 30);
-        assert_eq!(c.intervals, vec![(100, 400, 30)]);
+        assert_eq!(c.intervals, vec![(100, 400, 30, 0)]);
 
         // Adjacent but NOT overlapping: stays a separate interval so it
         // keeps its own read time (window-decay semantics, by design).
         c.add_interval(400, 500, 40);
-        assert_eq!(c.intervals, vec![(100, 400, 30), (400, 500, 40)]);
+        assert_eq!(c.intervals, vec![(100, 400, 30, 0), (400, 500, 40, 0)]);
 
         // An earlier disjoint interval inserts in sorted position.
         c.add_interval(10, 20, 5);
-        assert_eq!(c.intervals, vec![(10, 20, 5), (100, 400, 30), (400, 500, 40)]);
+        assert_eq!(c.intervals, vec![(10, 20, 5, 0), (100, 400, 30, 0), (400, 500, 40, 0)]);
 
         // A contained interval absorbs without changing the bounds.
         c.add_interval(200, 250, 99);
         assert_eq!(c.intervals.len(), 3);
-        assert_eq!(c.intervals[1], (100, 400, 99));
+        assert_eq!(c.intervals[1], (100, 400, 99, 0));
 
         // Empty ranges are ignored.
         let before = c.intervals.clone();
@@ -919,12 +922,12 @@ mod tests {
         assert_eq!(c.covered_bytes(), 60);
         assert!((c.ratio_of(c.covered_bytes()).unwrap() - 0.6).abs() < 1e-9);
         c.add_interval(20, 60, 3000); // bridges the gap (overlap)
-        assert_eq!(c.intervals, vec![(0, 80, 3000)]);
+        assert_eq!(c.intervals, vec![(0, 80, 3000, 0)]);
         c.add_interval(80, 100, 4000); // adjacent: stays separate (own ts)
-        assert_eq!(c.intervals, vec![(0, 80, 3000), (80, 100, 4000)]);
+        assert_eq!(c.intervals, vec![(0, 80, 3000, 0), (80, 100, 4000, 0)]);
         assert!((c.ratio_of(c.covered_bytes()).unwrap() - 1.0).abs() < 1e-9);
         c.add_interval(200, 200, 5000); // empty ignored
-        assert_eq!(c.intervals, vec![(0, 80, 3000), (80, 100, 4000)]);
+        assert_eq!(c.intervals, vec![(0, 80, 3000, 0), (80, 100, 4000, 0)]);
     }
 
     #[test]
@@ -937,7 +940,7 @@ mod tests {
         // The one pass reports the surviving coverage, which is what
         // promotion needs — it used to need a second walk for this.
         assert_eq!(c.decay_and_covered(2500, 1000), 30);
-        assert_eq!(c.intervals, vec![(50, 80, 2000)]);
+        assert_eq!(c.intervals, vec![(50, 80, 2000, 0)]);
         assert_eq!(c.covered_bytes(), 30);
         // Everything stale: ledger empties, coverage 0.
         assert_eq!(c.decay_and_covered(5000, 1000), 0);

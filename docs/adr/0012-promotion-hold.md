@@ -1,5 +1,13 @@
 # A promoted entry carries a hold
 
+> **Superseded by ADR-0015.** Promotion and the hold were both deleted:
+> staged spans became directly servable, so the ledger is itself the cache for
+> objects the magazine cannot hold whole, and there is nothing left to
+> assemble or to protect afterwards. `promoted_hold_secs`,
+> `coverage_threshold`, `EntryMeta::hold_until_millis` and the `promotions`
+> registry no longer exist. This file is kept for the reasoning that led here;
+> none of it is implemented.
+
 ## Context
 
 Promotion is the one write that pays for many upstream fetches: the efficient

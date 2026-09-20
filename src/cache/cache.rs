@@ -1027,6 +1027,9 @@ impl<C: Clock + Clone> Cache<C> {
             // upstream open, no stream gate and no disk write.
             tracing::info!(key = %rk.cache_key, from = start, to = end, "served from staged sidecars");
             self.staging.touch(&rk.cache_key, self.clock.now_millis()).await;
+            // The read count is the heat policy's input: one serve of this
+            // range adds one count to the span that holds it.
+            self.staging.add_read(&rk.cache_key, start, end).await;
             return Ok(PassthroughHit {
                 meta: hit_meta_remote(&rk.cache_key, &meta),
                 etag: meta.etag,
@@ -1039,6 +1042,13 @@ impl<C: Clock + Clone> Cache<C> {
             });
         }
         let staged_prefix = !plan.pieces.is_empty();
+        if staged_prefix {
+            // The staged head of this response is being re-served, so the
+            // spans it came from are read — credit them. Cold sequential
+            // playback is made of nothing but these partial hits, and the
+            // heat policy would otherwise see zero reads for the whole walk.
+            self.staging.add_read(&rk.cache_key, start, plan.frontier).await;
+        }
         // Staging admission (ADR-0013). Staged segments have exactly one
         // reader - promotion - and promotion is refused for an object the
         // magazine cannot hold, so staging such an object writes bytes
@@ -1782,22 +1792,35 @@ impl<C: Clock + Clone> Cache<C> {
         // 1b. Staged bytes share the disk budget (P56): `segment_bytes`
         //     used to be bounded only by time (inactive_ttl), so an
         //     efficient-profile scrub session could stage far more than
-        //     max_size_bytes while total_bytes stayed at zero. Pick the
-        //     oldest-touched ledger rows first, same LRU shape as entries.
+        //     max_size_bytes while total_bytes stayed at zero. The ledger's
+        //     own evictor owns the whole operation — picking spans, deleting
+        //     their files, subtracting their bytes (ADR-0015) — so this call
+        //     site never holds a span list it could route into the row-level
+        //     delete path below; that routing deleted every remaining span
+        //     of an evicted key and charged its bytes twice.
         let overrun = self.magazine.staged_overrun(self.state.read().await.segment_bytes).await;
-        let over_budget = overrun > 0;
-        let stage_victims: Vec<(String, u64)> =
-            if over_budget { self.staging.over_budget_rows(overrun, now).await } else { Vec::new() };
+        let (staged_keys, stage_freed) = if overrun > 0 {
+            self.staging.evict_staged(overrun, now).await
+        } else {
+            (0, 0)
+        };
+        if staged_keys > 0 {
+            tracing::info!(
+                keys = staged_keys,
+                bytes = stage_freed,
+                policy = ?self.config.eviction_policy,
+                "evicted staged spans to stay inside the magazine"
+            );
+        }
 
         // 2. Filesystem deletes hold no locks — and run off the async
         // runtime (blocking read_dir/remove_file in spawn_blocking).
-        let mut victims: Vec<String> = expired.clone();
-        victims.extend(stage_victims.iter().map(|(k, _)| k.clone()));
+        // Only age-expired rows reach this path: staged-byte eviction is
+        // span-level and has already deleted its own files.
+        let victims: Vec<String> = expired.clone();
         // `segment_bytes` is accounted from the LEDGER (finalize_coverage
-        // adds to it, scan_segments rebuilds it), so eviction subtracts
-        // the ledger's bytes too — not only what a disk scan happened to
-        // find.
-        let stage_freed: u64 = stage_victims.iter().map(|(_, b)| *b).sum();
+        // adds to it, scan_segments rebuilds it), so the age sweep subtracts
+        // what the disk scan finds for the rows it drops.
         let freed = {
             let cache_dir = self.config.cache_dir.clone();
             let victims = victims.clone();
@@ -1831,16 +1854,17 @@ impl<C: Clock + Clone> Cache<C> {
         // 3. State mutation — memory only, no awaits under the write
         // guard (C3); deletes for reaped/evicted rows run guard-free.
         let reaped = self.magazine.reap(ttl_ms, now).await;
-        // `freed` covers BOTH the age-expired rows and any rows evicted
-        // to bring staged bytes under budget, so it must be applied
-        // whenever either path ran — not only on the age sweep. A short
-        // write of its own: no redb or filesystem work inside (C3).
-        if do_sweep || !stage_victims.is_empty() {
+        // `freed` is what the age sweep removed from disk. Span eviction
+        // subtracted its own bytes inside the staging module, so this is the
+        // only place the two accounts could ever meet — keep them added, not
+        // max-ed: they are disjoint (expired rows vs. evicted spans of live
+        // rows) and a max would silently forgive a real shortage.
+        if do_sweep || freed > 0 {
             let mut s = self.state.write().await;
             if do_sweep {
                 s.segment_sweep_at_millis = now;
             }
-            s.segment_bytes = s.segment_bytes.saturating_sub(freed.max(stage_freed));
+            s.segment_bytes = s.segment_bytes.saturating_sub(freed);
         }
         self.magazine.delete(&reaped).await;
         let evicted = self.magazine.evict_budget().await;
@@ -1854,18 +1878,14 @@ impl<C: Clock + Clone> Cache<C> {
         //     make the disk a second, silent eviction budget for them.
         let pressure_victims = self.magazine.reclaim_under_pressure().await;
         self.magazine.delete(&pressure_victims).await;
-        // 4. Ledger removal (coverage only): expired rows plus any row
-        //    evicted to bring staged bytes back under budget.
-        if do_sweep || !stage_victims.is_empty() {
-            let keys: Vec<String> =
-                expired.iter().chain(stage_victims.iter().map(|(k, _)| k)).cloned().collect();
-            self.staging.drop_rows(&keys).await;
+        // 4. Ledger removal (coverage only) for the age sweep. Staged-byte
+        //    eviction removes the rows it empties itself, inside the module
+        //    that owns the ledger.
+        if do_sweep && !expired.is_empty() {
+            self.staging.drop_rows(&expired).await;
         }
     }
 }
-
-
-
 /// Everything one cold-miss driver needs, as one receiver: the flight it
 /// pumps, where the bytes go, and the metadata the caller's stat produced
 /// (admission is decided before a flight exists, ADR-0013, so the GET is
