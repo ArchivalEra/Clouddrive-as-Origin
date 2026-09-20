@@ -19,8 +19,10 @@ Three things the one-paragraph summary above leaves out (2026-09-19):
 
 * **Fill policy is per upstream** (`cache_profile`): `standard` is the
   water-pipe described above; `efficient` stages the served ranges of
-  ranged misses as sidecars and promotes a key once coverage passes a
-  threshold; `nocache` is pure streaming with zero disk writes.
+  ranged misses as sidecars, serves later reads from those spans, and fetches
+  them one upstream stream per window (so a shard walk costs an open per
+  window, not per request — ADR-0015/0016); `nocache` is pure streaming with
+  zero disk writes.
 * **The magazine only governs what fits.** An object larger than
   `max_size_bytes` cannot be brought into budget by evicting anyone, so it
   is admitted as a *resident stray*: cached while the disk allows it,

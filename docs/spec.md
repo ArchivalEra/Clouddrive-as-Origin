@@ -167,6 +167,11 @@ repo** — it is injected at runtime via an environment variable (e.g.
    not fit is answered through the per-upstream pipe: no flight, no entry,
    no disk write, no error. The cache refuses to cache.
 
+   **A staged-read run holds ONE stream permit for its window (ADR-0016)**, so
+   the per-upstream budget is charged per window rather than per request: many
+   viewers of the same window cost one permit. A cold seek still queues for
+   that permit in the starting request's name.
+
 5. **Revalidation on access (no background polling):** an entry that is
    present but older than a short TTL (default 60 s, configurable)
    triggers a revalidation before serving from disk: a `stat` is compared
@@ -248,12 +253,26 @@ repo** — it is injected at runtime via an environment variable (e.g.
     **Staged spans are directly servable, so the ledger IS the cache for
     objects the magazine cannot hold whole (ADR-0015).** A Range request is
     planned against the spans on disk: the covered parts are read from their
-    sidecar files and only the uncovered remainder is fetched, as ONE exact
-    Range open (the staged prefix rides along in the same response). A
-    request whose range is fully covered opens upstream zero times. The
-    ledger is thereby a sliding window sized by the byte budget, not by the
-    object; promotion and the promotion hold are deleted, so there is no
-    threshold, no merge task and no hold deadline.
+    sidecar files and the uncovered remainder is served by a **run**
+    (ADR-0016). The ledger is thereby a sliding window sized by the byte
+    budget, not by the object; promotion and the promotion hold are deleted,
+    so there is no threshold, no merge task and no hold deadline.
+
+    **A run is one upstream stream covering a window (ADR-0016).** The first
+    ranged miss on a key opens `[frontier, frontier + session_window_bytes)`
+    (default 64 MiB), pumps it through the flight machinery (watermark,
+    inactivity-bounded waits, fsync + rename) and seals it as one `.seg` span.
+    Every request whose range falls inside a live run's window is answered from
+    its watermark with **no upstream open and no stream permit** — the ~640 ms
+    open is paid once per window instead of once per request. A request no run
+    covers takes its own exact Range (the escape, unchanged); a gap larger than
+    the window widens it, so one response still costs one open; admission asks
+    the disk about the window, since that is what gets written. When a run
+    seals, the next window may start at once while a reader is still consuming
+    and within one window of the boundary, so the open lands ahead of the
+    playhead; a paused or departed reader stops the chain. `cache_session_total`
+    and `cache_session_reader_total{result=attached|standalone}` are the
+    account.
 
     **Version gate:** the etag the ledger last saw is compared with the stat
     the request already made; drift resets the key (spans, marker, row) and
@@ -772,3 +791,27 @@ three named tests fail)
       merges them, so no interval's bounds name a file) still bring the byte
       budget back under.
       — `a_sequential_walk_past_the_ledger_ceiling_stays_evictable`.
+
+### Added 2026-09-20 (the one-stream round; each line was reverse-verified by
+disabling the mechanism and watching the named test fail)
+
+- [x] Seeks inside one live window share **one upstream open**, byte-exact, and
+      are labelled stage-served.
+      — `ranged_seeks_on_one_key_share_one_upstream_open` (reverting attach
+      makes it a per-request open).
+- [x] A seek the live run does not cover opens its **own** exact Range.
+      — `a_seek_far_beyond_the_window_opens_its_own_range`.
+- [x] A sealed run's spans serve later reads with no further upstream open.
+      — `a_sealed_run_leaves_spans_that_serve_later_reads`.
+- [x] A walk costs **one open per window**, not one per request.
+      — `a_sequential_walk_opens_once_per_window`.
+- [x] A failed open **errors its reader** rather than parking it.
+      — `a_run_that_cannot_open_errors_its_reader_instead_of_hanging`.
+- [x] A consuming reader **chains the next window**; a paused one buys at most
+      one window of read-ahead and stops.
+      — `cache::session::tests::a_consuming_reader_chains_the_next_window`,
+      `a_paused_reader_buys_at_most_one_window_of_read_ahead` (reverting the
+      chain turns both red).
+- [x] The window is clamped to the object, and a bigger need widens it.
+      — `cache::session::tests::the_window_is_clamped_to_the_object`,
+      `a_need_larger_than_the_window_widens_it`.
