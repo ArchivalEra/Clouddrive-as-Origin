@@ -203,8 +203,17 @@ impl<C: Clock + 'static> Sessions<C> {
     ) -> Option<Arc<Run>> {
         {
             let mut slots = self.slots.lock().await;
-            if slots.contains_key(key) {
-                return None;
+            match slots.get(key) {
+                // A finished run still owns the key until somebody reaps it,
+                // and that would make every request of a sequential walk take
+                // the standalone escape (its own exact Range, no window) —
+                // the next window has to start immediately, not at the next
+                // tick. Reap it here instead of refusing.
+                Some(Slot::Live(run)) if run.is_terminal() => {
+                    slots.remove(key);
+                }
+                Some(_) => return None,
+                None => {}
             }
             slots.insert(key.to_string(), Slot::Starting);
         }
@@ -298,11 +307,10 @@ impl<C: Clock + 'static> Sessions<C> {
                 }
             }
             driver_run.finished.store(true, Ordering::SeqCst);
-            // The entry is NOT cleared here: it stays live until the tick
-            // decides whether a successor window is wanted, so a request
-            // arriving between the seal and that decision still attaches
-            // rather than paying an open of its own (and the next tick is at
-            // most a quarter second away).
+            // The entry is NOT cleared here: a request arriving between the
+            // seal and the next tick still attaches to the sealed window, and
+            // whoever needs the key next (the tick's chain decision, or the
+            // next request) reaps the finished run itself.
         });
         Some(run)
     }

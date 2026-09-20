@@ -1507,8 +1507,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-79")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         body_text(resp).await;
-        // Old segments dropped, ledger re-anchored on v2, no entry yet.
-        assert_eq!(staged_segments(&fx, "f.bin"), vec![(50, 80)]);
+        wait_ledger(&fx, "f.bin", &[(50, 100)]).await;
+        // Old segments dropped, ledger re-anchored on v2, no entry yet. The
+        // span is the request's WINDOW (50 bytes here), not its own 30 bytes:
+        // the seek starts a run (ADR-0016).
+        assert_eq!(staged_segments(&fx, "f.bin"), vec![(50, 100)]);
         let cov = fx.state.cache.coverage.lock().await;
         assert_eq!(cov.get("f.bin").unwrap().etag.as_deref(), Some("v2"));
         assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));

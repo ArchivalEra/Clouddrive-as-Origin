@@ -27,6 +27,9 @@ prewarm_shared_secret_env = "CDN_LAB_PREWARM_SECRET"
 # `lru_eviction_ejects_the_stale_span_even_when_it_is_hot` pins that).
 eviction_policy = "heat"
 
+# One upstream open per window (ADR-0016): small here so the LAB can count opens
+# against a 1 MiB object.
+session_window_bytes = 262144
 [cache_profiles.efficient]
 min_file_size = 4
 
