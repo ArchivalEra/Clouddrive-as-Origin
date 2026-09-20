@@ -329,6 +329,41 @@ the problem is OpenList or the provider — not this service. If the whole
 path is fast from the node but slow from a client, the time is in the edge
 segment (see `docs/notes/` for the EdgeOne findings).
 
+### Reading the shaping account (efficient profile)
+
+The efficient profile's whole claim is that a scrub costs few upstream
+requests. Two numbers answer it, both from the front's metrics port:
+
+```sh
+# Upstream byte-stream opens (the ~640 ms fixed cost each, measured)
+curl -s http://127.0.0.1:9090/metrics | grep 'backend_call_duration_seconds_count{op="open"'
+
+# Who served the bytes: disk entry, staged span, or upstream
+curl -s http://127.0.0.1:9090/metrics | grep 'cache_serve_source_total'
+```
+
+Divide delivered bytes by the `open` delta over the same window: a scrub that
+re-reads staged bytes moves `source="stage"` while `op="open"` stays put, and
+an `open` per request means the read missed the ledger (the sidecar was
+evicted or its interval decayed) and went upstream. `segment_bytes` and
+`coverage_intervals` in healthz say how much the window currently holds.
+
+Two knobs govern what leaves that window (ADR-0015), both span-level:
+
+```toml
+eviction_policy = "lru"   # default: the stalest span in the least-recently-
+                          # touched key goes first (a plain sliding window)
+# eviction_policy = "heat"  # the coldest span by READ COUNT goes first,
+                            # compared inside the trailing 20 spans
+```
+
+`heat` is the one to try when viewers scrub BACK to a region they already
+watched: it keeps a re-read span alive even when the clock says it is the
+oldest, which `lru` would evict first. Both policies trim single `.seg`
+files, never a key's whole window, and neither touches a row younger than
+60 s. A tick's decisions are logged, one line per eviction:
+`evicted staged spans to stay inside the magazine keys=.. bytes=.. policy=..`.
+
 ### Is seeking smooth? (added 2026-09-19)
 
 `cache_serve_duration_seconds` stops at response construction, so it cannot

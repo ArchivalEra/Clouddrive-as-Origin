@@ -1,6 +1,7 @@
-# CDN-LAB config C: efficient profile (coverage promotion) with a SHORT
-# coverage window (5s) so the window-decay acceptance test can observe
-# expiry in real time (map #30 T2).
+# CDN-LAB config C: efficient profile with a SHORT coverage window (5s) so
+# the ledger-decay acceptance test can observe expiry in real time (map #30
+# T2). Staged spans serve reads directly (ADR-0015), so the decade is
+# observable as coverage_intervals dropping to zero while the .seg files stay.
 front_listen = "127.0.0.1:7779"
 front_metrics_listen = "127.0.0.1:9092"
 listen_addr = "127.0.0.1:8082"

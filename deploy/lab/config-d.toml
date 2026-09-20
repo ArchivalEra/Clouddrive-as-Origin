@@ -1,0 +1,44 @@
+# CDN-LAB config D: efficient profile with a TINY magazine, for the
+# span-level eviction acceptance test (ADR-0015).
+#
+# The magazine holds 1.5 MiB while one 1 MiB object stages in four 256 KiB
+# spans, so staging a SECOND 1 MiB object overshoots by 0.5 MiB and the
+# reaper must trim exactly two spans out of the older key — never the whole
+# key, which is what the row-level evictor this replaced would have done.
+#
+# The coverage window is left at its default (an hour): the eviction test
+# needs the ledger to survive the wait for the 60 s production reaper tick,
+# unlike config-c whose 5 s window exists for the decay test.
+front_listen = "127.0.0.1:7780"
+front_metrics_listen = "127.0.0.1:9093"
+listen_addr = "127.0.0.1:8084"
+cache_dir = "/mnt/hdd/CDN-LAB/cache-d"
+max_size_bytes = 1572864
+inactive_ttl_secs = 1200
+revalidate_ttl_secs = 60
+negative_ttl_secs = 60
+concurrency_per_upstream = 3
+prewarm_shared_secret_env = "CDN_LAB_PREWARM_SECRET"
+
+# "heat": the coldest span inside the trailing window goes first, so a span
+# that was re-read survives even though it is the oldest. Flipping this to
+# "lru" makes the same shape drop the re-read span instead (the unit pair
+# `heat_eviction_keeps_the_hot_span_lru_would_eject` /
+# `lru_eviction_ejects_the_stale_span_even_when_it_is_hot` pins that).
+eviction_policy = "heat"
+
+[cache_profiles.efficient]
+min_file_size = 4
+
+[[upstreams]]
+id = "media"
+type = "openlist"
+base_url = "http://127.0.0.1:5244/dav"
+root_path = "media"
+username_env = "CDN_LAB_DAV_USER"
+password_env = "CDN_LAB_DAV_PASS"
+cache_profile = "efficient"
+
+[[routes]]
+prefix = ""
+upstream = "media"
