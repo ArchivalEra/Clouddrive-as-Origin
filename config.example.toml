@@ -51,6 +51,14 @@ eviction_policy = "lru"
 # and more disk churn per window.
 session_window_bytes = 67108864    # 64 MiB
 
+# Seconds a key stays protected from eviction after the last body reading it
+# ended (ADR-0017). While a body is streaming the key is protected regardless
+# of its age; this grace covers the pause between two requests of one viewing
+# session, so thinking about it does not cost a re-fetch. Disk pressure is the
+# exception: it may still reclaim a resident stray being streamed, because the
+# disk is the last resort and an open descriptor survives the unlink.
+read_grace_secs = 300
+
 # --- per-upstream throttling ---
 concurrency_per_upstream = 3
 retry_max_attempts = 4

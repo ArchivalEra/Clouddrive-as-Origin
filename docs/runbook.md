@@ -377,6 +377,15 @@ old behaviour. For a viewer scrubbing forward continuously, expect roughly
 `bytes / session_window_bytes` opens; for random seeking, expect one per seek
 no matter how large the window is.
 
+A key that is **being read** is not evicted at all (ADR-0017): the body holds a
+read lease for its whole life (a viewer who disconnects drops it), and policy
+eviction keeps skipping the key for `read_grace_secs` (default 300) after the
+last body ends, so a pause between two requests of one session does not cost a
+re-fetch. Only disk pressure outranks a lease — it may reclaim a resident stray
+mid-stream, because the disk is the last resort and the stream in flight
+survives the unlink. Set `read_grace_secs = 0` to keep live bodies protected
+but drop the grace.
+
 Two knobs govern what leaves the window (ADR-0015), both span-level:
 
 ```toml

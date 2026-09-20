@@ -60,6 +60,7 @@ pub(crate) struct Staging {
     coverage: Arc<Mutex<HashMap<String, store::Coverage>>>,
     state: Arc<RwLock<CacheState>>,
     config: Arc<Config>,
+    leases: Arc<super::leases::Leases>,
 }
 
 impl Staging {
@@ -67,8 +68,9 @@ impl Staging {
         coverage: Arc<Mutex<HashMap<String, store::Coverage>>>,
         state: Arc<RwLock<CacheState>>,
         config: Arc<Config>,
+        leases: Arc<super::leases::Leases>,
     ) -> Self {
-        Self { coverage, state, config }
+        Self { coverage, state, config, leases }
     }
 
     /// The etag the ledger last saw for a key: the version gate's peek.
@@ -83,10 +85,14 @@ impl Staging {
     }
 
     /// Ledger rows idle past the inactivity TTL (swept with their sidecars).
+    /// A row with a live read lease, or one read inside `read_grace_secs`, is
+    /// not idle however old its last request is (ADR-0017).
     pub(crate) async fn expired(&self, ttl_ms: u64, now: u64) -> Vec<String> {
+        let protected = self.leases.protected(now);
         let cov = self.coverage.lock().await;
         cov.iter()
             .filter(|(_, c)| now.saturating_sub(c.last_touch_millis) >= ttl_ms)
+            .filter(|(k, _)| !protected.contains(k.as_str()))
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -115,12 +121,19 @@ impl Staging {
     ///
     /// Returns `(keys touched, bytes freed)`.
     pub(crate) async fn evict_staged(&self, need_bytes: u64, now: u64) -> (usize, u64) {
+        let protected = self.leases.protected(now);
         let order = self.rows_by_age().await;
         let mut freed_total = 0u64;
         let mut touched = 0usize;
         for (_, key) in order {
             if freed_total >= need_bytes {
                 break;
+            }
+            // A key with a reader (or one read moments ago) keeps its spans:
+            // the guards below measure REQUESTS, so a long stream outlives
+            // them (ADR-0017).
+            if protected.contains(&key) {
+                continue;
             }
             let (age, prior) = {
                 let cov = self.coverage.lock().await;

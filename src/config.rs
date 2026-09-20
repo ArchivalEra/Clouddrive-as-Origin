@@ -145,6 +145,14 @@ pub enum EvictionPolicy {
 /// the time it is requested (measured wait ~ 0): the window has to exceed the
 /// reader's appetite, not the object. Larger = fewer opens and more disk
 /// churn per window.
+/// How long a key stays protected from policy eviction after the last body
+/// reading it ends (ADR-0017). A pause between two requests of the same
+/// viewing session must not cost a re-fetch, and the budget's own guard
+/// (`STAGE_MIN_AGE_MS`, 60 s) is too short to cover a viewer who is thinking.
+fn default_read_grace_secs() -> u64 {
+    300
+}
+
 fn default_session_window_bytes() -> u64 {
     64 * 1024 * 1024
 }
@@ -249,6 +257,10 @@ pub struct RawConfig {
     /// How much one staged-read run fetches (ADR-0016). Default 64 MiB.
     #[serde(default = "default_session_window_bytes")]
     pub session_window_bytes: u64,
+    /// Grace after the last read before a key becomes evictable again
+    /// (ADR-0017). Default 300; 0 disables (live bodies are still protected).
+    #[serde(default = "default_read_grace_secs")]
+    pub read_grace_secs: u64,
 
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
@@ -306,6 +318,8 @@ pub struct Config {
     /// Bytes one staged-read run fetches (ADR-0016): one upstream `open` per
     /// window, shared by every reader inside it.
     pub session_window_bytes: u64,
+    /// Seconds a key stays un-evictable after the last body reading it ended.
+    pub read_grace_secs: u64,
     pub concurrency_per_upstream: usize,
     pub retry_max_attempts: u32,
     pub retry_base_ms: u64,
@@ -492,6 +506,7 @@ impl Config {
             negative_ttl_secs: raw.negative_ttl_secs,
             eviction_policy: raw.eviction_policy,
             session_window_bytes: raw.session_window_bytes,
+            read_grace_secs: raw.read_grace_secs,
             concurrency_per_upstream: raw.concurrency_per_upstream,
             retry_max_attempts: raw.retry_max_attempts,
             retry_base_ms: raw.retry_base_ms,
@@ -525,6 +540,7 @@ impl Default for Config {
             negative_ttl_secs: default_negative_ttl(),
             eviction_policy: EvictionPolicy::default(),
             session_window_bytes: default_session_window_bytes(),
+            read_grace_secs: default_read_grace_secs(),
             concurrency_per_upstream: default_concurrency(),
             retry_max_attempts: default_retry_max(),
             retry_base_ms: default_retry_base(),

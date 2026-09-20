@@ -277,7 +277,21 @@ where
     let viewer_ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
     match state.cache.serve(&rk, range, viewer_ua).await {
         Ok(ServeOutcome::Redirect { location }) => redirect_response(location, &req_id, &host_id),
-        Ok(ServeOutcome::Stream(plan)) => stream_response(plan, &req_id, &host_id, started),
+        Ok(ServeOutcome::Stream(plan)) => {
+            // A body served from LOCAL bytes (a disk entry or a staged span)
+            // holds a read lease for as long as it streams, plus the grace:
+            // policy eviction must not take away what a viewer is watching,
+            // and the cache's other clocks only measure requests (ADR-0017).
+            // An upstream-served body holds nothing — there is nothing local
+            // to protect.
+            let lease = (plan.source != crate::cache::cache::BodySource::Upstream).then(|| {
+                state
+                    .cache
+                    .leases
+                    .acquire_at(&rk.cache_key, Arc::clone(&state.cache.clock))
+            });
+            stream_response(plan, &req_id, &host_id, started, lease)
+        }
         Err(e) => {
             // Size hint for 416 Content-Range: best-effort memory peek, no
             // upstream call (SHOULD-level per R1).
@@ -311,6 +325,7 @@ fn stream_response(
     req_id: &str,
     host_id: &str,
     started: std::time::Instant,
+    lease: Option<crate::cache::leases::LeaseGuard>,
 ) -> Response {
     let mut builder = Response::builder().status(plan.status);
     if let Some(cr) = &plan.content_range {
@@ -326,7 +341,7 @@ fn stream_response(
     let source = plan.source.label();
     crate::metrics::observe_source(source);
     builder
-        .body(Body::from_stream(instrument_body(plan.body, source, started)))
+        .body(Body::from_stream(instrument_body(plan.body, source, started, lease)))
         .unwrap()
 }
 
@@ -349,9 +364,14 @@ fn instrument_body(
     body: crate::cache::flight::BodyStream,
     source: &'static str,
     started: std::time::Instant,
+    lease: Option<crate::cache::leases::LeaseGuard>,
 ) -> crate::cache::flight::BodyStream {
     use futures::StreamExt;
     Box::pin(async_stream::try_stream! {
+        // The lease lives exactly as long as this body: hyper drops the stream
+        // when the viewer goes away (or once `content-length` is satisfied),
+        // and the guard's drop is what ends the protection (ADR-0017).
+        let _lease = lease;
         let mut body = body;
         let mut first = true;
         while let Some(chunk) = body.next().await {
@@ -1999,6 +2019,44 @@ mod tests {
         );
     }
 
+    /// End to end through the response path: a body that is still in flight
+    /// holds the key's read lease, so neither the budget nor the idle sweep
+    /// takes its bytes while the viewer is watching — and the lease ends with
+    /// the body (ADR-0017).
+    #[tokio::test]
+    async fn a_body_in_flight_keeps_its_bytes_alive_past_the_ttl() {
+        let bytes: Vec<u8> = (0..40u8).collect();
+        let fx = base(&bytes)
+            .etag(Some("v1"))
+            .coverage(4)
+            .session_window(8)
+            .max_size_bytes(1024)
+            .build();
+        let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", "bytes=0-7")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        // Hold the body WITHOUT polling it: that is the state a viewer is in
+        // while the bytes are queued on their side of the connection.
+        let body = resp.into_body();
+        wait_ledger(&fx, "a.bin", &[(0, 8)]).await;
+        assert_eq!(staged_segments(&fx, "a.bin"), vec![(0, 8)]);
+
+        // Idle long past the TTL: the sweep must spare what is being read.
+        fx.state.cache.clock.advance(1_201_000);
+        fx.state.cache.tick().await;
+        assert_eq!(
+            staged_segments(&fx, "a.bin"),
+            vec![(0, 8)],
+            "a body in flight keeps its bytes past the inactivity TTL"
+        );
+
+        // The viewer goes away (the body is dropped), and the next sweep
+        // window takes the bytes.
+        drop(body);
+        fx.state.cache.clock.advance(1_200_001);
+        fx.state.cache.tick().await;
+        assert!(staged_segments(&fx, "a.bin").is_empty(), "with no reader, idleness applies");
+        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 0);
+    }
+
     /// Router construction smoke test: every route path must survive
     /// matchit's pattern compiler at runtime. The integration suite
     /// calls handlers directly and never builds the Router — a blind
@@ -2056,7 +2114,7 @@ mod tests {
             Ok(bytes::Bytes::from_static(b"de")),
         ];
         let body: crate::cache::flight::BodyStream = Box::pin(futures::stream::iter(chunks));
-        let mut wrapped = instrument_body(body, "upstream", std::time::Instant::now());
+        let mut wrapped = instrument_body(body, "upstream", std::time::Instant::now(), None);
 
         let mut out = Vec::new();
         while let Some(chunk) = wrapped.next().await {
@@ -2084,7 +2142,7 @@ mod tests {
             Ok(bytes::Bytes::from_static(b"efgh")),
         ];
         let body: crate::cache::flight::BodyStream = Box::pin(futures::stream::iter(chunks));
-        let mut wrapped = instrument_body(body, "disk", std::time::Instant::now());
+        let mut wrapped = instrument_body(body, "disk", std::time::Instant::now(), None);
         let first = wrapped.next().await.unwrap().unwrap();
         assert_eq!(&first[..], b"abcd");
         drop(wrapped); // exactly what hyper does once content-length is met
