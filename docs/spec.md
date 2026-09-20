@@ -172,6 +172,18 @@ repo** — it is injected at runtime via an environment variable (e.g.
    viewers of the same window cost one permit. A cold seek still queues for
    that permit in the starting request's name.
 
+   **A key being read is not evicted (ADR-0017).** Every clock here measures
+   requests, so a body that streams for longer than a guard's window used to
+   lose its bytes mid-flight (past 60 s it was budget-evictable, past
+   `inactive_ttl` the sweep deleted it). A body served from local bytes now
+   holds a **read lease** for its whole life — released when the body ends or
+   the viewer disconnects — and policy eviction (byte/count budget, span trim,
+   inactivity sweep) skips leased keys and keeps skipping them for
+   `read_grace_secs` (default 300) after the last lease ends, so a pause inside
+   one viewing session does not pay a re-fetch. Disk pressure is the
+   exception: it may still reclaim a resident stray being streamed, because the
+   disk is the last resort and an open descriptor survives the unlink.
+
 5. **Revalidation on access (no background polling):** an entry that is
    present but older than a short TTL (default 60 s, configurable)
    triggers a revalidation before serving from disk: a `stat` is compared
@@ -815,3 +827,20 @@ disabling the mechanism and watching the named test fail)
 - [x] The window is clamped to the object, and a bigger need widens it.
       — `cache::session::tests::the_window_is_clamped_to_the_object`,
       `a_need_larger_than_the_window_widens_it`.
+
+### Added 2026-09-21 (the read-lease round; reverse-verified by making every
+eviction path ignore the lease map and watching all three tests fail)
+
+- [x] A key being streamed is not evicted by the **byte budget**, and stays
+      protected for the grace after the body ends.
+      — `a_leased_key_survives_the_budget_until_its_grace_expires`.
+- [x] The **inactivity sweep** spares a key being read, even a stream that
+      outlives `inactive_ttl`.
+      — `the_age_sweep_spares_a_key_being_read`.
+- [x] End to end: a response body that is still in flight keeps its bytes alive
+      past the TTL, and the bytes go once the viewer is gone.
+      — `business::tests::a_body_in_flight_keeps_its_bytes_alive_past_the_ttl`.
+- [x] The lease map prunes itself rather than growing with every key ever read,
+      and a zero grace protects only live bodies.
+      — `cache::leases::tests::the_map_does_not_grow_with_every_key_ever_read`,
+      `a_zero_grace_protects_only_while_the_body_lives`.

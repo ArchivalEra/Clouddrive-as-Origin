@@ -64,7 +64,11 @@ fn resident_bytes_of(state: &CacheState) -> u64 {
 
 /// Max-size LRU victim selection — memory only; deletes happen guard-free
 /// via [`Magazine::delete`] (C3 lock discipline).
-fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
+fn evict_pick(
+    state: &mut CacheState,
+    config: &Config,
+    protected: &std::collections::HashSet<String>,
+) -> Vec<(String, u64)> {
     // Two independent budgets (P10): bytes AND entry count. Entry rows cost
     // roughly 500 B of RAM each (key stored twice plus five Strings), and
     // max_size_bytes alone let millions of small objects exhaust memory on
@@ -105,6 +109,10 @@ fn evict_pick(state: &mut CacheState, config: &Config) -> Vec<(String, u64)> {
         .entries
         .iter()
         .filter(|(_, m)| m.negative_until_millis.is_none() && !m.oversize)
+        // A key a viewer is reading (or read a moment ago) is not budget
+        // material: taking its bytes away is what makes the next seek pay a
+        // re-fetch (ADR-0017).
+        .filter(|(k, _)| !protected.contains(k.as_str()))
         .map(|(k, m)| (m.eligible_at(config.inactive_ttl_secs), k.clone()))
         .collect();
     candidates.sort_unstable_by_key(|(eligible, _)| *eligible);
@@ -170,7 +178,12 @@ fn pick_strays_for_pressure(
 
 /// Inactive-expiry collection — memory only. Persistence and file
 /// deletes happen guard-free via [`Magazine::delete`] (C3 lock discipline).
-fn reap_collect(state: &mut CacheState, ttl_ms: u64, now: u64) -> Vec<(String, u64)> {
+fn reap_collect(
+    state: &mut CacheState,
+    ttl_ms: u64,
+    now: u64,
+    protected: &std::collections::HashSet<String>,
+) -> Vec<(String, u64)> {
     let expired: Vec<String> = state
         .entries
         .iter()
@@ -180,6 +193,10 @@ fn reap_collect(state: &mut CacheState, ttl_ms: u64, now: u64) -> Vec<(String, u
                 |until| now >= until,
             )
         })
+        // Idleness is measured from the last REQUEST, so a stream longer than
+        // the TTL would be swept mid-flight; a lease outranks the clock
+        // (ADR-0017). Negative tombstones are not leases: they hold no bytes.
+        .filter(|(k, m)| m.negative_until_millis.is_some() || !protected.contains(k.as_str()))
         .map(|(k, _)| k.clone())
         .collect();
     let mut out = Vec::with_capacity(expired.len());
@@ -199,6 +216,9 @@ pub(crate) struct Magazine {
     state: Arc<RwLock<CacheState>>,
     config: Arc<Config>,
     meta: Arc<crate::cache::persist::MetaStore>,
+    /// Read leases: policy eviction spares what a viewer is streaming
+    /// (ADR-0017). Disk pressure deliberately does not consult them.
+    leases: Arc<super::leases::Leases>,
 }
 
 impl Magazine {
@@ -206,8 +226,9 @@ impl Magazine {
         state: Arc<RwLock<CacheState>>,
         config: Arc<Config>,
         meta: Arc<crate::cache::persist::MetaStore>,
+        leases: Arc<super::leases::Leases>,
     ) -> Self {
-        Self { state, config, meta }
+        Self { state, config, meta, leases }
     }
 
     /// Whether the magazine can hold an object this size (see
@@ -272,7 +293,7 @@ impl Magazine {
             let mut s = self.state.write().await;
             s.total_bytes = s.total_bytes.saturating_sub(old_size) + entry.size_bytes;
             s.entries.insert(key.to_string(), entry);
-            evict_pick(&mut s, &self.config)
+            evict_pick(&mut s, &self.config, &std::collections::HashSet::new())
         };
         self.delete(&evicted).await;
     }
@@ -382,15 +403,17 @@ impl Magazine {
     /// Inactive-expiry pass: returns the victims whose redb rows and files
     /// the caller must remove via [`Magazine::delete`].
     pub(crate) async fn reap(&self, ttl_ms: u64, now: u64) -> Vec<(String, u64)> {
+        let protected = self.leases.protected(now);
         let mut s = self.state.write().await;
-        reap_collect(&mut s, ttl_ms, now)
+        reap_collect(&mut s, ttl_ms, now, &protected)
     }
 
     /// Byte/count budget pass: returns the victims that bring the magazine
     /// back under its caps.
-    pub(crate) async fn evict_budget(&self) -> Vec<(String, u64)> {
+    pub(crate) async fn evict_budget(&self, now: u64) -> Vec<(String, u64)> {
+        let protected = self.leases.protected(now);
         let mut s = self.state.write().await;
-        evict_pick(&mut s, &self.config)
+        evict_pick(&mut s, &self.config, &protected)
     }
 
     /// Disk-pressure pass: returns the resident strays to delete for
@@ -473,7 +496,7 @@ mod tests {
 
         // Over the budget only because of the stray: nobody is evicted.
         assert!(
-            evict_pick(&mut st, &cfg).is_empty(),
+            evict_pick(&mut st, &cfg, &std::collections::HashSet::new()).is_empty(),
             "a stray must not make the magazine look over budget"
         );
         assert!(st.entries.contains_key("small.bin"), "the member survives");
@@ -483,7 +506,7 @@ mod tests {
         // goes, never the stray.
         st.entries.insert("small2.bin".into(), row("small2.bin", 950, 20, false));
         st.total_bytes += 950;
-        let victims = evict_pick(&mut st, &cfg);
+        let victims = evict_pick(&mut st, &cfg, &std::collections::HashSet::new());
         assert_eq!(
             victims.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
             vec!["small.bin"],
@@ -555,6 +578,7 @@ mod tests {
             Arc::new(RwLock::new(CacheState::default())),
             Arc::new(cfg),
             Arc::new(meta),
+            Arc::new(crate::cache::leases::Leases::new(0)),
         );
         magazine
             .delete(&[

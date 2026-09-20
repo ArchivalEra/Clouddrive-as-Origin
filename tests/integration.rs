@@ -1032,6 +1032,109 @@ async fn staged_segment_bytes_join_the_disk_budget() {
 }
 
 // ---------------------------------------------------------------------------
+// Read leases (ADR-0017): what a viewer is streaming is not evicted.
+// ---------------------------------------------------------------------------
+
+/// The cache's clocks measure REQUESTS, so a stream longer than the guards'
+/// windows would otherwise lose its bytes while it is still being read: past
+/// `STAGE_MIN_AGE_MS` the spans become budget-evictable, past the TTL the sweep
+/// deletes them. A lease outranks both, and keeps outranking them for
+/// `read_grace_secs` after the body ends, which is what stops a pause between
+/// two requests of one viewing session from costing a re-fetch.
+#[tokio::test]
+async fn a_leased_key_survives_the_budget_until_its_grace_expires() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config::default();
+    cfg.cache_dir = dir.path().to_path_buf();
+    cfg.inactive_ttl_secs = 1_200;
+    cfg.read_grace_secs = 300;
+    cfg.max_size_bytes = 1_024; // one 2 KiB span is over budget on its own
+    let cfg = Arc::new(cfg);
+    let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+
+    let touched = 10_000u64;
+    clock.advance(120_000);
+    let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, "live.bin", 0, 2048);
+    std::fs::write(&path, vec![0u8; 2048]).unwrap();
+    {
+        let mut cov = cache.coverage.lock().await;
+        let mut c = origin_cache::cache::store::Coverage {
+            total: 2048,
+            last_touch_millis: touched,
+            ..Default::default()
+        };
+        c.add_interval(0, 2048, touched);
+        cov.insert("live.bin".to_string(), c);
+    }
+    cache.state.write().await.segment_bytes = 2048;
+
+    // A viewer is streaming this key right now.
+    let lease = cache.leases.acquire_at("live.bin", Arc::clone(&clock));
+    cache.tick().await;
+    assert!(path.exists(), "a key being read must not be evicted for budget");
+    assert_eq!(cache.state.read().await.segment_bytes, 2048);
+
+    // The body ends, but the grace still covers the pause before the next
+    // request of the same session.
+    drop(lease);
+    cache.tick().await;
+    assert!(path.exists(), "the grace covers the pause after a stream ends");
+
+    // Past the grace the budget applies again.
+    clock.advance(300_001);
+    cache.tick().await;
+    assert!(!path.exists(), "after the grace the key is ordinary budget material");
+    assert_eq!(cache.state.read().await.segment_bytes, 0);
+}
+
+/// The same rule against the inactivity sweep: idleness is measured from the
+/// last request, so a download longer than the TTL used to be swept
+/// mid-flight.
+#[tokio::test]
+async fn the_age_sweep_spares_a_key_being_read() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config::default();
+    cfg.cache_dir = dir.path().to_path_buf();
+    cfg.inactive_ttl_secs = 1_200;
+    cfg.read_grace_secs = 300;
+    let cfg = Arc::new(cfg);
+    let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+
+    let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, "long.bin", 0, 4096);
+    std::fs::write(&path, vec![0u8; 4096]).unwrap();
+    {
+        let mut cov = cache.coverage.lock().await;
+        let mut c = origin_cache::cache::store::Coverage {
+            total: 4096,
+            last_touch_millis: 0, // never touched: idle since the epoch
+            ..Default::default()
+        };
+        c.add_interval(0, 4096, 0);
+        cov.insert("long.bin".to_string(), c);
+    }
+    cache.state.write().await.segment_bytes = 4096;
+
+    let lease = cache.leases.acquire_at("long.bin", Arc::clone(&clock));
+    clock.advance(1_201_000); // far past the TTL, mid-download
+    cache.tick().await;
+    assert!(path.exists(), "a stream in flight outlives the inactivity TTL");
+    assert_eq!(cache.state.read().await.segment_bytes, 4096);
+
+    // The sweep is TTL-paced, not per-tick: the next one arrives a full
+    // `inactive_ttl` after the pass that spared the key. (The grace itself is
+    // what protects against the BUDGET, which runs on every tick — pinned by
+    // `a_leased_key_survives_the_budget_until_its_grace_expires`.)
+    drop(lease);
+    clock.advance(1_200_001);
+    cache.tick().await;
+    assert!(!path.exists(), "once the viewer is gone, the next sweep takes it");
+}
+
+// ---------------------------------------------------------------------------
 // Staged-read runs (ADR-0016): one upstream stream per key, shared by every
 // reader inside its window.
 // ---------------------------------------------------------------------------

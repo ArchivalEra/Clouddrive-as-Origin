@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod flight;
+pub mod leases;
 pub(crate) mod magazine;
 pub(crate) mod session;
 pub(crate) mod staging;

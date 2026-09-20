@@ -405,6 +405,11 @@ pub struct Cache<C: Clock> {
     /// The magazine: every byte-budget decision (admission, eviction,
     /// pressure reclaim, install, delete) lives behind this receiver.
     pub(crate) magazine: Magazine,
+    /// Read leases (ADR-0017): keys a viewer is streaming, which policy
+    /// eviction must leave alone while the body lives and for a grace after.
+    /// `pub` like the rest of the machinery's working state (tests drive it
+    /// directly; production goes through the response path).
+    pub leases: Arc<crate::cache::leases::Leases>,
     /// Staged-read runs (ADR-0016): one upstream stream per key, shared by
     /// every reader inside its window. Public because the serve path and the
     /// tests both drive it; the module owns the invariants.
@@ -435,11 +440,20 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         let dirty_access = Arc::new(AccessClock::new());
         let state = Arc::new(RwLock::new(CacheState::default()));
         let coverage = Arc::new(Mutex::new(HashMap::new()));
-        let magazine = Magazine::new(Arc::clone(&state), Arc::clone(&config), Arc::clone(&meta));
+        let leases = Arc::new(crate::cache::leases::Leases::new(
+            config.read_grace_secs.saturating_mul(1000),
+        ));
+        let magazine = Magazine::new(
+            Arc::clone(&state),
+            Arc::clone(&config),
+            Arc::clone(&meta),
+            Arc::clone(&leases),
+        );
         let staging = Staging::new(
             Arc::clone(&coverage),
             Arc::clone(&state),
             Arc::clone(&config),
+            Arc::clone(&leases),
         );
         let flights = crate::cache::flight::Flights::new(crate::cache::flight::DEFAULT_STALL_BUDGET);
         let sessions = Arc::new(Sessions::new(
@@ -459,6 +473,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             coverage,
             staging,
             sessions,
+            leases,
             reval_inflight: Inflight::new(),
             rebuilt_rows: std::sync::atomic::AtomicUsize::new(0),
             prewarm_inflight: std::sync::atomic::AtomicUsize::new(0),
@@ -1963,7 +1978,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             s.segment_bytes = s.segment_bytes.saturating_sub(freed);
         }
         self.magazine.delete(&reaped).await;
-        let evicted = self.magazine.evict_budget().await;
+        let evicted = self.magazine.evict_budget(now).await;
         self.magazine.delete(&evicted).await;
         // 3b. Disk pressure (ADR-0014). Resident strays sit outside the byte
         //     budget, so nothing else bounds how much of the disk they take;

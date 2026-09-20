@@ -427,7 +427,8 @@ mod tests {
         let cfg = Arc::new(cfg);
         let coverage = Arc::new(Mutex::new(HashMap::<String, Coverage>::new()));
         let state = Arc::new(tokio::sync::RwLock::new(crate::cache::cache::CacheState::default()));
-        let staging = Staging::new(Arc::clone(&coverage), Arc::clone(&state), Arc::clone(&cfg));
+        let leases = Arc::new(crate::cache::leases::Leases::new(0));
+        let staging = Staging::new(Arc::clone(&coverage), Arc::clone(&state), Arc::clone(&cfg), leases);
         let flights = Flights::new(flight::DEFAULT_STALL_BUDGET);
         let sessions = Arc::new(Sessions::new(cfg, Arc::clone(&clock), staging, flights));
         let backend = Arc::new(SizedBackend::new(&[("a.bin", object_bytes)], opens));
