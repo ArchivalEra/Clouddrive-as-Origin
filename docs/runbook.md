@@ -359,6 +359,16 @@ curl -s http://127.0.0.1:9090/metrics | grep 'cache_session_total'
 curl -s http://127.0.0.1:9090/metrics | grep 'cache_session_reader_total'
 ```
 
+The node-side acceptance for this mechanism is
+`deploy/oracle/efficient-walk.sh <object> [shards]`, run against a
+loopback-only efficient instance (its own cache dir and ports, the same
+OpenList upstream, a magazine larger than the walked object — admission
+refuses to stage an object the magazine cannot hold). It walks ascending 1 MiB
+shards and prints the account: on the 3 GiB test object, 512 shards cost 12
+opens (499 of the 512 requests rode a run), 128 unvisited shards cost 2, a
+sealed shard re-read costs 0, and a shard compares byte-identical to the
+provider's own bytes.
+
 `result="attached"` counts requests that cost no upstream open and no stream
 permit; `result="standalone"` counts the escape (a far seek, a run already
 starting, or no admission). `op="open"` divided by the walk's byte length is
