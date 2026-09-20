@@ -53,8 +53,20 @@ LRU either way), then spans inside the chosen row:
   trailing window (the newest 20 spans by offset, measured back from the
   frontier); when that window cannot cover the overshoot the next window back
   enters. Heat never compares across keys — the row order already carries
-  that — and only spans with a sidecar file behind them are candidates, so a
-  merged ledger interval (two files) is left alone rather than guessed at.
+  that.
+
+**The disk is the authority for what exists; the ledger is the policy's map of
+it** (ADR-0016). Candidates are the key's real `.seg` files, and the ledger
+supplies each file's read time and count — the intervals covering that file.
+After the files are deleted the row is *rebuilt* from the survivors, carrying
+the old stamps across and re-establishing the ceiling with the same merge the
+insert path uses. Reading candidates from the ledger's own bounds instead
+broke as soon as the two stopped being 1:1: `compact` merges a sequential walk
+into one interval that owns no single file, `decay` drops intervals whose
+bytes are still on disk, and the ceiling's `drop_coldest` discards records for
+surviving files — after any of the three, no interval named a real file and
+the key's staged bytes could not be evicted at all until the inactivity
+sweep.
 
 Both are span-level, so an overshoot trims the cold tail instead of emptying a
 key. The file deletion and the `segment_bytes` subtraction live inside the

@@ -63,3 +63,10 @@ same trade window decay already makes.
 `decay` and `covered_bytes` also became one pass, `decay_and_covered`, whose
 result is handed to the promotion check — which used to run its own decay and
 its own coverage walk, with the same window and clock, immediately after.
+
+(2026-09-20) Merging is a coarsening of the *policy map* and never a loss of
+evictability: once the ceiling fires, one interval can cover many sidecar
+files, and decay and `drop_coldest` can drop records whose bytes stay on disk.
+Span eviction therefore takes its candidates from the disk (`segments_for_key`)
+and rebuilds the row from the survivors (ADR-0016), so those files remain
+evictable one at a time no matter what the ledger's bounds say.

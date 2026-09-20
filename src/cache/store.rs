@@ -308,6 +308,32 @@ impl Coverage {
         self.compact();
     }
 
+    /// Rebuild this row's intervals from the sidecar files that remain on
+    /// disk, carrying the policy input across: each survivor inherits the read
+    /// time and count of the interval that covered it before the rebuild
+    /// (none ⇒ `(now_millis, 0)` — a file the ledger had no record of, which
+    /// only happens when `decay` or the ceiling dropped that record).
+    ///
+    /// The ledger's own invariants are re-established by the same code that
+    /// maintains them on the insert path: the list ends up sorted,
+    /// non-overlapping and bounded by [`MAX_INTERVALS_PER_KEY`] (a rebuilt row
+    /// can hold more files than the ceiling allows, and `compact` merges the
+    /// touching runs back down without inventing coverage).
+    ///
+    /// Existence lives on disk; this list is the policy's map of it.
+    pub fn adopt_files(&mut self, files: &[(u64, u64)], now_millis: u64) {
+        let prior = std::mem::take(&mut self.intervals);
+        self.intervals = files
+            .iter()
+            .map(|(start, end)| match prior.iter().find(|(ps, pe, ..)| *ps <= *start && *end <= *pe)
+            {
+                Some((_, _, t, r)) => (*start, *end, *t, *r),
+                None => (*start, *end, now_millis, 0),
+            })
+            .collect();
+        self.compact();
+    }
+
     /// Keep the vector under [`MAX_INTERVALS_PER_KEY`] — exactly, or not at
     /// all, because both steps here are lossless-then-conservative:
     ///
@@ -928,6 +954,37 @@ mod tests {
         assert!((c.ratio_of(c.covered_bytes()).unwrap() - 1.0).abs() < 1e-9);
         c.add_interval(200, 200, 5000); // empty ignored
         assert_eq!(c.intervals, vec![(0, 80, 3000, 0), (80, 100, 4000, 0)]);
+    }
+
+    /// The rebuild path: files are existence, the interval list is the
+    /// policy's map of them. Survivors inherit the read time and count of the
+    /// interval that covered them; bytes the ledger has no record of get a
+    /// fresh stamp and zero reads; and the ceiling still holds even when the
+    /// disk holds more files than a row may describe.
+    #[test]
+    fn adopt_files_keeps_the_invariants_and_carries_policy() {
+        let mut c = Coverage::default();
+        c.add_interval(0, 100, 10); // one merged interval over two files
+        c.add_interval(500, 600, 20);
+        c.intervals[0].3 = 3; // it was read three times
+        c.adopt_files(&[(0, 50), (50, 100), (500, 600)], 99);
+        assert_eq!(
+            c.intervals,
+            vec![(0, 50, 10, 3), (50, 100, 10, 3), (500, 600, 20, 0)],
+            "survivors keep the policy input of the interval that named them"
+        );
+
+        // No record at all (decay or the ceiling dropped it): fresh, unread.
+        c.adopt_files(&[(700, 800)], 77);
+        assert_eq!(c.intervals, vec![(700, 800, 77, 0)]);
+
+        // A rebuild can find more files than a row may hold; the ceiling is
+        // re-established by the same merge the insert path uses.
+        let files: Vec<(u64, u64)> =
+            (0..MAX_INTERVALS_PER_KEY as u64 + 10).map(|i| (i, i + 1)).collect();
+        c.adopt_files(&files, 5);
+        assert!(c.intervals.len() <= MAX_INTERVALS_PER_KEY, "{}", c.intervals.len());
+        assert_eq!(c.covered_bytes(), MAX_INTERVALS_PER_KEY as u64 + 10);
     }
 
     #[test]

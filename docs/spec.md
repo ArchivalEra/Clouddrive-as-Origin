@@ -144,7 +144,12 @@ repo** — it is injected at runtime via an environment variable (e.g.
    visited least-recently-touched first, so the choice *across* keys is LRU,
    and a row younger than 60 s is never touched. The ledger holds the read
    counts — `add_read` credits every span a request touches, including the
-   staged head of a partial hit — so heat survives a merge as a sum.
+   staged head of a partial hit — so heat survives a merge as a sum. **The
+   disk is the authority for what exists; the ledger is the policy's map of
+   it (ADR-0016):** candidates are the key's real `.seg` files and the row is
+   rebuilt from the survivors, so a ledger that merged (a sequential walk past
+   the 4096-interval ceiling), decayed, or dropped its coldest records still
+   evicts one file at a time.
 
    **An object larger than the whole magazine is resident, not evicted
    (ADR-0014).** Evicting others cannot bring it into budget — its own
@@ -750,3 +755,20 @@ reverting the rule and watching the named test fail)
 - [x] A read credits **every span it touches**: one straddling two spans
       credits both, and the staged head of a partial hit is credited.
       — `business::tests::a_read_credits_every_staged_span_it_touches`.
+
+### Added 2026-09-20 (the eviction-granularity round; the fix was
+reverse-verified by restoring the exact-bounds candidate rule and watching all
+three named tests fail)
+
+- [x] A **merged** ledger interval (a sequential walk past the 4096-interval
+      ceiling) still evicts one file at a time, and the row is rebuilt from the
+      survivors with their read times carried across.
+      — `a_merged_interval_still_evicts_one_file_at_a_time`,
+      `cache::store::tests::adopt_files_keeps_the_invariants_and_carries_policy`.
+- [x] A row whose records **decayed** away (files still on disk) is still
+      evictable, and the survivors are recorded again.
+      — `a_decayed_interval_leaves_its_files_evictable`.
+- [x] The ceiling's shape at scale: 4097 sequential 1-byte spans (compaction
+      merges them, so no interval's bounds name a file) still bring the byte
+      budget back under.
+      — `a_sequential_walk_past_the_ledger_ceiling_stays_evictable`.
