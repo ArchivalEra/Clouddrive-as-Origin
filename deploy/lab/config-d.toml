@@ -30,6 +30,12 @@ eviction_policy = "heat"
 # One upstream open per window (ADR-0016): small here so the LAB can count opens
 # against a 1 MiB object.
 session_window_bytes = 262144
+
+# The eviction test reads both keys and then waits for a trim, so the read
+# grace must be off: with the production default (300 s) the keys would still
+# be protected from the budget when the tick runs (ADR-0017). Live bodies are
+# protected regardless — that part is not a timer.
+read_grace_secs = 0
 [cache_profiles.efficient]
 min_file_size = 4
 
