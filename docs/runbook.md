@@ -348,7 +348,26 @@ an `open` per request means the read missed the ledger (the sidecar was
 evicted or its interval decayed) and went upstream. `segment_bytes` and
 `coverage_intervals` in healthz say how much the window currently holds.
 
-Two knobs govern what leaves that window (ADR-0015), both span-level:
+A scrub's reads ride **runs** (ADR-0016): the first ranged miss on a key opens
+one upstream stream covering `session_window_bytes` (default 64 MiB, about a
+second at the measured 63 MB/s) and every request inside that window is served
+from its watermark. So the account above reads differently than it used to:
+
+```sh
+# Runs by outcome (sealed / failed / chained) and requests by how they were served
+curl -s http://127.0.0.1:9090/metrics | grep 'cache_session_total'
+curl -s http://127.0.0.1:9090/metrics | grep 'cache_session_reader_total'
+```
+
+`result="attached"` counts requests that cost no upstream open and no stream
+permit; `result="standalone"` counts the escape (a far seek, a run already
+starting, or no admission). `op="open"` divided by the walk's byte length is
+the shaping account: one open per window is the target, one per request is the
+old behaviour. For a viewer scrubbing forward continuously, expect roughly
+`bytes / session_window_bytes` opens; for random seeking, expect one per seek
+no matter how large the window is.
+
+Two knobs govern what leaves the window (ADR-0015), both span-level:
 
 ```toml
 eviction_policy = "lru"   # default: the stalest span in the least-recently-
