@@ -108,10 +108,10 @@ impl Staging {
     /// single-big-object workload that is the whole magazine — on any
     /// overshoot.
     ///
-    /// File deletion and the `segment_bytes` subtraction live in this module
-    /// and nowhere else: the earlier shape returned span lists to `tick`,
-    /// which fed them into the row-level delete path — undoing the span
-    /// eviction and subtracting the same bytes twice.
+    /// File deletion, the ledger rebuild and the `segment_bytes` subtraction
+    /// live in this module and nowhere else: the earlier shape returned span
+    /// lists to `tick`, which fed them into the row-level delete path —
+    /// undoing the span eviction and subtracting the same bytes twice.
     ///
     /// Returns `(keys touched, bytes freed)`.
     pub(crate) async fn evict_staged(&self, need_bytes: u64, now: u64) -> (usize, u64) {
@@ -122,7 +122,7 @@ impl Staging {
             if freed_total >= need_bytes {
                 break;
             }
-            let (age, intervals) = {
+            let (age, prior) = {
                 let cov = self.coverage.lock().await;
                 match cov.get(&key) {
                     Some(c) => (now.saturating_sub(c.last_touch_millis), c.intervals.clone()),
@@ -130,14 +130,14 @@ impl Staging {
                 }
             };
             // Never evict a row that is actively staging right now.
-            if intervals.is_empty() || age < STAGE_MIN_AGE_MS {
+            if age < STAGE_MIN_AGE_MS {
                 continue;
             }
-            let picks = self.pick_spans(&key, &intervals, need_bytes - freed_total).await;
-            let mut freed = 0u64;
-            for (start, end) in picks {
-                freed += self.drop_span(&key, start, end).await;
+            let picks = self.pick_spans(&key, &prior, need_bytes - freed_total).await;
+            if picks.is_empty() {
+                continue;
             }
+            let freed = self.drop_spans(&key, &picks, now).await;
             if freed == 0 {
                 continue;
             }
@@ -165,41 +165,99 @@ impl Staging {
     }
 
     /// The spans to delete, in deletion order, until at least `need_bytes` is
-    /// covered. Only a span with an exact sidecar file is a candidate: an
-    /// interval merged out of two spans owns no single file and is left alone
-    /// rather than guessed at.
+    /// covered.
+    ///
+    /// **The disk is the authority for what exists.** Candidates are the key's
+    /// real `.seg` files, and the ledger only supplies each file's policy
+    /// input — the read time (`lru`) and read count (`heat`) of the interval
+    /// covering that file's start. Candidates used to come from the ledger's
+    /// own bounds, which broke the moment the ledger stopped being 1:1 with the
+    /// files: `compact` merges a sequential walk into one interval that owns no
+    /// single file, `decay` drops intervals whose bytes are still on disk, and
+    /// the ceiling's `drop_coldest` discards records for surviving files. After
+    /// any of the three, an exact-bounds lookup named a file that never existed
+    /// and the key's staged bytes could not be evicted at all — only the
+    /// inactivity sweep could reclaim them.
+    ///
+    /// A file the ledger has no record of sorts as `(t = 0, reads = 0)`, i.e.
+    /// first to go: the only two ways to lose a record are decay and the
+    /// ceiling, and both drop exactly the entries nobody was reading.
     async fn pick_spans(
         &self,
         key: &str,
-        intervals: &[(u64, u64, u64, u64)],
+        prior: &[(u64, u64, u64, u64)],
         need_bytes: u64,
     ) -> Vec<(u64, u64)> {
-        let newest = intervals.len().saturating_sub(1);
-        let mut ordered: Vec<(usize, (u64, u64, u64, u64))> =
-            intervals.iter().copied().enumerate().collect();
+        let files: Vec<(u64, u64)> = store::segments_for_key(&self.config.cache_dir, key)
+            .into_iter()
+            .map(|(start, end, _)| (start, end))
+            .collect();
+        if files.is_empty() {
+            return Vec::new();
+        }
+        // Per file: the policy input the ledger remembers about those bytes,
+        // plus the position in the file sequence (heat's trailing window is
+        // measured on real spans, not on ledger entries).
+        let policy: Vec<(u64, u64)> = files
+            .iter()
+            .map(|(start, end)| match prior.iter().find(|(ps, pe, ..)| ps <= start && end <= pe) {
+                Some((_, _, t, r)) => (*t, *r),
+                None => (0, 0),
+            })
+            .collect();
+        let newest = files.len().saturating_sub(1);
+        let mut ordered: Vec<usize> = (0..files.len()).collect();
         match self.config.eviction_policy {
             // Stalest first, lowest offset as the tiebreak.
-            EvictionPolicy::Lru => ordered.sort_by_key(|(_, (s, _, t, _))| (*t, *s)),
+            EvictionPolicy::Lru => {
+                ordered.sort_by_key(|i| (policy[*i].0, files[*i].0));
+            }
             // Fewest reads inside the trailing window; the window index (how
             // many windows back from the newest span) outranks the count, so
             // an older window never jumps ahead of the trailing one.
-            EvictionPolicy::Heat => ordered.sort_by_key(|(i, (s, _, t, r))| {
-                ((newest - *i) / HEAT_TRAILING_WINDOW, *r, *t, *s)
-            }),
+            EvictionPolicy::Heat => {
+                ordered.sort_by_key(|i| {
+                    ((newest - *i) / HEAT_TRAILING_WINDOW, policy[*i].1, policy[*i].0, files[*i].0)
+                });
+            }
         }
         let mut picked = Vec::new();
         let mut acc = 0u64;
-        for (_, (start, end, ..)) in ordered {
+        for i in ordered {
             if acc >= need_bytes {
                 break;
             }
-            let path = store::seg_path(&self.config.cache_dir, key, start, end);
-            if tokio::fs::metadata(&path).await.is_ok() {
-                acc += end - start;
-                picked.push((start, end));
-            }
+            let (start, end) = files[i];
+            acc += end - start;
+            picked.push((start, end));
         }
         picked
+    }
+
+    /// Delete the chosen spans' sidecar files, then RE-DERIVE this row's
+    /// intervals from the files that remain ([`store::Coverage::adopt_files`],
+    /// which reads the row's live intervals as the carry-over source): a merged
+    /// interval loses its span-level bounds the moment one of its files goes,
+    /// so the row is rebuilt rather than patched. Returns the bytes removed
+    /// from disk; the caller subtracts them from `segment_bytes` once.
+    async fn drop_spans(&self, key: &str, picks: &[(u64, u64)], now: u64) -> u64 {
+        let mut freed = 0u64;
+        for (start, end) in picks {
+            let path = store::seg_path(&self.config.cache_dir, key, *start, *end);
+            freed += tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+        let survivors: Vec<(u64, u64)> = store::segments_for_key(&self.config.cache_dir, key)
+            .into_iter()
+            .map(|(start, end, _)| (start, end))
+            .collect();
+        {
+            let mut cov = self.coverage.lock().await;
+            if let Some(entry) = cov.get_mut(key) {
+                entry.adopt_files(&survivors, now);
+            }
+        }
+        freed
     }
 
     /// Drop ledger rows (no files, no accounting — the caller owns both).
@@ -248,23 +306,6 @@ impl Staging {
                 }
             }
         }
-    }
-
-    /// Delete ONE span: its sidecar file and its ledger interval. Returns the
-    /// bytes removed from disk (0 when the file was already gone). The caller
-    /// subtracts them from `segment_bytes` once per eviction, so the
-    /// accounting has exactly one writer.
-    async fn drop_span(&self, key: &str, start: u64, end: u64) -> u64 {
-        let path = store::seg_path(&self.config.cache_dir, key, start, end);
-        let size = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
-        let _ = tokio::fs::remove_file(&path).await;
-        {
-            let mut cov = self.coverage.lock().await;
-            if let Some(entry) = cov.get_mut(key) {
-                entry.intervals.retain(|(s, e, ..)| !(*s == start && *e == end));
-            }
-        }
-        size
     }
 
     /// Remove a ledger row that holds no spans any more (the eviction took

@@ -1021,6 +1021,165 @@ async fn staged_segment_bytes_join_the_disk_budget() {
     assert!(paths.iter().all(|p| !p.exists()), "the evicted sidecar files must be gone");
 }
 
+/// The evictor takes its candidates from DISK and re-derives the row from the
+/// survivors, so a ledger that has stopped being 1:1 with the files still
+/// evicts. This is the post-`compact` shape: one merged interval covering four
+/// real spans. Before that change the evictor looked for a sidecar named
+/// after the *interval* (`.seg.m.bin.0-4096`, which was never written), found
+/// no candidate and freed nothing — the key's bytes were unreclaimable until
+/// the inactivity sweep.
+#[tokio::test]
+async fn a_merged_interval_still_evicts_one_file_at_a_time() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config::default();
+    cfg.cache_dir = dir.path().to_path_buf();
+    cfg.inactive_ttl_secs = 1_200;
+    cfg.max_size_bytes = 3072; // four spans staged, budget for three
+    let cfg = Arc::new(cfg);
+    let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+
+    let touched = 10_000u64;
+    clock.advance(120_000);
+    let mut paths = Vec::new();
+    for i in 0..4u64 {
+        let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, "m.bin", i * 1024, (i + 1) * 1024);
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        paths.push(path);
+    }
+    {
+        let mut cov = cache.coverage.lock().await;
+        let mut c = origin_cache::cache::store::Coverage {
+            total: 4096,
+            last_touch_millis: touched,
+            ..Default::default()
+        };
+        // One interval for the whole walk: what `compact` leaves behind.
+        c.add_interval(0, 4096, touched);
+        assert_eq!(c.intervals.len(), 1, "the premise is a merged ledger");
+        cov.insert("m.bin".to_string(), c);
+    }
+    cache.state.write().await.segment_bytes = 4096;
+
+    cache.tick().await;
+
+    let s = cache.state.read().await;
+    let cov = cache.coverage.lock().await;
+    assert_eq!(s.segment_bytes, 3072, "one span's worth must be freed");
+    assert!(paths[0].exists() == false, "the stalest span (lowest offset) goes first");
+    assert!(paths[1].exists() && paths[2].exists() && paths[3].exists(), "the rest stay");
+    assert_eq!(
+        cov.get("m.bin").unwrap().intervals,
+        vec![(1024, 2048, touched, 0), (2048, 3072, touched, 0), (3072, 4096, touched, 0)],
+        "the rebuilt ledger describes exactly the surviving files, carrying their read time"
+    );
+}
+
+/// The same hole from the other two entrances: `decay` (and the ceiling's
+/// `drop_coldest`) leaves files on disk with no interval naming them. A row
+/// that has lost every record is still evictable, and the rebuild gives the
+/// survivors a fresh stamp rather than pretending they were never staged.
+#[tokio::test]
+async fn a_decayed_interval_leaves_its_files_evictable() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config::default();
+    cfg.cache_dir = dir.path().to_path_buf();
+    cfg.inactive_ttl_secs = 1_200;
+    cfg.max_size_bytes = 1024; // two spans staged, budget for one
+    let cfg = Arc::new(cfg);
+    let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+
+    let touched = 10_000u64;
+    clock.advance(120_000);
+    let mut paths = Vec::new();
+    for i in 0..2u64 {
+        let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, "d.bin", i * 1024, (i + 1) * 1024);
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        paths.push(path);
+    }
+    {
+        let mut cov = cache.coverage.lock().await;
+        // No intervals at all: every record of these bytes decayed away.
+        cov.insert(
+            "d.bin".to_string(),
+            origin_cache::cache::store::Coverage {
+                total: 2048,
+                last_touch_millis: touched,
+                ..Default::default()
+            },
+        );
+    }
+    cache.state.write().await.segment_bytes = 2048;
+
+    cache.tick().await;
+
+    let s = cache.state.read().await;
+    let cov = cache.coverage.lock().await;
+    assert_eq!(s.segment_bytes, 1024);
+    assert!(!paths[0].exists() && paths[1].exists(), "one file goes, one stays");
+    let iv = &cov.get("d.bin").unwrap().intervals;
+    assert_eq!(iv.len(), 1, "the survivor is recorded again");
+    assert_eq!((iv[0].0, iv[0].1), (1024, 2048));
+}
+
+/// The scale shape: a sequential 1-byte-per-span walk past the ledger ceiling.
+/// `compact` merges touching intervals (4097 files -> 2049 two-byte intervals),
+/// so no interval's bounds ever equal a file's bounds — and the budget must
+/// still be brought back under. This is the workload the node cannot test with
+/// a real 200 GB object (disk 183 GB, upstream max 3.2 GB), so it is pinned
+/// here at the level where the ceiling actually fires.
+#[tokio::test]
+async fn a_sequential_walk_past_the_ledger_ceiling_stays_evictable() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config::default();
+    cfg.cache_dir = dir.path().to_path_buf();
+    cfg.inactive_ttl_secs = 1_200;
+    cfg.max_size_bytes = 1000;
+    let cfg = Arc::new(cfg);
+    let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+
+    let touched = 10_000u64;
+    clock.advance(120_000);
+    let spans = origin_cache::cache::store::MAX_INTERVALS_PER_KEY + 1;
+    for i in 0..spans as u64 {
+        let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, "walk.bin", i, i + 1);
+        std::fs::write(&path, vec![7u8; 1]).unwrap();
+    }
+    {
+        let mut cov = cache.coverage.lock().await;
+        let mut c = origin_cache::cache::store::Coverage {
+            total: spans as u64,
+            last_touch_millis: touched,
+            ..Default::default()
+        };
+        for i in 0..spans as u64 {
+            c.add_interval(i, i + 1, touched);
+        }
+        assert!(
+            c.intervals.len() < spans,
+            "the ceiling must have merged the walk (got {} intervals)",
+            c.intervals.len()
+        );
+        cov.insert("walk.bin".to_string(), c);
+    }
+    cache.state.write().await.segment_bytes = spans as u64;
+
+    cache.tick().await;
+
+    let s = cache.state.read().await;
+    let files = origin_cache::cache::store::segments_for_key(&cfg.cache_dir, "walk.bin").len();
+    let cov = cache.coverage.lock().await;
+    assert_eq!(s.segment_bytes, 1000, "the budget is respected");
+    assert_eq!(files, 1000, "exactly one file per byte of the budget remains");
+    let covered: u64 = cov.get("walk.bin").unwrap().intervals.iter().map(|(s, e, ..)| e - s).sum();
+    assert_eq!(covered, 1000, "the rebuilt ledger covers exactly the surviving files");
+}
+
 /// A mid-write failure must not leave the temp file behind: the leak used
 /// to persist until the next restart.
 #[tokio::test]

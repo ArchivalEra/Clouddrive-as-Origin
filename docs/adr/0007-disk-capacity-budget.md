@@ -31,10 +31,12 @@ Two related leaks compounded it:
 1. **Staged bytes share the disk budget.** `tick` now checks
    `total_bytes + segment_bytes > max_size_bytes` and, when over, evicts
    ledger rows oldest-touched-first (the same LRU shape as entry eviction).
-   Ledger bytes are the accounting authority for `segment_bytes` — it is
-   incremented by `finalize_coverage` and rebuilt by `scan_segments` — so
-   eviction subtracts the ledger's byte count, not whatever a disk scan
-   happens to find.
+   `segment_bytes` is incremented by the seal on the bytes actually written,
+   rebuilt at startup by `scan_segments`, and subtracted once per eviction by
+   the size of the sidecar files that were removed. (The original wording made
+   the ledger's byte *count* the authority; that drifted once the ledger
+   stopped being 1:1 with the files — a merged interval covers many files —
+   see ADR-0016.)
 
 2. **A reserve floor guards new transfers.** Before starting a cold pull,
    the driver checks free space (`statvfs`) and refuses when
