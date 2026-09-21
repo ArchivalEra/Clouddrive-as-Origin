@@ -25,7 +25,8 @@
 //!
 //! The pin is bounded in bytes by construction (`watch_pin_bytes`, split
 //! evenly behind and ahead of the position), and it is a deadline rather than
-//! an exemption (ADR-0012): a key whose pin is the only thing left to take
+//! an exemption (ADR-0012's rule, restated by ADR-0018): a key whose pin is
+//! the only thing left to take
 //! still yields, which is what keeps the budget real for a 200 GB object on a
 //! 10 GiB magazine.
 //!

@@ -469,8 +469,8 @@ use tokio::sync::Semaphore;
 /// the split: with a single shared gate, a HEAD on one key took **14.2 s**
 /// while three long cold pulls held the permits, versus **22 ms** idle —
 /// metadata operations were queueing behind byte-moving transfers. Metadata
-/// (stat/HEAD/list/direct_url) and streams (cold-miss pumps, passthrough
-/// staging, promotion assembly) now have independent budgets, so a long
+/// (stat/HEAD/list/direct_url) and streams (cold-miss pumps, staged reads)
+/// now have independent budgets, so a long
 /// download can never starve a HEAD.
 pub struct BackendSlot {
     pub backend: Arc<dyn StorageBackend>,

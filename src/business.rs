@@ -774,8 +774,6 @@ mod tests {
         }
     }
 
-    /// Efficient-profile fixture: primary serves `cache_profile =
-    /// "efficient"` with the given threshold/min_file_size.
     /// Efficient-profile fixture with the session window pinned to the span
     /// the test means to stage. A run fetches its whole WINDOW (ADR-0016), so
     /// the production 64 MiB default would stage this whole ten-byte fixture
@@ -1343,7 +1341,7 @@ mod tests {
     /// A partially covered range serves its covered prefix from stage and
     /// opens upstream ONCE for the remainder - one open regardless of how
     /// many sidecars rode along - and the remainder is staged, so the ledger
-    /// ends fully covered and promotion can fire off it.
+    /// ends fully covered, which is what a later read is served from.
     #[tokio::test]
     async fn a_partially_covered_range_needs_one_open_and_stages_the_rest() {
         let fx = fixture_efficient(b"0123456789", 5);          // window = 5: spans (0,5) and (5,10)
@@ -1383,7 +1381,7 @@ mod tests {
     /// revalidate window. The efficient gate used to be the 60 s freshness
     /// clock, so a complete entry stopped being served a minute after it was
     /// filled and every ranged request went back upstream for bytes already
-    /// on disk — which also capped the promotion hold's value at that same
+    /// on disk, which is why the gate is on the entry and not on its age.
     /// minute.
     #[tokio::test]
     async fn efficient_complete_entry_keeps_serving_ranges_after_the_revalidate_window() {
@@ -2318,6 +2316,36 @@ mod tests {
         // `a_spent_pin_gives_up_the_back_before_the_playhead`: this fixture has
         // no resident bytes, so its overshoot is exactly what the tail holds and
         // pass two never runs.)
+    }
+
+    /// A nocache node must not write anything, not even when a request fails.
+    /// A 404 used to fall out of the nocache arm into the ordinary path, which
+    /// installed a negative tombstone in redb — the exact thing this profile is
+    /// chosen to avoid (config's "nothing persists" contract).
+    #[tokio::test]
+    async fn a_nocache_404_writes_no_tombstone() {
+        let fx = base(b"0123456789")
+            .profile("nocache")
+            .missing(true)
+            .build();
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("gone.bin".into()),
+            headers(&[]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let (status, _, _) = body_text(resp).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let s = fx.state.cache.state.read().await;
+        assert!(
+            s.entries.is_empty(),
+            "a nocache 404 must leave no row, not even a tombstone: {:?}",
+            s.entries.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(s.total_bytes, 0);
+        assert_eq!(s.segment_bytes, 0);
     }
 
     /// Router construction smoke test: every route path must survive

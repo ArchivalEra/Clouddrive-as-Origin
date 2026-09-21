@@ -249,10 +249,6 @@ pub struct Coverage {
     /// Clock-domain last touch (stage or rebuild time): drives age sweep
     /// in MockClock-testable time, unlike fs mtime.
     pub last_touch_millis: u64,
-    /// Provider-side object path + owning upstream: promotion (P2-b)
-    /// fetches gaps through these, never by re-splitting the cache key.
-    pub backend_key: String,
-    pub upstream_id: String,
 }
 
 /// Ceiling on the intervals one key's ledger may hold. Adjacent staged shards
@@ -263,7 +259,7 @@ pub struct Coverage {
 ///
 /// Generous: a key that reaches this many spans has staged far more than any
 /// viewer will re-read (the eviction policy trims by bytes, and a
-/// threshold's worth of spans is far more than this for any real object).
+/// budget's worth of spans is far more than this for any real object).
 pub const MAX_INTERVALS_PER_KEY: usize = 4096;
 
 impl Coverage {
@@ -343,10 +339,10 @@ impl Coverage {
     /// 2. If spans with GAPS remain (a scrubber jumping around), merging
     ///    them would claim coverage of bytes we do not hold, so the coldest
     ///    spans are dropped instead. Under-reporting coverage is the safe
-    ///    direction: promotion waits for real bytes rather than assembling
-    ///    a gap it cannot fill, and this is the same trade `decay` already
-    ///    makes ("window expiry only removes ledger counts — the disk
-    ///    sidecars stay for the natural sweep").
+    ///    direction: the ledger under-reports rather than claiming a gap it
+    ///    cannot fill, and this is the same trade `decay` already makes
+    ///    ("window expiry only removes ledger counts — the disk sidecars
+    ///    stay for the natural sweep").
     fn compact(&mut self) {
         while self.intervals.len() > MAX_INTERVALS_PER_KEY {
             if !self.merge_touching_once() {
@@ -418,17 +414,6 @@ impl Coverage {
         self.intervals.iter().map(|(s, e, ..)| e - s).sum()
     }
 
-    /// Staged fraction of the object for an already-known covered-byte
-    /// count, or `None` while the total is unknown (never promotes — P2
-    /// correctness bar). Taking the count lets a caller that just computed
-    /// it (see [`Coverage::decay_and_covered`]) reuse it instead of walking
-    /// the vector again.
-    pub fn ratio_of(&self, covered_bytes: u64) -> Option<f64> {
-        if self.total == 0 {
-            return None;
-        }
-        Some(covered_bytes as f64 / self.total as f64)
-    }
 }
 
 /// Reversible flattening for segment filenames (`%` first, then `/`).
@@ -476,7 +461,8 @@ pub fn segpart_path(cache_dir: &Path, key: &str, start: u64, end: u64) -> PathBu
     cache_dir.join(format!(".segpart.{}.{start}-{end}", escape_key(key)))
 }
 
-/// Per-key segment metadata (etag + total for promotion-time verification).
+/// Per-key segment metadata: the version marker a later transfer compares
+/// against, plus the object's total size.
 pub fn segmeta_path(cache_dir: &Path, key: &str) -> PathBuf {
     cache_dir.join(format!(".segmeta.{}", escape_key(key)))
 }
@@ -485,10 +471,6 @@ pub fn segmeta_path(cache_dir: &Path, key: &str) -> PathBuf {
 pub struct SegMeta {
     pub etag: Option<String>,
     pub total: u64,
-    #[serde(default)]
-    pub backend_key: String,
-    #[serde(default)]
-    pub upstream_id: String,
 }
 
 /// Parse a `.seg.*` filename back to `(key, start, end)`. The range part
@@ -549,15 +531,13 @@ pub fn scan_segments(cache_dir: &Path, now_millis: u64) -> (std::collections::Ha
             std::fs::read(segmeta_path(cache_dir, &key))
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or(SegMeta { etag: None, total: 0, backend_key: String::new(), upstream_id: String::new() })
+                .unwrap_or(SegMeta { etag: None, total: 0 })
         });
         let cov = ledger.entry(key).or_insert_with(|| Coverage {
             etag: meta.etag.clone(),
             total: meta.total,
             intervals: Vec::new(),
             last_touch_millis: now_millis,
-            backend_key: meta.backend_key.clone(),
-            upstream_id: meta.upstream_id.clone(),
         });
         cov.add_interval(start, end.min(start.saturating_add(len)), now_millis);
         staged_bytes += len;
@@ -595,7 +575,7 @@ pub fn segments_for_key(cache_dir: &Path, key: &str) -> Vec<(u64, u64, PathBuf)>
 /// path). In-flight `.segpart.*` files are left alone: a concurrent transfer
 /// still owns them.
 ///
-/// `keep` names the one segment to preserve — the one being promoted.
+/// `keep` names the one segment to preserve — the one just sealed.
 ///
 /// This lives here rather than at the caller because the filename shape is
 /// this module's rule. Re-deriving it by hand is the class of bug that once
@@ -743,13 +723,13 @@ mod tests {
         assert_eq!(std::fs::read(&live).unwrap(), b"the real database");
     }
 
-    /// The reset path must drop a key's segments and its version marker, keep the
-    /// one segment being promoted, and — the part that matters most — never
-    /// touch anything that is not this key's. `segments_for_key` is the same
+    /// The reset path must drop a key's segments and its version marker, keep
+    /// the one just sealed, and — the part that matters most — never touch
+    /// anything that is not this key's. `segments_for_key` is the same
     /// rule the sweeps use, so a name that parses as another key's segment is
     /// left alone.
     #[test]
-    fn remove_key_segments_keeps_the_promoted_segment_and_others_keys() {
+    fn remove_key_segments_keeps_the_just_sealed_segment_and_other_keys() {
         let dir = tempdir().unwrap();
         let kept = seg_path(dir.path(), "v/f.bin", 0, 30);
         let dropped = seg_path(dir.path(), "v/f.bin", 30, 60);
@@ -764,7 +744,7 @@ mod tests {
 
         remove_key_segments(dir.path(), "v/f.bin", Some(&kept));
 
-        assert!(kept.exists(), "the promoted segment must be kept");
+        assert!(kept.exists(), "the just-sealed segment must be kept");
         assert!(!dropped.exists(), "the other segments of this key must go");
         assert!(!meta.exists(), "the version marker must go with them");
         assert!(other.exists(), "another key's segments are not ours to delete");
@@ -939,19 +919,17 @@ mod tests {
     }
 
     #[test]
-    fn coverage_merges_and_ratios() {
+    fn coverage_merges_and_reports_covered_bytes() {
         let mut c = Coverage::default();
-        assert_eq!(c.ratio_of(c.covered_bytes()), None); // total unknown → never promotes
         c.total = 100;
         c.add_interval(0, 30, 1000);
         c.add_interval(50, 80, 2000);
         assert_eq!(c.covered_bytes(), 60);
-        assert!((c.ratio_of(c.covered_bytes()).unwrap() - 0.6).abs() < 1e-9);
         c.add_interval(20, 60, 3000); // bridges the gap (overlap)
         assert_eq!(c.intervals, vec![(0, 80, 3000, 0)]);
         c.add_interval(80, 100, 4000); // adjacent: stays separate (own ts)
         assert_eq!(c.intervals, vec![(0, 80, 3000, 0), (80, 100, 4000, 0)]);
-        assert!((c.ratio_of(c.covered_bytes()).unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(c.covered_bytes(), 100);
         c.add_interval(200, 200, 5000); // empty ignored
         assert_eq!(c.intervals, vec![(0, 80, 3000, 0), (80, 100, 4000, 0)]);
     }
@@ -994,8 +972,8 @@ mod tests {
         c.add_interval(0, 30, 1000);
         c.add_interval(50, 80, 2000);
         // Window 1000ms, now=2500: interval [0,30) read at 1000 is stale.
-        // The one pass reports the surviving coverage, which is what
-        // promotion needs — it used to need a second walk for this.
+        // One pass reports the surviving coverage, so a caller does not have
+        // to walk the ledger again to learn what is left.
         assert_eq!(c.decay_and_covered(2500, 1000), 30);
         assert_eq!(c.intervals, vec![(50, 80, 2000, 0)]);
         assert_eq!(c.covered_bytes(), 30);
@@ -1039,13 +1017,12 @@ mod tests {
             c.intervals.windows(2).all(|w| w[0].1 <= w[1].0),
             "still sorted and non-overlapping"
         );
-        assert_eq!(c.ratio_of(c.covered_bytes()), Some(1.0));
     }
 
     /// With gaps between the spans there is nothing exact left to merge:
     /// merging across a gap would claim bytes we do not hold, so the coldest
     /// spans are dropped. Under-reporting coverage is the safe direction —
-    /// promotion waits rather than assembling a gap it cannot fill.
+    /// the ledger under-reports rather than claiming a gap it cannot fill.
     #[test]
     fn a_gapped_ledger_is_bounded_by_dropping_the_coldest_spans() {
         let mut c = Coverage::default();
@@ -1074,7 +1051,15 @@ mod tests {
         std::fs::write(seg_path(dir.path(), "v/f.bin", 50, 80), vec![0u8; 30]).unwrap();
         std::fs::write(
             segmeta_path(dir.path(), "v/f.bin"),
-            serde_json::to_vec(&SegMeta { etag: Some("e1".into()), total: 100, backend_key: "v/f.bin".into(), upstream_id: "primary".into() }).unwrap(),
+            // A row written by an older build, with fields this one no longer
+            // has: it must still load (serde ignores what it does not know).
+            serde_json::to_vec(&serde_json::json!({
+                "etag": "e1",
+                "total": 100,
+                "backend_key": "v/f.bin",
+                "upstream_id": "primary"
+            }))
+            .unwrap(),
         )
         .unwrap();
         std::fs::write(segpart_path(dir.path(), "v/f.bin", 80, 100), vec![0u8; 5]).unwrap();

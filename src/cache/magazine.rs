@@ -175,7 +175,7 @@ fn evict_pick(
 /// Strays are the only population this may take. They sit outside the
 /// magazine's byte budget (ADR-0014), so they are what the disk was never
 /// promised, and evicting them cannot make the magazine's own members
-/// re-fetch. A held entry yields here like anywhere else: a hold is a
+/// re-fetch. A key being watched yields here like anywhere else: a pin is a
 /// deadline, not immortality.
 ///
 /// Pure in its inputs (a `need_bytes` computed by the caller from a real
@@ -297,7 +297,7 @@ impl Magazine {
             .sum::<u64>()
     }
 
-    /// Install a completed entry (cold-pull seal or promotion) and run the
+    /// Install a completed entry (a cold-pull seal) and run the
     /// eviction sweep it may have triggered. Persist first: on crash between
     /// redb and memory, startup rebuilds memory from redb; the reverse order
     /// would lose the row.
