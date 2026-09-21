@@ -108,6 +108,12 @@ repo** — it is injected at runtime via an environment variable (e.g.
 
 - `GET /_internal/healthz`: `200` with basic info — entry count, disk
   usage, token status per upstream. No secrets in the response.
+- `GET /_internal/healthz?key=<raw key>` (2026-09-21): the same body plus a
+  `key` section for ONE object — `installed`, `staged_spans`/`staged_bytes`
+  (what is on disk), `ledger_spans`/`ledger_total`/`ledger_etag`/age (what the
+  policy believes), the watch `pin`, and `leased`. Same seam the tests read
+  state through (`Cache::inspect`, ADR-0022). The key is percent-decoded; the
+  body is byte-identical when the parameter is absent.
 
 ## 3. Cache semantics (each item is an acceptance gate)
 
@@ -662,6 +668,11 @@ text no longer matched called out rather than dropped.
   the metrics endpoint. Candidate ticket; not implemented here.
 - `/_internal/healthz` additionally reports `segment_bytes` (staged,
   efficiently-staged sidecars). — holds.
+- `/_internal/healthz?key=` reports one key's state (2026-09-21): which spans
+  exist on disk, what the ledger believes about them, where the viewer is
+  pinned and whether a body holds the key. It answers "why is this object being
+  refetched?" without a debugger, and it is the production consumer that keeps
+  `Cache::inspect` from being an accessor invented for tests.
 - `/_internal/healthz` reports `stray_bytes` (2026-09-19): the part of
   `bytes` that belongs to resident strays, which the magazine's byte budget
   neither counts nor evicts (ADR-0014). It is the field that explains a

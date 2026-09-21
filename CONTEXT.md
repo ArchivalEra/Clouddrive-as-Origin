@@ -76,3 +76,19 @@ is evidence the seam is missing something, not a licence to keep projecting.
 **Served** — the response shape that carries its own read protection
 (`ServeOutcome::Stream(Served)`). An invariant the interface cannot express is one
 a future caller loses silently; this one cannot be lost.
+
+**the ranged body** — the ONE builder for "staged pieces, then one upstream
+Range" (`ranged::upstream_body`, ADR-0021). `sink: Option<StageSink>` is the
+single statement of whether this transfer also writes a span, so the one path
+that stages what it serves is a parameter rather than a second loop.
+
+**a promise / `total_len`** — how many bytes a stream was asked for and will
+deliver. The pump reads AT MOST it (an upstream that streams past its
+Content-Length cannot turn a window into the rest of the object), and a body
+that comes up short fails rather than sealing a truncated span.
+
+**key state** — what `Cache::inspect(key)` answers: installed (and whether the
+row is a tombstone), the spans on disk, the ledger's map of the same bytes with
+their read clock and count, the watch pin, and whether a lease is held. One
+look, consistent: the operator's `?key=` view and the tests read the same seam
+(ADR-0022).
