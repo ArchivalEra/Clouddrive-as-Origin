@@ -38,7 +38,7 @@ hz() { curl -fsS --max-time 5 "$1/_internal/healthz"; }
 wait_ready || exit 1
 
 echo "=== healthz carries the new field ==="
-echo "  standard: $(hz $BIZ | pick status degraded entries bytes stray_bytes segment_bytes)"
+echo "  main:     $(hz $BIZ | pick status degraded entries bytes stray_bytes segment_bytes)"
 h=$(hz $BIZ)
 printf '%s' "$h" | grep -q '"status":"ok"' || fail "healthz must be ok"
 printf '%s' "$h" | grep -q '"stray_bytes"' || fail "healthz must report stray_bytes"
