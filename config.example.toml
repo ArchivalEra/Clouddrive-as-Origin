@@ -135,14 +135,16 @@ password_env = "OPENLIST_PASSWORD"
                                               # (Settings → Other → Token)
 
 # Fill-policy profiles: orthogonal to cold_miss (serve behavior). Upstreams opt
-# in with `cache_profile = "<name>"`; the names "efficient", "standard" and
+# in with `cache_profile = "<name>"`; the names "efficient" and
 # "nocache" are built in.
 #
 # "efficient" IS THE DEFAULT. A ranged read stages the window it served as .seg
 # sidecars and serves later reads inside that window from them (ADR-0015/0016),
 # so one upstream open covers a whole window instead of one request — and the
 # ledger acts as a sliding window for objects the magazine cannot hold whole
-# (ADR-0019). Set `cache_profile = "standard"` for the old full-file water-pipe.
+# (ADR-0019). There is no other fill profile to switch to: the full-file
+# water-pipe that used to be called "standard" was retired (ADR-0022), and a
+# `[cache_profiles.<name>]` table below only tunes the two knobs.
 # [cache_profiles.efficient]      # tunes the built-in; stages everything by default
 # min_file_size = 0             # objects below this take the ordinary path
 # coverage_window_secs = 3600   # staged spans older than this decay out

@@ -91,7 +91,7 @@ async fn two_upstream_routing_by_prefix() {
         accept_invalid_certs: false,
         cold_miss: origin_cache::config::ColdMiss::Proxy,
         link_api_token_env: None,
-        cache_profile: "standard".into(),
+        cache_profile: "efficient".into(),
     });
     cfg.routes = RouteTable::new(vec![
         RouteRule { prefix: "archive/".into(), upstream: "archive".into() },
@@ -1317,24 +1317,20 @@ async fn wait_staged(cache: &Arc<Cache<MockClock>>, bytes: u64) {
     );
 }
 
-/// The PROFILE NAME no longer decides whether a ranged request gets a run. It
-/// used to: only an upstream configured `efficient` reached the run path, so a
-/// `standard` upstream paid one upstream open per request on exactly the objects
-/// a window helps most. What decides now is the request (ranged?), whether the
-/// key already has a durable entry (then the ordinary path owns it, and only it
-/// revalidates), and the object's size against the profile's `min_file_size`.
+/// The PROFILE NAME no longer decides whether a ranged request gets a run
+/// (ADR-0020), and since ADR-0022 there is only one fill profile left to name.
+/// What decides is the request (ranged?), whether the key already has a durable
+/// entry (then the ordinary path owns it, and only it revalidates), and the
+/// object's size against the profile's `min_file_size`.
 #[tokio::test]
-async fn a_standard_profile_upstream_gets_runs_for_ranged_reads() {
+async fn the_default_profile_gets_runs_for_ranged_reads() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
     let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
-    // Standard is the default everywhere, so ask for it explicitly.
-    cfg.upstreams[0].cache_profile = "standard".into();
     cfg.session_window_bytes = 1 << 20;
     let cfg = Arc::new(cfg);
     let opens = Arc::new(AtomicUsize::new(0));
-    // 128 MiB: above standard's `min_file_size` floor, and generated rather than
-    // stored, so the fixture costs nothing.
+    // 128 MiB, generated rather than stored, so the fixture costs nothing.
     let backend = Arc::new(SizedBackend::new(&[("big.bin", 128 << 20)], Arc::clone(&opens)));
     let mut slots = HashMap::new();
     slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));

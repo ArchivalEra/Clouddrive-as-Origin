@@ -19,7 +19,7 @@ set -u
 # burned once by hardcoded deployment facts: it probed a TLS port in plaintext
 # for weeks and logged 94 FAILs while the service was healthy. A fact that
 # lives in two places drifts in one of them.
-UNITS="${UNITS:-origin-cache-standard origin-cache-nocache}"
+UNITS="${UNITS:-origin-cache-efficient origin-cache-nocache}"
 # State files, kept together so a test can point them at a scratch directory.
 STATE_DIR="${STATE_DIR:-/opt/origin-cache}"
 LOG="$STATE_DIR/watchdog.log"
@@ -30,7 +30,7 @@ DISK_WARN_PCT="${DISK_WARN_PCT:-85}"
 DISK_CRIT_PCT="${DISK_CRIT_PCT:-95}"
 # The business plane answers on its own loopback port; `listen_addr` in the
 # node's config is the authority, and these are the shipped values.
-HEALTHZ_STANDARD_URL="${HEALTHZ_STANDARD_URL:-http://127.0.0.1:8080/_internal/healthz}"
+MEASURED_URL="${MEASURED_URL:-http://127.0.0.1:8080/_internal/healthz}"
 HEALTHZ_NOCACHE_URL="${HEALTHZ_NOCACHE_URL:-http://127.0.0.1:8081/_internal/healthz}"
 
 # Reporting endpoints. Overridable so the local dry-run can point at a
@@ -131,11 +131,11 @@ PROBLEMS=""
 note() { PROBLEMS="${PROBLEMS}${PROBLEMS:+; }$*"; }
 
 # --- unit health ------------------------------------------------------------
-STD_UNIT_UP=1
+MAIN_UNIT_UP=1
 for u in $UNITS; do
   if ! systemctl is-active --quiet "$u"; then
     note "unit=$u inactive"
-    [ "$u" = origin-cache-standard ] && STD_UNIT_UP=0
+    [ "$u" = origin-cache-efficient ] && MAIN_UNIT_UP=0
   fi
 done
 
@@ -178,10 +178,10 @@ probe() { # name, url
     note "$name degraded${why:+: $why}"
   fi
 }
-probe "healthz standard" "$HEALTHZ_STANDARD_URL"
-STD_BODY="$LAST_BODY"
-STD_PROBE_OK=0
-[ -n "$STD_BODY" ] && STD_PROBE_OK=1
+probe "healthz efficient" "$MEASURED_URL"
+MAIN_BODY="$LAST_BODY"
+MAIN_PROBE_OK=0
+[ -n "$MAIN_BODY" ] && MAIN_PROBE_OK=1
 probe "healthz nocache"  "$HEALTHZ_NOCACHE_URL"
 
 # --- report: transitions + a daily heartbeat (D3) ---------------------------
@@ -224,16 +224,16 @@ fi
 if ! command -v jq >/dev/null 2>&1; then
   log "report skipped: jq not installed"
 else
-  entries=$(jq -r '.entries // 0' <<<"$STD_BODY" 2>/dev/null || echo 0)
-  bytes=$(jq -r '.bytes // 0' <<<"$STD_BODY" 2>/dev/null || echo 0)
-  version=$(jq -r '.version // "unknown"' <<<"$STD_BODY" 2>/dev/null || echo unknown)
+  entries=$(jq -r '.entries // 0' <<<"$MAIN_BODY" 2>/dev/null || echo 0)
+  bytes=$(jq -r '.bytes // 0' <<<"$MAIN_BODY" 2>/dev/null || echo 0)
+  version=$(jq -r '.version // "unknown"' <<<"$MAIN_BODY" 2>/dev/null || echo unknown)
   case "$entries" in ''|*[!0-9]*) entries=0 ;; esac
   case "$bytes"   in ''|*[!0-9]*) bytes=0 ;; esac
-  # `down` means this node cannot serve at all (standard plane unreachable);
+  # `down` means this node cannot serve at all (the main plane is unreachable);
   # `degraded` means it serves but something needs a human: the nocache
   # plane, the disk watermark, or a healthz verdict of its own.
   status=active
-  if [ "$STD_UNIT_UP" = 0 ] || [ "$STD_PROBE_OK" != 1 ]; then
+  if [ "$MAIN_UNIT_UP" = 0 ] || [ "$MAIN_PROBE_OK" != 1 ]; then
     status=down
   elif [ -n "$PROBLEMS" ]; then
     status=degraded

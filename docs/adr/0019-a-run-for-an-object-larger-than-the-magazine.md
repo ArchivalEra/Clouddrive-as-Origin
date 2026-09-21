@@ -102,8 +102,9 @@ large-object case is a *size* relationship.
 - Full coverage of such an object is unreachable by construction (the magazine
   cannot hold it), so a random seek still pays its own Range — unchanged, and the
   edge cache is what makes a re-scrub over already-pulled regions cheap.
-- The production deployment's upstream uses the `standard` profile, whose ranged
-  misses do not go through the run machinery at all; this decision makes the win
-  available to the efficient profile, which is the profile for objects larger
-  than the magazine. Whether production should switch is a deployment question,
+- The production deployment's upstream ran the `standard` profile when this was
+  written, whose ranged misses did not go through the run machinery at all; this
+  decision made the win available to the profile that stages windows, and
+  ADR-0022 has since retired the name. Whether production should switch was a
+  deployment question,
   and the walk account above is its evidence.

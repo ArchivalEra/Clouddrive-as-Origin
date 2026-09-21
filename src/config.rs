@@ -36,12 +36,11 @@ pub struct UpstreamConfig {
     /// openlist upstreams only, and requires `link_api_token_env`.
     #[serde(default)]
     pub cold_miss: ColdMiss,
-    /// Fill-policy profile name (P2 efficientcache). `"standard"` (default)
-    /// = full-file water-pipe into cache, and the default. `"efficient"`
-    /// (built in) or a `[cache_profiles.<name>]` table stages the served
-    /// windows instead, so a ranged read costs one upstream open per window
-    /// rather than one per request (ADR-0016/0019); `"nocache"` writes
-    /// nothing at all.
+    /// Fill-policy profile name. `"efficient"` (the default, built in) stages
+    /// the windows a request is served from, so a ranged read costs one
+    /// upstream open per window rather than one per request (ADR-0016/0019);
+    /// `"nocache"` writes nothing at all; a `[cache_profiles.<name>]` table
+    /// names a custom pair of knobs (ADR-0022).
     #[serde(default = "default_cache_profile")]
     pub cache_profile: String,
     /// OpenList static admin token (Settings → Other → Token) for the
@@ -64,12 +63,15 @@ pub enum ColdMiss {
 fn default_cache_profile() -> String {
     // Efficient by default: a ranged read is the shape every viewer produces,
     // and staging its window is what makes one upstream open serve many
-    // requests (ADR-0016/0019). `"standard"` remains available and unchanged
-    // for an operator who wants full-file fills.
+    // requests (ADR-0016/0019).
     "efficient".into()
 }
 
-fn default_min_file_size() -> u64 {
+/// The `min_file_size` a `[cache_profiles.<name>]` table gets when it omits the
+/// key. It is NOT a global default: the built-in profiles set their own (0 for
+/// both `efficient` and `nocache`), and an object below the floor takes the
+/// ordinary cached path instead of staging a window.
+fn default_profile_min_file_size() -> u64 {
     64 * 1024 * 1024
 }
 
@@ -88,7 +90,7 @@ fn default_coverage_window_secs() -> u64 {
 /// keeps counting for the ledger's eviction policy before it decays.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RawCacheProfile {
-    #[serde(default = "default_min_file_size")]
+    #[serde(default = "default_profile_min_file_size")]
     pub min_file_size: u64,
     #[serde(default = "default_coverage_window_secs")]
     pub coverage_window_secs: u64,
@@ -101,13 +103,16 @@ pub struct CacheProfile {
     pub coverage_window_secs: u64,
 }
 
-/// Resolved per-upstream fill behavior. `standard` = full-file water-pipe
-/// into cache; `efficient` = ranged reads served from staged windows, one
-/// upstream open per window (ADR-0016/0019); `nocache` = pure water-pipe,
-/// zero disk writes
-/// (small-footprint nodes: bytes stream through, metadata stat still
-/// happens so ETag/Size/Last-Modified headers render, nothing persists —
-/// no entries, no segments, no redb writes, no negative tombstones).
+/// Resolved per-upstream fill behavior. `efficient` = ranged reads served from
+/// staged windows, one upstream open per window (ADR-0016/0019); `nocache` =
+/// pure water-pipe, zero disk writes (small-footprint nodes: bytes stream
+/// through, metadata stat still happens so ETag/Size/Last-Modified headers
+/// render, nothing persists — no entries, no segments, no redb writes, no
+/// negative tombstones).
+///
+/// The two flags are the whole state: a profile that is neither would be the
+/// full-file water-pipe that ADR-0022 retired, and every resolution path ends
+/// at `efficient` or `nocache`.
 #[derive(Debug, Clone, Copy)]
 pub struct EffectiveProfile {
     pub efficient: bool,
@@ -117,10 +122,6 @@ pub struct EffectiveProfile {
 }
 
 impl EffectiveProfile {
-    pub fn standard() -> Self {
-        Self { efficient: false, nocache: false, min_file_size: default_min_file_size(), coverage_window_secs: default_coverage_window_secs() }
-    }
-
     pub fn nocache() -> Self {
         Self { efficient: false, nocache: true, min_file_size: 0, coverage_window_secs: 0 }
     }
@@ -310,8 +311,9 @@ pub struct RawConfig {
     pub upstreams: Vec<UpstreamConfig>,
     #[serde(default)]
     pub routes: Vec<RouteRule>,
-    /// Named fill-policy profiles (`[cache_profiles.<name>]`). Upstreams
-    /// opt in via `cache_profile = "<name>"`; `"standard"` is built-in.
+    /// Named fill-policy profiles (`[cache_profiles.<name>]`). An upstream opts
+    /// in via `cache_profile = "<name>"`; `"efficient"` and `"nocache"` are
+    /// built in and need no table (ADR-0022).
     #[serde(default)]
     pub cache_profiles: HashMap<String, RawCacheProfile>,
 }
@@ -395,15 +397,14 @@ impl Config {
         self.upstreams.iter().find(|u| u.id == id)
     }
 
-    /// Resolve an upstream's fill behavior. Unknown upstreams and
-    /// `"standard"` both yield the legacy profile; `"nocache"` is a
-    /// built-in no-disk profile (pure water-pipe). Any other name must
-    /// have a `[cache_profiles.<name>]` table (defensive: boot
-    /// validation already rejects dangling references).
+    /// Resolve an upstream's fill behavior. An unknown upstream resolves to the
+    /// default profile (it is a lookup for a misrouted key, not a policy
+    /// question); `"nocache"` is the built-in no-disk profile. Any other name
+    /// must have a `[cache_profiles.<name>]` table (defensive: boot validation
+    /// already rejects dangling references).
     pub fn cache_profile(&self, upstream_id: &str) -> EffectiveProfile {
-        let name = self.upstream(upstream_id).map(|u| u.cache_profile.as_str()).unwrap_or("standard");
+        let name = self.upstream(upstream_id).map(|u| u.cache_profile.as_str()).unwrap_or("efficient");
         match name {
-            "standard" => EffectiveProfile::standard(),
             "nocache" => EffectiveProfile::nocache(),
             "efficient" => match self.cache_profiles.get("efficient") {
                 Some(p) => EffectiveProfile {
@@ -421,7 +422,9 @@ impl Config {
                     min_file_size: p.min_file_size,
                     coverage_window_secs: p.coverage_window_secs,
                 },
-                None => EffectiveProfile::standard(),
+                // Boot validation rejects a dangling name, so this is a lookup
+                // for a name that cannot be configured: the default profile.
+                None => EffectiveProfile::efficient(),
             },
         }
     }
@@ -504,8 +507,8 @@ impl Config {
                 }
             }
         }
-        // Fill-policy profiles: every non-standard reference resolves. Fail
-        // fast at boot, not on first miss.
+        // Fill-policy profiles: every reference resolves, or the node refuses
+        // to start. Fail fast at boot, not on first miss.
         let mut profiles = HashMap::new();
         for (name, raw) in &raw.cache_profiles {
             profiles.insert(
@@ -519,9 +522,7 @@ impl Config {
         for u in &raw.upstreams {
             // Built-in profile names need no [cache_profiles] table;
             // anything else must resolve to a declared table.
-            let builtin = u.cache_profile == "standard"
-            || u.cache_profile == "nocache"
-            || u.cache_profile == "efficient";
+            let builtin = u.cache_profile == "nocache" || u.cache_profile == "efficient";
             if !builtin && !profiles.contains_key(&u.cache_profile) {
                 anyhow::bail!(
                     "upstream {}: cache_profile {:?} has no [cache_profiles.<name>] table",
@@ -870,10 +871,11 @@ mod tests {
         let p = default.cache_profile("a");
         assert!(p.efficient, "the default profile must be efficient");
         assert_eq!(p.min_file_size, 0);
-        // ...and `standard` is still available, unchanged.
-        let std_toml = profile_toml("", "cache_profile = \"standard\"");
-        let std = Config::from_toml_str(&std_toml).unwrap();
-        assert!(!std.cache_profile("a").efficient);
+        // A RETIRED name is not a silent fallback: the node refuses to start
+        // with a profile nobody can explain (ADR-0022).
+        let gone = profile_toml("", "cache_profile = \"standard\"");
+        let err = Config::from_toml_str(&gone).unwrap_err().to_string();
+        assert!(err.contains("cache_profiles"), "a dangling name must name its fix: {err}");
     }
 
     #[test]

@@ -98,7 +98,7 @@ echo "  FAIL verdicts in the last 90 minutes: $last"
 [ "$last" = 0 ] || fail "the watchdog reported a failure while the units were up"
 
 echo "=== units ==="
-systemctl is-active origin-cache-standard origin-cache-nocache origin-cache-watchdog.timer cloudflared | tr '\n' ' '; echo
+systemctl is-active origin-cache-efficient origin-cache-nocache origin-cache-watchdog.timer cloudflared | tr '\n' ' '; echo
 failed=$(systemctl --failed --no-legend | wc -l)
 echo "  failed units: $failed"
 [ "$failed" = 0 ] || fail "systemctl --failed is not empty"

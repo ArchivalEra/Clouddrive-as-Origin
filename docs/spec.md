@@ -299,14 +299,15 @@ repo** — it is injected at runtime via an environment variable (e.g.
       (`Cache-Control: no-store`, never edge-cached), bytes filled in
       background. Hits never redirect; every failure silently proxies.
     - **B (water-pipe, default):** stream + full-file fill simultaneously.
-    - **C (passthrough):** `cache_profile != "standard"` + ranged miss →
+    - **C (passthrough):** ranged miss on a key with no durable entry →
       exact-Range origin bytes streamed straight through (no flight, no
-      full fill). Full GETs and small files still water-pipe; all
-      failures fall back to B (stale-if-error included).
+      full fill). Full GETs and objects below the profile's `min_file_size`
+      still water-pipe; all failures fall back to B (stale-if-error
+      included).
 
-12. **efficient cache fill policy (per-upstream `cache_profile`):**
-    orthogonal to §3.11's serve modes. Under a non-`"standard"` profile,
-    ranged misses stage exactly the served bytes as `.seg` sidecars and
+12. **efficient cache fill policy (the default, per-upstream `cache_profile`):**
+    orthogonal to §3.11's serve modes. Ranged misses stage a window of the
+    served bytes as `.seg` sidecars and
     merge them into a per-key **coverage ledger** (etag-locked). Files
     below `min_file_size` (default 64 MiB) fill whole via B. Segments count
     separately (`segment_bytes` in healthz), age-sweep with `inactive_ttl`,
@@ -615,7 +616,8 @@ base_url = "http://127.0.0.1:5244/dav"
 root_path = "assets"                  # provider-side path; keys append to it
 username_env = "OPENLIST_USERNAME"
 password_env = "OPENLIST_PASSWORD"
-# cache_profile = "standard"          # or "efficient" / "nocache"
+# cache_profile = "efficient"         # the default; or "nocache", or a name
+                                     # declared in [cache_profiles.<name>]
 
 [[routes]]
 prefix = ""                            # default (catch-all)

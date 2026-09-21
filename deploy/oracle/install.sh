@@ -20,7 +20,7 @@ USER=opc
 
 mkdir -p "$APP/cache-standard" "$APP/cache-nocache" "$APP/acme-webroot"
 install -m 0755 "$SRC_BIN" "$APP/origin-cache"
-install -m 0644 "$REPO_DIR/deploy/oracle/config-standard.toml" "$APP/config-standard.toml"
+install -m 0644 "$REPO_DIR/deploy/oracle/config-efficient.toml" "$APP/config-efficient.toml"
 install -m 0644 "$REPO_DIR/deploy/oracle/config-nocache.toml"  "$APP/config-nocache.toml"
 # The watchdog is the reporting sender AND the ExecStopPost hook below, so
 # the units are only valid once this file exists.
@@ -43,9 +43,9 @@ ENV
   chmod 600 "$APP/origin-cache.env"
 fi
 
-cat > /etc/systemd/system/origin-cache-standard.service <<UNIT
+cat > /etc/systemd/system/origin-cache-efficient.service <<UNIT
 [Unit]
-Description=Clouddrive-as-Origin standard profile (7777 https)
+Description=Clouddrive-as-Origin main plane (7777 https)
 After=network-online.target
 Wants=network-online.target
 
@@ -53,7 +53,7 @@ Wants=network-online.target
 Type=simple
 User=$USER
 Group=$USER
-ExecStart=$APP/origin-cache $APP/config-standard.toml
+ExecStart=$APP/origin-cache $APP/config-efficient.toml
 EnvironmentFile=$APP/origin-cache.env
 WorkingDirectory=$APP
 CacheDirectory=origin-cache
@@ -116,9 +116,9 @@ install -m 0644 "$REPO_DIR/deploy/oracle/journald-origin-cache.conf" \
 
 systemctl daemon-reload
 systemctl restart systemd-journald
-systemctl enable --now origin-cache-standard origin-cache-nocache
+systemctl enable --now origin-cache-efficient origin-cache-nocache
 systemctl enable --now origin-cache-watchdog.timer
-systemctl restart origin-cache-standard origin-cache-nocache origin-cache-watchdog.timer
+systemctl restart origin-cache-efficient origin-cache-nocache origin-cache-watchdog.timer
 
 # Announce the node as soon as it is serving again. The timer's next tick can
 # be 5 minutes away, and the far side reads silence as "maybe gone"; a
