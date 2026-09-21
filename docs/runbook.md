@@ -411,6 +411,23 @@ and the LAB's two efficient accounts are built on them: config-d runs with both
 off so its numbers measure the policy alone, config-e with both on so it can
 measure what they cost.
 
+The real-provider account of the rule above is a PAIR of runs, because one run
+cannot say what held the window: `deploy/oracle/efficient-walk-pair.sh` walks the
+same object twice on two loopback-only instances — `efficient-walk.toml` with the
+protections on, `efficient-walk-nowatch.toml` with them off — each with a pause
+in the middle, and both with `read_grace_secs = 0` and a 60 s idle TTL so a
+150 s pause outlives every other protection. Measured:
+
+```
+watch ON : 512 shards -> 12 opens; pause +1 open (the read-ahead it is owed);
+           post-pause re-read of the playhead's shard 0 opens, byte-exact
+watch OFF: 512 shards -> 12 opens; pause +0; post-pause re-read 1 open
+```
+
+Read the pause lines together with the totals: the walk costs the same either
+way, so the read-ahead is not extra upstream traffic, only differently timed —
+during the gap instead of at the resume.
+
 Two knobs govern what leaves the window (ADR-0015), both span-level:
 
 ```toml

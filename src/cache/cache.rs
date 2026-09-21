@@ -1194,6 +1194,9 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                         meta.size_bytes,
                         plan.frontier,
                         end - plan.frontier,
+                        // This request's reader IS the viewer's position; there
+                        // is nothing to inherit.
+                        None,
                     )
                     .await
             }

@@ -1,0 +1,51 @@
+# Acceptance config for the real-provider walk (efficient-walk.sh): the staged-
+# read run account (ADR-0016) and the watch account (ADR-0018).
+#
+# Loopback only — no public route points at these ports — with the same OpenList
+# upstream the production units use and its own cache dir, so nothing here
+# touches a production instance.
+#
+# Deliberately a PAIR with efficient-walk-nowatch.toml. This one has the viewer
+# protections ON; the other has them OFF, and the walk is run once against each.
+# Both leave `read_grace_secs = 0` so nothing except the WATCH can explain a
+# span surviving a gap, and both set the idle TTL to 60 s so a minute-scale
+# pause gives the age sweep a chance to take it: that is what makes the pause
+# account in the two runs differ.
+front_listen = "127.0.0.1:7791"
+front_metrics_listen = "127.0.0.1:9094"
+front_ip_block = []
+front_ip_allow = []
+front_rate_rps = 0
+listen_addr = "127.0.0.1:8091"
+cache_dir = "/home/opc/eff-cache"
+# The magazine has to hold the object being walked whole (ADR-0013): staging
+# refuses an object it cannot hold, and the walk object is 3 GiB.
+max_size_bytes = 6442450944
+inactive_ttl_secs = 60
+revalidate_ttl_secs = 60
+negative_ttl_secs = 60
+concurrency_per_upstream = 3
+prewarm_shared_secret_env = "ORIGIN_PREWARM_SECRET"
+
+# Top level ON PURPOSE: a TOML key written after a table header belongs to that
+# table and is silently ignored, which the node config fell for twice.
+session_window_bytes = 67108864
+read_grace_secs = 0
+watch_idle_secs = 900
+watch_pin_bytes = 134217728
+
+[cache_profiles.efficient]
+min_file_size = 1048576
+
+[[upstreams]]
+id = "googledrive1"
+type = "openlist"
+base_url = "http://127.0.0.1:5244/dav"
+root_path = "googledrive1"
+username_env = "OPENLIST_USERNAME"
+password_env = "OPENLIST_PASSWORD"
+cache_profile = "efficient"
+
+[[routes]]
+prefix = ""
+upstream = "googledrive1"

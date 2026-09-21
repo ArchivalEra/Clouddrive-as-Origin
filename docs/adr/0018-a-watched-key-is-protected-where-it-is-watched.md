@@ -95,9 +95,18 @@ used to require a reader, so a pause stopped the read-ahead immediately and
 threw away the window it had already paid for. It now runs while the key is
 watched, still bounded by the playhead (`CHAIN_KEEP_AHEAD_WINDOWS`), so a paused
 viewer's next window is fetched during the pause and the resume costs no open.
-The bound is what keeps "watch the file" from becoming "pull the file": a
-stalled playhead stops the chain one window later, and a departed viewer's watch
-lapses on its own.
+
+**A successor inherits its predecessor's playhead.** This is the load-bearing
+half of the rule above, and the real provider found it: a run's `playhead`
+started at its own window, so a chained run nobody had read yet reported a
+position equal to its own start, its own end satisfied `next <= playhead +
+keep_ahead`, and a paused watch pulled the object. Measured before the fix: 25
+upstream opens and 1.6 GiB fetched during a single 90 s pause. With the
+inheritance the chain is bounded by the VIEWER's position in every case — a
+stalled viewer buys the one window of read-ahead it is owed and no more, and a
+consuming viewer keeps chaining — which is also why the idle budget changes the
+chain's behaviour only for the case it was written for (a body that drops while
+the playhead sits inside a window) and not for a viewer who is merely stalled.
 
 **A seal that did not land is not claimed.** The `.segpart` rename and the
 ledger claim are one step: claiming after a failed rename (a strays sweep or a
@@ -132,6 +141,14 @@ the second restores ADR-0017's coarser whole-key rule.
   keeps its old ledger row (and its old spans) until the watch lapses. Correct —
   nothing mixes versions — but it means the disk holds both versions' bytes for
   up to `watch_idle_secs`.
+- The chain now has two conditions rather than one: a live watch AND a playhead
+  within `keep_ahead` windows. The node's pair run is the account — 512 shards,
+  a 150 s pause, `read_grace_secs = 0`, a 60 s idle TTL: with the watch the
+  pause costs one open (the owed read-ahead) and the post-pause re-read of the
+  playhead's shard costs none; without it the pause costs nothing and the same
+  re-read costs an upstream open, because a 150 s gap outlives both the grace
+  and the sweep. Same total opens for the walk either way (12), so the
+  read-ahead is not extra traffic — only differently timed.
 - A viewer who never comes back holds a pin for `watch_idle_secs` after their
   last byte. The map is pruned on every pass, so it cannot grow with the keys
   the node has served; the disk holds at most one pin per live watch, which is
