@@ -611,6 +611,33 @@ not the shape. What the criterion needs is a REAL long video — one with an ind
 or a real `mvhd` duration. The object in the bucket never was a 30-hour film, and
 the domestic-vantage run still needs a viewer outside this network.
 
+### The real 30-hour film, and the route it exposes (2026-09-22)
+
+The bucket now holds a REAL long film — key `googledrive1/%E9%9C%87%E6%92%BC%E6%88%91%E4%BB%AC%E7%9A%84%E6%9C%AA%E6%9D%A5%E5%90%A7_200G.mp4`, 214,748,364,800 bytes,
+uploaded 2026-09-21 18:04. Verified before any test: `mvhd` duration 110,716,239
+ms = 30.75 h at timescale 1000, `avc1` + `mp4a` (Chromium decodes both), `moov`
+at the head with real sample tables (stts/stss/ctts/stsc/stsz/stco) plus
+`mvex`/`trex`, and no filler — the last 64 bytes and three mid-file offsets (50%,
+90%, 99% of the object) are real data, unlike round3.mp4.
+
+- It PLAYS in Chromium from a plain local server: readyState 4, playback running
+  through the probe's window, no error. Object and codec are fine.
+- Through the CDN from the node the edge is healthy for it: fresh 1 MiB ranges
+  complete (TTFB 0.21-0.63 s), an open-ended 8 s pull streams steadily.
+- Through the CDN from the workstation the player still never starts — and this
+  time the object is exonerated; the route is not. The workstation has no IPv6
+  route, so GeoDNS serves it an OVERSEAS IPv4 POP (43.174.246/247.108), which
+  delivered 0.4-1.4 MB/s at best and hard-stalled during the test (36 KB in 10 s,
+  full timeouts); the player's first request was cancelled with 300 bytes —
+  headers only. The node reaches a domestic IPv6 POP (240d:c010::/32) and gets
+  steady service from the same hostname.
+
+So the last unknown for the criterion is precisely the domestic vantage: a real
+viewer on a domestic route should resolve to the domestic POP the node sees,
+where the edge is proven healthy. Worth checking in the EdgeOne console that the
+acceleration area/GeoDNS actually puts domestic users on domestic POPs — this
+workstation, on a domestic-ish ISP, was classified overseas.
+
 ### Multi-viewer accounts through the CDN: from the NODE
 
 A "N viewers through the CDN" number taken from a workstation measures the
