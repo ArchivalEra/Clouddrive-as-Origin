@@ -1,0 +1,52 @@
+# CDN-LAB config E: the WATCH account (ADR-0018).
+#
+# config-d is the opposite arrangement on purpose. That one turns the viewer
+# protections OFF (`read_grace_secs = 0`, pinning off) so its eviction numbers
+# measure the policy alone; this one turns them ON so the LAB can measure what
+# they cost and what they buy.
+#
+# The numbers: two 1 MiB objects stage four 256 KiB windows each, so the magazine
+# holds 1 MiB and the cache holds 2 — four windows must go, and the question the
+# section asks is WHICH four. The pin is 512 KiB (two windows), a MINORITY of
+# the key rather than the whole of it, which is the property ADR-0018 exists for.
+#
+# The magazine has to hold one whole object, not most of one: staging admission
+# refuses an object the magazine cannot hold (ADR-0013), so a 512 KiB magazine
+# would stage nothing at all and the section would assert nothing.
+front_listen = "127.0.0.1:7781"
+front_metrics_listen = "127.0.0.1:9094"
+listen_addr = "127.0.0.1:8085"
+cache_dir = "/mnt/hdd/CDN-LAB/cache-e"
+max_size_bytes = 1048576
+inactive_ttl_secs = 1200
+revalidate_ttl_secs = 60
+negative_ttl_secs = 60
+concurrency_per_upstream = 3
+prewarm_shared_secret_env = "CDN_LAB_PREWARM_SECRET"
+
+# Stalest span first: without a pin the two OLDEST windows are the ones the
+# budget takes, and they are the ones the viewer is looking at.
+eviction_policy = "lru"
+session_window_bytes = 262144
+
+# The watch account (ADR-0018). The read grace is off so that nothing except
+# the WATCH can explain a span surviving an idle period, and the coverage
+# window is the default so the ledger survives the wait for the 60 s reaper.
+read_grace_secs = 0
+watch_idle_secs = 900
+watch_pin_bytes = 524288
+[cache_profiles.efficient]
+min_file_size = 4
+
+[[upstreams]]
+id = "media"
+type = "openlist"
+base_url = "http://127.0.0.1:5244/dav"
+root_path = "media"
+username_env = "CDN_LAB_DAV_USER"
+password_env = "CDN_LAB_DAV_PASS"
+cache_profile = "efficient"
+
+[[routes]]
+prefix = ""
+upstream = "media"

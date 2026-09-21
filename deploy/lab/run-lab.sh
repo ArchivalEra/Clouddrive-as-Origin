@@ -22,7 +22,7 @@ DAV_PASS=labpass
 PREWARM_SECRET=labsecret
 SIGV4_AK=AKLLABTESTKEY
 SIGV4_SK=labsk_demo
-PID_DAV= PID_A= PID_B= PID_C= PID_D=
+PID_DAV= PID_A= PID_B= PID_C= PID_D= PID_E=
 PASS=0; FAIL=0
 
 ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
@@ -30,9 +30,14 @@ bad()  { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 note() { echo "---- $1"; }
 
 cleanup() {
-  for pid in "$PID_A" "$PID_B" "$PID_C" "$PID_D" "$PID_DAV"; do
+  for pid in "$PID_A" "$PID_B" "$PID_C" "$PID_D" "$PID_E" "$PID_DAV"; do
     [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null
   done
+  # Belt and braces: an instance this run failed to track would keep `wait`
+  # from ever returning while it holds the terminal — the leak that hung a run
+  # of this script for the full timeout with its output unflushed. The pattern
+  # does not occur in this script's own command line, so it cannot match itself.
+  pkill -f "target/release/origin-cache" 2>/dev/null
   wait 2>/dev/null
 }
 trap cleanup EXIT
@@ -60,12 +65,15 @@ done
 # The cache dirs must start EMPTY: they persist across runs, the ledger is
 # rebuilt from whatever sidecars are on disk at boot, and every staged-bytes
 # assertion below would otherwise be measuring the previous run.
-rm -rf "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d"
-mkdir -p "$LAB/dav-data/media/2026/08" "$LAB/dav-data/archive" "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d"
+rm -rf "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e"
+mkdir -p "$LAB/dav-data/media/2026/08" "$LAB/dav-data/archive" "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e"
 echo "hello-origin" > "$LAB/dav-data/media/hello.txt"
 head -c 1048576 /dev/urandom > "$LAB/dav-data/media/big1mb.bin"
 # A second 1 MiB object: the eviction test needs two keys staging at once.
 head -c 1048576 /dev/urandom > "$LAB/dav-data/media/big1mb-b.bin"
+# A third, for the watch section: its own key so the eviction section's rows
+# cannot be what explains its numbers.
+head -c 1048576 /dev/urandom > "$LAB/dav-data/media/big1mb-w.bin"
 if [ ! -f "$LAB/dav-data/media/big3g.bin" ]; then
   dd if=/dev/zero bs=1M count=3072 2>/dev/null | tr '\0' 'B' > "$LAB/dav-data/media/big3g.bin"
 fi
@@ -94,6 +102,7 @@ cd "$REPO"
 "$BIN" "$REPO/deploy/lab/config-b.toml" > "$LAB/cache-b/serve.log" 2>&1 & PID_B=$!
 "$BIN" "$REPO/deploy/lab/config-c.toml" > "$LAB/cache-c/serve.log" 2>&1 & PID_C=$!
 "$BIN" "$REPO/deploy/lab/config-d.toml" > "$LAB/cache-d/serve.log" 2>&1 & PID_D=$!
+"$BIN" "$REPO/deploy/lab/config-e.toml" > "$LAB/cache-e/serve.log" 2>&1 & PID_E=$!
 # Readiness is POLLED, never a fixed sleep: boot measures 1-11 s on the node
 # (aarch64 with a cold page cache), and a single-shot probe fails a healthy
 # instance. `-f` matters too: without it a 404 (or any error page) still exits
@@ -111,12 +120,14 @@ probe_up 8083 standard || { echo "FAIL: standard not up"; tail -3 "$LAB/cache-a/
 probe_up 8081 nocache  || { echo "FAIL: nocache not up";  tail -3 "$LAB/cache-b/serve.log"; exit 1; }
 probe_up 8082 efficient|| { echo "FAIL: efficient not up";tail -3 "$LAB/cache-c/serve.log"; exit 1; }
 probe_up 8084 eviction || { echo "FAIL: eviction not up"; tail -3 "$LAB/cache-d/serve.log"; exit 1; }
+probe_up 8085 watch    || { echo "FAIL: watch not up";    tail -3 "$LAB/cache-e/serve.log"; exit 1; }
 # healthz may have been answered by a stale leftover instance — assert the
 # fresh processes are actually alive (boot panic = redb/port conflict).
 kill -0 "$PID_A" 2>/dev/null || { echo "FAIL: standard process died at boot"; tail -5 "$LAB/cache-a/serve.log"; exit 1; }
 kill -0 "$PID_B" 2>/dev/null || { echo "FAIL: nocache process died at boot"; tail -5 "$LAB/cache-b/serve.log"; exit 1; }
 kill -0 "$PID_C" 2>/dev/null || { echo "FAIL: efficient process died at boot"; tail -5 "$LAB/cache-c/serve.log"; exit 1; }
 kill -0 "$PID_D" 2>/dev/null || { echo "FAIL: eviction process died at boot"; tail -5 "$LAB/cache-d/serve.log"; exit 1; }
+kill -0 "$PID_E" 2>/dev/null || { echo "FAIL: watch process died at boot";    tail -5 "$LAB/cache-e/serve.log"; exit 1; }
 
 H() { curl -s "$@"; }
 
@@ -369,6 +380,91 @@ b_spans=$(seg_files "$LAB/cache-d" big1mb-b.bin)
 ls -a "$LAB/cache-d" | grep -q '^\.seg\.media%2Fbig1mb\.bin\.0-262144$' \
   && ok "heat kept the re-read window (0-262144)" \
   || bad "the re-read window was evicted under heat"
+
+note "12. a watch: the viewing session outlives its bodies (ADR-0018)"
+# config-e: efficient, a 1 MiB magazine, 256 KiB windows, read grace 0, a
+# 512 KiB pin. Two 1 MiB objects stage four windows each, so the magazine is
+# 1 MiB over and the reaper MUST take four windows — the question this section
+# asks is WHICH four. Grace 0 is the point: nothing but the watch can explain
+# a survivor.
+#
+# Note the admission rule the first cut of this section got wrong (ADR-0013):
+# an object larger than the magazine is never staged at all, so a magazine of
+# 512 KiB would stage nothing and every assertion here would be vacuous.
+WKEY=big1mb-w.bin
+BKEY=big1mb-b.bin
+for off in 0 262144 524288 786432; do
+  H -o /dev/null -H "Range: bytes=$off-$((off+65535))" "http://127.0.0.1:7781/media/$WKEY"
+  sleep 1
+done
+wait_segment_bytes 8085 1048576 || bad "the watched key staged $(hz_field 8085 segment_bytes)"
+wspans=$(seg_files "$LAB/cache-e" "$WKEY")
+[ "$wspans" = 4 ] && ok "the watched key staged four windows (1 MiB)" \
+  || bad "the watched key staged $wspans windows (want 4)"
+# The viewer's position: the WHOLE first window, so the pin ([0, 512 KiB)) is
+# exactly the two windows the viewer is on, and the other two are the tail.
+H -o /dev/null -H "Range: bytes=0-262143" "http://127.0.0.1:7781/media/$WKEY"
+# A second key fills the magazine, so the budget has to choose between them.
+for off in 0 262144 524288 786432; do
+  H -o /dev/null -H "Range: bytes=$off-$((off+65535))" "http://127.0.0.1:7781/media/$BKEY"
+  sleep 1
+done
+wait_segment_bytes 8085 2097152 || bad "both keys staged $(hz_field 8085 segment_bytes) (want 2097152)"
+# The viewer then pauses for as long as the trim takes — and the trim is what
+# the pause is measured against: a row younger than STAGE_MIN_AGE_MS (60 s) is
+# not trimmed, and the reaper tick is 60 s, so this is the same wait section 11
+# pays. The watch is what has to hold the viewer's window through it.
+wtrimmed=0
+for i in $(seq 1 150); do
+  seg=$(hz_field 8085 segment_bytes)
+  [ "${seg:-2097152}" -le 1048576 ] && { wtrimmed=1; break; }
+  sleep 1
+done
+hz 8085 | sed 's/^/    healthz: /' >&2
+[ "$wtrimmed" = 1 ] && ok "the budget is real while a viewer is watching (segment_bytes=$(hz_field 8085 segment_bytes))" \
+  || bad "segment_bytes=$(hz_field 8085 segment_bytes) after the wait (budget 1048576)"
+ls -a "$LAB/cache-e" | grep '^\.seg\.' | sed 's/^/    sidecar: /' >&2
+# Which windows went? The two outside the pin first, and then — because the
+# cache is a few bytes over even after that — one span from inside the pin. The
+# pin is spent from the BACK (ADR-0018): the window the viewer has already
+# watched goes, and the window it is about to need stays. Under lru with no pin
+# the order is the opposite (the stalest windows are the first two), which is
+# what makes these assertions about the watch rather than about the policy.
+{ [ ! -f "$LAB/cache-e/.seg.media%2F$WKEY.524288-786432" ] && [ ! -f "$LAB/cache-e/.seg.media%2F$WKEY.786432-1048576" ]; } \
+  && ok "the tail beyond the pin was what went" \
+  || bad "the trim did not take the tail"
+[ -f "$LAB/cache-e/.seg.media%2F$WKEY.262144-524288" ] && ok "the window the viewer is about to need survived" \
+  || bad "the read-ahead window was evicted"
+[ ! -f "$LAB/cache-e/.seg.media%2F$WKEY.0-262144" ] && ok "the pin was spent from the back, not from the playhead" \
+  || bad "the trim did not take the window behind the viewer"
+# Re-reading the window after the pause: no upstream open, and byte-exact.
+before=$(opens 9094)
+# A range inside the window that SURVIVED (the window ahead of the pause point).
+code=$(H -o /tmp/lab-watch.bin -w "%{http_code}" -H "Range: bytes=262144-327679" "http://127.0.0.1:7781/media/$WKEY")
+after=$(opens 9094)
+[ "$code" = 206 ] && ok "post-pause re-read 206" || bad "post-pause re-read code=$code"
+tail -c +262145 "/mnt/hdd/CDN-LAB/dav-data/media/$WKEY" | head -c 65536 > /tmp/lab-watch-ref.bin
+cmp -s /tmp/lab-watch.bin /tmp/lab-watch-ref.bin && ok "post-pause re-read is byte-exact" \
+  || bad "post-pause re-read differs from the source"
+[ $((after - before)) = 0 ] && ok "post-pause re-read: zero upstream opens" \
+  || bad "the re-read after the pause cost $((after-before)) opens"
+# The watch account itself: one key watched, a pin the size it was configured
+# to be, and the resume counted. The gauges are published by the reaper tick,
+# so they are polled rather than sampled once.
+wactive=0
+for i in $(seq 1 20); do
+  wactive=$(H http://127.0.0.1:9094/metrics | awk '/^cache_watch_active /{print $2+0}' | head -1)
+  [ "${wactive:-0}" -ge 1 ] && break
+  sleep 0.5
+done
+[ "${wactive:-0}" -ge 1 ] && ok "a key is being watched (cache_watch_active=$wactive)" \
+  || bad "cache_watch_active=${wactive:-0} (want >=1)"
+wpinned=$(H http://127.0.0.1:9094/metrics | awk '/^cache_watch_pinned_bytes /{print $2+0}' | head -1)
+[ "${wpinned:-0}" -ge 524288 ] && ok "the pin is at least the configured size ($wpinned bytes)" \
+  || bad "cache_watch_pinned_bytes=${wpinned:-0} (want >=524288)"
+wresume=$(H http://127.0.0.1:9094/metrics | awk '/^cache_watch_resume_total\{outcome="hit"\}/{print $2+0}' | head -1)
+[ "${wresume:-0}" -ge 1 ] && ok "responses answered by the watch itself (${wresume:-0})" \
+  || bad "cache_watch_resume_total{outcome=hit}=${wresume:-0} (want >=1)"
 
 note "13. single-flight: 50 concurrent cold key -> one upstream fetch"
 # Fresh key (never requested): 50 parallel GETs must coalesce to one fetch.
