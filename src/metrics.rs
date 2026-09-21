@@ -13,7 +13,8 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use prometheus::{
-    register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec,
+    register_histogram_vec, register_int_counter_vec, register_int_gauge, HistogramVec,
+    IntCounterVec, IntGauge,
 };
 
 /// Same bucket span as the front plane (1 ms through 3 min).
@@ -117,6 +118,40 @@ pub static SESSION_READER: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register cache_session_reader_total")
 });
 
+/// Keys being watched right now, and the bytes their pins cover (ADR-0018).
+/// A watch is a viewing session that outlives its response bodies, so
+/// `cache_watch_active` is the number of viewers the cache is holding a
+/// neighbourhood for, and `cache_watch_pinned_bytes` is what that costs the
+/// magazine's budget. Read them together: pinning that grows while the active
+/// count falls is how a budget goes soft.
+pub static WATCH_ACTIVE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "cache_watch_active",
+        "cache keys currently watched (a viewing session inside its idle budget)"
+    )
+    .expect("register cache_watch_active")
+});
+
+pub static WATCH_PINNED_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!("cache_watch_pinned_bytes", "bytes covered by live watch pins")
+        .expect("register cache_watch_pinned_bytes")
+});
+
+/// Responses arriving at a watched key with no body streaming it — the watch,
+/// not a live body, is what the cache answered from. `hit` = answered from
+/// this node's bytes with no upstream open; `miss` = it still cost a fetch.
+/// An EdgeOne shard walk contributes one per shard (the origin's bodies for
+/// consecutive shards do not overlap), so read this as "how often the watch
+/// bought something", not as a pause counter.
+pub static WATCH_RESUME: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cache_watch_resume_total",
+        "responses arriving at a watched key with no body streaming it, by whether they cost an upstream open",
+        &["outcome"]
+    )
+    .expect("register cache_watch_resume_total")
+});
+
 /// Observe one backend call. The closure runs the actual call; we time
 /// around it so callers stay one-line.
 pub async fn observe_backend<T, F, Fut>(op: &'static str, f: F) -> T
@@ -166,6 +201,18 @@ pub fn observe_session_reader(result: &str) {
     SESSION_READER.with_label_values(&[result]).inc();
 }
 
+/// Publish the watch gauges (the cache tick is their single writer).
+pub fn set_watch(active: usize, pinned_bytes: u64) {
+    WATCH_ACTIVE.set(active as i64);
+    WATCH_PINNED_BYTES.set(pinned_bytes as i64);
+}
+
+/// Record how a response that arrived at an idle watch was served: `hit` when
+/// this node's own bytes answered it, `miss` when it cost an upstream open.
+pub fn observe_watch_resume(outcome: &str) {
+    WATCH_RESUME.with_label_values(&[outcome]).inc();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,12 +258,14 @@ mod tests {
     fn session_metrics_are_exposed() {
         observe_session("sealed");
         observe_session_reader("attached");
-        let text = prometheus::gather()
-            .iter()
-            .map(|f| f.get_name().to_string() + "\n")
-            .collect::<String>();
+        observe_watch_resume("hit");
+        set_watch(2, 4096);
+        let text = rendered();
         assert!(text.contains("cache_session_total"), "{text}");
         assert!(text.contains("cache_session_reader_total"), "{text}");
+        assert!(text.contains("cache_watch_resume_total"), "{text}");
+        assert!(text.contains(r#"cache_watch_active 2"#), "{text}");
+        assert!(text.contains(r#"cache_watch_pinned_bytes 4096"#), "{text}");
     }
 
     #[test]

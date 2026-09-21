@@ -4,6 +4,14 @@ Amends ADR-0015 (span eviction) and ADR-0006/0007 (the byte budget), and
 re-establishes — in the form that survives — the protection ADR-0012 tried to
 give a freshly promoted entry.
 
+> **Amended by ADR-0018** in three places, each found by measuring this rule on
+> the real traffic shape: every response holds its key's lease, not only a
+> locally-served one (the longest streams are the upstream ones); a leased key
+> is protected around the viewer's *position* rather than in its entirety; and
+> the 300 s grace is the short end of a watch that outlives the bodies of one
+> viewing session. The rule below is still the rule for a key with a body on it
+> and no watch — which is exactly what `watch_idle_secs = 0` produces.
+
 ## Context
 
 Every clock in this cache measures **requests**. `last_touch` moves when a

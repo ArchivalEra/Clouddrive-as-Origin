@@ -157,6 +157,28 @@ fn default_session_window_bytes() -> u64 {
     64 * 1024 * 1024
 }
 
+/// How long a key stays watched after its last body ends (ADR-0018). A
+/// viewing session lasts hours while its bodies last milliseconds (EdgeOne
+/// asks for ascending 1 MiB shards), so the protection a viewer needs has to
+/// outlive the requests: a pause inside this budget keeps the key's
+/// neighbourhood pinned and the read-ahead in place, and the resume costs no
+/// upstream open. It is also a deadline rather than an exemption — past it the
+/// key is an ordinary eviction candidate again. Default 900 (15 minutes:
+/// longer than a phone call, shorter than the 20-minute idle TTL); 0 disables
+/// watching, leaving only live bodies protected.
+fn default_watch_idle_secs() -> u64 {
+    900
+}
+
+/// Bytes pinned around a watched viewer's position (ADR-0018): half behind
+/// (what a small scrub back needs) and half ahead (the window the chain
+/// fetches before the player asks for it). Default 128 MiB, two default
+/// windows. Larger = a smoother scrub back over a bigger object, paid for by
+/// a budget the magazine cannot spend.
+fn default_watch_pin_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
 fn default_backend_type() -> String {
     "openlist".into()
 }
@@ -261,6 +283,16 @@ pub struct RawConfig {
     /// (ADR-0017). Default 300; 0 disables (live bodies are still protected).
     #[serde(default = "default_read_grace_secs")]
     pub read_grace_secs: u64,
+    /// How long a key stays watched after its last body ends (ADR-0018).
+    /// Default 900; 0 disables watching, leaving a key protected only while a
+    /// body streams it (ADR-0017's rule).
+    #[serde(default = "default_watch_idle_secs")]
+    pub watch_idle_secs: u64,
+    /// Bytes pinned around a watching viewer's position (ADR-0018). Default
+    /// 128 MiB; 0 disables pinning, which restores ADR-0017's coarser rule —
+    /// a key being read keeps all of its spans.
+    #[serde(default = "default_watch_pin_bytes")]
+    pub watch_pin_bytes: u64,
 
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
@@ -320,6 +352,12 @@ pub struct Config {
     pub session_window_bytes: u64,
     /// Seconds a key stays un-evictable after the last body reading it ended.
     pub read_grace_secs: u64,
+    /// Seconds a key stays WATCHED after its last body ended (ADR-0018): its
+    /// neighbourhood stays pinned and its read-ahead survives a pause. 0
+    /// disables watching.
+    pub watch_idle_secs: u64,
+    /// Bytes pinned around a watched viewer's position (ADR-0018).
+    pub watch_pin_bytes: u64,
     pub concurrency_per_upstream: usize,
     pub retry_max_attempts: u32,
     pub retry_base_ms: u64,
@@ -507,6 +545,8 @@ impl Config {
             eviction_policy: raw.eviction_policy,
             session_window_bytes: raw.session_window_bytes,
             read_grace_secs: raw.read_grace_secs,
+            watch_idle_secs: raw.watch_idle_secs,
+            watch_pin_bytes: raw.watch_pin_bytes,
             concurrency_per_upstream: raw.concurrency_per_upstream,
             retry_max_attempts: raw.retry_max_attempts,
             retry_base_ms: raw.retry_base_ms,
@@ -541,6 +581,8 @@ impl Default for Config {
             eviction_policy: EvictionPolicy::default(),
             session_window_bytes: default_session_window_bytes(),
             read_grace_secs: default_read_grace_secs(),
+            watch_idle_secs: default_watch_idle_secs(),
+            watch_pin_bytes: default_watch_pin_bytes(),
             concurrency_per_upstream: default_concurrency(),
             retry_max_attempts: default_retry_max(),
             retry_base_ms: default_retry_base(),

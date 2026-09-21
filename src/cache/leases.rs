@@ -89,6 +89,15 @@ impl Leases {
             || (entry.last_end_millis > 0
                 && now.saturating_sub(entry.last_end_millis) < self.grace_ms)
     }
+
+    /// Whether this one key is protected right now. A single-key question for
+    /// callers that already know which key they are about (the version gate
+    /// asking "is somebody reading these bytes"), where building the whole
+    /// set would be wasted work.
+    pub fn is_protected(&self, key: &str, now: u64) -> bool {
+        let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(key).is_some_and(|e| self.protected_entry(e, now))
+    }
 }
 
 /// One body's lease. Dropping it stamps the end time, which is what gives the

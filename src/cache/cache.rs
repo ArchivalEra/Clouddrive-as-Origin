@@ -252,6 +252,18 @@ pub struct StreamPlan {
     pub source: BodySource,
 }
 
+impl StreamPlan {
+    /// The byte range this response serves: where the viewer is on the object,
+    /// which is the position a watch pins around (ADR-0018). A ranged response
+    /// carries it in the content-range; a whole-object response starts at 0.
+    pub fn served_span(&self) -> (u64, u64) {
+        match &self.content_range {
+            Some(cr) => (cr.first, cr.last.saturating_add(1)),
+            None => (0, self.content_length.unwrap_or(0)),
+        }
+    }
+}
+
 pub struct CacheState {
     pub entries: HashMap<String, EntryMeta>,
     pub total_bytes: u64,
@@ -410,6 +422,11 @@ pub struct Cache<C: Clock> {
     /// `pub` like the rest of the machinery's working state (tests drive it
     /// directly; production goes through the response path).
     pub leases: Arc<crate::cache::leases::Leases>,
+    /// Watches (ADR-0018): keys being VIEWED, which outlives the bodies of one
+    /// viewing session. Where a lease protects coarsely (the whole key, while a
+    /// body lives), a watch protects precisely — a bounded neighbourhood
+    /// around the viewer's position — and for as long as the session lasts.
+    pub watches: Arc<crate::cache::watch::Watches>,
     /// Staged-read runs (ADR-0016): one upstream stream per key, shared by
     /// every reader inside its window. Public because the serve path and the
     /// tests both drive it; the module owns the invariants.
@@ -443,17 +460,24 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         let leases = Arc::new(crate::cache::leases::Leases::new(
             config.read_grace_secs.saturating_mul(1000),
         ));
+        // Watches (ADR-0018): the viewing session, which outlives its bodies.
+        let watches = Arc::new(crate::cache::watch::Watches::new(
+            config.watch_idle_secs.saturating_mul(1000),
+            config.watch_pin_bytes,
+        ));
         let magazine = Magazine::new(
             Arc::clone(&state),
             Arc::clone(&config),
             Arc::clone(&meta),
             Arc::clone(&leases),
+            Arc::clone(&watches),
         );
         let staging = Staging::new(
             Arc::clone(&coverage),
             Arc::clone(&state),
             Arc::clone(&config),
             Arc::clone(&leases),
+            Arc::clone(&watches),
         );
         let flights = crate::cache::flight::Flights::new(crate::cache::flight::DEFAULT_STALL_BUDGET);
         let sessions = Arc::new(Sessions::new(
@@ -461,6 +485,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             Arc::clone(&clock),
             staging.clone(),
             flights.clone(),
+            Arc::clone(&watches),
         ));
         Self {
             config,
@@ -474,6 +499,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             staging,
             sessions,
             leases,
+            watches,
             reval_inflight: Inflight::new(),
             rebuilt_rows: std::sync::atomic::AtomicUsize::new(0),
             prewarm_inflight: std::sync::atomic::AtomicUsize::new(0),
@@ -1061,6 +1087,22 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                 _ => false,
             };
             if changed {
+                // A reset deletes every `.seg` of the key, and a response body
+                // serves its staged pieces LAZILY (`pieces_then` opens each one
+                // as it reaches it), so a reset under a live body cuts the
+                // viewer off mid-stream on the piece it has not opened yet.
+                // The reset is right — mixed versions must never be served —
+                // but it does not have to happen while somebody is reading:
+                // answer this request from upstream and let the drift be
+                // settled by the next request that arrives when nobody is.
+                let now = self.clock.now_millis();
+                if self.watches.live(&rk.cache_key, now) || self.leases.is_protected(&rk.cache_key, now) {
+                    tracing::info!(
+                        key = %rk.cache_key,
+                        "version drifted while this key is being read: serving upstream, settling the ledger later"
+                    );
+                    return self.serve_upstream_range(&slot, rk, range, meta).await;
+                }
                 self.staging.reset(&rk.cache_key).await;
             }
         }
@@ -1263,21 +1305,25 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                             if tokio::fs::metadata(&seg).await.is_ok() {
                                 return;
                             }
-                            // Seal it here.
-                            let _ = tokio::fs::rename(&segpart, &seg).await;
+                            // Seal it here — through the same rename-and-claim
+                            // step the stream's own tail uses.
                             staging
-                                .seal_span(FinalizedSpan {
-                                    cache_dir,
-                                    key: cache_key,
-                                    backend_key,
-                                    upstream_id,
-                                    etag,
-                                    total,
-                                    start: fetch_start,
-                                    end: fetch_start + size,
-                                    bytes: size,
-                                    now_millis: clock.now_millis(),
-                                })
+                                .seal_renamed(
+                                    &segpart,
+                                    &seg,
+                                    FinalizedSpan {
+                                        cache_dir,
+                                        key: cache_key,
+                                        backend_key,
+                                        upstream_id,
+                                        etag,
+                                        total,
+                                        start: fetch_start,
+                                        end: fetch_start + size,
+                                        bytes: size,
+                                        now_millis: clock.now_millis(),
+                                    },
+                                )
                                 .await;
                             return;
                         }
@@ -1338,20 +1384,26 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             if written > 0 {
                 drop(file);
                 let seg = store::seg_path(&cache_dir, &cache_key, fetch_start, fetch_start + written);
-                let _ = tokio::fs::rename(&segpart, &seg).await;
+                // The rename and the claim are one step: a swallowed failure
+                // here left the ledger and `segment_bytes` describing a span
+                // with no file behind it (see [`Staging::seal_renamed`]).
                 staging
-                    .seal_span(FinalizedSpan {
-                        cache_dir,
-                        key: cache_key,
-                        backend_key,
-                        upstream_id,
-                        etag,
-                        total,
-                        start: fetch_start,
-                        end: fetch_start + written,
-                        bytes: written,
-                        now_millis: clock.now_millis(),
-                    })
+                    .seal_renamed(
+                        &segpart,
+                        &seg,
+                        FinalizedSpan {
+                            cache_dir,
+                            key: cache_key,
+                            backend_key,
+                            upstream_id,
+                            etag,
+                            total,
+                            start: fetch_start,
+                            end: fetch_start + written,
+                            bytes: written,
+                            now_millis: clock.now_millis(),
+                        },
+                    )
                     .await;
             } else if file.is_some() {
                 let _ = tokio::fs::remove_file(&segpart).await;
@@ -1995,6 +2047,11 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         if do_sweep && !expired.is_empty() {
             self.staging.drop_rows(&expired).await;
         }
+        // 5. Publish what the cache is holding for viewers (ADR-0018). These
+        //    are gauges, not counters: the question they answer is "how much
+        //    of the budget is currently spoken for by viewing sessions", and a
+        //    pin whose owner never comes back must fall on its own.
+        crate::metrics::set_watch(self.watches.active(now), self.watches.pinned_bytes(now));
     }
 }
 /// Everything one cold-miss driver needs, as one receiver: the flight it

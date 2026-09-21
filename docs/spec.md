@@ -184,6 +184,31 @@ repo** — it is injected at runtime via an environment variable (e.g.
    exception: it may still reclaim a resident stray being streamed, because the
    disk is the last resort and an open descriptor survives the unlink.
 
+   **A watched key is protected where it is being watched (ADR-0018).** A lease
+   is anchored to a response body, and the real traffic shape is one 1 MiB shard
+   per request: bodies last milliseconds and a viewing session lasts hours, so a
+   300 s grace is the whole horizon a viewer gets — pause for six minutes and
+   the window the chain already fetched is ordinary eviction material. A key
+   that has been requested is therefore **watched** for `watch_idle_secs`
+   (default 900) after its last body ended, remembering the byte range of the
+   most recent response, and the protection is a bounded **neighbourhood**
+   around that position: `watch_pin_bytes` (default 128 MiB, half behind and
+   half ahead of it) rather than the whole key. That fixes both directions of
+   the same mistake — the lease protected too little (protection lapsed
+   mid-watch) and too much (a key being read could not be trimmed at all, so
+   the byte budget stopped being enforceable against exactly the key a long
+   watch was filling).
+
+   The pin is a preference, not an exemption: a trim takes bytes outside every
+   pin first and spends a pin only when the rest of the cache cannot cover the
+   need — and a pin that has to be spent is spent from its BACK (the spans the
+   viewer has already watched) before the span it is about to need, because
+   forward progress is continuous while a scrub back is deliberate. The chain's
+   read-ahead also follows the watch rather than an attached body, so a pause
+   does not throw away the window it already paid for. Every response holds its
+   key's lease whatever its byte source: the longest streams are the upstream
+   ones, and what they need protected is the key's own staged bytes.
+
 5. **Revalidation on access (no background polling):** an entry that is
    present but older than a short TTL (default 60 s, configurable)
    triggers a revalidation before serving from disk: a `stat` is compared

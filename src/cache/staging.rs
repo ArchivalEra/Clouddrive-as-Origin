@@ -61,6 +61,12 @@ pub(crate) struct Staging {
     state: Arc<RwLock<CacheState>>,
     config: Arc<Config>,
     leases: Arc<super::leases::Leases>,
+    /// Watches: a key being VIEWED, which outlives its response bodies
+    /// (ADR-0018). A lease says a body is alive; a watch says the viewer is
+    /// still there and where — and that position is what turns "spare the
+    /// whole key" into a bounded neighbourhood the budget can still spend
+    /// around.
+    watches: Arc<super::watch::Watches>,
 }
 
 impl Staging {
@@ -69,8 +75,9 @@ impl Staging {
         state: Arc<RwLock<CacheState>>,
         config: Arc<Config>,
         leases: Arc<super::leases::Leases>,
+        watches: Arc<super::watch::Watches>,
     ) -> Self {
-        Self { coverage, state, config, leases }
+        Self { coverage, state, config, leases, watches }
     }
 
     /// The etag the ledger last saw for a key: the version gate's peek.
@@ -88,11 +95,15 @@ impl Staging {
     /// A row with a live read lease, or one read inside `read_grace_secs`, is
     /// not idle however old its last request is (ADR-0017).
     pub(crate) async fn expired(&self, ttl_ms: u64, now: u64) -> Vec<String> {
-        let protected = self.leases.protected(now);
+        let mut spared = self.leases.protected(now);
+        // A key mid-watch is not idle however old its last request is. That is
+        // the whole point of a watch outliving its bodies (ADR-0018): a viewer
+        // who pauses for longer than the read grace is still watching.
+        spared.extend(self.watches.live_keys(now));
         let cov = self.coverage.lock().await;
         cov.iter()
             .filter(|(_, c)| now.saturating_sub(c.last_touch_millis) >= ttl_ms)
-            .filter(|(k, _)| !protected.contains(k.as_str()))
+            .filter(|(k, _)| !spared.contains(k.as_str()))
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -122,22 +133,32 @@ impl Staging {
     /// Returns `(keys touched, bytes freed)`.
     pub(crate) async fn evict_staged(&self, need_bytes: u64, now: u64) -> (usize, u64) {
         let protected = self.leases.protected(now);
+        let pins = self.watches.pins(now);
         let order = self.rows_by_age().await;
         let mut freed_total = 0u64;
         let mut touched = 0usize;
-        for (_, key) in order {
+        // Two passes over the whole cache, not one pass into each row:
+        // everything a viewer is NOT looking at first, and the pins only if the
+        // rest of the cache could not cover the need. Per row, the first
+        // watched row would be trimmed inside its own pin while a later row
+        // still had bytes to give — a deadline, but the last one (ADR-0012,
+        // ADR-0018).
+        for inside_pins in [false, true] {
+        for (_, key) in &order {
             if freed_total >= need_bytes {
                 break;
             }
-            // A key with a reader (or one read moments ago) keeps its spans:
-            // the guards below measure REQUESTS, so a long stream outlives
-            // them (ADR-0017).
-            if protected.contains(&key) {
+            // A watched key keeps its neighbourhood, not its whole row
+            // (ADR-0018): the tail the viewer has already passed is exactly
+            // what the budget should be able to spend. A key with a body but
+            // no look at it keeps the older, coarser rule.
+            let pin = pins.get(key).copied();
+            if pin.is_none() && protected.contains(key) {
                 continue;
             }
             let (age, prior) = {
                 let cov = self.coverage.lock().await;
-                match cov.get(&key) {
+                match cov.get(key) {
                     Some(c) => (now.saturating_sub(c.last_touch_millis), c.intervals.clone()),
                     None => continue,
                 }
@@ -146,7 +167,9 @@ impl Staging {
             if age < STAGE_MIN_AGE_MS {
                 continue;
             }
-            let picks = self.pick_spans(&key, &prior, need_bytes - freed_total).await;
+            let picks = self
+                .pick_spans(key, &prior, need_bytes - freed_total, pin, inside_pins)
+                .await;
             if picks.is_empty() {
                 continue;
             }
@@ -163,7 +186,8 @@ impl Staging {
             // A row that lost every span has nothing left to protect: drop it
             // with its version marker so the next request re-stats upstream
             // instead of gating on an etag for bytes that no longer exist.
-            self.drop_empty_row(&key).await;
+            self.drop_empty_row(key).await;
+        }
         }
         (touched, freed_total)
     }
@@ -200,6 +224,9 @@ impl Staging {
         key: &str,
         prior: &[(u64, u64, u64, u64)],
         need_bytes: u64,
+        pin: Option<super::watch::Pin>,
+        // Whether this pass may spend the pin itself. Pass one may not.
+        inside_pins: bool,
     ) -> Vec<(u64, u64)> {
         let files: Vec<(u64, u64)> = store::segments_for_key(&self.config.cache_dir, key)
             .into_iter()
@@ -234,9 +261,38 @@ impl Staging {
                 });
             }
         }
+        // A watched key's pin is a PREFERENCE, not an exemption (ADR-0012's
+        // rule, third application): spans outside the viewer's neighbourhood
+        // go first, however the policy ordered them, and the neighbourhood is
+        // taken only when nothing outside it can cover the need. Without the
+        // split, "a key being read keeps its spans" made the magazine's budget
+        // unenforceable against exactly the key a long watch was filling with
+        // bytes that the viewer had already passed.
+        let outside = |(start, end): (u64, u64)| match pin {
+            Some(p) => end <= p.start || start >= p.end,
+            None => true,
+        };
+        let mut ordered: Vec<usize> = if inside_pins {
+            // A pin that has to be spent is spent from the BACK: the spans the
+            // viewer has already watched go before the spans it is about to
+            // need, because forward progress is continuous while a scrub back
+            // is deliberate. Without this the policy's own order decides, and
+            // its stalest span is very often the one under the playhead.
+            // Behind: nearest-last (farthest behind first). Ahead: nearest
+            // kept last. Spans straddling the anchor are the last resort.
+            let rank = |(s, e): (u64, u64)| match pin {
+                Some(p) if e <= p.anchor => (0u8, std::cmp::Reverse(p.anchor - e)),
+                Some(p) if s >= p.anchor => (2u8, std::cmp::Reverse(s - p.anchor)),
+                _ => (1u8, std::cmp::Reverse(0u64)),
+            };
+            ordered.sort_by_key(|i| rank(files[*i]));
+            ordered
+        } else {
+            ordered.into_iter().filter(|i| outside(files[*i])).collect()
+        };
         let mut picked = Vec::new();
         let mut acc = 0u64;
-        for i in ordered {
+        for i in ordered.drain(..) {
             if acc >= need_bytes {
                 break;
             }
@@ -278,6 +334,41 @@ impl Staging {
         let mut cov = self.coverage.lock().await;
         for key in keys {
             cov.remove(key);
+        }
+    }
+
+    /// Seal a staged span: RENAME the part into place and claim it only when
+    /// the rename actually landed. The ledger and `segment_bytes` describe what
+    /// is on disk, so a claim written over a failed rename is a phantom span —
+    /// invisible until the next restart's scan, and until then bytes an
+    /// eviction pass would "free" without a file behind them. A failure is a
+    /// real possibility rather than a theoretical one: the part can be gone
+    /// (a strays sweep, or a pressure reclaim racing the writer), and the
+    /// rename is the point where that becomes visible. Both writers (the
+    /// body's exhaustion tail and the disconnect watcher) come through here,
+    /// so the order is stated once.
+    pub(crate) async fn seal_renamed(
+        &self,
+        segpart: &std::path::Path,
+        seg: &std::path::Path,
+        span: FinalizedSpan,
+    ) -> bool {
+        match tokio::fs::rename(segpart, seg).await {
+            Ok(()) => {
+                self.seal_span(span).await;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    key = %span.key,
+                    start = span.start,
+                    bytes = span.bytes,
+                    error = %e,
+                    "staged span could not be sealed: not claiming it"
+                );
+                let _ = tokio::fs::remove_file(segpart).await;
+                false
+            }
         }
     }
 
@@ -492,4 +583,280 @@ pub(crate) fn pieces_then(
             yield chunk?;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::{leases::Leases, watch::Watches};
+    use crate::config::EvictionPolicy;
+    use std::path::PathBuf;
+
+    /// The staging receiver on its own: the eviction and sealing rules are
+    /// exercised here without a request, which is what makes "the pin decides
+    /// which span goes" assertable at all.
+    struct Harness {
+        staging: Staging,
+        coverage: Arc<Mutex<HashMap<String, store::Coverage>>>,
+        state: Arc<RwLock<CacheState>>,
+        leases: Arc<Leases>,
+        watches: Arc<Watches>,
+        dir: tempfile::TempDir,
+    }
+
+    fn harness(policy: EvictionPolicy, pin_bytes: u64, watch_idle_ms: u64) -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+        cfg.eviction_policy = policy;
+        let cfg = Arc::new(cfg);
+        let coverage = Arc::new(Mutex::new(HashMap::new()));
+        let state = Arc::new(RwLock::new(CacheState::default()));
+        let leases = Arc::new(Leases::new(0));
+        let watches = Arc::new(Watches::new(watch_idle_ms, pin_bytes));
+        let staging = Staging::new(
+            Arc::clone(&coverage),
+            Arc::clone(&state),
+            Arc::clone(&cfg),
+            Arc::clone(&leases),
+            Arc::clone(&watches),
+        );
+        Harness { staging, coverage, state, leases, watches, dir }
+    }
+
+    impl Harness {
+        fn cache_dir(&self) -> PathBuf {
+            self.dir.path().to_path_buf()
+        }
+
+        /// Write one real `.seg` file and give the ledger the policy input the
+        /// eviction paths read about it: the disk is the authority for
+        /// existence, the row only supplies the ordering.
+        async fn stage_span(&self, key: &str, start: u64, end: u64, t: u64, reads: u64) {
+            let path = store::seg_path(&self.cache_dir(), key, start, end);
+            std::fs::write(&path, vec![b'x'; (end - start) as usize]).unwrap();
+            let mut cov = self.coverage.lock().await;
+            let row = cov.entry(key.to_string()).or_default();
+            row.intervals.push((start, end, t, reads));
+            row.intervals.sort();
+            row.total = 1_000_000;
+            row.etag = Some("v1".into());
+            // The ROW's age (the min-age guard and the cross-key LRU) is left
+            // old, so the trim is not refused as "actively staging"; the
+            // per-interval `t` is the policy input the span ordering uses.
+            drop(cov);
+            let mut s = self.state.write().await;
+            s.segment_bytes += end - start;
+        }
+
+        fn spans(&self, key: &str) -> Vec<(u64, u64)> {
+            store::segments_for_key(&self.cache_dir(), key)
+                .into_iter()
+                .map(|(s, e, _)| (s, e))
+                .collect()
+        }
+    }
+
+    /// A watched key's pin is a PREFERENCE, not an exemption (ADR-0018): the
+    /// spans outside the viewer's neighbourhood go first even when the policy
+    /// would have taken an older one, and the neighbourhood is what survives a
+    /// trim. The old rule — "a key being read keeps its spans" — protected the
+    /// whole row, so a long watch made the budget unenforceable against
+    /// exactly the key that was filling the disk.
+    #[tokio::test]
+    async fn a_watched_key_gives_up_the_spans_outside_its_neighbourhood() {
+        let h = harness(EvictionPolicy::Lru, 200, 900_000);
+        for (start, end, t) in [(0u64, 100u64, 1u64), (100, 200, 2), (200, 300, 3), (300, 400, 4)] {
+            h.stage_span("a.bin", start, end, t, 1).await;
+        }
+        // The viewer is at the start of the object: the pin is [0, 200).
+        let _watch =
+            h.watches.acquire_at("a.bin", (0, 100), Arc::new(crate::clock::MockClock::new(400_000)));
+        let now = 400_000u64;
+
+        let (touched, freed) = h.staging.evict_staged(100, now).await;
+        assert_eq!(touched, 1);
+        assert_eq!(freed, 100, "one span's bytes, exactly");
+        assert_eq!(
+            h.spans("a.bin"),
+            vec![(0, 100), (100, 200), (300, 400)],
+            "the LRU-oldest span was NOT the one to go: the pin sent the trim to the tail"
+        );
+        assert_eq!(h.state.read().await.segment_bytes, 300, "accounting follows the file");
+    }
+
+    /// The reverse verification: with the pin switched off, the same setup
+    /// takes the policy's own choice — the oldest span. Two opposite
+    /// expectations from one input is what says the pin, not the ordering, is
+    /// what moved.
+    #[tokio::test]
+    async fn without_a_pin_the_policy_takes_the_oldest_span() {
+        let h = harness(EvictionPolicy::Lru, 0, 900_000);
+        for (start, end, t) in [(0u64, 100u64, 1u64), (100, 200, 2), (200, 300, 3), (300, 400, 4)] {
+            h.stage_span("a.bin", start, end, t, 1).await;
+        }
+        let _watch =
+            h.watches.acquire_at("a.bin", (0, 100), Arc::new(crate::clock::MockClock::new(400_000)));
+        let (touched, freed) = h.staging.evict_staged(100, 400_000).await;
+        assert_eq!((touched, freed), (1, 100));
+        assert_eq!(
+            h.spans("a.bin"),
+            vec![(100, 200), (200, 300), (300, 400)],
+            "no pin: the stalest span goes, as it always did"
+        );
+    }
+
+    /// And the pin is a deadline, not immortality: when nothing outside it can
+    /// cover the need, it is taken too. Otherwise "watched" would be a second
+    /// byte budget that nothing can reclaim.
+    #[tokio::test]
+    async fn the_pin_yields_when_nothing_outside_it_covers_the_need() {
+        let h = harness(EvictionPolicy::Lru, 200, 900_000);
+        for (start, end, t) in [(0u64, 100u64, 1u64), (100, 200, 2), (200, 300, 3), (300, 400, 4)] {
+            h.stage_span("a.bin", start, end, t, 1).await;
+        }
+        let _watch =
+            h.watches.acquire_at("a.bin", (0, 100), Arc::new(crate::clock::MockClock::new(400_000)));
+        // 400 bytes wanted, 200 of them outside the pin.
+        let (_, freed) = h.staging.evict_staged(400, 400_000).await;
+        assert_eq!(freed, 400, "the whole row goes when the need is bigger than the tail");
+        assert!(h.spans("a.bin").is_empty());
+        assert_eq!(h.state.read().await.segment_bytes, 0);
+    }
+
+    /// A leased key with NO watch keeps the older, coarser rule: the whole row
+    /// is spared. That is the shape `watch_idle_secs = 0` produces (watching
+    /// turned off), so ADR-0017's behaviour survives the change intact.
+    #[tokio::test]
+    async fn a_leased_key_without_a_watch_keeps_its_whole_row() {
+        let h = harness(EvictionPolicy::Lru, 0, 0);
+        for (start, end, t) in [(0u64, 100u64, 1u64), (100, 200, 2)] {
+            h.stage_span("a.bin", start, end, t, 1).await;
+        }
+        let _lease = h.leases.acquire("a.bin", Arc::new(|| 400_000));
+        let (touched, freed) = h.staging.evict_staged(100, 400_000).await;
+        assert_eq!((touched, freed), (0, 0), "a leased key with no watch is not budget material");
+        assert_eq!(h.spans("a.bin"), vec![(0, 100), (100, 200)]);
+    }
+
+    /// A pin that has to be spent is spent from the BACK: the span the viewer
+    /// has already watched goes before the span it is about to need. The
+    /// policy's own order is arranged to disagree — lru's stalest span is the
+    /// one ahead — so the two possible expectations are opposite.
+    #[tokio::test]
+    async fn a_spent_pin_gives_up_the_back_before_the_playhead() {
+        let h = harness(EvictionPolicy::Lru, 200, 900_000);
+        // Outside the pin, to pay with first (t=3, so lru would keep it).
+        h.stage_span("a.bin", 0, 100, 3, 1).await;
+        // Behind the anchor: already watched, t=2, so lru would keep it too.
+        h.stage_span("a.bin", 100, 200, 2, 1).await;
+        // Ahead of the anchor, and the STALEST: what the viewer needs next, and
+        // what lru would eject first.
+        h.stage_span("a.bin", 200, 300, 1, 1).await;
+        // The viewer's last response was [100, 200): the anchor is 200 and the
+        // pin is [100, 300).
+        let _watch =
+            h.watches.acquire_at("a.bin", (100, 200), Arc::new(crate::clock::MockClock::new(400_000)));
+        assert_eq!(
+            h.watches.pin("a.bin", 400_000).map(|p| (p.start, p.end, p.anchor)),
+            Some((100, 300, 200))
+        );
+
+        // 200 bytes wanted: the span outside the pin pays 100, and the pin pays
+        // the other 100 — from its BACK.
+        let (_, freed) = h.staging.evict_staged(200, 400_000).await;
+        assert_eq!(freed, 200);
+        assert_eq!(
+            h.spans("a.bin"),
+            vec![(200, 300)],
+            "the span AHEAD of the viewer survives, not the span the policy would have kept"
+        );
+    }
+
+    /// A watch keeps a row alive across the idle sweep exactly as a lease does
+    /// — that is the horizon a lease cannot give: a viewer who pauses for
+    /// longer than the read grace is still watching (ADR-0018).
+    #[tokio::test]
+    async fn a_watch_spares_a_row_the_idle_sweep_would_take() {
+        let h = harness(EvictionPolicy::Lru, 200, 900_000);
+        h.stage_span("a.bin", 0, 100, 0, 1).await;
+        let now = 1_300_000u64;
+        // Nothing has read this key for 1300 s: past the TTL, and the lease is
+        // long gone (its grace is 0 here).
+        assert_eq!(
+            h.staging.expired(1_200_000, now).await,
+            vec!["a.bin".to_string()],
+            "untouched and unwatched, the row is idle"
+        );
+
+        let _body = h.watches.acquire_at("a.bin", (0, 100), Arc::new(crate::clock::MockClock::new(now)));
+        assert!(
+            h.staging.expired(1_200_000, now).await.is_empty(),
+            "the viewing session is still there, so the bytes are not idle"
+        );
+    }
+
+    /// The seal is the rename AND the claim: a span that did not land is not
+    /// recorded. Claiming it anyway left `segment_bytes` and the ledger
+    /// describing a file that does not exist — invisible until the next
+    /// restart's scan, and until then a phantom the eviction pass would
+    /// "free" bytes for.
+    #[tokio::test]
+    async fn a_seal_that_did_not_land_is_not_claimed() {
+        let h = harness(EvictionPolicy::Lru, 0, 0);
+        let dir = h.cache_dir();
+        let seg = store::seg_path(&dir, "a.bin", 0, 100);
+        // The part is gone — exactly what a strays sweep or a pressure
+        // reclaim racing the writer leaves behind.
+        let missing = store::segpart_path(&dir, "a.bin", 0, 100);
+        let claimed = h
+            .staging
+            .seal_renamed(
+                &missing,
+                &seg,
+                FinalizedSpan {
+                    cache_dir: dir.clone(),
+                    key: "a.bin".into(),
+                    backend_key: "a.bin".into(),
+                    upstream_id: "primary".into(),
+                    etag: Some("v1".into()),
+                    total: 1_000_000,
+                    start: 0,
+                    end: 100,
+                    bytes: 100,
+                    now_millis: 0,
+                },
+            )
+            .await;
+        assert!(!claimed, "the rename did not land, so nothing was claimed");
+        assert!(!seg.exists());
+        assert_eq!(h.state.read().await.segment_bytes, 0);
+        assert!(h.spans("a.bin").is_empty());
+
+        // The positive control: with the part present, the same call seals and
+        // claims.
+        std::fs::write(&missing, vec![b'x'; 100]).unwrap();
+        let claimed = h
+            .staging
+            .seal_renamed(
+                &missing,
+                &seg,
+                FinalizedSpan {
+                    cache_dir: dir.clone(),
+                    key: "a.bin".into(),
+                    backend_key: "a.bin".into(),
+                    upstream_id: "primary".into(),
+                    etag: Some("v1".into()),
+                    total: 1_000_000,
+                    start: 0,
+                    end: 100,
+                    bytes: 100,
+                    now_millis: 0,
+                },
+            )
+            .await;
+        assert!(claimed);
+        assert!(seg.exists());
+        assert_eq!(h.state.read().await.segment_bytes, 100);
+        assert_eq!(h.spans("a.bin"), vec![(0, 100)]);
+    }
 }

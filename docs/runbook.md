@@ -386,6 +386,31 @@ mid-stream, because the disk is the last resort and the stream in flight
 survives the unlink. Set `read_grace_secs = 0` to keep live bodies protected
 but drop the grace.
 
+A key being **watched** is protected around its viewer's position (ADR-0018).
+A viewing session lasts hours while its bodies last milliseconds, so the lease
+alone is the wrong unit: a key that has been requested stays watched for
+`watch_idle_secs` (default 900) after its last body, and what a trim must leave
+alone is `watch_pin_bytes` (default 128 MiB) around the end of the most recent
+response — not the whole key. Read the two gauges together:
+`cache_watch_active` is how many sessions the cache is holding a neighbourhood
+for and `cache_watch_pinned_bytes` is what that costs the budget; pinning that
+grows while the active count falls is how a budget goes soft.
+`cache_watch_resume_total{outcome}` counts responses that arrived with no body
+on the key — an EdgeOne shard walk contributes one per shard, so read it as how
+often the watch (rather than a live body) was what answered, and `miss` on it
+means that path still paid an upstream open.
+
+A pin is a preference rather than an exemption: the trim takes bytes outside
+every pin first, and spends a pin only when the rest of the cache cannot cover
+the need — from its BACK, because the span the viewer has already watched is
+worth less than the one it is about to need. `watch_pin_bytes = 0` switches
+pinning off (ADR-0017's coarser rule returns: a key being read keeps all its
+spans), and `watch_idle_secs = 0` switches watching off (only live bodies
+protect). Both switches are what the reverse verification of this round used,
+and the LAB's two efficient accounts are built on them: config-d runs with both
+off so its numbers measure the policy alone, config-e with both on so it can
+measure what they cost.
+
 Two knobs govern what leaves the window (ADR-0015), both span-level:
 
 ```toml

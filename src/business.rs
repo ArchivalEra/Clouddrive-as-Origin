@@ -278,19 +278,36 @@ where
     match state.cache.serve(&rk, range, viewer_ua).await {
         Ok(ServeOutcome::Redirect { location }) => redirect_response(location, &req_id, &host_id),
         Ok(ServeOutcome::Stream(plan)) => {
-            // A body served from LOCAL bytes (a disk entry or a staged span)
-            // holds a read lease for as long as it streams, plus the grace:
-            // policy eviction must not take away what a viewer is watching,
-            // and the cache's other clocks only measure requests (ADR-0017).
-            // An upstream-served body holds nothing — there is nothing local
-            // to protect.
-            let lease = (plan.source != crate::cache::cache::BodySource::Upstream).then(|| {
-                state
-                    .cache
-                    .leases
-                    .acquire_at(&rk.cache_key, Arc::clone(&state.cache.clock))
-            });
-            stream_response(plan, &req_id, &host_id, started, lease)
+            // Every response holds the key's read lease for as long as its body
+            // streams, plus the grace (ADR-0017), and registers the key as
+            // WATCHED for the viewer's position (ADR-0018).
+            //
+            // The lease used to be taken only for a local byte source, on the
+            // reasoning that an upstream-served body has nothing local to
+            // protect. That missed the case it was written for: what a long
+            // stream needs protected is the KEY — the spans earlier requests of
+            // the same viewing session staged, which a concurrent eviction pass
+            // would otherwise take while the viewer is still on the object.
+            // Protection is about the key's session, not about which end of the
+            // pipe happened to fill this particular body.
+            let lease = state
+                .cache
+                .leases
+                .acquire_at(&rk.cache_key, Arc::clone(&state.cache.clock));
+            let span = plan.served_span();
+            let watch = state
+                .cache
+                .watches
+                .acquire_at(&rk.cache_key, span, Arc::clone(&state.cache.clock));
+            if watch.resumed() {
+                // A viewer coming back after a pause: did the pause stay free?
+                let outcome = match plan.source {
+                    crate::cache::cache::BodySource::Upstream => "miss",
+                    _ => "hit",
+                };
+                crate::metrics::observe_watch_resume(outcome);
+            }
+            stream_response(plan, &req_id, &host_id, started, lease, watch)
         }
         Err(e) => {
             // Size hint for 416 Content-Range: best-effort memory peek, no
@@ -325,7 +342,8 @@ fn stream_response(
     req_id: &str,
     host_id: &str,
     started: std::time::Instant,
-    lease: Option<crate::cache::leases::LeaseGuard>,
+    lease: crate::cache::leases::LeaseGuard,
+    watch: crate::cache::watch::WatchGuard,
 ) -> Response {
     let mut builder = Response::builder().status(plan.status);
     if let Some(cr) = &plan.content_range {
@@ -341,7 +359,7 @@ fn stream_response(
     let source = plan.source.label();
     crate::metrics::observe_source(source);
     builder
-        .body(Body::from_stream(instrument_body(plan.body, source, started, lease)))
+        .body(Body::from_stream(instrument_body(plan.body, source, started, lease, watch)))
         .unwrap()
 }
 
@@ -364,14 +382,18 @@ fn instrument_body(
     body: crate::cache::flight::BodyStream,
     source: &'static str,
     started: std::time::Instant,
-    lease: Option<crate::cache::leases::LeaseGuard>,
+    lease: crate::cache::leases::LeaseGuard,
+    watch: crate::cache::watch::WatchGuard,
 ) -> crate::cache::flight::BodyStream {
     use futures::StreamExt;
     Box::pin(async_stream::try_stream! {
         // The lease lives exactly as long as this body: hyper drops the stream
         // when the viewer goes away (or once `content-length` is satisfied),
-        // and the guard's drop is what ends the protection (ADR-0017).
+        // and the guard's drop is what ends the protection (ADR-0017). The
+        // watch is the same shape with a longer memory — it survives this body
+        // for its idle budget (ADR-0018).
         let _lease = lease;
+        let _watch = watch;
         let mut body = body;
         let mut first = true;
         while let Some(chunk) = body.next().await {
@@ -1510,8 +1532,10 @@ mod tests {
         assert!(body.contains("\"entries\":0"), "{body}");
     }
 
-    /// Version flip between staging and promotion: history resets, no
-    /// mixed-version entry is ever installed.
+    /// Version flip between transfers: history resets, no mixed-version entry
+    /// is ever installed. The flip is settled on a request that arrives once
+    /// nobody is watching the key — while a viewer is still there the reset is
+    /// deferred (`a_version_drift_waits_for_a_watcher_to_leave`).
     #[tokio::test]
     async fn etag_flip_resets_staged_history() {
         let bytes: Vec<u8> = (0..100u8).collect();
@@ -1520,6 +1544,9 @@ mod tests {
         body_text(resp).await;
         wait_ledger(&fx, "f.bin", &[(0, 50)]).await;
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
+        // The viewer is gone and its watch has lapsed, so the drifted ledger is
+        // settled where it stands rather than deferred.
+        fx.state.cache.clock.advance(1_000_000);
         // Object replaced upstream: next transfer restarts history. Wait
         // out the stat single-flight cooldown so the flip is
         // observed on a fresh stat.
@@ -1535,6 +1562,55 @@ mod tests {
         let cov = fx.state.cache.coverage.lock().await;
         assert_eq!(cov.get("f.bin").unwrap().etag.as_deref(), Some("v2"));
         assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
+    }
+
+    /// A drift discovered WHILE the key is being watched must not cut the
+    /// viewer off: the reset deletes every `.seg` of the key, and a response
+    /// body opens its staged pieces lazily, so a reset under a live body breaks
+    /// it on the first piece it has not opened yet. The reset is right — mixed
+    /// versions must never be served — but it can wait: this request is
+    /// answered from upstream (never from a mix), and the next request that
+    /// arrives when nobody is watching settles the drift.
+    #[tokio::test]
+    async fn a_version_drift_waits_for_a_watcher_to_leave() {
+        let bytes: Vec<u8> = (0..100u8).collect();
+        let fx = fixture_efficient(&bytes, 50);
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        body_text(resp).await;
+        wait_ledger(&fx, "f.bin", &[(0, 50)]).await;
+
+        *fx.etag.lock().unwrap() = Some("v2".into());
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let before = source_total("upstream");
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-79")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body.as_bytes(), &bytes[50..80], "the bytes are the provider's, not the stale span's");
+        assert!(
+            source_total("upstream") - before >= 1.0,
+            "a drifted read is answered from upstream while a watcher holds the key"
+        );
+        assert_eq!(
+            staged_segments(&fx, "f.bin"),
+            vec![(0, 50)],
+            "the old version's spans are still on disk, untouched"
+        );
+        assert_eq!(
+            fx.state.cache.coverage.lock().await.get("f.bin").unwrap().etag.as_deref(),
+            Some("v1"),
+            "the ledger was not re-anchored under the viewer: nothing was mixed"
+        );
+
+        // The viewer leaves; the next request settles the drift.
+        fx.state.cache.clock.advance(1_000_000);
+        let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-79")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
+        body_text(resp).await;
+        wait_ledger(&fx, "f.bin", &[(50, 100)]).await;
+        assert_eq!(staged_segments(&fx, "f.bin"), vec![(50, 100)], "the old spans went once nobody was reading");
+        assert_eq!(
+            fx.state.cache.coverage.lock().await.get("f.bin").unwrap().etag.as_deref(),
+            Some("v2")
+        );
     }
 
     #[tokio::test]
@@ -1854,6 +1930,12 @@ mod tests {
             .session_window(5) // two 5-byte spans, so a policy has a choice
             .max_size_bytes(10)
             .eviction(crate::config::EvictionPolicy::Heat)
+            // The viewer protections are OFF here, exactly as they are in the
+            // LAB's eviction account (config-d): what this test measures is the
+            // POLICY's choice between two spans, so a pin must not be part of
+            // the answer (ADR-0018).
+            .read_grace(0)
+            .watch_pin(0)
             .build();
 
         // a.bin stages two spans ([0,5) then [5,10)) — its whole 10 bytes,
@@ -1898,6 +1980,9 @@ mod tests {
             .session_window(5) // two 5-byte spans, so a policy has a choice
             .max_size_bytes(10)
             .eviction(crate::config::EvictionPolicy::Lru)
+            // Protections off: this measures the policy (see the heat twin).
+            .read_grace(0)
+            .watch_pin(0)
             .build();
 
         stage(&fx, "a.bin", "bytes=0-4").await;
@@ -2057,6 +2142,184 @@ mod tests {
         assert_eq!(fx.state.cache.state.read().await.segment_bytes, 0);
     }
 
+    /// Every response holds its key's lease, whatever end of the pipe filled
+    /// it (ADR-0018's correction to ADR-0017). The longest streams in the
+    /// system are the upstream ones, and what they need protected is the KEY's
+    /// own staged bytes: a concurrent eviction pass neither knows nor cares
+    /// which end of the pipe filled this particular body.
+    #[tokio::test]
+    async fn an_upstream_sourced_body_holds_its_key() {
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        // Grace 0, so the lease's own life is what is being asserted.
+        let fx = base(&bytes).etag(Some("v1")).read_grace(0).build();
+        let now = fx.state.cache.clock.now_millis();
+        assert!(!fx.state.cache.leases.is_protected("a.bin", now), "nothing read yet");
+
+        // A cold miss: the body IS the provider's stream, which is exactly the
+        // case the source test used to exclude from protection.
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=0-2047")]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let body = resp.into_body();
+        assert!(
+            fx.state.cache.leases.is_protected("a.bin", now),
+            "an upstream-served body must hold its key's lease"
+        );
+
+        // And the lease ends with the body: no grace here, so the drop is the
+        // whole difference.
+        drop(body);
+        assert!(
+            !fx.state.cache.leases.is_protected("a.bin", now),
+            "the lease ends when the body does"
+        );
+    }
+
+    /// A request arriving at a live watch with no body on the key is counted:
+    /// that is the instrument that says whether the watch bought anything
+    /// (ADR-0018). The response it measures here is a fully staged one, so it
+    /// cost no upstream open — `hit`.
+    #[tokio::test]
+    async fn a_request_inside_the_watch_budget_is_counted_as_a_watch_resume() {
+        let bytes: Vec<u8> = (0..40u8).collect();
+        let fx = base(&bytes)
+            .etag(Some("v1"))
+            .coverage(4)
+            .session_window(8)
+            .max_size_bytes(1024)
+            .build();
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=0-7")]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        body_text(resp).await;
+        wait_ledger(&fx, "a.bin", &[(0, 8)]).await;
+
+        let before = watch_resume_total("hit");
+        // Five seconds later, same viewing session: nothing is streaming the
+        // key, the watch is.
+        fx.state.cache.clock.advance(5_000);
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=0-7")]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        let (status, _, body) = body_text(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body.as_bytes(), &bytes[0..8]);
+        assert!(
+            watch_resume_total("hit") - before >= 1.0,
+            "the watch, not a live body, answered this request"
+        );
+    }
+
+    /// Wait until a key has staged exactly `n` spans (the run's seal is
+    /// asynchronous, so the count is polled rather than sampled).
+    async fn wait_spans(fx: &Fixture, key: &str, n: usize) {
+        for _ in 0..400 {
+            if staged_segments(fx, key).len() == n {
+                // The seal lands before the driver marks its run terminal, and
+                // a request that arrives in between finds a live run that does
+                // not cover it and takes the standalone escape (one span of the
+                // request's own length instead of a window). A real walk has the
+                // same gap; here it is a few milliseconds wide.
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("{key} never reached {n} staged spans: {:?}", staged_segments(fx, key));
+    }
+
+    /// The LAB's watch account with a movable clock: two keys stage four
+    /// windows each against a magazine that holds one window's worth of four,
+    /// and one of them is being watched at its first window. Which windows does
+    /// the trim take?
+    ///
+    /// This is the deterministic form of LAB section 12, and it exists because
+    /// the LAB's own numbers came back wrong: the trim took the window the
+    /// viewer was on. The pin is asserted here so the answer is not guesswork.
+    #[tokio::test]
+    async fn the_trim_takes_the_tail_and_leaves_the_window_the_viewer_is_on() {
+        let bytes: Vec<u8> = (0..1_048_576u32).map(|i| (i % 251) as u8).collect();
+        let fx = base(&bytes)
+            .etag(Some("v1"))
+            .coverage(4)
+            .session_window(262_144)
+            .max_size_bytes(1_048_576)
+            .watch_pin(524_288)
+            .watch_idle(900)
+            .read_grace(0)
+            .build();
+        // Four windows for the watched key, one run at a time.
+        for off in [0u64, 262_144, 524_288, 786_432] {
+            stage(&fx, "a.bin", &format!("bytes={off}-{}", off + 65_535)).await;
+            wait_spans(&fx, "a.bin", (off / 262_144 + 1) as usize).await;
+        }
+        // The viewer sits on the whole first window: the pin must be [0, 512 KiB).
+        stage(&fx, "a.bin", "bytes=0-262143").await;
+        let now = fx.state.cache.clock.now_millis();
+        let pin = fx
+            .state
+            .cache
+            .watches
+            .pin("a.bin", now)
+            .expect("a watched key has a pin");
+        assert_eq!(
+            (pin.start, pin.end, pin.anchor),
+            (0, 524_288, 262_144),
+            "the pin follows the last response, and that response was the whole first window"
+        );
+
+        // A second key fills the magazine.
+        for off in [0u64, 262_144, 524_288, 786_432] {
+            stage(&fx, "b.bin", &format!("bytes={off}-{}", off + 65_535)).await;
+            wait_spans(&fx, "b.bin", (off / 262_144 + 1) as usize).await;
+        }
+        assert_eq!(
+            fx.state.cache.state.read().await.segment_bytes,
+            2_097_152,
+            "a={:?} b={:?}",
+            staged_segments(&fx, "a.bin"),
+            staged_segments(&fx, "b.bin")
+        );
+
+        // Past the minimum age, so the trim is allowed to look at both rows.
+        fx.state.cache.clock.advance(120_000);
+        fx.state.cache.tick().await;
+
+        let a = staged_segments(&fx, "a.bin");
+        let seg = fx.state.cache.state.read().await.segment_bytes;
+        assert!(
+            seg <= 1_048_576,
+            "the budget must be enforced while a viewer is watching (segment_bytes={seg})"
+        );
+        assert!(
+            a.contains(&(262_144, 524_288)),
+            "the window the viewer is about to need must survive the trim (a={a:?})"
+        );
+        assert!(
+            !a.contains(&(524_288, 786_432)) && !a.contains(&(786_432, 1_048_576)),
+            "the tail beyond the pin goes first (a={a:?})"
+        );
+        // (The order in which a pin is spent is pinned by the staging unit test
+        // `a_spent_pin_gives_up_the_back_before_the_playhead`: this fixture has
+        // no resident bytes, so its overshoot is exactly what the tail holds and
+        // pass two never runs.)
+    }
+
     /// Router construction smoke test: every route path must survive
     /// matchit's pattern compiler at runtime. The integration suite
     /// calls handlers directly and never builds the Router — a blind
@@ -2065,6 +2328,19 @@ mod tests {
     async fn router_constructs_without_panic() {
         let fx = fixture(b"0123456789", None, vec![], false);
         let _app = router(fx.state.clone());
+    }
+
+    /// A lease and a watch for tests that drive `instrument_body` directly:
+    /// production takes both from the serve path, where the request's own
+    /// response range is known.
+    fn test_guards() -> (crate::cache::leases::LeaseGuard, crate::cache::watch::WatchGuard) {
+        let clock = std::sync::Arc::new(MockClock::new(0));
+        let leases = std::sync::Arc::new(crate::cache::leases::Leases::new(0));
+        let watches = std::sync::Arc::new(crate::cache::watch::Watches::new(0, 0));
+        (
+            leases.acquire_at("test.bin", std::sync::Arc::clone(&clock)),
+            watches.acquire_at("test.bin", (0, 1), clock),
+        )
     }
 
     /// Read one counter's current value for a source label. The registry is
@@ -2079,6 +2355,23 @@ mod tests {
                     m.get_label()
                         .iter()
                         .any(|l| l.get_name() == "source" && l.get_value() == source)
+                })
+            })
+            .map(|m| m.get_counter().get_value())
+            .unwrap_or(0.0)
+    }
+
+    /// One `cache_watch_resume_total` outcome's current value. Process-global
+    /// registry, so callers assert on the increase.
+    fn watch_resume_total(outcome: &str) -> f64 {
+        prometheus::gather()
+            .iter()
+            .find(|f| f.get_name() == "cache_watch_resume_total")
+            .and_then(|f| {
+                f.get_metric().iter().find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.get_name() == "outcome" && l.get_value() == outcome)
                 })
             })
             .map(|m| m.get_counter().get_value())
@@ -2114,7 +2407,8 @@ mod tests {
             Ok(bytes::Bytes::from_static(b"de")),
         ];
         let body: crate::cache::flight::BodyStream = Box::pin(futures::stream::iter(chunks));
-        let mut wrapped = instrument_body(body, "upstream", std::time::Instant::now(), None);
+        let (lease, watch) = test_guards();
+        let mut wrapped = instrument_body(body, "upstream", std::time::Instant::now(), lease, watch);
 
         let mut out = Vec::new();
         while let Some(chunk) = wrapped.next().await {
@@ -2142,7 +2436,8 @@ mod tests {
             Ok(bytes::Bytes::from_static(b"efgh")),
         ];
         let body: crate::cache::flight::BodyStream = Box::pin(futures::stream::iter(chunks));
-        let mut wrapped = instrument_body(body, "disk", std::time::Instant::now(), None);
+        let (lease, watch) = test_guards();
+        let mut wrapped = instrument_body(body, "disk", std::time::Instant::now(), lease, watch);
         let first = wrapped.next().await.unwrap().unwrap();
         assert_eq!(&first[..], b"abcd");
         drop(wrapped); // exactly what hyper does once content-length is met

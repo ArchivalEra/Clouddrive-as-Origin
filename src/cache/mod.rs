@@ -4,6 +4,7 @@ pub mod leases;
 pub(crate) mod magazine;
 pub(crate) mod session;
 pub(crate) mod staging;
+pub mod watch;
 pub mod meta;
 pub mod persist;
 pub mod store;

@@ -114,11 +114,18 @@ impl Run {
 
     /// Whether a still-consuming reader makes the next window worth starting
     /// now, and where it would begin.
-    fn wants_successor(&self) -> Option<u64> {
+    ///
+    /// `watched` is the caller's answer to "is this key still being viewed"
+    /// (an attached body, or a watch inside its idle budget). It replaces the
+    /// readers-only test: a viewer who paused keeps the read-ahead it already
+    /// paid for, while the `next <= playhead + keep_ahead` bound — which does
+    /// not move while the playhead is stalled — still stops the chain, so
+    /// watching a file never becomes pulling it.
+    fn wants_successor(&self, watched: bool) -> Option<u64> {
         let next = self.end;
         let keep_ahead = self.successor.window.saturating_mul(CHAIN_KEEP_AHEAD_WINDOWS);
         if next < self.successor.total
-            && self.readers() > 0
+            && watched
             && next <= self.playhead().saturating_add(keep_ahead)
         {
             Some(next)
@@ -154,11 +161,22 @@ pub(crate) struct Sessions<C: Clock> {
     staging: Staging,
     config: Arc<Config>,
     clock: Arc<C>,
+    /// Watches (ADR-0018). The chain's condition used to be "a reader is
+    /// attached", which stops the moment a browser pauses and throws away the
+    /// read-ahead it had already paid for; a watch says the *viewing session*
+    /// is still there, bounded by its own idle budget.
+    watches: Arc<super::watch::Watches>,
 }
 
 impl<C: Clock + 'static> Sessions<C> {
-    pub(crate) fn new(config: Arc<Config>, clock: Arc<C>, staging: Staging, flights: Flights) -> Self {
-        Self { slots: Mutex::new(HashMap::new()), flights, staging, config, clock }
+    pub(crate) fn new(
+        config: Arc<Config>,
+        clock: Arc<C>,
+        staging: Staging,
+        flights: Flights,
+        watches: Arc<super::watch::Watches>,
+    ) -> Self {
+        Self { slots: Mutex::new(HashMap::new()), flights, staging, config, clock, watches }
     }
 
     /// The live run that can serve all of `[start, end)`, if there is one.
@@ -358,7 +376,12 @@ impl<C: Clock + 'static> Sessions<C> {
                 .collect()
         };
         for (key, run) in spent {
-            let next_start = run.wants_successor();
+            // A body still attached counts as watching even with the idle
+            // budget turned off, so `watch_idle_secs = 0` is exactly the
+            // pre-ADR-0018 rule and the reverse verification is a config flip.
+            let watched =
+                run.readers() > 0 || self.watches.live(&key, self.clock.now_millis());
+            let next_start = run.wants_successor(watched);
             // The spent entry goes first: `start` refuses a key that still has
             // one, so chaining before releasing would never fire. `finish` is
             // pointer-checked, and two ticks racing here both release (the
@@ -418,6 +441,19 @@ mod tests {
     use std::collections::HashMap;
 
     fn sessions(dir: &std::path::Path, window: u64, object_bytes: u64, opens: Arc<AtomicUsize>) -> (Arc<Sessions<MockClock>>, Arc<BackendSlot>) {
+        // No idle budget: a watch exists only while a body streams it, which
+        // is the pre-ADR-0018 chain rule these tests were written against.
+        let (sessions, slot, _watches) = sessions_watching(dir, window, object_bytes, opens, 0);
+        (sessions, slot)
+    }
+
+    fn sessions_watching(
+        dir: &std::path::Path,
+        window: u64,
+        object_bytes: u64,
+        opens: Arc<AtomicUsize>,
+        watch_idle_ms: u64,
+    ) -> (Arc<Sessions<MockClock>>, Arc<BackendSlot>, Arc<crate::cache::watch::Watches>) {
         let clock = Arc::new(MockClock::new(0));
         let mut cfg = Config {
             cache_dir: dir.to_path_buf(),
@@ -428,12 +464,20 @@ mod tests {
         let coverage = Arc::new(Mutex::new(HashMap::<String, Coverage>::new()));
         let state = Arc::new(tokio::sync::RwLock::new(crate::cache::cache::CacheState::default()));
         let leases = Arc::new(crate::cache::leases::Leases::new(0));
-        let staging = Staging::new(Arc::clone(&coverage), Arc::clone(&state), Arc::clone(&cfg), leases);
+        let watches = Arc::new(crate::cache::watch::Watches::new(watch_idle_ms, 4096));
+        let staging = Staging::new(
+            Arc::clone(&coverage),
+            Arc::clone(&state),
+            Arc::clone(&cfg),
+            leases,
+            Arc::clone(&watches),
+        );
         let flights = Flights::new(flight::DEFAULT_STALL_BUDGET);
-        let sessions = Arc::new(Sessions::new(cfg, Arc::clone(&clock), staging, flights));
+        let sessions =
+            Arc::new(Sessions::new(cfg, Arc::clone(&clock), staging, flights, Arc::clone(&watches)));
         let backend = Arc::new(SizedBackend::new(&[("a.bin", object_bytes)], opens));
         let slot = Arc::new(BackendSlot::new(backend, 3));
-        (sessions, slot)
+        (sessions, slot, watches)
     }
 
     fn key() -> Key {
@@ -543,6 +587,63 @@ mod tests {
             .map(|(s, e, _)| (s, e))
             .collect();
         assert_eq!(spans, vec![(9000, 10_000)]);
+    }
+
+    /// A viewer who PAUSES keeps the read-ahead it already paid for: the
+    /// chain's condition is the watch, not an attached body, so the next
+    /// window is fetched while the viewer is away (ADR-0018). Without this the
+    /// pause threw away the window and the resume paid a fresh ~640 ms open.
+    #[tokio::test]
+    async fn a_paused_viewer_keeps_the_chain_inside_its_watch_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let opens = Arc::new(AtomicUsize::new(0));
+        // 15 minutes of watch: the pause is inside it.
+        let (sessions, slot, watches) =
+            sessions_watching(dir.path(), 4096, 64 * 1024, Arc::clone(&opens), 900_000);
+        let run = start(&sessions, &slot, 64 * 1024).await;
+
+        // The viewer watches the first window and then goes quiet: the body is
+        // dropped, so nothing is streaming the key — only the watch is left.
+        let watch = watches.acquire_at("a.bin", (0, 4096), Arc::new(MockClock::new(0)));
+        {
+            let mut body = Sessions::<MockClock>::reader(Arc::clone(&run), 0, 4096);
+            let _ = futures::StreamExt::next(&mut body).await;
+        }
+        assert_eq!(run.readers(), 0, "the body is gone");
+        drop(watch);
+        wait_terminal(&run).await;
+
+        sessions.tick().await;
+        let next = sessions
+            .covering("a.bin", 4096, 8192)
+            .await
+            .expect("the watch keeps the chain for one more window");
+        wait_terminal(&next).await;
+        assert_eq!(opens.load(Ordering::SeqCst), 2, "the read-ahead was fetched during the pause");
+    }
+
+    /// The reverse verification for the rule above: with watching turned off
+    /// (`watch_idle_secs = 0`) a departed body stops the chain exactly as it
+    /// did before ADR-0018. One config flip, two opposite outcomes.
+    #[tokio::test]
+    async fn a_departed_viewer_stops_the_chain_when_watching_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let (sessions, slot) = sessions(dir.path(), 4096, 64 * 1024, Arc::clone(&opens));
+        let run = start(&sessions, &slot, 64 * 1024).await;
+        {
+            let mut body = Sessions::<MockClock>::reader(Arc::clone(&run), 0, 4096);
+            let _ = futures::StreamExt::next(&mut body).await;
+        }
+        assert_eq!(run.readers(), 0);
+        wait_terminal(&run).await;
+
+        sessions.tick().await;
+        assert!(
+            sessions.covering("a.bin", 4096, 8192).await.is_none(),
+            "no watch, no reader: the chain must not run"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1, "one window, and nothing after it");
     }
 
     /// A request whose gap is larger than the window widens it: nothing is
