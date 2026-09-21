@@ -488,16 +488,14 @@ where
                 return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, true, Some(meta.size));
             }
             let end = r.length.map_or(meta.size, |l| (r.offset + l).min(meta.size));
-            let cr = ContentRange { first: r.offset, last: end - 1, total: meta.size };
-            (end - r.offset, Some(cr))
+            (end - r.offset, ContentRange::for_span(meta.size, r.offset, end, true))
         }
         ClientRange::Suffix(n) => {
             if meta.size == 0 || n == 0 {
                 return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, true, Some(meta.size));
             }
             let (offset, len) = if n >= meta.size { (0, meta.size) } else { (meta.size - n, n) };
-            let cr = ContentRange { first: offset, last: offset + len - 1, total: meta.size };
-            (len, Some(cr))
+            (len, ContentRange::for_span(meta.size, offset, offset + len, true))
         }
     };
 
@@ -1097,7 +1095,7 @@ mod tests {
         assert!(h.get("x-amz-request-id").is_some());
         assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 1);
         // Background fill installs the entry without any viewer attached.
-        for _ in 0..200 {
+        for _ in 0..crate::testsupport::WAIT_TRIES {
             if fx.state.cache.state.read().await.entries.contains_key("new.bin") {
                 break;
             }
@@ -1159,7 +1157,7 @@ mod tests {
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::ACCEPTED);
         assert!(body.contains("accepted"), "{body}");
-        for _ in 0..200 {
+        for _ in 0..crate::testsupport::WAIT_TRIES {
             if fx.state.cache.state.read().await.entries.contains_key("w.bin") {
                 break;
             }
@@ -1330,6 +1328,12 @@ mod tests {
         let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[("range", "bytes=0-4")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        // The first window must be ON DISK before the second request asks for
+        // it, or this stops being a test about a partially covered range: a
+        // request that arrives while the first run is still unsealed finds no
+        // coverage and no live run to ride, so it takes the standalone escape
+        // (one span the length of the request, not one window).
+        wait_spans(&fx, "a.bin", 1).await;
         reset(&fx);
 
         let resp = get_key(
@@ -1939,6 +1943,10 @@ mod tests {
         // hot. [5,10) was staged later and never read again.
         stage(&fx, "a.bin", "bytes=0-4").await;
         stage(&fx, "a.bin", "bytes=0-4").await;
+        // Both spans on disk before the policy is asked anything: the seal is
+        // asynchronous (see `wait_ledger`), and a missing span here would be
+        // read as a policy answer rather than a timing artifact.
+        wait_spans(&fx, "a.bin", 2).await;
         assert_eq!(staged_segments(&fx, "a.bin"), vec![(0, 5), (5, 10)]);
         // b.bin stages 5 more bytes, and its row is the NEWER one: the 5-byte
         // overshoot must come out of a.bin, under both policies.
@@ -2007,7 +2015,7 @@ mod tests {
     /// (the same discipline the lab's `wait_segment_bytes` uses). Poll for the
     /// ledger to describe `expect` instead.
     async fn wait_ledger(fx: &Fixture, key: &str, expect: &[(u64, u64)]) {
-        for _ in 0..400 {
+        for _ in 0..crate::testsupport::WAIT_TRIES {
             {
                 let cov = fx.state.cache.coverage.lock().await;
                 if let Some(c) = cov.get(key) {
@@ -2029,7 +2037,7 @@ mod tests {
 
     /// The same wait for the staged-byte counter (healthz-level assertions).
     async fn wait_segment_bytes(fx: &Fixture, expect: u64) {
-        for _ in 0..400 {
+        for _ in 0..crate::testsupport::WAIT_TRIES {
             if fx.state.cache.state.read().await.segment_bytes == expect {
                 return;
             }
@@ -2221,7 +2229,7 @@ mod tests {
     /// Wait until a key has staged exactly `n` spans (the run's seal is
     /// asynchronous, so the count is polled rather than sampled).
     async fn wait_spans(fx: &Fixture, key: &str, n: usize) {
-        for _ in 0..400 {
+        for _ in 0..crate::testsupport::WAIT_TRIES {
             if staged_segments(fx, key).len() == n {
                 // The seal lands before the driver marks its run terminal, and
                 // a request that arrives in between finds a live run that does
