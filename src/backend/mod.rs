@@ -126,12 +126,20 @@ impl ContentRange {
     }
 }
 
-/// A readable byte stream with a known-or-unknown total length.
-/// `total_len` is `Some` when the provider returned it (stat or
-/// Content-Range total); the water-pipe uses it for `Content-Length`.
+/// A readable byte stream and what its response PROMISED to deliver.
+///
+/// `promised_len` is the length THIS response claims — `Content-Length`, or the
+/// length in a `Content-Range`. It is never the object's size: a ranged
+/// response promises its range. Two rules read it the same way: a pump reads AT
+/// MOST this many bytes, so a provider that streams past its own Content-Length
+/// cannot hand over more than it promised; and a body that comes up SHORT of it
+/// fails rather than sealing a truncated span (ADR-0021).
+///
+/// `None` = the response did not say (chunked, no Content-Range): read to EOF
+/// and do not police the length.
 pub struct StreamSource {
     pub stream: Box<dyn AsyncRead + Send + Unpin>,
-    pub total_len: Option<u64>,
+    pub promised_len: Option<u64>,
 }
 
 /// Whether a URL may be handed to a viewer as a redirect target (A relief
@@ -464,7 +472,9 @@ mod tests {
         assert_eq!(meta.size_bytes, 5);
         assert_eq!(meta.etag.as_deref(), Some("abc"));
         let src = b.open(&key, Some(ByteRange::from_offset(1))).await.unwrap();
-        assert_eq!(src.total_len, Some(5));
+        // An offset-only Range runs to the end of the object, so the promise is
+        // what remains: 5 - 1 bytes, which is what the stream delivers.
+        assert_eq!(src.promised_len, Some(4));
         let mut s = src.stream;
         let mut buf = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf).await.unwrap();

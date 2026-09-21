@@ -22,7 +22,8 @@ struct's own doc states the invariant (`first <= last < total`); nothing enforce
 it.
 
 **A stream's promise was checked on one side only.** `pump_and_seal` stopped at
-EOF and compared the result against `total_len` only when the body came up SHORT.
+EOF and compared the result against the response's length only when the body
+came up SHORT.
 Its comment argued that an over-long body is harmless — "every serving read is
 bounded by the promised length" — which is true for a whole-file pull and false
 for a run, whose stored artifact IS the span and whose size drives the ledger and
@@ -46,15 +47,19 @@ is the only clamp: `end` is exclusive, `None` means this response carries no
 `Content-Range` (a whole-object request, or an empty span, which callers answer
 416 for), so `end - 1` cannot underflow and `last < first` cannot be rendered.
 
-**A promise is read on both sides.** `pump_and_seal` reads at most `total_len`, so
-an upstream that streams past the length it was asked for cannot stage the rest of
-the object into a "window". The cap is on the read, not a truncation after it: the
-extra bytes are never taken off the stream.
+**A promise is read on both sides.** `pump_and_seal` reads at most the promised
+length, so an upstream that streams past the length it was asked for cannot stage
+the rest of the object into a "window". The cap is on the read, not a truncation
+after it: the extra bytes are never taken off the stream.
 
-**What `total_len` means at the pump** is "what this stream was promised" — the
-run sets it to its window, and a whole-file pull's backend reports the object. The
-backend field keeps its documented meaning (the object's total, pinned by
-`tests/openlist.rs`); the two agree everywhere the pump is called today.
+**One name, one meaning.** `StreamSource.total_len` was documented as "the
+object's total (stat or Content-Range total)" and read as "what this stream was
+promised" — which worked only because the field's one ranged-open caller (a run)
+overwrote it with its window, and it meant a ranged 206 from OpenList promised the
+whole object. The field is now `promised_len`: the length THIS response claims
+(`Content-Length`, or the length in a `Content-Range`), never the object's size.
+The run still restates its own window on top, now as a contract rather than as a
+correction, and the object's size stays `stat`'s answer to a different question.
 
 ## Consequences
 
