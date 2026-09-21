@@ -9,8 +9,9 @@
 #   SigV4 three states, and the efficient profile: staged spans served
 #   without upstream opens, ledger window decay, span-level eviction.
 #
-# Usage:  deploy/lab/run-lab.sh [--quick]
+# Usage:  deploy/lab/run-lab.sh [--quick|--smoke]
 #   --quick: skip the 3GB full-pull test (everything else runs).
+#   --smoke: the core set in about a minute (see the note by SMOKE below).
 # Exit 0 = all PASS, 1 = any FAIL. Output: PASS/FAIL per item.
 set -u
 
@@ -24,6 +25,15 @@ SIGV4_AK=AKLLABTESTKEY
 SIGV4_SK=labsk_demo
 PID_DAV= PID_A= PID_B= PID_C= PID_D= PID_E= PID_F= PID_G=
 PASS=0; FAIL=0
+# `--smoke` is the core regression set in a minute: the binary boots, the front
+# serves, ranges are 206 and byte-exact, and the run/window machinery shares one
+# upstream open. It skips the accounts that need a 150 s poll, the browsers, and
+# the shard walk — the things a change to one module rarely breaks. `--quick`
+# remains the full matrix without the 3 GB pull.
+SMOKE=0
+for arg in "$@"; do
+  [ "$arg" = "--smoke" ] && SMOKE=1
+done
 
 ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
@@ -255,7 +265,7 @@ r=$(H -o /dev/null -w "%{http_code}" -H "Range: bytes=-10" http://127.0.0.1:7777
 [ "$r" = 206 ] && ok "suffix range 206" || bad "suffix range $r"
 
 note "3. 3GB full pull + atomic install (skip with --quick)"
-if [ "${1:-}" != "--quick" ]; then
+if [ "${1:-}" != "--quick" ] && [ "$SMOKE" = 0 ]; then
   out=$(H -o /dev/null -w "%{http_code} %{size_download}" "http://127.0.0.1:7777/media/big3g.bin")
   code=${out%% *}; size=${out##* }
   real=$(stat -c %s "$DAV_ROOT/media/big3g.bin")
@@ -400,6 +410,9 @@ attached=$(H http://127.0.0.1:9092/metrics | awk '/^cache_session_reader_total\{
 [ "${attached:-0}" -ge 3 ] && ok "requests counted as run-attached (${attached:-0})" \
   || bad "only ${attached:-0} requests rode a run"
 
+if [ "$SMOKE" = 1 ]; then
+  note "10-15. skipped in --smoke (decay, eviction, watch, stampede, browsers)"
+else
 note "10. a decayed interval leaves the bytes served"
 # config-c's coverage window is 5 s. A window that closes and a new one that
 # opens past the window: the ledger drops the stale interval (that is the
@@ -725,6 +738,8 @@ fi
 # gate and the body cap are consulted on a live connection, and whether healthz
 # is really absent from the public port. config-f runs with `front_rate_rps = 2`
 # so that the third request in a second must be refused.
+fi
+
 note "16. the front's own guards (404 / 429 / 413)"
 # 3 GiB: bigger than the 256 MiB magazine (the un-keepable class) and, at 24 MiB
 # of shards, well inside the 64 MiB default window section 17 walks it with.
@@ -770,6 +785,7 @@ code=$(H -o /dev/null -w "%{http_code}" -X POST --data-binary @"$LAB/oversize-pr
 # quick, which left the value the node actually runs (the 64 MiB default)
 # justified by prose and hand-run probes only. This walks config-g the way the
 # edge really asks: ascending 1 MiB shards on an object the magazine cannot hold.
+if [ "$SMOKE" = 0 ]; then
 note "17. the default window vs the CDN's 1 MiB shards"
 if [ ! -f "$LAB/dav-data/media/$WALK_OBJ" ]; then
   note "17. skipped ($WALK_OBJ is missing)"
@@ -799,6 +815,7 @@ done
 [ "${gbytes:-0}" -ge 1048576 ] && ok "the walk staged its window ($gbytes bytes)" \
   || bad "the walk staged nothing after 30 s (segment_bytes=$gbytes)"
 echo "    walk: ${walk_ms} ms for 24 MiB, opens=$opened, staged=$gbytes" >&2
+fi
 fi
 
 # --- 5. summary ---------------------------------------------------------------

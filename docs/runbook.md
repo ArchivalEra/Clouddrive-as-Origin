@@ -770,6 +770,19 @@ Two files carry the rest:
 - **`docs/adr/README.md`** — one line per decision, which ones amend which, and
   the cross-cutting rule (ADR-0012: a guard is a deadline, not an exemption).
 
+Three modes, in rising cost:
+
+```sh
+bash deploy/lab/run-lab.sh --smoke    # ~2 min: the core set (see below)
+bash deploy/lab/run-lab.sh --quick    # ~7 min: everything but the 3 GB pull
+bash deploy/lab/run-lab.sh            # ~9 min: the whole matrix
+```
+
+`--smoke` keeps the binary boot, the front's guards, the acceptance matrix and the
+run/window account (sections 1-9 and 16) and skips the accounts that need a 150 s
+poll, the browsers and the shard walk (10-15, 17) — the parts a change to one
+module rarely breaks. Use it between edits; use `--quick` before a commit.
+
 The suite refuses to start on a busy box (`MAX_LOAD`, default 6) or with orphan
 browsers alive; the same revision produced 7 false FAILs at load 46 and 60 PASS /
 0 FAIL at load 4. `MAX_LOAD=<n>` overrides when a noisy run is worth having.
