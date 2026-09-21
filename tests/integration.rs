@@ -38,7 +38,7 @@ fn registry_with(backend: Arc<dyn StorageBackend>) -> BackendRegistry {
 /// Wait until every flight has left the map (an admission round keeps the
 /// map as its coalescing key-set, and these tests assert on its drain).
 async fn wait_map_empty(cache: &Cache<MockClock>) {
-    for _ in 0..200 {
+    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
         if cache.flights.active().await == 0 {
             return;
         }
@@ -403,7 +403,7 @@ async fn spawned_reaper_expires_entries_without_manual_tick() {
     // real-time moment to fire (the loop interval is wall time, the TTL is
     // mock-clock time).
     clock.advance(1_201_000);
-    for _ in 0..200 {
+    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
         if cache.state.read().await.entries.is_empty() {
             break;
         }
@@ -664,7 +664,7 @@ async fn head_not_starved_by_saturated_stream_gate() {
         });
     }
     // Wait until both transfers have reached open() (both stream permits held).
-    for _ in 0..200 {
+    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
         if opened.load(Ordering::SeqCst) >= 2 {
             break;
         }
@@ -751,6 +751,8 @@ async fn an_object_larger_than_the_magazine_is_cached_as_a_stray() {
 
 /// The cache never refuses to SERVE, only to cache (ADR-0013). An object no
 /// disk could hold — and with no stray to evict for it — is answered through
+/// the passthrough path and nothing is written.
+#[tokio::test]
 async fn a_window_bigger_than_the_retention_budget_is_not_written() {
     use origin_cache::cache::cache::{BodySource, ServeOutcome};
 
@@ -882,7 +884,7 @@ async fn efficient_passthrough_waits_for_a_stream_permit() {
     // Free the gate: the transfer proceeds, and the permit it takes must
     // stay held for the body rather than being dropped when `serve` returns.
     drop(held);
-    for _ in 0..200 {
+    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
         if opened.load(Ordering::SeqCst) >= 1 {
             break;
         }
@@ -917,7 +919,7 @@ async fn efficient_passthrough_waits_for_a_stream_permit() {
     // held while the run's window transfers — which is what lets one open serve
     // every request inside that window — and released when the window ends,
     // possibly after this body is already consumed. So poll rather than sample.
-    for _ in 0..400 {
+    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
         if slot.stream_gate.available_permits() == 2 {
             break;
         }
@@ -1288,6 +1290,29 @@ fn run_fixture_capped(
     pace_ms: u64,
     max_size_bytes: u64,
 ) -> (Arc<Cache<MockClock>>, Arc<AtomicUsize>) {
+    run_fixture_with(dir, object_bytes, window, pace_ms, max_size_bytes, false)
+}
+
+/// The same fixture with an upstream that ignores the END of the range it was
+/// asked for: the 206 keeps streaming to the end of the object, the shape a
+/// reused connection without an EOF at its Content-Length boundary produces.
+fn run_fixture_overlong(
+    dir: &std::path::Path,
+    object_bytes: u64,
+    window: u64,
+    pace_ms: u64,
+) -> (Arc<Cache<MockClock>>, Arc<AtomicUsize>) {
+    run_fixture_with(dir, object_bytes, window, pace_ms, 64 * 1024 * 1024, true)
+}
+
+fn run_fixture_with(
+    dir: &std::path::Path,
+    object_bytes: u64,
+    window: u64,
+    pace_ms: u64,
+    max_size_bytes: u64,
+    overlong: bool,
+) -> (Arc<Cache<MockClock>>, Arc<AtomicUsize>) {
     let clock = Arc::new(MockClock::new(0));
     let mut cfg = Config {
         cache_dir: dir.to_path_buf(),
@@ -1302,10 +1327,9 @@ fn run_fixture_capped(
     cfg.max_size_bytes = max_size_bytes;
     let cfg = Arc::new(cfg);
     let opens = Arc::new(AtomicUsize::new(0));
-    let backend = Arc::new(
-        SizedBackend::new(&[("a.bin", object_bytes)], Arc::clone(&opens))
-            .paced(1024, std::time::Duration::from_millis(pace_ms)),
-    );
+    let sized = SizedBackend::new(&[("a.bin", object_bytes)], Arc::clone(&opens))
+        .paced(1024, std::time::Duration::from_millis(pace_ms));
+    let backend = Arc::new(if overlong { sized.overlong() } else { sized });
     let mut slots = HashMap::new();
     slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
     let cache = Arc::new(Cache::new(cfg, clock, BackendRegistry::new(slots)));
@@ -1337,7 +1361,7 @@ async fn get_range(
 /// Wait until the key has exactly `bytes` staged (the seal lands after the
 /// body's last byte, so staged state is polled, never sampled).
 async fn wait_staged(cache: &Arc<Cache<MockClock>>, bytes: u64) {
-    for _ in 0..400 {
+    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
         if cache.state.read().await.segment_bytes == bytes {
             return;
         }
@@ -1389,7 +1413,7 @@ async fn a_standard_profile_upstream_gets_runs_for_ranged_reads() {
     let mut body = served.plan.body;
     let _ = collect(&mut body).await;
     assert_eq!(opens.load(Ordering::SeqCst), 1, "one run, one upstream open");
-    for _ in 0..400 {
+    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
         if cache.state.read().await.segment_bytes == 1 << 20 {
             break;
         }
@@ -1612,6 +1636,45 @@ async fn a_seek_far_beyond_the_window_opens_its_own_range() {
         2,
         "a far seek takes its own Range rather than riding the window"
     );
+}
+
+/// An upstream 206 that does NOT stop at the length it was asked for must not
+/// leak the rest of the object into the response, and must not let the sealed
+/// span claim bytes nobody asked for: the standalone escape reads at most its
+/// own remainder. The other shaped paths need no such cap because nothing is
+/// written after their read; here a read that trusted EOF would stage the rest
+/// of the object and hand the viewer a body longer than the promise.
+#[tokio::test]
+async fn an_overlong_upstream_range_is_cut_at_the_remainder_it_asked_for() {
+    let dir = tempdir().unwrap();
+    let (cache, opens) = run_fixture_overlong(dir.path(), 1 << 20, 8192, 10);
+
+    // The run at 0 stays live (paced), so the far seek below is outside every
+    // run and no new one can start: that is the escape this test is about.
+    let served = get_range(&cache, 0, 1024).await;
+    let mut body = served.plan.body;
+    let first = collect(&mut body).await;
+
+    let served = get_range(&cache, 65536, 1024).await;
+    assert_eq!(served.plan.content_length, Some(1024));
+    let mut body = served.plan.body;
+    let escaped = collect(&mut body).await;
+
+    assert_eq!(first.len(), 1024, "the window's reader got its bytes");
+    assert_eq!(
+        escaped,
+        synthetic(65536, 1024),
+        "the escape stops at the length the request asked for, not at EOF"
+    );
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        2,
+        "one open for the window and one for the escape"
+    );
+    // The window is a window and the escape is its remainder: an upstream that
+    // streams past both would stage the rest of the object instead.
+    wait_staged(&cache, 8192 + 1024).await;
+    assert_eq!(cache.state.read().await.segment_bytes, 8192 + 1024);
 }
 
 /// Once a run has sealed, its window is a normal staged span: a later read
