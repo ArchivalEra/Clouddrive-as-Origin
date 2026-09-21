@@ -1,4 +1,9 @@
 # A key being read is not evicted
+> **Amended by ADR-0020:** the guard this ADR describes is no longer acquired by
+> the caller. `Cache::serve` takes it and returns it with the body
+> (`ServeOutcome::Stream(Served)`), so the protection cannot be forgotten by a new
+> entry point. The rule itself is unchanged, and the lease is taken for EVERY
+> response body (a pure upstream stream included) — see ADR-0018.
 
 Amends ADR-0015 (span eviction) and ADR-0006/0007 (the byte budget), and
 re-establishes — in the form that survives — the protection ADR-0012 tried to

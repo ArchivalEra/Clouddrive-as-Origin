@@ -1,5 +1,12 @@
 # Admission: refuse to cache, never to serve
 
+> **Reopened by ADR-0019 and ADR-0020.** This ADR's premise — an object larger
+> than the magazine is served but never STAGED — died with ADR-0015 (staged spans
+> became the cache) and is superseded: what admission asks now is whether the
+> WRITE is affordable, not whether the object fits, and a ranged request takes the
+> staged-read run whatever its upstream profile is NAMED. The "never refuse to
+> serve" rule itself is untouched.
+
 Decided while closing the code-side distance to production (round of
 2026-09-19). Companion to ADR-0014 (what "large" means to the magazine);
 ADR-0007 owns the disk budget, ADR-0004 the per-upstream gates.

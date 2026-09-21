@@ -1,4 +1,8 @@
 # A watched key is protected where it is being watched
+> **Amended by ADR-0020:** the lease and the watch are taken by `Cache::serve`
+> and travel with the response (`Served`), rather than being built by the HTTP
+> handler; and the ranged path is no longer gated on the profile NAME. The
+> protection rules themselves are unchanged.
 
 Amends ADR-0017 (read leases) in three places — every response holds its key's
 lease, not only a local one; protection is a bounded neighbourhood rather than
