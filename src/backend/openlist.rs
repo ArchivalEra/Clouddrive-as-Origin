@@ -296,23 +296,31 @@ impl StorageBackend for OpenListBackend {
             let body = resp.text().await.unwrap_or_default();
             return Err(Self::map_status_with(status, body, retry_after));
         }
-        // Full object length from Content-Range total (206) or Content-Length.
-        let total_len = resp
+        // What THIS response promises. `Content-Length` is the object's size on
+        // a 200 and the range's length on a 206 — in both cases exactly what
+        // this stream delivers. The Content-Range form is the fallback for a
+        // response that omits Content-Length: it reads `bytes first-last/total`,
+        // and the LENGTH is what the stream carries. The `total` is the object,
+        // a different number that nothing here should promise (ADR-0021): the
+        // run's window would otherwise be checked against the whole object.
+        let promised_len = resp
             .headers()
-            .get("content-range")
+            .get("content-length")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.rsplit('/').next())
-            .and_then(|t| t.parse::<u64>().ok())
+            .and_then(|v| v.parse::<u64>().ok())
             .or_else(|| {
-                resp.headers()
-                    .get("content-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
+                let cr = resp.headers().get("content-range")?.to_str().ok()?;
+                let (span, _total) = cr.rsplit_once('/')?;
+                let (_unit, range) = span.split_once(' ')?;
+                let (first, last) = range.split_once('-')?;
+                let first: u64 = first.trim().parse().ok()?;
+                let last: u64 = last.trim().parse().ok()?;
+                Some(last.saturating_sub(first) + 1)
             });
         let reader = StreamReader::new(
             resp.bytes_stream().map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
         );
-        Ok(StreamSource { stream: Box::new(reader), total_len })
+        Ok(StreamSource { stream: Box::new(reader), promised_len })
     }
 
     /// Tier 1 direct link (A relief valve): issue via `/api/fs/link`,

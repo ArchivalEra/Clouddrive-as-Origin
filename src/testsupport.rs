@@ -217,9 +217,10 @@ impl StorageBackend for MockBackend {
             .lock()
             .unwrap()
             .push(range.map(|r| (r.offset, r.length)).unwrap_or((0, None)));
+        let body = self.slice(range)?;
         Ok(StreamSource {
-            stream: Box::new(std::io::Cursor::new(self.slice(range)?)),
-            total_len: Some(self.bytes.len() as u64),
+            promised_len: Some(body.len() as u64),
+            stream: Box::new(std::io::Cursor::new(body)),
         })
     }
 
@@ -468,18 +469,20 @@ impl StorageBackend for StormBackend {
             StormMode::FailOpen => Err(BackendError::ServerError("open refused".into())),
             StormMode::PanicOpen => panic!("storm open boom"),
             StormMode::ShortBody => {
+                // Promises the object and delivers half: the short-read case the
+                // pump's guard exists for.
                 let cut = self.payload.len() / 2;
                 Ok(StreamSource {
+                    promised_len: Some(self.payload.len() as u64),
                     stream: Box::new(std::io::Cursor::new(self.payload[..cut].to_vec())),
-                    total_len: Some(self.payload.len() as u64),
                 })
             }
             StormMode::Good => {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let len = self.payload.len() as u64;
+                let body = self.payload.clone();
                 Ok(StreamSource {
-                    stream: Box::new(std::io::Cursor::new(self.payload.clone())),
-                    total_len: Some(len),
+                    promised_len: Some(body.len() as u64),
+                    stream: Box::new(std::io::Cursor::new(body)),
                 })
             }
         }
@@ -535,9 +538,10 @@ impl StorageBackend for BlockingOpenBackend {
                 (r.offset, r.length.map_or(total, |l| (r.offset + l).min(total)))
             }
         };
+        let body = self.bytes[start as usize..end as usize].to_vec();
         Ok(StreamSource {
-            stream: Box::new(std::io::Cursor::new(self.bytes[start as usize..end as usize].to_vec())),
-            total_len: Some(total),
+            promised_len: Some(body.len() as u64),
+            stream: Box::new(std::io::Cursor::new(body)),
         })
     }
     async fn refresh_if_needed(&self) -> Result<(), BackendError> {
@@ -607,18 +611,17 @@ impl StorageBackend for SizedBackend {
     async fn open(&self, key: &Key, range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
         let total = *self.sizes.get(key.as_str()).ok_or(BackendError::NotFound)?;
-        let (start, end) = match range {
-            None => (0, total),
+        // `promised` is what the response CLAIMS (its Content-Length), which is
+        // the requested range even when `overlong` makes the body run past it.
+        let (start, end, promised) = match range {
+            None => (0, total, total),
             Some(r) => {
                 if r.offset >= total {
                     return Err(BackendError::RangeNotSatisfiable);
                 }
-                let end = if self.overlong {
-                    total
-                } else {
-                    r.length.map_or(total, |l| (r.offset + l).min(total))
-                };
-                (r.offset, end)
+                let wanted = r.length.map_or(total, |l| (r.offset + l).min(total));
+                let end = if self.overlong { total } else { wanted };
+                (r.offset, end, wanted)
             }
         };
         // Chunked and lazy: a window can be far larger than any buffer a test
@@ -639,8 +642,8 @@ impl StorageBackend for SizedBackend {
             }
         };
         Ok(StreamSource {
+            promised_len: Some(promised - start),
             stream: Box::new(tokio_util::io::StreamReader::new(Box::pin(body))),
-            total_len: Some(total),
         })
     }
     async fn refresh_if_needed(&self) -> Result<(), BackendError> {
@@ -678,7 +681,7 @@ impl StorageBackend for VersionedBackend {
         // (short-read guard, and the read cap) made the lie truncate the body.
         Ok(StreamSource {
             stream: Box::new(std::io::Cursor::new(bytes.clone())),
-            total_len: Some(bytes.len() as u64),
+            promised_len: Some(bytes.len() as u64),
         })
     }
     async fn refresh_if_needed(&self) -> Result<(), BackendError> {

@@ -1879,7 +1879,7 @@ async fn failed_pump_removes_its_temp_file() {
     }
     let src = StreamSource {
         stream: Box::new(FailingStream),
-        total_len: Some(1024),
+        promised_len: Some(1024),
     };
 
     let res = pump_and_seal(src, &tmp, &finalp, &tx).await;

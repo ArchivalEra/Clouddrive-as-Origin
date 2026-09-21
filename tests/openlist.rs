@@ -134,7 +134,10 @@ async fn open_passes_range_header_and_streams() {
         .open(&Key::from_validated("media/big.bin".into()), Some(ByteRange::from_offset(3)))
         .await
         .unwrap();
-    assert_eq!(src.total_len, Some(10), "Content-Range total is the full object size");
+    // The promise is what THIS response carries (the range), not the object:
+    // `bytes 3-9/10` promises 7 bytes, which is also what the body delivers.
+    // The object's size (10) is `stat`'s answer, a different question.
+    assert_eq!(src.promised_len, Some(7), "a ranged response promises its range");
     assert_eq!(read_all(src).await, b"3456789");
 }
 
@@ -148,7 +151,7 @@ async fn open_without_range_streams_whole_object() {
         .await;
     let b = backend_for(server.uri());
     let src = b.open(&Key::from_validated("media/full.bin".into()), None).await.unwrap();
-    assert_eq!(src.total_len, Some(5));
+    assert_eq!(src.promised_len, Some(5));
     assert_eq!(read_all(src).await, b"whole");
 }
 

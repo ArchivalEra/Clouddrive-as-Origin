@@ -422,7 +422,7 @@ pub async fn pump_and_seal(
     // rest of the object into a "window" and walk straight through the
     // retention budget. The limit is on the READ, not a truncation after it, so
     // the extra bytes are never taken off the stream in the first place.
-    let expected = src.total_len;
+    let expected = src.promised_len;
     loop {
         let allow = expected
             .map_or(buf.len(), |e| e.saturating_sub(written).min(buf.len() as u64) as usize);
@@ -461,11 +461,11 @@ pub async fn pump_and_seal(
         let _ = tx.send(FlightProgress::Growing(written));
     }
     // A SHORT upstream body must never be sealed into the cache: readers
-    // were promised `total_len` bytes, and a truncated file would poison
+    // were promised `promised_len` bytes, and a truncated file would poison
     // every later hit. Delete the tmp and fail the flight instead. The
     // over-long side is cut at the promised length by the read loop above,
     // which is why only the short case can reach here.
-    if let Some(expected) = src.total_len {
+    if let Some(expected) = src.promised_len {
         if written < expected {
             let _ = tokio::fs::remove_file(tmp_path).await;
             return Err(BackendError::ServerError(format!(
@@ -560,7 +560,7 @@ mod tests {
                 // writes through our tmp path and seals into final_path.
                 let src = StreamSource {
                     stream: Box::new(std::io::Cursor::new(payload)),
-                    total_len: Some(600_000),
+                    promised_len: Some(600_000),
                 };
                 let meta = ObjectMeta { size_bytes: 600_000, etag: None, last_modified: None, mime_hint: None };
                 let _ = flight.progress_tx.send(FlightProgress::Meta(meta));
@@ -619,7 +619,7 @@ mod tests {
         }
         let src = StreamSource {
             stream: Box::new(StallAfterFirst { first: Some(vec![7u8; 64]) }),
-            total_len: Some(1024),
+            promised_len: Some(1024),
         };
         let driver = {
             let flight = flight.clone();
@@ -746,7 +746,7 @@ mod tests {
         }
         let src = StreamSource {
             stream: Box::new(SmallThenStall { sent: false }),
-            total_len: Some(4096),
+            promised_len: Some(4096),
         };
         let driver = {
             let flight = flight.clone();

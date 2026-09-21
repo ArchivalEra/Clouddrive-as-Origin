@@ -298,7 +298,13 @@ impl<C: Clock + 'static> Sessions<C> {
             let _permit = permit;
             let src = match backend.backend.open(&backend_key, Some(ByteRange::bounded(start, want))).await {
                 Ok(mut s) => {
-                    s.total_len = Some(want);
+                    // The run's promise is the WINDOW it asked for. Every backend
+                    // here already promises its range (ADR-0021), so this
+                    // restates the contract rather than correcting a lie — and a
+                    // backend that reported the OBJECT instead would have the
+                    // pump accept, and the guard require, far more than this
+                    // window.
+                    s.promised_len = Some(want);
                     s
                 }
                 Err(e) => {
