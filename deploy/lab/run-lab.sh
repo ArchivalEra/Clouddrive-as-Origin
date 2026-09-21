@@ -29,7 +29,20 @@ ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 note() { echo "---- $1"; }
 
+# One run at a time, enforced: two concurrent runs fight over ports and cache
+# dirs, and — worse — this script's cleanup pkills EVERY origin-cache process on
+# the box, so a late finisher kills the other run's instances mid-assertion.
+# That happened (a cancelled run's cleanup fired four minutes later), which is
+# why the lock exists rather than a comment asking nicely.
+LOCK=/tmp/cdn-lab.lock
+if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  echo "FAIL: another run-lab.sh (pid $(cat "$LOCK")) is alive; refusing to run concurrently"
+  exit 1
+fi
+echo $$ > "$LOCK"
+
 cleanup() {
+  rm -f "$LOCK"
   for pid in "$PID_A" "$PID_B" "$PID_C" "$PID_D" "$PID_E" "$PID_DAV"; do
     [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null
   done
@@ -285,9 +298,25 @@ done
 after=$(opens 9092)
 [ $((after - before)) = 1 ] && ok "three seeks inside one window: 1 upstream open" \
   || bad "three seeks cost $((after - before)) upstream opens (want 1)"
-wait_segment_bytes 8082 262144 || bad "the window never landed (segment_bytes=$(hz_field 8082 segment_bytes))"
-[ "$(seg_files "$LAB/cache-c" big1mb.bin)" = 1 ] && ok "the window staged as ONE span" \
-  || bad "staged $(seg_files "$LAB/cache-c" big1mb.bin) spans (want 1)"
+# The request's own window must land, and it must land as ONE span — but the
+# count is no longer exactly one: with the key WATCHED (ADR-0018) the chain
+# pre-fetches the next window after the run seals, so a walk can leave one extra
+# span behind. That is the read-ahead a pause is owed, bounded to one window by
+# the playhead; the claim this line makes is about the SHARING (one open for
+# three seeks, asserted above), not about the total.
+wlanded=0
+for i in $(seq 1 40); do
+  seg=$(hz_field 8082 segment_bytes)
+  [ "${seg:-0}" -ge 262144 ] && { wlanded=1; break; }
+  sleep 0.25
+done
+[ "$wlanded" = 1 ] && ok "the window landed (segment_bytes=$(hz_field 8082 segment_bytes))" \
+  || bad "the window never landed (segment_bytes=$(hz_field 8082 segment_bytes))"
+cspans=$(seg_files "$LAB/cache-c" big1mb.bin)
+{ [ "$cspans" -ge 1 ] && [ "$cspans" -le 2 ]; } && ok "the window staged as one span, plus at most one read-ahead ($cspans)" \
+  || bad "staged $cspans spans (want 1, or 2 with the chain's read-ahead)"
+[ -f "$LAB/cache-c/.seg.media%2Fbig1mb.bin.0-262144" ] && ok "the requested window's span is there (0-262144)" \
+  || bad "the requested window's span is missing"
 # A covered re-read of the same window: byte-exact, zero upstream opens.
 before=$(opens 9092)
 code=$(H -o /tmp/lab-staged.bin -w "%{http_code}" -H "Range: bytes=32768-98303" "http://127.0.0.1:7779/media/big1mb.bin")
