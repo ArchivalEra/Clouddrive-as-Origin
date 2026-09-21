@@ -1,4 +1,4 @@
-# CDN-LAB config A: standard profile against a local rclone webdav
+# CDN-LAB config A: the default profile against a local rclone webdav
 # (simulated OpenList). Plain http loopback upstream is allowed.
 front_listen = "127.0.0.1:7777"
 front_metrics_listen = "127.0.0.1:9090"

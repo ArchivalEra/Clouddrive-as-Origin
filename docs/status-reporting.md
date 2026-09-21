@@ -59,7 +59,7 @@ is alive):
 |---|---|
 | `active` | every unit active, both healthz probes answered, no disk verdict |
 | `degraded` | the node serves, but something needs a human: the nocache plane is down, the disk crossed a watermark, or a healthz probe reported its own degraded verdict |
-| `down` | the standard plane is not serving (unit inactive, or its healthz probe failed) |
+| `down` | the main plane is not serving (unit inactive, or its healthz probe failed) |
 
 Down (non-clean exit only):
 
@@ -69,7 +69,7 @@ Down (non-clean exit only):
   "host": "origin-1",
   "event": "down",
   "ts": "2026-09-16T13:54:26Z",
-  "service": "origin-cache-standard",
+  "service": "origin-cache-efficient",
   "status": "down",
   "death": {
     "signal": "SIGKILL",
@@ -86,7 +86,7 @@ when the kernel killed it (`SIGKILL` here means a kill -9, or an OOM kill),
 `reason` is free text for a human. `signal` and `exit_code` are `null` when
 they do not apply.
 
-Note that `service` names the **unit** in a down event (`origin-cache-standard`
+Note that `service` names the **unit** in a down event (`origin-cache-efficient`
 or `origin-cache-nocache`) and is the literal `origin-cache` in a heartbeat.
 
 ## Rules the sender follows
@@ -135,7 +135,7 @@ wide, and let the 15-minute timeout decide actual unavailability.
 sudo -u opc /opt/origin-cache/watchdog.sh
 
 # Confirm the units carry the ExecStopPost hook
-systemctl cat origin-cache-standard | grep ExecStopPost
+systemctl cat origin-cache-efficient | grep ExecStopPost
 
 # Confirm the tunnel the report rides is up
 systemctl is-active cloudflared

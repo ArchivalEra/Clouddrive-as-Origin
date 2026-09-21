@@ -539,7 +539,10 @@ where
             let prof = state.config.cache_profile(&u.id);
             json!({
                 "id": u.id,
-                "profile": if prof.nocache { "nocache" } else if prof.efficient { "efficient" } else { "standard" },
+                // Two states, because there are two profiles (ADR-0022): the
+                // retired full-file water-pipe had no flag of its own, and no
+                // resolution path can produce it any more.
+                "profile": if prof.nocache { "nocache" } else { "efficient" },
                 "cold_miss": format!("{:?}", u.cold_miss).to_lowercase(),
                 "sigv4_layer": state.sigv4_config.is_some(),
             })

@@ -4,7 +4,7 @@ Single binary, two planes (front TLS terminator + axum business plane on
 loopback). The oracle node runs **four** units, all installed by
 `deploy/oracle/install.sh` (which writes them verbatim):
 
-- `origin-cache-standard.service` — https front on `[::]:7777` (TLS)
+- `origin-cache-efficient.service` — https front on `[::]:7777` (TLS)
 - `origin-cache-nocache.service` — internal front on `[::]:7778`
 - `origin-cache-watchdog.service` + `.timer` — health checks every 5 min,
   the status heartbeat, and the `ExecStopPost` hook
@@ -18,7 +18,7 @@ Install: `sudo bash deploy/oracle/install.sh <binary> [--keep-env]`
 
 ```ini
 [Unit]
-Description=Clouddrive-as-Origin standard profile (7777 https)
+Description=Clouddrive-as-Origin main plane (7777 https)
 After=network-online.target
 Wants=network-online.target
 
@@ -26,7 +26,7 @@ Wants=network-online.target
 Type=simple
 User=opc
 Group=opc
-ExecStart=/opt/origin-cache/origin-cache /opt/origin-cache/config-standard.toml
+ExecStart=/opt/origin-cache/origin-cache /opt/origin-cache/config-efficient.toml
 EnvironmentFile=/opt/origin-cache/origin-cache.env
 WorkingDirectory=/opt/origin-cache
 CacheDirectory=origin-cache

@@ -13,7 +13,7 @@ prewarm_shared_secret_env = "ORIGIN_PREWARM_SECRET"
 
 [[upstreams]]
 # Upstream id MUST equal the first URL path segment (bucket-alias
-# semantics) — see config-standard.toml for the double-prefix trap.
+# semantics) — see config-efficient.toml for the double-prefix trap.
 id = "googledrive1"
 type = "openlist"
 base_url = "http://127.0.0.1:5244/dav"

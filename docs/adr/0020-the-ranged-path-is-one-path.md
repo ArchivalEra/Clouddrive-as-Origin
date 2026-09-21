@@ -50,19 +50,21 @@ answer cost an upstream open. There is now exactly one production acquisition si
 ## Consequences
 
 - Production gets the ranged win with NO config change: `efficient` is the default,
-  and `deploy/oracle/config-standard.toml` sets no `cache_profile`. Measured on the
+  and `deploy/oracle/config-efficient.toml` sets no `cache_profile`. Measured on the
   node after the deploy, against the real 200 GiB object: **24 shards → 1 upstream
   open in 2.1 s** (one open per window), where the same walk was 24 opens before.
-  The unit and its config file keep their historical `standard` name; the runbook
-  says so, and `healthz` reports `"profile":"efficient"`.
-- A ranged request on a `standard`-named upstream now gets a run too, for objects
-  at or above `min_file_size` — pinned by
-  `a_standard_profile_upstream_gets_runs_for_ranged_reads`.
+  The unit and its config file keep their historical `standard` name — see
+  ADR-0022, which has since renamed them — and `healthz` reports
+  `"profile":"efficient"`.
+- A ranged request on any named upstream now gets a run, for objects at or above
+  `min_file_size` — pinned by
+  `the_default_profile_gets_runs_for_ranged_reads`.
 - The ranged arm of the cold-pull flight survives, and correctly: it serves the
   ranged requests of objects below `min_file_size` (a small object is worth a
-  durable entry) and of `standard` upstreams.
-- An operator who wants the old full-file behaviour sets
-  `cache_profile = "standard"`; nothing was removed.
+  durable entry).
+- An operator who wants the old full-file behaviour sets a
+  `[cache_profiles.<name>]` table with `min_file_size` above their objects;
+  the `standard` NAME was removed later (ADR-0022).
 - Tests written against the default profile were re-pointed rather than deleted:
   the default-profile ranged miss stages its window (it used to water-pipe and
   install), and the "object the disk cannot hold" claim became two bounded tests

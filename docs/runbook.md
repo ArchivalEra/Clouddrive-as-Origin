@@ -11,7 +11,7 @@ SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
   Encrypt `cdn-oracle.isui.ren` (DNS-01 via dnspod). Port 80 is **not** an
   origin path: it is filtered at the cloud layer and nothing listens on it
   (see "Retired: port-80 helper").
-- **origin-cache** (2 systemd units): `origin-cache-standard` `[::]:7777` TLS
+- **origin-cache** (2 systemd units): `origin-cache-efficient` `[::]:7777` TLS
   (the name is historical — it runs the default, `efficient`, profile) /
   `origin-cache-nocache` `[::]:7778`.
 
@@ -42,7 +42,7 @@ SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
    ```
 3. Switch the site's origin to the new config. EdgeOne propagates in
    seconds.
-4. Watch: `sudo journalctl -u origin-cache-standard -f` for origin-pull
+4. Watch: `sudo journalctl -u origin-cache-efficient -f` for origin-pull
    traffic; `curl -sI https://cdn-oracle.isui.ren/<key>` for `age`/`eo-cache-status`.
 
 **Rollback**: EdgeOne console → switch origin back to the previous config.
@@ -83,6 +83,37 @@ decision and the measurements.
   cannot flood the receiver.
 
 
+## Retiring the old unit name (standard -> efficient, 2026-09-21)
+
+The main plane's unit and config used to be named after the `standard` profile,
+which ADR-0022 retired. On a node still running the old names:
+
+```sh
+# 1. Put the new files in place (install.sh does this too).
+sudo install -m 0644 deploy/oracle/config-efficient.toml /opt/origin-cache/
+sudo cp deploy/oracle/origin-cache-efficient.service /etc/systemd/system/   # see install.sh
+# 2. Swap the units. The port does not change, so EdgeOne keeps pointing at it,
+#    but NOTHING is listening on 7777 for the seconds between the two commands.
+sudo systemctl daemon-reload
+sudo systemctl disable --now origin-cache-standard
+sudo systemctl enable  --now origin-cache-efficient
+sudo systemctl is-active origin-cache-efficient origin-cache-nocache
+curl -s http://127.0.0.1:8080/_internal/healthz | jq -r .upstreams[0].profile   # efficient
+```
+
+Two things NOT to touch:
+
+- **`cache_dir`** (`/opt/origin-cache/cache-standard`) is not renamed with the
+  unit. It holds the live metadata database and every staged sidecar; renaming it
+  orphans both and starts the node on an empty cache.
+- **The `service` field the watchdog reports** changes with the unit, because
+  `ExecStopPost` passes `%n`. The dead-man switch is silence-based (15 minutes)
+  and heartbeats report a different spelling (`origin-cache`), so the receiver
+  does not match on the unit name; a down event's label changes and nothing else.
+
+Keep the old unit file on disk until the new one is verified serving, so a
+rollback is one `enable --now` away.
+
 ## Provisioning a fresh node
 
 `deploy/oracle/install.sh <binary> [--keep-env]` does the mechanical part:
@@ -119,9 +150,9 @@ script). Run it directly to check a behaviour change before deploying:
 ### Service down (unit inactive)
 
 ```sh
-systemctl is-active origin-cache-standard origin-cache-nocache
-sudo journalctl -u origin-cache-standard --no-pager -n 50
-sudo systemctl restart origin-cache-standard
+systemctl is-active origin-cache-efficient origin-cache-nocache
+sudo journalctl -u origin-cache-efficient --no-pager -n 50
+sudo systemctl restart origin-cache-efficient
 ```
 
 `Restart=always` self-heals on crash; a manual `systemctl stop` stays
@@ -136,9 +167,9 @@ once (e.g. wrong upstream id → double-prefixed path) stays tombstoned.
 Clear it:
 
 ```sh
-sudo systemctl stop origin-cache-standard
+sudo systemctl stop origin-cache-efficient
 sudo rm -f /opt/origin-cache/cache-standard/redb.db
-sudo systemctl start origin-cache-standard
+sudo systemctl start origin-cache-efficient
 ```
 
 This is a deliberate manual act. The service never reaps its own metadata
@@ -160,7 +191,7 @@ If `redb.db` cannot be opened (corrupt in a way redb rejects, or the path is
 not a file), the service **does not crash**: it logs an error, moves the bad
 file aside as `redb.db.corrupt-<epoch>`, and starts with a fresh store. The
 entry rows are then rebuilt from the object tree as above. Inspect
-`journalctl -u origin-cache-standard | grep -i metadata` for the quarantine
+`journalctl -u origin-cache-efficient | grep -i metadata` for the quarantine
 record; the quarantined file can be deleted once the cause is understood.
 
 ### Retired: port-80 helper (2026-09-12)
@@ -180,7 +211,7 @@ timeouts rather than reviving that script.
 acme.sh auto-renews (next: 2026-11-07). A deploy hook
 (`~/.acme.sh/deploy/origin-cache.sh`, registered as `Le_DeployHook` in
 the domain conf) installs the new cert to `/etc/ssl/dib.l.cd/cdn-oracle/`
-and restarts `origin-cache-standard` automatically — no manual step.
+and restarts `origin-cache-efficient` automatically — no manual step.
 
 Verify: `sudo openssl x509 -in /etc/ssl/dib.l.cd/cdn-oracle/cert.pem -noout -dates`.
 If renewal failed: `sudo ~/.acme.sh/acme.sh --renew -d cdn-oracle.isui.ren --dns dns_dp`
@@ -295,7 +326,7 @@ front's metrics and access log.
 curl -s http://127.0.0.1:9090/metrics | grep 'front_requests_total{.*status="5"'
 
 # Recent failures, with the error string the front recorded
-sudo journalctl -u origin-cache-standard --no-pager -n 100 | grep -i 'front access' | grep -v 'status="2'
+sudo journalctl -u origin-cache-efficient --no-pager -n 100 | grep -i 'front access' | grep -v 'status="2'
 
 # Upstream health: 401/403 auth, 429 throttling, 5xx provider errors
 curl -s http://127.0.0.1:9090/metrics | grep 'backend_call_duration_seconds_count'
@@ -451,12 +482,14 @@ tick, but a span is a candidate only once it is older than `STAGE_MIN_AGE_MS`
 after the last request.
 
 The production upstream gets this win without a config change: `efficient` is the
-default profile, and a ranged request takes the run path whatever its upstream is
-named (the profile no longer selects the response shape — it carries `min_file_size`
-and the ledger window). The deployed unit and its config file are still NAMED
-`standard` for historical reasons; the name says nothing about the profile, and
-`deploy/oracle/config-standard.toml` sets no `cache_profile` so the default
-applies.
+default profile (ADR-0022), and a ranged request takes the run path whatever its
+upstream is named (the profile no longer selects the response shape — it carries
+`min_file_size` and the ledger window). The deployed unit and its config file are
+named `origin-cache-efficient.service` and `config-efficient.toml`; neither is the
+old `standard` name any more, and neither sets `cache_profile`, so the default
+applies. One identifier was deliberately NOT renamed: `cache_dir =
+/opt/origin-cache/cache-standard`, which holds the live metadata database and
+every staged sidecar.
 
 ### Multi-viewer accounts (browsers, both paths)
 
@@ -508,7 +541,7 @@ efficient profile, loopback instance (magazine 6 GiB)
   random seeks         : 823-924 ms to first byte
   one 16 MiB range     : 1 open, 1475 ms -> 10.8 MiB/s
   three concurrent 1 MiB ranges on one key: 3 opens
-standard profile, the production instance (magazine 10 GiB)
+the production instance before the windowed walk (magazine 10 GiB)
   1 MiB shard          : 1 open, 1246 ms, upstream-served
   random seeks         : 858-901 ms to first byte
   cache                : nothing written for the key

@@ -22,7 +22,8 @@ route maps them).
 **profile** — a per-upstream fill policy. It carries **knobs only** (ADR-0020):
 `min_file_size` (below this, a ranged read takes the ordinary path) and
 `coverage_window_secs` (how long a staged interval keeps counting). `efficient`
-(built in, the default), `standard` (full-file water-pipe), `nocache` (zero disk).
+(built in, the default) or `nocache` (zero disk); the full-file water-pipe that
+used to be called `standard` was retired (ADR-0022).
 
 **the ranged path** — the ONE path a ranged request takes (ADR-0020): plan what is
 already on disk, serve it, and fetch only the gap. Profile name does not select it.

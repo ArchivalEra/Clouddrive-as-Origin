@@ -101,7 +101,7 @@ doc=\$(jq -nc --arg status "\$status" --argjson degraded "\$degraded" --argjson 
   --argjson entries "\${FAKE_ENTRIES:-7}" --argjson bytes "\${FAKE_BYTES:-2048}" --arg version "9.9.9" \\
   '{status:\$status,degraded:\$degraded,degraded_reasons:\$reasons,entries:\$entries,bytes:\$bytes,version:\$version,
     store:{state:"ready",moved_to:"/opt/origin-cache/cache-standard/redb.db.corrupt-1"},
-    upstreams:[{id:"leaky-upstream",profile:"standard"}]}')
+    upstreams:[{id:"leaky-upstream",profile:"efficient"}]}')
 printf '%s\n200' "\$doc"
 exit 0
 STUB
@@ -115,7 +115,7 @@ run_watchdog() { # extra env assignments as args
 
 run_down() { # systemd result vars as args
   env PATH="$STUB:$PATH" STATE_DIR="$ROOT/state" REPORT_URL="http://receiver.invalid/report" \
-    "$@" bash "$WATCHDOG" --down origin-cache-standard.service >/dev/null 2>&1
+    "$@" bash "$WATCHDOG" --down origin-cache-efficient.service >/dev/null 2>&1
 }
 
 reset_reports() { : > "$RECEIVED"; : > "$HEADERS"; : > "$PROBED"; rm -f "$ROOT/state/notify-down.stamp"; }
@@ -177,11 +177,11 @@ else
 fi
 
 reset_reports
-run_watchdog FAKE_INACTIVE_UNITS=origin-cache-standard
+run_watchdog FAKE_INACTIVE_UNITS=origin-cache-efficient
 if [ "$(field .status)" = down ]; then
-  ok "a down standard plane reports down"
+  ok "a down main plane reports down"
 else
-  bad "a down standard plane reports down" "$(reports)"
+  bad "a down main plane reports down" "$(reports)"
 fi
 
 reset_reports
@@ -255,7 +255,7 @@ if [ "$(field .death.exit_code)" = 1 ] && [ "$(field .death.signal)" = null ]; t
 else
   bad "a clean non-zero exit reports exit_code=1 with a null signal" "$(reports)"
 fi
-if [ "$(field .service)" = origin-cache-standard ]; then
+if [ "$(field .service)" = origin-cache-efficient ]; then
   ok "a down event names the unit that died"
 else
   bad "a down event names the unit that died" "$(reports)"
@@ -275,7 +275,7 @@ fi
 
 reset_reports
 env PATH="$STUB:$PATH" STATE_DIR="$ROOT/state" REPORT_URL="http://receiver.invalid/report" \
-  HEALTHZ_STANDARD_URL="http://127.0.0.1:9999/_internal/healthz" \
+  MEASURED_URL="http://127.0.0.1:9999/_internal/healthz" \
   bash "$WATCHDOG" >/dev/null 2>&1
 if grep -q "http://127.0.0.1:9999/_internal/healthz" "$PROBED"; then
   ok "an overridden probe target is the one used"
@@ -285,7 +285,7 @@ fi
 
 reset_reports
 env PATH="$STUB:$PATH" STATE_DIR="$ROOT/state" REPORT_URL="http://receiver.invalid/report" \
-  UNITS="origin-cache-standard" DISK_WARN_PCT=1 bash "$WATCHDOG" >/dev/null 2>&1
+  UNITS="origin-cache-efficient" DISK_WARN_PCT=1 bash "$WATCHDOG" >/dev/null 2>&1
 if [ "$(field .status)" = degraded ]; then
   ok "overridden thresholds and unit list are honoured"
 else
@@ -337,13 +337,13 @@ else
 fi
 
 reset_reports
-run_watchdog FAKE_INACTIVE_UNITS=origin-cache-standard
+run_watchdog FAKE_INACTIVE_UNITS=origin-cache-efficient
 if [ "$(transition_lines)" = 1 ]; then
   ok "a verdict change writes one transition line"
 else
   bad "a verdict change writes one transition line" "$(cat "$ROOT/state/watchdog.log")"
 fi
-run_watchdog FAKE_INACTIVE_UNITS=origin-cache-standard
+run_watchdog FAKE_INACTIVE_UNITS=origin-cache-efficient
 if [ "$(transition_lines)" = 1 ]; then
   ok "a repeated verdict does not rewrite the log"
 else

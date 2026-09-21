@@ -1,4 +1,12 @@
-# Clouddrive-as-Origin — oracle node, standard profile (node B: overseas drive)
+# Clouddrive-as-Origin — oracle node, main plane (node B: overseas drive)
+#
+# This file sets NO `cache_profile`: the default is `efficient` (ADR-0022), and
+# the unit that runs it is `origin-cache-efficient.service`. The unit and this
+# file were named after the retired `standard` profile until 2026-09-21; the
+# `cache_dir` below was NOT renamed with them, because it holds the live
+# metadata database and every staged sidecar — a rename would orphan both and
+# start the node on an empty cache.
+
 # Dual-stack front: EdgeOne origin-pull arrives over IPv6 (apple.dib.l.cd
 # is IPv6-only), so bind [::] not 0.0.0.0.
 front_listen = "[::]:7777"
@@ -12,6 +20,7 @@ front_rate_rps = 0
 tls_cert_env = "ORIGIN_TLS_CERT_PATH"
 tls_key_env = "ORIGIN_TLS_KEY_PATH"
 listen_addr = "127.0.0.1:8080"
+# Historical path name: see the header. Renaming it loses the cache.
 cache_dir = "/opt/origin-cache/cache-standard"
 max_size_bytes = 10737418240
 inactive_ttl_secs = 1200
