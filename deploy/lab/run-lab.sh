@@ -683,6 +683,30 @@ else
   echo "    skipped: node, playwright-core or the test object is missing"
 fi
 
+# --- 15. a real player's request shape ---------------------------------------
+# The one shape the harnesses above cannot produce: a browser deciding its own
+# ranges, in its own order, with its own retries. Recorded from the resource
+# timing buffer (page JS cannot see the video's requests), with the player's own
+# `waiting`/`stalled`/`error` events as the experience side of the account.
+note "15. a real player (the browser chooses its own ranges)"
+if command -v node >/dev/null 2>&1 && [ -d "$PW_DIR" ] && [ -f "$LAB/dav-data/media/$VIEWER_OBJ" ]; then
+  pout=$(node "$REPO/deploy/lab/viewer/player-probe.mjs" --target http://127.0.0.1:7779 \
+    --object "media/$VIEWER_OBJ" --page media/hello.txt --play-secs 12 2>&1)
+  echo "$pout" | sed 's/^/    /' >&2
+  echo "$pout" | grep -q "VERDICT: the player never loaded metadata" && bad "a real player never got metadata" \
+    || ok "a real player: loaded metadata"
+  echo "$pout" | grep -q "VERDICT: the player hit an error" && bad "a real player hit an error" \
+    || ok "a real player: no error"
+  echo "$pout" | grep -q "VERDICT: the player stalled" && bad "a real player stalled" \
+    || ok "a real player: no stall"
+  preqs=$(echo "$pout" | grep -oE "^summary: requests=[0-9]+" | head -1 | cut -d= -f2)
+  pbytes=$(echo "$pout" | grep -oE "/[0-9]+s ready" | head -1 | tr -d '/s ready')
+  [ "${preqs:-0}" -ge 1 ] && ok "the player's request shape was recorded ($preqs requests)" \
+    || bad "the player's request shape was not recorded"
+else
+  note "15. skipped (node, playwright-core or the clip is missing)"
+fi
+
 # --- 5. summary ---------------------------------------------------------------
 echo "======================================"
 echo "PASS=$PASS FAIL=$FAIL"
