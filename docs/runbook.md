@@ -502,6 +502,50 @@ applies. One identifier was deliberately NOT renamed: `cache_dir =
 /opt/origin-cache/cache-standard`, which holds the live metadata database and
 every staged sidecar.
 
+### A real player, and the request shape it actually sends (2026-09-21)
+
+`deploy/lab/viewer/player-probe.mjs` plays the object in real Chromium and records
+what the browser asked for — through CDP, because page JavaScript cannot see the
+media requests — alongside the events the viewer feels (`waiting`, `stalled`,
+`error`, and how far it played). It has a LAB section (15); run it by hand with:
+
+```sh
+node deploy/lab/viewer/player-probe.mjs --target http://127.0.0.1:7779 \
+  --object media/viewer-object.mp4 --page media/hello.txt --play-secs 12
+```
+
+What it found on the product's own object (`googledrive1/round3.mp4`, 200 GiB)
+through the CDN, from a workstation:
+
+- The player's FIRST request is **open-ended**: `Range: bytes=0-`. Chromium then
+  asks for `bytes=30932992-`.
+- Our origin answers `bytes=0-` literally, which on this object means
+  `content-range: bytes 0-214748364799/214748364800` and
+  `content-length: 214748364800` — a 200 GiB promise. Check it directly:
+
+```sh
+curl -s -r 0- -D- -o /dev/null http://127.0.0.1:8080/googledrive1/round3.mp4 | head -4
+```
+- Through the CDN the player then **never loads metadata** (`readyState` 0, a
+  `stalled` event, 300 bytes delivered in 8.9 s): playback never begins. The same
+  object in BOUNDED ranges is served in 0.2 s, so the shard shape is fine and the
+  open-ended one is not.
+
+This is a product-shape finding, not a bug in the ranged path: `bytes=N-` means
+"to the end" per HTTP, and the origin honors it. But a browser's first request is
+always that shape, the object is faststart (`ftyp` 28 B + `moov` 1242 B at offset
+28, so 1.3 KB is all the player needs to start), and a 200 GiB promise is a shape
+no CDN relays well. The options are a decision, not a cleanup:
+
+1. Answer an open-ended range with a bounded window (`bytes=N-(N+W-1)/total`):
+   CDN- and player-friendly, mildly non-conformant, and a downloader that wanted
+   "the rest" then re-requests.
+2. Leave it (correct HTTP) and require the CDN in front to cap what it pulls.
+3. Measure another CDN's handling of the same request before choosing.
+
+`player-probe.mjs` is the tool for whichever is chosen, and the domestic-vantage
+run still needs a viewer outside this network.
+
 ### Multi-viewer accounts through the CDN: from the NODE
 
 A "N viewers through the CDN" number taken from a workstation measures the
