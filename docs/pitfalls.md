@@ -198,3 +198,11 @@ entry for being obvious in hindsight — hindsight is the point.
     put the killer in a script file (`bash /tmp/x.sh`) so no live command line
     contains the pattern, or kill by port (`fuser -k 7811/tcp`) or by recorded
     PID.
+
+32. **A `git push` that hangs eats the whole retry loop.** The remote here goes
+    through a proxy that occasionally just stops answering: one attempt sat in
+    state `S` for 15 minutes producing nothing, so a loop of five unbounded
+    attempts would have burned an hour. *Fix:* bound every attempt
+    (`timeout 100 git push origin HEAD`) inside the loop, and check the exit code
+    rather than the tail of the output; the next attempt then runs on a fresh
+    connection and usually succeeds first try.
