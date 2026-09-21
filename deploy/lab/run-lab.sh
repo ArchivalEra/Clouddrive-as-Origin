@@ -39,6 +39,25 @@ if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
   echo "FAIL: another run-lab.sh (pid $(cat "$LOCK")) is alive; refusing to run concurrently"
   exit 1
 fi
+
+# A quiet box, or no verdict at all. The assertions below count staged bytes,
+# spans and upstream-open deltas, and several of them wait for a state that a
+# busy machine sails past: the SAME revision produced 7 FAILs at load 32-46
+# (extra spans, half spans, a refused connection) and 60 PASS / 0 FAIL at load 4.
+# A false red costs more than a deferred run: it sends somebody hunting a
+# regression that is not there. `MAX_LOAD=99` overrides when a run is worth the
+# noise.
+MAX_LOAD="${MAX_LOAD:-6}"
+load1=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)
+# Orphan browsers from a harness run that was killed mid-flight keep the box
+# busy for minutes and are invisible in `ps` at a glance.
+orphans=$(pgrep -c 'chromi[um]' 2>/dev/null)
+if [ "${load1%%.*}" -gt "$MAX_LOAD" ] || [ "$orphans" -gt 0 ]; then
+  echo "FAIL: not a quiet box (load=$load1 > $MAX_LOAD, chromium procs=$orphans)."
+  echo "      The timing assertions need it. Wait for the box, kill the browsers,"
+  echo "      or set MAX_LOAD=<n> to override."
+  exit 1
+fi
 echo $$ > "$LOCK"
 
 cleanup() {
