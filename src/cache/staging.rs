@@ -42,7 +42,8 @@ const HEAT_TRAILING_WINDOW: usize = 20;
 pub(crate) struct FinalizedSpan {
     pub(crate) cache_dir: std::path::PathBuf,
     pub(crate) key: String,
-    pub(crate) backend_key: String,
+    /// Which upstream's profile decides this span's window decay. The
+    /// provider-side path is deliberately NOT carried: nothing reads it.
     pub(crate) upstream_id: String,
     pub(crate) etag: Option<String>,
     pub(crate) total: u64,
@@ -143,7 +144,7 @@ impl Staging {
         // pins only if the rest of the cache could not cover the need. Per row,
         // the first watched row would be trimmed inside its own pin while a
         // later row still had bytes to give — a deadline, but the last one
-        // (ADR-0012, ADR-0018).
+        // (ADR-0012's rule, restated by ADR-0018).
         for inside_pins in [false, true] {
             for (_, key) in &order {
                 if freed_total >= need_bytes {
@@ -370,8 +371,8 @@ impl Staging {
                 });
             }
         }
-        // A watched key's pin is a PREFERENCE, not an exemption (ADR-0012's
-        // rule, third application): spans outside the viewer's neighbourhood
+        // A watched key's pin is a PREFERENCE, not an exemption (ADR-0018):
+        // spans outside the viewer's neighbourhood
         // go first, however the policy ordered them, and the neighbourhood is
         // taken only when nothing outside it can cover the need. Without the
         // split, "a key being read keeps its spans" made the magazine's budget
@@ -563,7 +564,6 @@ impl Staging {
         let FinalizedSpan {
             cache_dir,
             key,
-            backend_key,
             upstream_id,
             etag,
             total,
@@ -592,12 +592,6 @@ impl Staging {
             if total != 0 {
                 entry.total = total;
             }
-            if !backend_key.is_empty() {
-                entry.backend_key = backend_key.clone();
-            }
-            if !upstream_id.is_empty() {
-                entry.upstream_id = upstream_id.clone();
-            }
             entry.add_interval(start, end, now_millis);
             entry.last_touch_millis = now_millis;
             // Window decay: drop intervals whose last read is older than the
@@ -605,12 +599,7 @@ impl Staging {
             // sidecars stay for the sweep.
             entry.decay_and_covered(now_millis, window_millis);
         }
-        let meta = store::SegMeta {
-            etag,
-            total,
-            backend_key,
-            upstream_id,
-        };
+        let meta = store::SegMeta { etag, total };
         if let Ok(b) = serde_json::to_vec(&meta) {
             let _ = tokio::fs::write(store::segmeta_path(&cache_dir, &key), b).await;
         }
@@ -964,7 +953,6 @@ mod tests {
                 FinalizedSpan {
                     cache_dir: dir.clone(),
                     key: "a.bin".into(),
-                    backend_key: "a.bin".into(),
                     upstream_id: "primary".into(),
                     etag: Some("v1".into()),
                     total: 1_000_000,
@@ -991,7 +979,6 @@ mod tests {
                 FinalizedSpan {
                     cache_dir: dir.clone(),
                     key: "a.bin".into(),
-                    backend_key: "a.bin".into(),
                     upstream_id: "primary".into(),
                     etag: Some("v1".into()),
                     total: 1_000_000,

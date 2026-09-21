@@ -7,8 +7,9 @@
 //! budget-evictable, past `inactive_ttl` the sweep deletes them, and a viewer
 //! who pauses between requests loses the window to the next overshoot.
 //!
-//! A lease is held for the life of a response body that is served from local
-//! bytes (`Disk` or `Stage`), and it is released when that body ends or is
+//! A lease is held for the life of EVERY response body — local bytes or a
+//! pure upstream stream, because what a long stream needs protected is the
+//! key's own staged bytes — and it is released when that body ends or is
 //! dropped — including the disconnect case, because the body's drop is what
 //! axum does when the viewer goes away. Eviction consults the lease map before
 //! taking anything from a key, and keeps doing so for `read_grace_secs` after
@@ -17,7 +18,7 @@
 //! What a lease does NOT do is outrank the disk. Pressure reclaims strays even
 //! while they are being streamed (ADR-0014/0017): the disk is the last resort,
 //! and unlinking a file does not cut a stream that already holds its
-//! descriptor open. The rule is the one ADR-0012 established for its hold — a
+//! descriptor open. The rule is the one ADR-0018 states for its pin — a
 //! deadline, not an exemption.
 
 use std::collections::{HashMap, HashSet};

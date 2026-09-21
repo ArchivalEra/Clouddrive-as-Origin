@@ -622,9 +622,10 @@ prefix = ""                            # default (catch-all)
 upstream = "primary"
 ```
 
-`prewarm_shared_secret_env` and `allowed_download_suffixes` are likewise
-configurable; TLS/hostname material always via `*_env` indirection so the
-repo never contains `${ORIGIN_HOST}`'s real value.
+`prewarm_shared_secret_env` is likewise configurable; TLS/hostname material
+always via `*_env` indirection so the repo never contains `${ORIGIN_HOST}`'s
+real value. The redirect-target allow-list is a hardcoded predicate
+(`backend::redirect_target_allowed`), not a config key.
 
 ## 8. Observability
 

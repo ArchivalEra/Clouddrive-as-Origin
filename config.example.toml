@@ -95,9 +95,6 @@ retry_max_ms = 30000
 
 # --- observability & internal ---
 prewarm_shared_secret_env = "ORIGIN_PREWARM_SECRET"
-# Host allow-check applies to any redirect targets we follow (OpenList is
-# loopback; direct 302 mode is not used, so this rarely fires).
-allowed_download_suffixes = []
 
 # --- S3-compatible inbound (spec §6.1) ---
 # SigV4 verification of inbound requests (header auth + presigned URLs).

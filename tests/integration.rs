@@ -965,7 +965,14 @@ async fn entry_count_cap_evicts_lru_even_under_byte_budget() {
         "entry-count cap must bound the map (got {} entries)",
         s.entries.len()
     );
-    assert!(s.entries.contains_key("k5"), "the most recent key must survive");
+    // The three most recent survive, the two oldest are gone: the cap evicts
+    // in LRU order, not merely "something".
+    for k in ["k3", "k4", "k5"] {
+        assert!(s.entries.contains_key(k), "{k} (recent) must survive eviction");
+    }
+    for k in ["k1", "k2"] {
+        assert!(!s.entries.contains_key(k), "{k} (oldest) must be evicted");
+    }
     drop(s);
 }
 
@@ -1861,35 +1868,3 @@ async fn metadata_loss_rebuilds_rows_from_the_object_tree() {
     }
 }
 
-/// O2: eviction must pick the same victims, in the same order, as the
-/// original repeated-minimum scan — and do it in one pass.
-#[tokio::test]
-async fn eviction_picks_lru_victims_in_order() {
-    let dir = tempdir().unwrap();
-    let clock = Arc::new(MockClock::new(0));
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.max_entries = 3; // count budget drives the sweep
-    let cfg = Arc::new(cfg);
-
-    let backend = CountingBackend::counting(b"x".to_vec(), Some("v".into()), Arc::new(AtomicUsize::new(0)), None);
-    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
-
-    // Five keys, each accessed later than the last, so recency is strict.
-    for (i, k) in ["k1", "k2", "k3", "k4", "k5"].iter().enumerate() {
-        clock.advance(1000 * (i as u64 + 1));
-        let mut hit = cache.get_by_key(k, None).await.unwrap();
-        let _ = collect(&mut hit.body).await;
-        wait_entry(&cache, k).await;
-    }
-
-    let s = cache.state.read().await;
-    assert!(s.entries.len() <= 3, "count budget must bound the map (got {})", s.entries.len());
-    // The three most recent survive; the two oldest are gone.
-    for k in ["k3", "k4", "k5"] {
-        assert!(s.entries.contains_key(k), "{k} (recent) must survive eviction");
-    }
-    for k in ["k1", "k2"] {
-        assert!(!s.entries.contains_key(k), "{k} (oldest) must be evicted");
-    }
-}

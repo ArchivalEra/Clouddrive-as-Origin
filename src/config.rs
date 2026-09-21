@@ -37,10 +37,11 @@ pub struct UpstreamConfig {
     #[serde(default)]
     pub cold_miss: ColdMiss,
     /// Fill-policy profile name (P2 efficientcache). `"standard"` (default)
-    /// = legacy behavior: every miss water-pipes a full file into cache.
-    /// Any other name must have a `[cache_profiles.<name>]` table, which
-    /// switches this upstream to ranged-passthrough + segment staging +
-    /// coverage-triggered promotion.
+    /// = full-file water-pipe into cache, and the default. `"efficient"`
+    /// (built in) or a `[cache_profiles.<name>]` table stages the served
+    /// windows instead, so a ranged read costs one upstream open per window
+    /// rather than one per request (ADR-0016/0019); `"nocache"` writes
+    /// nothing at all.
     #[serde(default = "default_cache_profile")]
     pub cache_profile: String,
     /// OpenList static admin token (Settings → Other → Token) for the
@@ -68,22 +69,19 @@ fn default_min_file_size() -> u64 {
     64 * 1024 * 1024
 }
 
-/// How long a freshly promoted entry is held (immune to the inactivity TTL
-/// and to being picked as an eviction victim). Assembling a large object
-/// costs many upstream fetches, and the 20-minute inactivity clock has no way
-/// to know that: pause a video to look at something else and the merge you
-/// just paid for is swept. 0 disables the hold.
+/// How long a staged interval keeps counting for the ledger's policy. An
+/// interval whose last read is older than this decays out of the ledger, so
+/// stale partial reads stop competing with fresh ones for the eviction order
+/// (the disk sidecars themselves stay for the age sweep). 0 disables decay.
 fn default_coverage_window_secs() -> u64 {
     3600
 }
 
-/// Fill-policy profile (P2 efficientcache): when ranged misses stage
-/// segments instead of full-filing, and what staged coverage promotes a
-/// key to a full cache entry. `threshold` ∈ (0, 1]; 1.0 = promote only
-/// once every byte has been served. `coverage_window_secs` bounds how
-/// long a staged interval counts toward coverage: intervals
-/// whose last read is older than the window decay out of the ledger, so
-/// stale partial reads never accumulate into a promotion.
+/// Fill-policy profile: what an upstream with a staged-read profile stages.
+/// `min_file_size` is the object size below which ranged requests take the
+/// ordinary path (a small object is worth a durable entry; a large one is
+/// worth windows). `coverage_window_secs` is how long a staged interval
+/// keeps counting for the ledger's eviction policy before it decays.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RawCacheProfile {
     #[serde(default = "default_min_file_size")]
@@ -99,9 +97,10 @@ pub struct CacheProfile {
     pub coverage_window_secs: u64,
 }
 
-/// Resolved per-upstream fill behavior. `standard` = legacy full-file
-/// water-pipe into cache; `efficient` = ranged passthrough + staging +
-/// coverage promotion; `nocache` = pure water-pipe, zero disk writes
+/// Resolved per-upstream fill behavior. `standard` = full-file water-pipe
+/// into cache; `efficient` = ranged reads served from staged windows, one
+/// upstream open per window (ADR-0016/0019); `nocache` = pure water-pipe,
+/// zero disk writes
 /// (small-footprint nodes: bytes stream through, metadata stat still
 /// happens so ETag/Size/Last-Modified headers render, nothing persists —
 /// no entries, no segments, no redb writes, no negative tombstones).
@@ -123,11 +122,11 @@ impl EffectiveProfile {
     }
 }
 
-/// How the magazine ejects staged spans when the budget overshoots.
-/// `lru` drops whole ledger rows oldest-touched-first (the original shape);
-/// `heat` drops single spans, coldest read-count first, within a row's
-/// trailing window — the scrub workload keeps hot segments alive even when
-/// time has passed them by.
+/// Which span a trim takes first (both are SPAN-level; rows are visited
+/// least-recently-touched first, ADR-0015). `lru` takes the stalest span —
+/// a plain sliding window. `heat` takes the span with the fewest reads
+/// inside the trailing window, so a workload that scrubs back keeps a
+/// re-read segment alive even when time has passed it by.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EvictionPolicy {
@@ -259,7 +258,6 @@ pub struct RawConfig {
     pub revalidate_ttl_secs: u64,
     #[serde(default = "default_negative_ttl")]
     pub negative_ttl_secs: u64,
-    /// Hold window for a freshly promoted entry; 0 disables it.
     #[serde(default = "default_concurrency")]
     #[serde(alias = "graph_concurrency_per_upstream")]
     pub concurrency_per_upstream: usize,
@@ -271,8 +269,6 @@ pub struct RawConfig {
     pub retry_max_ms: u64,
     #[serde(default)]
     pub prewarm_shared_secret_env: Option<String>,
-    #[serde(default = "default_allowed_suffixes")]
-    pub allowed_download_suffixes: Vec<String>,
     /// Magazine eviction policy for staged spans. Default `lru`.
     #[serde(default)]
     pub eviction_policy: EvictionPolicy,
@@ -319,14 +315,6 @@ fn default_concurrency() -> usize { 3 }
 fn default_retry_max() -> u32 { 4 }
 fn default_retry_base() -> u64 { 200 }
 fn default_retry_max_ms() -> u64 { 30_000 }
-fn default_allowed_suffixes() -> Vec<String> {
-    vec![
-        ".files.1drv.com".into(),
-        ".sharepoint.com".into(),
-        "storage.live.com".into(),
-    ]
-}
-
 /// Validated, runtime config.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -363,7 +351,6 @@ pub struct Config {
     pub retry_base_ms: u64,
     pub retry_max_ms: u64,
     pub prewarm_shared_secret_env: Option<String>,
-    pub allowed_download_suffixes: Vec<String>,
     pub upstreams: Vec<UpstreamConfig>,
     pub routes: RouteTable,
     pub cache_profiles: HashMap<String, CacheProfile>,
@@ -552,7 +539,6 @@ impl Config {
             retry_base_ms: raw.retry_base_ms,
             retry_max_ms: raw.retry_max_ms,
             prewarm_shared_secret_env: raw.prewarm_shared_secret_env,
-            allowed_download_suffixes: raw.allowed_download_suffixes,
             upstreams: raw.upstreams,
             routes: RouteTable::new(raw.routes),
             cache_profiles: profiles,
@@ -588,7 +574,6 @@ impl Default for Config {
             retry_base_ms: default_retry_base(),
             retry_max_ms: default_retry_max_ms(),
             prewarm_shared_secret_env: None,
-            allowed_download_suffixes: default_allowed_suffixes(),
             upstreams: vec![UpstreamConfig {
                 id: "primary".into(),
                 backend_type: "openlist".into(),
@@ -825,11 +810,6 @@ mod tests {
     fn redirect_requires_link_token() {
         assert!(Config::from_toml_str(&redirect_toml("")).is_err());
         assert!(Config::from_toml_str(&redirect_toml("link_api_token_env = \"A_TOKEN\"")).is_ok());
-    }
-
-    #[test]
-    fn proxy_is_default_no_token_needed() {
-        assert!(Config::from_toml_str(&upstream_toml("http://127.0.0.1:5244/dav")).is_ok());
     }
 
     fn profile_toml(profile_section: &str, profile_ref: &str) -> String {

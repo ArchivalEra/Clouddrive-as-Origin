@@ -274,6 +274,8 @@ impl<C: Clock + 'static> Sessions<C> {
             shared: Arc::clone(&shared),
             successor: Successor {
                 slot: Arc::clone(slot),
+                // The successor's own upstream key: it is what the NEXT window
+                // opens against, so this one is live.
                 backend_key: backend_key.clone(),
                 upstream_id: backend_id.clone(),
                 etag: etag.clone(),
@@ -313,7 +315,6 @@ impl<C: Clock + 'static> Sessions<C> {
                         .seal_span(FinalizedSpan {
                             cache_dir,
                             key: session_key.clone(),
-                            backend_key: backend_key.as_str().to_string(),
                             upstream_id: backend_id.clone(),
                             etag: etag.clone(),
                             total,

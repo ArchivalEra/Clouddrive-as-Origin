@@ -134,9 +134,10 @@ pub struct PassthroughHit {
     pub content_range: Option<ContentRange>,
     pub content_length: Option<u64>,
     pub body: BodyStream,
-    /// Where the bytes came from: the metric label. "stage" means every byte
-    /// came from this node's sidecars; any upstream open makes it
-    /// "upstream", even when the first byte was served from stage.
+    /// Where the response's bytes came from, for the metric label. It is the
+    /// HEAD's provenance: a response whose first bytes are local is `Stage`
+    /// (or `Disk`) even when its tail cost an upstream open — see
+    /// `BodySource::Stage`.
     pub source: BodySource,
 }
 
@@ -222,8 +223,9 @@ fn stream_plan(
 pub enum BodySource {
     /// A complete object file on this node.
     Disk,
-    /// Staged sidecars of this key (the efficient profile): the request was
-    /// answered without opening upstream at all.
+    /// Staged sidecars of this key served as the head of the response. NOT a
+    /// promise that no upstream was opened: a staged PREFIX rides along with
+    /// one open for the uncovered remainder (the run path, or the escape).
     Stage,
     /// A live upstream stream: a cold-miss flight, a nocache water-pipe, or
     /// an efficient passthrough that needed bytes.
@@ -267,9 +269,9 @@ impl StreamPlan {
 pub struct CacheState {
     pub entries: HashMap<String, EntryMeta>,
     pub total_bytes: u64,
-    /// Bytes staged as `.seg` sidecars (efficientcache): served but not
-    /// yet promoted. Swept by age, never evicted by LRU (separate counter
-    /// so entry eviction math stays exact).
+    /// Bytes held as `.seg` sidecars: served directly, trimmed by the staged
+    /// budget (span by span, ADR-0015/0019) and swept by age. A separate
+    /// counter from `total_bytes` so entry eviction math stays exact.
     pub segment_bytes: u64,
     pub segment_sweep_at_millis: u64,
 }
@@ -412,8 +414,6 @@ pub struct Cache<C: Clock> {
     /// key. Segment files on disk are the source of truth; this map is
     /// the working view, rebuilt by scan on startup.
     pub coverage: Arc<Mutex<HashMap<String, store::Coverage>>>,
-    /// Keys with a promotion task in flight (P2-b single-flight: threshold
-    /// re-hits while promoting attach to nothing — the task re-verifies).
     /// The magazine: every byte-budget decision (admission, eviction,
     /// pressure reclaim, install, delete) lives behind this receiver.
     pub(crate) magazine: Magazine,
@@ -431,8 +431,8 @@ pub struct Cache<C: Clock> {
     /// every reader inside its window. Public because the serve path and the
     /// tests both drive it; the module owns the invariants.
     pub(crate) sessions: Arc<Sessions<C>>,
-    /// The staging ledger: the efficient profile's transfer history,
-    /// promotion and assembly, behind this receiver.
+    /// The staging ledger: the staged-transfer history — what is on disk per
+    /// key, how recently and how often it was read — behind this receiver.
     pub(crate) staging: Staging,
     pub(crate) reval_inflight: Inflight<StatData, BackendError>,
     /// Rows rebuilt from the object tree after metadata loss (C1). Read by
@@ -725,7 +725,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     /// Relief-valve link lookup (A: redirect cold misses): bounded
     /// `direct_url` against the routed upstream. `None` = unknown upstream
     /// or the budget blew; the caller owns target validation.
-    pub async fn direct_url_bounded(
+    async fn direct_url_bounded(
         &self,
         upstream_id: &str,
         backend_key: &str,
@@ -837,7 +837,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     /// revalidated is exactly what that operator wants redirected. The
     /// efficient profile deliberately does NOT use this gate — see
     /// [`Cache::has_durable_entry`].
-    pub(crate) async fn memory_hit_fresh(&self, raw_key: &str) -> bool {
+    async fn memory_hit_fresh(&self, raw_key: &str) -> bool {
         let key = match validate_key(raw_key) {
             Ok(k) => k,
             Err(_) => return false,
@@ -857,13 +857,11 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     /// negative tombstone included (an answer is an answer — the ordinary
     /// path renders it 404).
     ///
-    /// Deliberately NOT a freshness check. The efficient profile's whole
-    /// purpose is to serve bytes it holds, and gating that on the 60 s
-    /// revalidate clock meant a complete promoted entry stopped serving
-    /// ranged reads a minute after its promotion — which also capped the
-    /// promotion hold's value at that same minute. Whether the bytes need
-    /// revalidating is the ordinary path's business: it stats, compares
-    /// etags and either serves the file or refetches it.
+    /// Deliberately NOT a freshness check: it answers "does this key have a
+    /// whole object on disk", which is what decides whether a ranged request
+    /// can be answered from it. Whether those bytes need revalidating is the
+    /// ordinary path's business — it stats, compares etags and either serves
+    /// the file or refetches it.
     ///
     /// Pure peek: no upstream call, no mutation, no flights, and no
     /// filesystem call — a row whose file vanished falls through the
@@ -1047,7 +1045,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     /// disk writes**: no entries, no segments, no redb rows, no negative
     /// tombstones, no coverage ledger. Every failure is the caller's
     /// fallback problem, exactly like `serve_passthrough`.
-    pub async fn serve_nocache(
+    async fn serve_nocache(
         &self,
         rk: &ResolvedKey,
         range: Option<crate::backend::ByteRange>,
@@ -1076,15 +1074,14 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         self.serve_upstream_range(&slot, rk, range, meta).await
     }
 
-    /// C-path response (efficientcache): origin bytes streamed straight to
-    /// the viewer with zero cache machinery — no flight, no tmp/seal, no
-    /// entry, no revalidation. The served interval is staged as a sidecar
-    /// segment so coverage-triggered promotion (P2-b) can reuse it; the
-    /// ledger merge happens only on successful exhaustion (aborts leave
+    /// The ranged path: origin bytes streamed to the viewer while the served
+    /// window is staged as a sidecar segment, so later requests inside it cost
+    /// no upstream open (ADR-0016/0019). No flight, no entry, no revalidation;
+    /// the ledger merge happens only on successful exhaustion (aborts leave
     /// `.segpart` orphans for the sweeper). Small files (`size <
     /// min_file_size`) and every failure fall back to the B path in the
     /// caller — this method never serves from disk.
-    pub async fn serve_passthrough(
+    async fn serve_passthrough(
         self: &Arc<Self>,
         rk: &ResolvedKey,
         range: Option<crate::backend::ByteRange>,
@@ -1331,7 +1328,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         let staging = self.staging.clone();
         let cache_dir = self.config.cache_dir.clone();
         let cache_key = rk.cache_key.clone();
-        let backend_key = rk.backend_key.clone();
         let upstream_id = rk.upstream_id.clone();
         let segpart = store::segpart_path(&cache_dir, &cache_key, fetch_start, end);
         let mut src_stream = src.stream;
@@ -1353,7 +1349,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             let staging = self.staging.clone();
             let cache_dir = cache_dir.clone();
             let cache_key = cache_key.clone();
-            let backend_key = backend_key.clone();
             let upstream_id = upstream_id.clone();
             let etag = etag.clone();
             let total = total;
@@ -1384,7 +1379,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                                     FinalizedSpan {
                                         cache_dir,
                                         key: cache_key,
-                                        backend_key,
                                         upstream_id,
                                         etag,
                                         total,
@@ -1464,7 +1458,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                         FinalizedSpan {
                             cache_dir,
                             key: cache_key,
-                            backend_key,
                             upstream_id,
                             etag,
                             total,
@@ -1569,24 +1562,36 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         }
 
         // 2. Nocache profile: pure water-pipe, no disk, no stale-if-error.
+        //
+        // Its failure is the ANSWER, not a fall-through. This used to be
+        // `if let Ok(hit) = …`, so a 404 or a transient upstream error dropped
+        // into the ordinary path below — which stats, installs a negative
+        // tombstone in redb and can attach a flight that writes an entry and a
+        // file. The contract this profile is chosen for is "nothing persists: no
+        // entries, no segments, no redb writes, no negative tombstones", and a
+        // node runs it.
         if prof.nocache {
-            if let Ok(hit) = self.serve_nocache(rk, range).await {
-                tracing::info!(key = %rk.cache_key, size = hit.meta.size, "nocache passthrough response");
-                return Ok(ServeOutcome::Stream(stream_plan(
-                    hit.meta,
-                    hit.content_range,
-                    hit.content_length,
-                    hit.body,
-                    false,
-                    BodySource::Upstream,
-                )));
+            match self.serve_nocache(rk, range).await {
+                Ok(hit) => {
+                    tracing::info!(key = %rk.cache_key, size = hit.meta.size, "nocache passthrough response");
+                    return Ok(ServeOutcome::Stream(stream_plan(
+                        hit.meta,
+                        hit.content_range,
+                        hit.content_length,
+                        hit.body,
+                        false,
+                        BodySource::Upstream,
+                    )));
+                }
+                // The error IS the answer: see the comment above.
+                Err(e) => return Err(e),
             }
         }
 
         // 3. Efficient profile: a ranged miss streams origin bytes while the
         // served interval is staged. Always 206 (this path only runs with a
         // range). An object we already hold goes to the ordinary path
-        // instead, so a promoted entry keeps serving ranges for its whole
+        // instead, so a durable entry keeps serving ranges for its whole
         // life rather than only for the revalidate window.
         if prof.efficient && range.is_some() && !self.has_durable_entry(&rk.cache_key).await {
             if let Ok(hit) = self.serve_passthrough(rk, range, prof.min_file_size).await {
