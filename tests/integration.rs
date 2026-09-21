@@ -773,12 +773,12 @@ async fn a_window_bigger_than_the_retention_budget_is_not_written() {
         .serve(&rk, Some(ByteRange::bounded(0, 8)), None)
         .await
         .expect("a cache that cannot keep this window must still serve the range");
-    let plan = match out {
-        ServeOutcome::Stream(plan) => plan,
+    let served = match out {
+        ServeOutcome::Stream(served) => served,
         _ => panic!("a ranged miss must stream"),
     };
-    assert_eq!(plan.source, BodySource::Upstream, "the bytes came straight from upstream");
-    let mut body = plan.body;
+    assert_eq!(served.plan.source, BodySource::Upstream, "the bytes came straight from upstream");
+    let mut body = served.plan.body;
     assert_eq!(
         collect(&mut body).await,
         (0..8u64).map(|i| (i % 251) as u8).collect::<Vec<u8>>()
@@ -811,12 +811,12 @@ async fn an_unkeepable_object_stages_one_window_and_never_the_object() {
         .serve(&rk, Some(ByteRange::bounded(0, 8)), None)
         .await
         .expect("a ranged read of an un-keepable object must still serve");
-    let plan = match out {
-        ServeOutcome::Stream(plan) => plan,
+    let served = match out {
+        ServeOutcome::Stream(served) => served,
         _ => panic!("a ranged miss must stream"),
     };
-    assert_eq!(plan.source, BodySource::Stage, "the run's watermark served it");
-    let mut body = plan.body;
+    assert_eq!(served.plan.source, BodySource::Stage, "the run's watermark served it");
+    let mut body = served.plan.body;
     assert_eq!(
         collect(&mut body).await,
         (0..8u64).map(|i| (i % 251) as u8).collect::<Vec<u8>>()
@@ -901,8 +901,8 @@ async fn efficient_passthrough_waits_for_a_stream_permit() {
         .expect("the passthrough must finish once the upstream opens")
         .unwrap()
         .unwrap();
-    let plan = match outcome {
-        ServeOutcome::Stream(plan) => plan,
+    let served = match outcome {
+        ServeOutcome::Stream(served) => served,
         _ => panic!("a ranged efficient miss must stream"),
     };
     assert_eq!(
@@ -911,7 +911,7 @@ async fn efficient_passthrough_waits_for_a_stream_permit() {
         "the permit must be held by the body, not released when the response was built"
     );
 
-    let mut body = plan.body;
+    let mut body = served.plan.body;
     assert_eq!(collect(&mut body).await, vec![7u8; 64]);
     // The permit belongs to the RUN, not to this response (ADR-0016): it is
     // held while the run's window transfers — which is what lets one open serve
@@ -1319,11 +1319,17 @@ fn synthetic(offset: u64, len: u64) -> Vec<u8> {
 }
 
 /// One ranged GET, returning the plan and asserting it streamed.
-async fn get_range(cache: &Arc<Cache<MockClock>>, offset: u64, len: u64) -> origin_cache::cache::cache::StreamPlan {
+async fn get_range(
+    cache: &Arc<Cache<MockClock>>,
+    offset: u64,
+    len: u64,
+) -> origin_cache::cache::cache::Served {
     use origin_cache::cache::cache::ServeOutcome;
     let rk = cache.resolve("a.bin").unwrap();
     match cache.serve(&rk, Some(ByteRange::bounded(offset, len)), None).await.unwrap() {
-        ServeOutcome::Stream(p) => p,
+        // Returned WITH its protection, exactly as production receives it: a
+        // test that drops the guards would be testing a shape nobody runs.
+        ServeOutcome::Stream(served) => served,
         _ => panic!("expected a streamed passthrough from a ranged efficient miss"),
     }
 }
@@ -1371,16 +1377,16 @@ async fn a_standard_profile_upstream_gets_runs_for_ranged_reads() {
         .serve(&rk, Some(ByteRange::bounded(0, 65536)), None)
         .await
         .unwrap();
-    let plan = match out {
+    let served = match out {
         origin_cache::cache::cache::ServeOutcome::Stream(p) => p,
         _ => panic!("a ranged miss must stream"),
     };
     assert_eq!(
-        plan.source,
+        served.plan.source,
         origin_cache::cache::cache::BodySource::Stage,
         "a ranged read of a large object stages its window whatever the profile is named"
     );
-    let mut body = plan.body;
+    let mut body = served.plan.body;
     let _ = collect(&mut body).await;
     assert_eq!(opens.load(Ordering::SeqCst), 1, "one run, one upstream open");
     for _ in 0..400 {
@@ -1408,13 +1414,13 @@ async fn a_run_starts_for_an_object_larger_than_the_magazine() {
     // drained, not just planned: a plan only says where the bytes WILL come
     // from, and the run's own open happens in its driver task.
     for offset in [0u64, 65_536, 131_072] {
-        let plan = get_range(&cache, offset, 65_536).await;
+        let served = get_range(&cache, offset, 65_536).await;
         assert_eq!(
-            plan.source,
+            served.plan.source,
             origin_cache::cache::cache::BodySource::Stage,
             "a window of an object too large to keep is still staged and served"
         );
-        let mut body = plan.body;
+        let mut body = served.plan.body;
         assert_eq!(collect(&mut body).await, synthetic(offset, 65_536), "seek at {offset}");
     }
     assert_eq!(
@@ -1434,9 +1440,9 @@ async fn a_range_larger_than_the_magazine_streams_through_without_a_run() {
     let dir = tempdir().unwrap();
     let (cache, opens) = run_fixture_capped(dir.path(), 4 << 20, 256 << 10, 0, 1 << 20);
     // The whole object in one request: run_len = 4 MiB > 1 MiB magazine.
-    let plan = get_range(&cache, 0, 4 << 20).await;
+    let served = get_range(&cache, 0, 4 << 20).await;
     assert_eq!(
-        plan.source,
+        served.plan.source,
         origin_cache::cache::cache::BodySource::Upstream,
         "a window bigger than the retention budget is not written"
     );
@@ -1495,15 +1501,15 @@ async fn an_admission_escape_does_not_refetch_the_staged_prefix() {
 
     // Ask for the whole object: the run would write 4 MiB against a 1 MiB
     // budget, so it streams through — with the prefix served locally.
-    let plan = get_range(&cache, 0, 4 << 20).await;
+    let served = get_range(&cache, 0, 4 << 20).await;
     let opens = opens_log.lock().unwrap().clone();
     let last = *opens.last().expect("an upstream open happened");
     assert_eq!(
         last.0, 262_144,
         "the open starts at the staged frontier, not at the requested start: {opens:?}"
     );
-    assert_eq!(plan.content_length, Some(4 << 20), "the response still promises the whole range");
-    let mut body = plan.body;
+    assert_eq!(served.plan.content_length, Some(4 << 20), "the response still promises the whole range");
+    let mut body = served.plan.body;
     let bytes = collect(&mut body).await;
     assert_eq!(bytes.len() as u64, 4 << 20, "and delivers it");
     assert_eq!(&bytes[..262_144], &payload[..262_144], "byte-exact across the prefix boundary");
@@ -1572,13 +1578,13 @@ async fn ranged_seeks_on_one_key_share_one_upstream_open() {
     let (cache, opens) = run_fixture(dir.path(), 1 << 20, 8192, 10);
 
     for offset in [0u64, 2048, 4096] {
-        let plan = get_range(&cache, offset, 1024).await;
+        let served = get_range(&cache, offset, 1024).await;
         assert_eq!(
-            plan.source,
+            served.plan.source,
             origin_cache::cache::cache::BodySource::Stage,
             "a run-served response reads staged bytes, not a fresh upstream stream"
         );
-        let mut body = plan.body;
+        let mut body = served.plan.body;
         assert_eq!(collect(&mut body).await, synthetic(offset, 1024), "seek at {offset}");
     }
     assert_eq!(
@@ -1597,8 +1603,8 @@ async fn a_seek_far_beyond_the_window_opens_its_own_range() {
     let (cache, opens) = run_fixture(dir.path(), 1 << 20, 8192, 10);
 
     for offset in [0u64, 65536] {
-        let plan = get_range(&cache, offset, 1024).await;
-        let mut body = plan.body;
+        let served = get_range(&cache, offset, 1024).await;
+        let mut body = served.plan.body;
         assert_eq!(collect(&mut body).await, synthetic(offset, 1024));
     }
     assert_eq!(
@@ -1615,15 +1621,15 @@ async fn a_sealed_run_leaves_spans_that_serve_later_reads() {
     let dir = tempdir().unwrap();
     let (cache, opens) = run_fixture(dir.path(), 1 << 20, 8192, 10);
 
-    let plan = get_range(&cache, 0, 1024).await;
-    let mut body = plan.body;
+    let served = get_range(&cache, 0, 1024).await;
+    let mut body = served.plan.body;
     assert_eq!(collect(&mut body).await, synthetic(0, 1024));
     wait_staged(&cache, 8192).await;
 
     // The next read sits inside the sealed window.
-    let plan = get_range(&cache, 1024, 1024).await;
-    assert_eq!(plan.source, origin_cache::cache::cache::BodySource::Stage);
-    let mut body = plan.body;
+    let served = get_range(&cache, 1024, 1024).await;
+    assert_eq!(served.plan.source, origin_cache::cache::cache::BodySource::Stage);
+    let mut body = served.plan.body;
     assert_eq!(collect(&mut body).await, synthetic(1024, 1024));
     assert_eq!(
         opens.load(Ordering::SeqCst),
@@ -1641,8 +1647,8 @@ async fn a_sequential_walk_opens_once_per_window() {
 
     for i in 0..4u64 {
         let offset = i * 8192;
-        let plan = get_range(&cache, offset, 1024).await;
-        let mut body = plan.body;
+        let served = get_range(&cache, offset, 1024).await;
+        let mut body = served.plan.body;
         assert_eq!(collect(&mut body).await, synthetic(offset, 1024));
     }
     assert_eq!(
@@ -1679,8 +1685,8 @@ async fn a_run_that_cannot_open_errors_its_reader_instead_of_hanging() {
     slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
     let cache = Arc::new(Cache::new(cfg, clock, BackendRegistry::new(slots)));
 
-    let plan = get_range(&cache, 0, 1024).await;
-    let (bytes, errored) = collect_allow_error(plan.body).await;
+    let served = get_range(&cache, 0, 1024).await;
+    let (bytes, errored) = collect_allow_error(served.plan.body).await;
     assert!(bytes.is_empty(), "no bytes can come from a failed open");
     assert!(errored, "the reader must see the failure, not wait forever");
 }

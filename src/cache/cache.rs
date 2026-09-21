@@ -170,11 +170,35 @@ impl PassthroughHit {
 /// first, then the nocache passthrough, then the efficient passthrough, then
 /// the ordinary cached path. Range validation and the 416 precedence stay in
 /// the caller — they are request validation, not mode selection.
+/// A streamed answer, WITH the protection that answer is entitled to.
+///
+/// The guards used to be acquired by the caller (`business.rs` reached into
+/// `cache.leases` and `cache.watches`, held both, and dropped them in the body
+/// wrapper) while the cache itself depended on them: the version gate defers a
+/// ledger reset only if somebody took a guard, and eviction spares a key only
+/// while one is held. An invariant the interface cannot express is one every
+/// future caller gets wrong silently, so it now travels with the bytes: whoever
+/// holds the body holds the protection, by construction.
+pub struct Served {
+    pub plan: StreamPlan,
+    pub(crate) lease: crate::cache::leases::LeaseGuard,
+    pub(crate) watch: crate::cache::watch::WatchGuard,
+}
+
+impl Served {
+    /// The response's own byte range — where the viewer is. Public because the
+    /// tests read it to assert the pin they expect.
+    pub fn served_span(&self) -> (u64, u64) {
+        self.plan.served_span()
+    }
+}
+
+
 pub enum ServeOutcome {
     /// Hand the viewer the upstream's own signed link (307).
     Redirect { location: String },
     /// Stream these bytes, with the status and headers this path decided.
-    Stream(StreamPlan),
+    Stream(Served),
 }
 
 /// The render facts for a streaming answer, taken from whichever path
@@ -1506,6 +1530,25 @@ impl<C: Clock + Clone + 'static> Cache<C> {
 
     /// Decide how to answer one GET — see [`ServeOutcome`] for the order and
     /// why the decision lives here rather than in the handler.
+    /// Take the read protection this response is entitled to, and report the
+    /// resume counter — the one place that knows both the watch's state (a body
+    /// was streaming this key or not) and the plan's byte source (did the answer
+    /// cost an upstream open).
+    fn protect(self: &Arc<Self>, rk: &ResolvedKey, plan: StreamPlan) -> Served {
+        let lease = self.leases.acquire_at(&rk.cache_key, Arc::clone(&self.clock));
+        let watch = self
+            .watches
+            .acquire_at(&rk.cache_key, plan.served_span(), Arc::clone(&self.clock));
+        if watch.resumed() {
+            let outcome = match plan.source {
+                BodySource::Upstream => "miss",
+                _ => "hit",
+            };
+            crate::metrics::observe_watch_resume(outcome);
+        }
+        Served { plan, lease, watch }
+    }
+
     pub async fn serve(
         self: &Arc<Self>,
         rk: &ResolvedKey,
@@ -1561,13 +1604,17 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             match self.serve_nocache(rk, range).await {
                 Ok(hit) => {
                     tracing::info!(key = %rk.cache_key, size = hit.meta.size, "nocache passthrough response");
-                    return Ok(ServeOutcome::Stream(stream_plan(
-                        hit.meta,
-                        hit.content_range,
-                        hit.content_length,
-                        hit.body,
-                        false,
-                        BodySource::Upstream,
+                    return Ok(ServeOutcome::Stream(Self::protect(
+                        self,
+                        rk,
+                        stream_plan(
+                            hit.meta,
+                            hit.content_range,
+                            hit.content_length,
+                            hit.body,
+                            false,
+                            BodySource::Upstream,
+                        ),
                     )));
                 }
                 // The error IS the answer: see the comment above.
@@ -1594,13 +1641,17 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                 // always carries the honoured content-range. The source is
                 // the hit's own: stage when every byte was local, upstream
                 // when any open happened.
-                return Ok(ServeOutcome::Stream(stream_plan(
-                    hit.meta,
-                    hit.content_range,
-                    hit.content_length,
-                    hit.body,
-                    false,
-                    hit.source,
+                return Ok(ServeOutcome::Stream(Self::protect(
+                    self,
+                    rk,
+                    stream_plan(
+                        hit.meta,
+                        hit.content_range,
+                        hit.content_length,
+                        hit.body,
+                        false,
+                        hit.source,
+                    ),
                 )));
             }
         }
@@ -1614,13 +1665,17 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             size = hit.meta.size,
             "cache response"
         );
-        Ok(ServeOutcome::Stream(stream_plan(
-            hit.meta,
-            hit.content_range,
-            hit.content_length,
-            hit.body,
-            hit.outcome == CacheOutcome::Stale,
-            hit.source,
+        Ok(ServeOutcome::Stream(Self::protect(
+            self,
+            rk,
+            stream_plan(
+                hit.meta,
+                hit.content_range,
+                hit.content_length,
+                hit.body,
+                hit.outcome == CacheOutcome::Stale,
+                hit.source,
+            ),
         )))
     }
 
@@ -2330,16 +2385,16 @@ mod tests {
             !cache.state.read().await.entries.contains_key("a.png"),
             "the first serve must really be a miss, or this test proves nothing"
         );
-        let plan = match cache.serve(&rk, None, None).await.unwrap() {
-            ServeOutcome::Stream(plan) => plan,
+        let served = match cache.serve(&rk, None, None).await.unwrap() {
+            ServeOutcome::Stream(served) => served,
             _ => panic!("a cold miss must stream, not redirect"),
         };
         assert_eq!(
-            plan.source,
+            served.plan.source,
             BodySource::Upstream,
             "the first read is pulled through the flight"
         );
-        let mut body = plan.body;
+        let mut body = served.plan.body;
         assert_eq!(crate::testsupport::collect(&mut body).await, b"hello");
         for _ in 0..100 {
             if cache.state.read().await.entries.contains_key("a.png") {
@@ -2347,12 +2402,12 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let plan2 = match cache.serve(&rk, None, None).await.unwrap() {
-            ServeOutcome::Stream(plan) => plan,
+        let served2 = match cache.serve(&rk, None, None).await.unwrap() {
+            ServeOutcome::Stream(served) => served,
             _ => panic!("a hit must stream"),
         };
         assert_eq!(
-            plan2.source,
+            served2.plan.source,
             BodySource::Disk,
             "the second read is served from the file on this node"
         );

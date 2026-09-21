@@ -277,37 +277,20 @@ where
     let viewer_ua = headers.get("user-agent").and_then(|v| v.to_str().ok());
     match state.cache.serve(&rk, range, viewer_ua).await {
         Ok(ServeOutcome::Redirect { location }) => redirect_response(location, &req_id, &host_id),
-        Ok(ServeOutcome::Stream(plan)) => {
-            // Every response holds the key's read lease for as long as its body
-            // streams, plus the grace (ADR-0017), and registers the key as
-            // WATCHED for the viewer's position (ADR-0018).
+        Ok(ServeOutcome::Stream(served)) => {
+            // The read protection travels WITH the response: `serve` takes the
+            // key's lease and its watch when it builds the plan — the span is the
+            // response's own byte range, and only there is the byte source known
+            // — so this handler cannot forget to hold them and the body cannot
+            // forget to drop them.
             //
-            // The lease used to be taken only for a local byte source, on the
-            // reasoning that an upstream-served body has nothing local to
-            // protect. That missed the case it was written for: what a long
-            // stream needs protected is the KEY — the spans earlier requests of
-            // the same viewing session staged, which a concurrent eviction pass
-            // would otherwise take while the viewer is still on the object.
-            // Protection is about the key's session, not about which end of the
-            // pipe happened to fill this particular body.
-            let lease = state
-                .cache
-                .leases
-                .acquire_at(&rk.cache_key, Arc::clone(&state.cache.clock));
-            let span = plan.served_span();
-            let watch = state
-                .cache
-                .watches
-                .acquire_at(&rk.cache_key, span, Arc::clone(&state.cache.clock));
-            if watch.resumed() {
-                // A viewer coming back after a pause: did the pause stay free?
-                let outcome = match plan.source {
-                    crate::cache::cache::BodySource::Upstream => "miss",
-                    _ => "hit",
-                };
-                crate::metrics::observe_watch_resume(outcome);
-            }
-            stream_response(plan, &req_id, &host_id, started, lease, watch)
+            // It used to be a protocol between two files: this one reached into
+            // `cache.leases` and `cache.watches`, built both guards, and passed
+            // them down for `instrument_body` to hold, while the cache itself
+            // depended on them (the version gate defers a ledger reset only if a
+            // guard exists). An invariant the interface cannot express is one a
+            // new caller loses silently.
+            stream_response(served, &req_id, &host_id, started)
         }
         Err(e) => {
             // Size hint for 416 Content-Range: best-effort memory peek, no
@@ -338,13 +321,12 @@ fn redirect_response(location: String, req_id: &str, host_id: &str) -> Response 
 /// nocache and the cached path answer 206 only when a range was honoured,
 /// while the efficient passthrough always does.
 fn stream_response(
-    plan: crate::cache::cache::StreamPlan,
+    served: crate::cache::cache::Served,
     req_id: &str,
     host_id: &str,
     started: std::time::Instant,
-    lease: crate::cache::leases::LeaseGuard,
-    watch: crate::cache::watch::WatchGuard,
 ) -> Response {
+    let crate::cache::cache::Served { plan, lease, watch } = served;
     let mut builder = Response::builder().status(plan.status);
     if let Some(cr) = &plan.content_range {
         builder = builder.header("content-range", cr.header_value());
