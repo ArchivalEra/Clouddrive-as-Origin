@@ -1,0 +1,38 @@
+# CDN-LAB config G: the PRODUCTION DEFAULT window, against the CDN's shard shape
+# (LAB section 17).
+#
+# Every other efficient config in this directory overrides `session_window_bytes`
+# to 256 KiB so its numbers are quick — which means the value the node actually
+# runs (the 64 MiB default) was justified only by prose, and by hand-run operator
+# probes. This instance leaves the default alone and is walked with the shape the
+# edge really produces: ascending 1 MiB shards.
+#
+# The magazine holds the windows but not the object: 256 MiB against 3 GiB, so
+# the walk is the un-keepable class (ADR-0019) with a working-window cap of
+# pin + window = 192 MiB, comfortably inside the budget.
+front_listen = "127.0.0.1:7783"
+front_metrics_listen = "127.0.0.1:9096"
+listen_addr = "127.0.0.1:8087"
+cache_dir = "/mnt/hdd/CDN-LAB/cache-g"
+max_size_bytes = 268435456
+inactive_ttl_secs = 1200
+revalidate_ttl_secs = 60
+negative_ttl_secs = 60
+concurrency_per_upstream = 3
+prewarm_shared_secret_env = "CDN_LAB_PREWARM_SECRET"
+# No `session_window_bytes`: the point of this instance is the DEFAULT (64 MiB).
+[cache_profiles.efficient]
+min_file_size = 4
+
+[[upstreams]]
+id = "media"
+type = "openlist"
+base_url = "http://127.0.0.1:5244/dav"
+root_path = "media"
+username_env = "CDN_LAB_DAV_USER"
+password_env = "CDN_LAB_DAV_PASS"
+cache_profile = "efficient"
+
+[[routes]]
+prefix = ""
+upstream = "media"

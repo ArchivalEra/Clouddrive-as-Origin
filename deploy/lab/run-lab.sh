@@ -22,7 +22,7 @@ DAV_PASS=labpass
 PREWARM_SECRET=labsecret
 SIGV4_AK=AKLLABTESTKEY
 SIGV4_SK=labsk_demo
-PID_DAV= PID_A= PID_B= PID_C= PID_D= PID_E=
+PID_DAV= PID_A= PID_B= PID_C= PID_D= PID_E= PID_F= PID_G=
 PASS=0; FAIL=0
 
 ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
@@ -62,7 +62,7 @@ echo $$ > "$LOCK"
 
 cleanup() {
   rm -f "$LOCK"
-  for pid in "$PID_A" "$PID_B" "$PID_C" "$PID_D" "$PID_E" "$PID_DAV"; do
+  for pid in "$PID_A" "$PID_B" "$PID_C" "$PID_D" "$PID_E" "$PID_F" "$PID_G" "$PID_DAV"; do
     [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null
   done
   # Belt and braces: an instance this run failed to track would keep `wait`
@@ -86,7 +86,7 @@ pkill -f "target/release/origin-cache" 2>/dev/null
 # Every port a stale instance could hold, front AND business: waiting only on
 # the front ports let a dying process keep its business port and the fresh
 # instance died at bind with "Address already in use".
-for port in 7777 7778 7779 7780 8081 8082 8083 8084; do
+for port in 7777 7778 7779 7780 7781 7782 7783 8081 8082 8083 8084 8085 8086 8087; do
   for _ in $(seq 1 20); do
     ss -tln 2>/dev/null | grep -q ":$port " || break
     sleep 0.5
@@ -97,8 +97,8 @@ done
 # The cache dirs must start EMPTY: they persist across runs, the ledger is
 # rebuilt from whatever sidecars are on disk at boot, and every staged-bytes
 # assertion below would otherwise be measuring the previous run.
-rm -rf "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e"
-mkdir -p "$LAB/dav-data/media/2026/08" "$LAB/dav-data/archive" "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e"
+rm -rf "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e" "$LAB/cache-f" "$LAB/cache-g"
+mkdir -p "$LAB/dav-data/media/2026/08" "$LAB/dav-data/archive" "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e" "$LAB/cache-f" "$LAB/cache-g"
 echo "hello-origin" > "$LAB/dav-data/media/hello.txt"
 head -c 1048576 /dev/urandom > "$LAB/dav-data/media/big1mb.bin"
 # A second 1 MiB object: the eviction test needs two keys staging at once.
@@ -150,6 +150,8 @@ cd "$REPO"
 "$BIN" "$REPO/deploy/lab/config-c.toml" > "$LAB/cache-c/serve.log" 2>&1 & PID_C=$!
 "$BIN" "$REPO/deploy/lab/config-d.toml" > "$LAB/cache-d/serve.log" 2>&1 & PID_D=$!
 "$BIN" "$REPO/deploy/lab/config-e.toml" > "$LAB/cache-e/serve.log" 2>&1 & PID_E=$!
+"$BIN" "$REPO/deploy/lab/config-f.toml" > "$LAB/cache-f/serve.log" 2>&1 & PID_F=$!
+"$BIN" "$REPO/deploy/lab/config-g.toml" > "$LAB/cache-g/serve.log" 2>&1 & PID_G=$!
 # Readiness is POLLED, never a fixed sleep: boot measures 1-11 s on the node
 # (aarch64 with a cold page cache), and a single-shot probe fails a healthy
 # instance. `-f` matters too: without it a 404 (or any error page) still exits
@@ -168,6 +170,8 @@ probe_up 8081 nocache  || { echo "FAIL: nocache not up";  tail -3 "$LAB/cache-b/
 probe_up 8082 efficient|| { echo "FAIL: efficient not up";tail -3 "$LAB/cache-c/serve.log"; exit 1; }
 probe_up 8084 eviction || { echo "FAIL: eviction not up"; tail -3 "$LAB/cache-d/serve.log"; exit 1; }
 probe_up 8085 watch    || { echo "FAIL: watch not up";    tail -3 "$LAB/cache-e/serve.log"; exit 1; }
+probe_up 8086 front    || { echo "FAIL: front guards not up"; tail -3 "$LAB/cache-f/serve.log"; exit 1; }
+probe_up 8087 default  || { echo "FAIL: default window not up"; tail -3 "$LAB/cache-g/serve.log"; exit 1; }
 # healthz may have been answered by a stale leftover instance — assert the
 # fresh processes are actually alive (boot panic = redb/port conflict).
 kill -0 "$PID_A" 2>/dev/null || { echo "FAIL: standard process died at boot"; tail -5 "$LAB/cache-a/serve.log"; exit 1; }
@@ -175,8 +179,16 @@ kill -0 "$PID_B" 2>/dev/null || { echo "FAIL: nocache process died at boot"; tai
 kill -0 "$PID_C" 2>/dev/null || { echo "FAIL: efficient process died at boot"; tail -5 "$LAB/cache-c/serve.log"; exit 1; }
 kill -0 "$PID_D" 2>/dev/null || { echo "FAIL: eviction process died at boot"; tail -5 "$LAB/cache-d/serve.log"; exit 1; }
 kill -0 "$PID_E" 2>/dev/null || { echo "FAIL: watch process died at boot";    tail -5 "$LAB/cache-e/serve.log"; exit 1; }
+kill -0 "$PID_F" 2>/dev/null || { echo "FAIL: front guards died at boot"; tail -5 "$LAB/cache-f/serve.log"; exit 1; }
+kill -0 "$PID_G" 2>/dev/null || { echo "FAIL: default-window instance died at boot"; tail -5 "$LAB/cache-g/serve.log"; exit 1; }
 
-H() { curl -s "$@"; }
+# Every request is BOUNDED. Without a timeout a single stalled request hangs the
+# whole suite with no output at all — which is exactly what happened once, in
+# section 11: the log stopped mid-section and the run sat there until the
+# wrapper's 1600 s ceiling. A failing request must fail an assertion instead.
+# 120 s clears the longest legitimate one (the 3 GB pull, ~50 s at the measured
+# rate) and `H` callers may pass their own `-m` to tighten it.
+H() { curl -s --connect-timeout 5 --max-time 120 "$@"; }
 
 # healthz is on the BUSINESS port (the front 404s it by design).
 hz() { H "http://127.0.0.1:$1/_internal/healthz"; }
@@ -705,6 +717,88 @@ if command -v node >/dev/null 2>&1 && [ -d "$PW_DIR" ] && [ -f "$LAB/dav-data/me
     || bad "the player's request shape was not recorded"
 else
   note "15. skipped (node, playwright-core or the clip is missing)"
+fi
+
+# --- 16. the front's own guards ----------------------------------------------
+# The front's pure helpers are unit-tested (CIDR parsing, the rate gate's
+# `exceeds`, the metric families). What had no test was the WIRING: whether the
+# gate and the body cap are consulted on a live connection, and whether healthz
+# is really absent from the public port. config-f runs with `front_rate_rps = 2`
+# so that the third request in a second must be refused.
+note "16. the front's own guards (404 / 429 / 413)"
+# 3 GiB: bigger than the 256 MiB magazine (the un-keepable class) and, at 24 MiB
+# of shards, well inside the 64 MiB default window section 17 walks it with.
+WALK_OBJ=big3g.bin
+code=$(H -o /dev/null -w "%{http_code}" "http://127.0.0.1:7782/_internal/healthz")
+[ "$code" = 404 ] && ok "the front refuses healthz with 404 (not 403: it should not even admit the surface exists)" \
+  || bad "front healthz returned $code (want 404)"
+# The assertion is that the BUSINESS plane answers on its own port (`hz_field`
+# reads numeric fields only, and `status` is a string). It must NOT require
+# `status:"ok"`: a fresh cache directory whose files predate the metadata store
+# boots `degraded` with `metadata_rows_rebuilt`, which is correct.
+hz 8086 | grep -q '"plane":"business"' && ok "and the business port answers it" \
+  || bad "business healthz on 8086 did not answer: $(hz 8086 | head -c 120)"
+
+# The rate ceiling is per second; let the window clear, then send three.
+sleep 1.2
+codes=""
+for _ in 1 2 3; do
+  codes="$codes $(H -m 10 -o /dev/null -w '%{http_code}' -r 0-1023 "http://127.0.0.1:7782/media/$WALK_OBJ")"
+done
+case "$codes" in
+  *" 429") ok "a request over the ceiling is 429 (codes:$codes)" ;;
+  *) bad "rate limiting never refused: codes:$codes (want a 429 among them)" ;;
+esac
+# A refused request must not reach the business plane: the instance's own
+# healthz counters are not the measure, but the 429 body is small and the front
+# is the only place it can come from (the business plane has no limiter).
+sleep 1.2
+code=$(H -m 10 -o /dev/null -w "%{http_code}" -r 0-1023 "http://127.0.0.1:7782/media/$WALK_OBJ")
+[ "$code" = 206 ] || [ "$code" = 200 ] && ok "and a request under it still serves ($code)" \
+  || bad "an allowed request returned $code"
+
+# The prewarm body cap: the front 413s an over-sized body BEFORE the business
+# plane (and therefore before the token check) sees it.
+head -c 70000 /dev/zero > "$LAB/oversize-prewarm.bin"
+code=$(H -o /dev/null -w "%{http_code}" -X POST --data-binary @"$LAB/oversize-prewarm.bin" \
+  "http://127.0.0.1:7782/_internal/prewarm/media/$WALK_OBJ")
+[ "$code" = 413 ] && ok "an oversized prewarm body is 413 at the front" \
+  || bad "oversized prewarm returned $code (want 413)"
+
+# --- 17. the production DEFAULT window against the CDN's shard shape ----------
+# Every other efficient config here sets a 256 KiB window so its numbers are
+# quick, which left the value the node actually runs (the 64 MiB default)
+# justified by prose and hand-run probes only. This walks config-g the way the
+# edge really asks: ascending 1 MiB shards on an object the magazine cannot hold.
+note "17. the default window vs the CDN's 1 MiB shards"
+if [ ! -f "$LAB/dav-data/media/$WALK_OBJ" ]; then
+  note "17. skipped ($WALK_OBJ is missing)"
+else
+before_g=$(opens 9096)
+walk_start=$(date +%s%N)
+for i in $(seq 1 24); do
+  off=$(( i * 1048576 ))
+  H -o /dev/null -H "Range: bytes=$off-$((off + 1048575))" "http://127.0.0.1:7783/media/$WALK_OBJ"
+done
+walk_ms=$(( ($(date +%s%N) - walk_start) / 1000000 ))
+opened=$(( $(opens 9096) - before_g ))
+# 24 MiB of ascending shards against a 64 MiB default window: one window covers
+# the whole walk, so the origin is opened ONCE — the property the node's own
+# 24-shard measurement showed, asserted here so a default change cannot break it
+# silently.
+[ "$opened" -le 2 ] && ok "24 ascending 1 MiB shards cost $opened upstream open(s) (want 1, at most 2)" \
+  || bad "24 shards on the default window cost $opened opens (want 1)"
+# The window SEALS asynchronously — the run's driver keeps pumping the 64 MiB
+# window after the last shard was served — so this polls rather than samples.
+gbytes=0
+for _ in $(seq 1 60); do
+  gbytes=$(hz_field 8087 segment_bytes)
+  [ "${gbytes:-0}" -ge 1048576 ] && break
+  sleep 0.5
+done
+[ "${gbytes:-0}" -ge 1048576 ] && ok "the walk staged its window ($gbytes bytes)" \
+  || bad "the walk staged nothing after 30 s (segment_bytes=$gbytes)"
+echo "    walk: ${walk_ms} ms for 24 MiB, opens=$opened, staged=$gbytes" >&2
 fi
 
 # --- 5. summary ---------------------------------------------------------------

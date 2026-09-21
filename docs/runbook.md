@@ -748,6 +748,32 @@ the disk can hold it (ADR-0014), and through the pipe otherwise. Note the
 staged-byte eviction knob in the cache section: `eviction_policy = "lru"`
 (default) or `"heat"` (ADR-0015).
 
+## Reading the suite, and where the knowledge lives
+
+`deploy/lab/run-lab.sh` is seventeen sections, each with a `note` line naming what
+it pins. Two of them were added last and are the ones to look at when a change
+touches the front or the window default:
+
+- **16** — the front's own guards: healthz refused with 404 on the public port
+  (not 403: a caller should not learn the surface exists), the per-IP rate ceiling
+  returning 429, and an over-sized prewarm body 413'd before the business plane
+  sees it. `config-f.toml` runs with `front_rate_rps = 2` for it.
+- **17** — the production DEFAULT window (64 MiB) walked with the shape the edge
+  really produces: ascending 1 MiB shards on a 3 GiB object the magazine cannot
+  hold. `config-g.toml` deliberately sets no `session_window_bytes`, so a change
+  to that default cannot pass silently.
+
+Two files carry the rest:
+
+- **`docs/pitfalls.md`** — every trap that has cost real time, with its evidence.
+  Read it before an experiment, and add to it after one that surprises you.
+- **`docs/adr/README.md`** — one line per decision, which ones amend which, and
+  the cross-cutting rule (ADR-0012: a guard is a deadline, not an exemption).
+
+The suite refuses to start on a busy box (`MAX_LOAD`, default 6) or with orphan
+browsers alive; the same revision produced 7 false FAILs at load 46 and 60 PASS /
+0 FAIL at load 4. `MAX_LOAD=<n>` overrides when a noisy run is worth having.
+
 ## Test data cleanup
 
 The 3 GiB coverage test file lives in googledrive1 (`coverage-test-3g.bin`).
