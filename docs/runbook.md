@@ -428,6 +428,66 @@ Read the pause lines together with the totals: the walk costs the same either
 way, so the read-ahead is not extra upstream traffic, only differently timed —
 during the gap instead of at the resume.
 
+### The target-scale account: an object the node can never hold
+
+The product's object is a 3-hour video of 30-200 GB. Measured on the node against
+a real one — `/googledrive1/round3.mp4`, 214 748 364 800 bytes (200 GiB) — with
+`big-object-probe.sh` (bounded traffic: a shard, a short walk, five seeks, one
+larger range, three concurrent ranges):
+
+```
+efficient profile, loopback instance (magazine 6 GiB)
+  admission            : every request logged "passthrough without staging: the
+                         magazine cannot hold this object"; segment_bytes = 0,
+                         entries = 0, stray_bytes = 0 for the whole probe
+  one 1 MiB shard      : 1 upstream open, 1277 ms
+  walk of 24 shards    : 24 opens (one per request), 1126 ms per MiB
+  random seeks         : 823-924 ms to first byte
+  one 16 MiB range     : 1 open, 1475 ms -> 10.8 MiB/s
+  three concurrent 1 MiB ranges on one key: 3 opens
+standard profile, the production instance (magazine 10 GiB)
+  1 MiB shard          : 1 open, 1246 ms, upstream-served
+  random seeks         : 858-901 ms to first byte
+  cache                : nothing written for the key
+```
+
+Through the CDN the picture has one more layer, and it is the layer the viewer
+actually feels (`probe-edgeone-big.sh`, run from the node itself — never through
+an HTTP proxy, whose RTT is the thing being measured):
+
+```
+HEAD                : eo-cache-status MISS, content-length = the object
+one 1 MiB range     : TTFB 0.206 s, 1.62 s total, origin opens +1
+the SAME range again: eo-cache-status HIT (age 2), origin opens +0
+three random seeks  : TTFB 0.206-0.209 s
+24-shard 1 MiB walk : 39 s (1.6 s per MiB), origin opens +24
+origin log          : "serving without caching: the disk cannot hold this
+                      object want=214748364800", one open per request, 1 MiB
+                      ascending shards over h2, ~1.1 s each
+```
+
+So the EDGE is what makes a re-scrub cheap on an object the origin cannot hold:
+EdgeOne caches the shards it has pulled (a repeat is a HIT with zero origin
+traffic), and its first-byte latency is its own (~0.2 s) rather than the
+origin's pull. The origin's job for such an object is the first pull of each
+region, and it does that with one `open` per request because nothing can be
+staged — which is where the run machinery stops helping.
+
+Read this as the boundary of what the cache currently buys. An object larger than
+the magazine is neither a magazine member nor a resident stray (ADR-0013/0014),
+so **nothing about it is cached, and the run machinery never starts** — a run is
+gated on staging admission, so a 1 MiB-granularity walk pays one ~1.2 s provider
+open per MiB (a stageable object pays about one per 64 MiB window: 512 shards ->
+12 opens). Sequential playback is still feasible (24 shards in 27 s is ~0.9 MiB/s,
+and a player asks for ranges far larger than 1 MiB, which amortizes the open:
+16 MiB cost 1 open and 1.5 s), but every seek costs ~0.9 s, and scrubbing across
+a 200 GiB object is a seek per gesture.
+
+That is the next mechanism's case, and it is measurable from here: a NO-RETENTION
+run — one open per window, readers riding the watermark, nothing written to disk
+— would make the walk cost one open per window instead of one per request with
+zero disk cost, which is exactly what an object too large to keep needs.
+
 Two knobs govern what leaves the window (ADR-0015), both span-level:
 
 ```toml
