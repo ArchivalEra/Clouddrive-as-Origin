@@ -5,8 +5,10 @@ use tempfile::tempdir;
 
 // The mock lives in the lib now: one implementation for the whole tree.
 use origin_cache::testsupport::{
-    collect, collect_allow_error, BlockingOpenBackend, CacheTestExt, MockBackend as CountingBackend,
-    SizedBackend, StormBackend, StormMode, VersionedBackend, wait_entry,
+    collect, collect_allow_error, install_staged, install_staged_aged, rebuild_staged_bytes,
+    wait_entry,
+    BlockingOpenBackend, CacheTestExt, MockBackend as CountingBackend, SizedBackend, StormBackend,
+    StormMode, VersionedBackend,
 };
 
 use origin_cache::{
@@ -118,7 +120,7 @@ async fn inactive_ttl_expiry_removes_file_and_meta() {
     clock.advance(2000);
     cache.tick().await;
     assert!(!dir.path().join("a.png").exists());
-    assert!(cache.state.read().await.entries.is_empty());
+    assert!(cache.snapshot().await.entries == 0);
 }
 
 #[tokio::test]
@@ -139,9 +141,9 @@ async fn max_size_evicts_lru_order() {
         wait_entry(&cache, k).await;
         clock.advance(10);
     }
-    let remaining = cache.state.read().await.entries.len();
+    let remaining = cache.snapshot().await.entries;
     assert!(remaining < 3);
-    assert!(!cache.state.read().await.entries.contains_key("a.png"));
+    assert!(!cache.entry_exists("a.png").await);
 }
 
 #[tokio::test]
@@ -404,12 +406,12 @@ async fn spawned_reaper_expires_entries_without_manual_tick() {
     // mock-clock time).
     clock.advance(1_201_000);
     for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if cache.state.read().await.entries.is_empty() {
+        if cache.snapshot().await.entries == 0 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert!(cache.state.read().await.entries.is_empty(), "spawned reaper did not expire the entry");
+    assert!(cache.snapshot().await.entries == 0, "spawned reaper did not expire the entry");
     assert!(!cache.config.cache_dir.join("old.png").exists(), "expired file must be deleted");
 }
 
@@ -535,7 +537,7 @@ async fn panicked_driver_fails_flight_and_releases_key() {
     };
     assert!(errored, "panic must surface as an error");
     wait_map_empty(&cache).await;
-    assert!(cache.state.read().await.entries.is_empty(), "a panicked flight installs nothing");
+    assert!(cache.snapshot().await.entries == 0, "a panicked flight installs nothing");
 
     *mode.lock().unwrap() = StormMode::Good;
     let mut hit = cache.get_by_key("panic.bin", None).await.unwrap();
@@ -564,7 +566,7 @@ async fn short_upstream_body_is_never_sealed() {
     assert!(errored, "short body must surface as an error");
     assert!(out.len() <= 50, "at most the bytes that did land reach the reader");
     wait_map_empty(&cache).await;
-    assert!(cache.state.read().await.entries.is_empty(), "short read must not install an entry");
+    assert!(cache.snapshot().await.entries == 0, "short read must not install an entry");
     assert!(
         !cache.config.cache_dir.join("short.bin").exists(),
         "short read must not be renamed into the cache"
@@ -628,7 +630,7 @@ async fn concurrent_hits_stamp_access_without_state_write_lock() {
     // After a real-time flush tick the row carries the stamp the hit wrote
     // (5000), proving the flusher folds the lock-free records into state.
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-    let last = cache.state.read().await.entries.get("hot.bin").unwrap().last_access_millis;
+    let last = cache.inspect("hot.bin").await.last_access_millis.unwrap();
     assert_eq!(last, 5000, "flusher must fold the access stamp into the entry row");
 }
 
@@ -719,16 +721,15 @@ async fn an_object_larger_than_the_magazine_is_cached_as_a_stray() {
     wait_entry(&cache, "stray.bin").await;
 
     {
-        let s = cache.state.read().await;
         assert!(
-            s.entries.contains_key("member.bin"),
+            cache.entry_exists("member.bin").await,
             "a stray must not evict the magazine on its way in"
         );
         assert!(
-            s.entries.get("stray.bin").expect("stray installed").oversize,
+            cache.inspect("stray.bin").await.oversize,
             "the row records that it was admitted outside the budget"
         );
-        assert_eq!(s.total_bytes, 4_100, "both objects are on disk");
+        assert_eq!(cache.snapshot().await.total_bytes, 4_100, "both objects are on disk");
     }
     let snap = cache.snapshot().await;
     assert_eq!(snap.stray_bytes, 4_000, "and healthz reports the part the budget does not govern");
@@ -786,8 +787,8 @@ async fn a_window_bigger_than_the_retention_budget_is_not_written() {
         (0..8u64).map(|i| (i % 251) as u8).collect::<Vec<u8>>()
     );
     assert_eq!(opens.load(Ordering::SeqCst), 1, "one upstream open, no fill");
-    assert_eq!(cache.state.read().await.segment_bytes, 0, "nothing was staged");
-    assert!(cache.state.read().await.entries.is_empty(), "and nothing was installed");
+    assert_eq!(cache.snapshot().await.segment_bytes, 0, "nothing was staged");
+    assert!(cache.snapshot().await.entries == 0, "and nothing was installed");
 }
 
 /// The other half of the same decision: when the window IS affordable, a ranged
@@ -829,7 +830,7 @@ async fn an_unkeepable_object_stages_one_window_and_never_the_object() {
         !dir.path().join("huge.bin").exists(),
         "the OBJECT is never written; only its window is"
     );
-    assert!(cache.state.read().await.entries.is_empty());
+    assert!(cache.snapshot().await.entries == 0);
 }
 
 /// The efficient passthrough MOVES BYTES, so it must hold the STREAM gate
@@ -1003,21 +1004,19 @@ async fn entry_count_cap_evicts_lru_even_under_byte_budget() {
         let _ = i;
     }
 
-    let s = cache.state.read().await;
+    let entries = cache.snapshot().await.entries;
     assert!(
-        s.entries.len() <= 3,
-        "entry-count cap must bound the map (got {} entries)",
-        s.entries.len()
+        entries <= 3,
+        "entry-count cap must bound the map (got {entries} entries)"
     );
     // The three most recent survive, the two oldest are gone: the cap evicts
     // in LRU order, not merely "something".
     for k in ["k3", "k4", "k5"] {
-        assert!(s.entries.contains_key(k), "{k} (recent) must survive eviction");
+        assert!(cache.entry_exists(k).await, "{k} (recent) must survive eviction");
     }
     for k in ["k1", "k2"] {
-        assert!(!s.entries.contains_key(k), "{k} (oldest) must be evicted");
+        assert!(!cache.entry_exists(k).await, "{k} (oldest) must be evicted");
     }
-    drop(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,37 +1047,25 @@ async fn staged_segment_bytes_join_the_disk_budget() {
     // interval owns no single file), so the files are written for real: a
     // ledger row with nothing on disk is not evictable by design, and
     // asserting on one would test nothing.
-    let touched = 10_000u64;
+    // Staged now, then aged: the ledger stamps what a scan sees with the
+    // clock's now, and the min-age guard needs the spans to be older.
+    install_staged(&cache, &[("s1.bin", 0, 8192), ("s2.bin", 0, 8192)]).await;
     clock.advance(120_000);
-    let mut paths = Vec::new();
-    {
-        let mut cov = cache.coverage.lock().await;
-        for key in ["s1.bin", "s2.bin"].iter() {
-            let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, key, 0, 8192);
-            std::fs::write(&path, vec![0u8; 8192]).unwrap();
-            paths.push(path);
-            let mut c = origin_cache::cache::store::Coverage {
-                total: 8192,
-                last_touch_millis: touched,
-                ..Default::default()
-            };
-            c.add_interval(0, 8192, touched);
-            cov.insert(key.to_string(), c);
-        }
-    }
-    cache.state.write().await.segment_bytes = 16_384; // > max_size_bytes
+    let paths: Vec<_> = ["s1.bin", "s2.bin"]
+        .iter()
+        .map(|key| origin_cache::cache::store::seg_path(&cfg.cache_dir, key, 0, 8192))
+        .collect();
 
     cache.tick().await;
 
-    let s = cache.state.read().await;
-    let cov = cache.coverage.lock().await;
+    let snap = cache.snapshot().await;
     assert!(
-        s.total_bytes.saturating_add(s.segment_bytes) <= cfg.max_size_bytes,
+        snap.total_bytes.saturating_add(snap.segment_bytes) <= cfg.max_size_bytes,
         "staged bytes must be brought back under the shared budget (got {} + {})",
-        s.total_bytes,
-        s.segment_bytes
+        snap.total_bytes,
+        snap.segment_bytes
     );
-    assert!(cov.is_empty(), "evicted ledger rows must be dropped");
+    assert_eq!(snap.coverage_keys, 0, "evicted ledger rows must be dropped");
     assert!(paths.iter().all(|p| !p.exists()), "the evicted sidecar files must be gone");
 }
 
@@ -1112,25 +1099,13 @@ async fn a_watch_keeps_the_viewers_window_while_the_budget_takes_other_keys() {
     clock.advance(120_000);
     let watched = origin_cache::cache::store::seg_path(&cfg.cache_dir, "live.bin", 0, 2048);
     let other = origin_cache::cache::store::seg_path(&cfg.cache_dir, "other.bin", 0, 2048);
-    std::fs::write(&watched, vec![0u8; 2048]).unwrap();
-    std::fs::write(&other, vec![0u8; 2048]).unwrap();
-    {
-        let mut cov = cache.coverage.lock().await;
-        // The watched key is the OLDER row, so the cross-key LRU visits it
-        // first: without the pin it is the one the budget takes.
-        let mut live =
-            origin_cache::cache::store::Coverage { total: 4096, last_touch_millis: 10_000, ..Default::default() };
-        live.add_interval(0, 2048, 10_000);
-        cov.insert("live.bin".to_string(), live);
-        let mut o = origin_cache::cache::store::Coverage {
-            total: 4096,
-            last_touch_millis: 120_000,
-            ..Default::default()
-        };
-        o.add_interval(0, 2048, 120_000);
-        cov.insert("other.bin".to_string(), o);
-    }
-    cache.state.write().await.segment_bytes = 4_096;
+    // The watched key is the OLDER row, so the cross-key LRU visits it first:
+    // without the pin it is the one the budget takes.
+    install_staged_aged(
+        &cache,
+        &[("live.bin", 0, 2048, 10_000), ("other.bin", 0, 2048, 120_000)],
+    )
+    .await;
 
     // The viewer watched [0, 2048) and is between two requests of the same
     // session: no body holds the key, the watch does.
@@ -1142,24 +1117,15 @@ async fn a_watch_keeps_the_viewers_window_while_the_budget_takes_other_keys() {
 
     assert!(watched.exists(), "the viewer's window survives the pause");
     assert!(!other.exists(), "the budget took the other key instead");
-    assert_eq!(cache.state.read().await.segment_bytes, 2_048, "accounting moved with the file");
+    assert_eq!(cache.snapshot().await.segment_bytes, 2_048, "accounting moved with the file");
 
     // Past the watch budget the key is ordinary material again: the pin is a
     // deadline, not an exemption (ADR-0012's rule, third application).
     clock.advance(900_001);
-    std::fs::write(&other, vec![0u8; 2048]).unwrap();
-    {
-        let mut cov = cache.coverage.lock().await;
-        let now = clock.now_millis();
-        let mut o =
-            origin_cache::cache::store::Coverage { total: 4096, last_touch_millis: now, ..Default::default() };
-        o.add_interval(0, 2048, now);
-        cov.insert("other.bin".to_string(), o);
-    }
-    cache.state.write().await.segment_bytes = 4_096;
+    install_staged_aged(&cache, &[("other.bin", 0, 2048, clock.now_millis())]).await;
     cache.tick().await;
     assert!(!watched.exists(), "after its budget a watch protects nothing");
-    assert_eq!(cache.state.read().await.segment_bytes, 2_048);
+    assert_eq!(cache.snapshot().await.segment_bytes, 2_048);
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,27 +1151,15 @@ async fn a_leased_key_survives_the_budget_until_its_grace_expires() {
     let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
 
-    let touched = 10_000u64;
     clock.advance(120_000);
+    install_staged(&cache, &[("live.bin", 0, 2048)]).await;
     let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, "live.bin", 0, 2048);
-    std::fs::write(&path, vec![0u8; 2048]).unwrap();
-    {
-        let mut cov = cache.coverage.lock().await;
-        let mut c = origin_cache::cache::store::Coverage {
-            total: 2048,
-            last_touch_millis: touched,
-            ..Default::default()
-        };
-        c.add_interval(0, 2048, touched);
-        cov.insert("live.bin".to_string(), c);
-    }
-    cache.state.write().await.segment_bytes = 2048;
 
     // A viewer is streaming this key right now.
     let lease = cache.leases.acquire_at("live.bin", Arc::clone(&clock));
     cache.tick().await;
     assert!(path.exists(), "a key being read must not be evicted for budget");
-    assert_eq!(cache.state.read().await.segment_bytes, 2048);
+    assert_eq!(cache.snapshot().await.segment_bytes, 2048);
 
     // The body ends, but the grace still covers the pause before the next
     // request of the same session.
@@ -1217,7 +1171,7 @@ async fn a_leased_key_survives_the_budget_until_its_grace_expires() {
     clock.advance(300_001);
     cache.tick().await;
     assert!(!path.exists(), "after the grace the key is ordinary budget material");
-    assert_eq!(cache.state.read().await.segment_bytes, 0);
+    assert_eq!(cache.snapshot().await.segment_bytes, 0);
 }
 
 /// The same rule against the inactivity sweep: idleness is measured from the
@@ -1235,25 +1189,15 @@ async fn the_age_sweep_spares_a_key_being_read() {
     let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
 
+    // Staged and never touched again: idle since the clock's epoch.
+    install_staged_aged(&cache, &[("long.bin", 0, 4096, 0)]).await;
     let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, "long.bin", 0, 4096);
-    std::fs::write(&path, vec![0u8; 4096]).unwrap();
-    {
-        let mut cov = cache.coverage.lock().await;
-        let mut c = origin_cache::cache::store::Coverage {
-            total: 4096,
-            last_touch_millis: 0, // never touched: idle since the epoch
-            ..Default::default()
-        };
-        c.add_interval(0, 4096, 0);
-        cov.insert("long.bin".to_string(), c);
-    }
-    cache.state.write().await.segment_bytes = 4096;
 
     let lease = cache.leases.acquire_at("long.bin", Arc::clone(&clock));
     clock.advance(1_201_000); // far past the TTL, mid-download
     cache.tick().await;
     assert!(path.exists(), "a stream in flight outlives the inactivity TTL");
-    assert_eq!(cache.state.read().await.segment_bytes, 4096);
+    assert_eq!(cache.snapshot().await.segment_bytes, 4096);
 
     // The sweep is TTL-paced, not per-tick: the next one arrives a full
     // `inactive_ttl` after the pass that spared the key. (The grace itself is
@@ -1362,14 +1306,14 @@ async fn get_range(
 /// body's last byte, so staged state is polled, never sampled).
 async fn wait_staged(cache: &Arc<Cache<MockClock>>, bytes: u64) {
     for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if cache.state.read().await.segment_bytes == bytes {
+        if cache.snapshot().await.segment_bytes == bytes {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     panic!(
         "segment_bytes never became {bytes}; got {}",
-        cache.state.read().await.segment_bytes
+        cache.snapshot().await.segment_bytes
     );
 }
 
@@ -1414,12 +1358,12 @@ async fn a_standard_profile_upstream_gets_runs_for_ranged_reads() {
     let _ = collect(&mut body).await;
     assert_eq!(opens.load(Ordering::SeqCst), 1, "one run, one upstream open");
     for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if cache.state.read().await.segment_bytes == 1 << 20 {
+        if cache.snapshot().await.segment_bytes == 1 << 20 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    assert_eq!(cache.state.read().await.segment_bytes, 1 << 20, "one window staged");
+    assert_eq!(cache.snapshot().await.segment_bytes, 1 << 20, "one window staged");
 }
 
 /// An object the magazine can NEVER hold whole still gets a run (ADR-0019).
@@ -1472,7 +1416,7 @@ async fn a_range_larger_than_the_magazine_streams_through_without_a_run() {
     );
     assert_eq!(opens.load(Ordering::SeqCst), 1, "one open, straight through");
     assert_eq!(
-        cache.state.read().await.segment_bytes,
+        cache.snapshot().await.segment_bytes,
         0,
         "and nothing was staged for it"
     );
@@ -1577,13 +1521,13 @@ async fn an_unkeepable_key_trims_itself_to_its_working_window() {
     // Exactly at the global limit, not over it: 1 MiB staged against a 1 MiB
     // cap with no durable entries is `resident + segment_bytes - max_size = 0`.
     // The trim asserted below is therefore the PER-KEY rule, not the global one.
-    assert_eq!(cache.state.read().await.segment_bytes, 1 << 20, "four windows staged");
+    assert_eq!(cache.snapshot().await.segment_bytes, 1 << 20, "four windows staged");
 
     // The spans are older than the minimum age, so they are candidates.
     clock.advance(120_000);
     cache.tick().await;
 
-    let staged = cache.state.read().await.segment_bytes;
+    let staged = cache.snapshot().await.segment_bytes;
     assert!(
         staged <= 320 << 10,
         "the key holds its working window (pin + one window = 320 KiB), not the whole walk: {staged}"
@@ -1674,7 +1618,7 @@ async fn an_overlong_upstream_range_is_cut_at_the_remainder_it_asked_for() {
     // The window is a window and the escape is its remainder: an upstream that
     // streams past both would stage the rest of the object instead.
     wait_staged(&cache, 8192 + 1024).await;
-    assert_eq!(cache.state.read().await.segment_bytes, 8192 + 1024);
+    assert_eq!(cache.snapshot().await.segment_bytes, 8192 + 1024);
 }
 
 /// Once a run has sealed, its window is a normal staged span: a later read
@@ -1782,28 +1726,30 @@ async fn a_merged_interval_still_evicts_one_file_at_a_time() {
         paths.push(path);
     }
     {
+        // One interval for the whole walk: a scan cannot produce this (touching
+        // intervals stay separate in the ledger by design, so each keeps its
+        // own window), and this bridged history is what the walk's compaction
+        // leaves behind. The BYTES still come off the disk.
         let mut cov = cache.coverage.lock().await;
         let mut c = origin_cache::cache::store::Coverage {
             total: 4096,
             last_touch_millis: touched,
             ..Default::default()
         };
-        // One interval for the whole walk: what `compact` leaves behind.
         c.add_interval(0, 4096, touched);
         assert_eq!(c.intervals.len(), 1, "the premise is a merged ledger");
         cov.insert("m.bin".to_string(), c);
     }
-    cache.state.write().await.segment_bytes = 4096;
+    rebuild_staged_bytes(&cache).await;
 
     cache.tick().await;
 
-    let s = cache.state.read().await;
-    let cov = cache.coverage.lock().await;
-    assert_eq!(s.segment_bytes, 3072, "one span's worth must be freed");
+    assert_eq!(cache.snapshot().await.segment_bytes, 3072, "one span's worth must be freed");
     assert!(paths[0].exists() == false, "the stalest span (lowest offset) goes first");
     assert!(paths[1].exists() && paths[2].exists() && paths[3].exists(), "the rest stay");
+    let spans = cache.inspect("m.bin").await.ledger_spans;
     assert_eq!(
-        cov.get("m.bin").unwrap().intervals,
+        spans.iter().map(|s| (s.start, s.end, s.last_read_millis, s.reads)).collect::<Vec<_>>(),
         vec![(1024, 2048, touched, 0), (2048, 3072, touched, 0), (3072, 4096, touched, 0)],
         "the rebuilt ledger describes exactly the surviving files, carrying their read time"
     );
@@ -1834,8 +1780,10 @@ async fn a_decayed_interval_leaves_its_files_evictable() {
         paths.push(path);
     }
     {
+        // No intervals at all: every record of these bytes decayed away, while
+        // the files themselves are still here. That is a state only the decay
+        // path produces, so it is built rather than scanned.
         let mut cov = cache.coverage.lock().await;
-        // No intervals at all: every record of these bytes decayed away.
         cov.insert(
             "d.bin".to_string(),
             origin_cache::cache::store::Coverage {
@@ -1845,17 +1793,15 @@ async fn a_decayed_interval_leaves_its_files_evictable() {
             },
         );
     }
-    cache.state.write().await.segment_bytes = 2048;
+    rebuild_staged_bytes(&cache).await;
 
     cache.tick().await;
 
-    let s = cache.state.read().await;
-    let cov = cache.coverage.lock().await;
-    assert_eq!(s.segment_bytes, 1024);
+    assert_eq!(cache.snapshot().await.segment_bytes, 1024);
     assert!(!paths[0].exists() && paths[1].exists(), "one file goes, one stays");
-    let iv = &cov.get("d.bin").unwrap().intervals;
+    let iv = cache.inspect("d.bin").await.ledger_spans;
     assert_eq!(iv.len(), 1, "the survivor is recorded again");
-    assert_eq!((iv[0].0, iv[0].1), (1024, 2048));
+    assert_eq!((iv[0].start, iv[0].end), (1024, 2048));
 }
 
 /// The scale shape: a sequential 1-byte-per-span walk past the ledger ceiling.
@@ -1884,6 +1830,8 @@ async fn a_sequential_walk_past_the_ledger_ceiling_stays_evictable() {
         std::fs::write(&path, vec![7u8; 1]).unwrap();
     }
     {
+        // The ceiling's own compaction, which no scan produces: the ledger
+        // collapses a walk this long. The BYTES come off the disk.
         let mut cov = cache.coverage.lock().await;
         let mut c = origin_cache::cache::store::Coverage {
             total: spans as u64,
@@ -1900,16 +1848,14 @@ async fn a_sequential_walk_past_the_ledger_ceiling_stays_evictable() {
         );
         cov.insert("walk.bin".to_string(), c);
     }
-    cache.state.write().await.segment_bytes = spans as u64;
+    rebuild_staged_bytes(&cache).await;
 
     cache.tick().await;
 
-    let s = cache.state.read().await;
-    let files = origin_cache::cache::store::segments_for_key(&cfg.cache_dir, "walk.bin").len();
-    let cov = cache.coverage.lock().await;
-    assert_eq!(s.segment_bytes, 1000, "the budget is respected");
-    assert_eq!(files, 1000, "exactly one file per byte of the budget remains");
-    let covered: u64 = cov.get("walk.bin").unwrap().intervals.iter().map(|(s, e, ..)| e - s).sum();
+    let key = cache.inspect("walk.bin").await;
+    assert_eq!(cache.snapshot().await.segment_bytes, 1000, "the budget is respected");
+    assert_eq!(key.staged_spans.len(), 1000, "exactly one file per byte of the budget remains");
+    let covered: u64 = key.ledger_spans.iter().map(|s| s.end - s.start).sum();
     assert_eq!(covered, 1000, "the rebuilt ledger covers exactly the surviving files");
 }
 
@@ -2028,3 +1974,91 @@ async fn metadata_loss_rebuilds_rows_from_the_object_tree() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// The key-state view (ADR-0021): one read-only seam that production's operator
+// surface and the tests share, replacing direct projections of the machinery's
+// fields.
+// ---------------------------------------------------------------------------
+
+/// A key nobody touched is empty; a ranged read stages a window, takes a lease
+/// while the body lives and a watch that outlives it; a whole-file pull
+/// installs the row the ranged path never does. The view keeps the DISK's
+/// answer (what exists) apart from the LEDGER's (what the policy believes).
+#[tokio::test]
+async fn inspect_reports_one_key_from_disk_and_ledger() {
+    let dir = tempdir().unwrap();
+    let (cache, _opens) = run_fixture(dir.path(), 1 << 20, 8192, 0);
+
+    let untouched = cache.inspect("a.bin").await;
+    assert!(!untouched.installed);
+    assert!(untouched.staged_spans.is_empty());
+    assert_eq!(untouched.staged_bytes, 0);
+    assert!(untouched.ledger_spans.is_empty());
+    assert_eq!(untouched.ledger_total, None);
+    assert_eq!(untouched.pin, None);
+    assert!(!untouched.leased);
+
+    let served = get_range(&cache, 0, 1024).await;
+    let mut body = served.plan.body;
+    assert_eq!(collect(&mut body).await, synthetic(0, 1024));
+    wait_staged(&cache, 8192).await;
+
+    let staged = cache.inspect("a.bin").await;
+    assert!(!staged.installed, "a run stages a window; it installs no entry");
+    assert_eq!(staged.staged_spans, vec![(0, 8192)], "the disk's answer");
+    assert_eq!(staged.staged_bytes, 8192);
+    assert_eq!(staged.ledger_spans.len(), 1, "the ledger's map of the same bytes");
+    assert_eq!((staged.ledger_spans[0].start, staged.ledger_spans[0].end), (0, 8192));
+    assert_eq!(staged.ledger_total, Some(1 << 20), "the object's size, as staged");
+    assert!(staged.ledger_last_touch_millis.is_some());
+    // The response's own guard is still in this scope, so the key reports as
+    // leased; the watch is what outlives the body (ADR-0017 vs ADR-0018), and
+    // the healthz test pins the other side of it — once the plane drops the
+    // body, `leased` goes false while the pin stays.
+    assert!(staged.leased, "the guard this scope holds is visible");
+    assert!(staged.pin.is_some(), "the viewer's neighbourhood is still pinned");
+
+    // A whole-file pull installs the row the ranged path never does.
+    let mut hit = cache.get_by_key("a.bin", None).await.unwrap();
+    assert_eq!(collect(&mut hit.body).await.len(), 1 << 20);
+    wait_entry(&cache, "a.bin").await;
+    let installed = cache.inspect("a.bin").await;
+    assert!(installed.installed);
+    assert!(!installed.tombstone);
+    assert_eq!(installed.entry_bytes, Some(1 << 20));
+    assert!(!installed.oversize);
+}
+
+/// A negative row is a row: `installed` says something is known about the key,
+/// `tombstone` says what — and the tombstone expires with its window.
+#[tokio::test]
+async fn inspect_reports_a_negative_row_as_a_tombstone() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ..Config::default()
+    };
+    cfg.negative_ttl_secs = 60;
+    let cfg = Arc::new(cfg);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend =
+        CountingBackend::counting(b"x".to_vec(), None, Arc::clone(&calls), Some(BackendError::NotFound));
+    let mut slots = HashMap::new();
+    slots.insert("primary".to_string(), Arc::new(BackendSlot::new(Arc::new(backend), 3)));
+    let cache = Arc::new(Cache::new(cfg, Arc::clone(&clock), BackendRegistry::new(slots)));
+
+    assert!(cache.get_by_key("gone.bin", None).await.is_err(), "404 from upstream");
+    wait_entry(&cache, "gone.bin").await;
+    let k = cache.inspect("gone.bin").await;
+    assert!(k.installed, "a tombstone is a row");
+    assert!(k.tombstone, "and it says so");
+    assert!(k.staged_spans.is_empty(), "nothing was written for it");
+
+    // Past the negative window the row is no longer a tombstone.
+    clock.advance(61_000);
+    let k = cache.inspect("gone.bin").await;
+    assert!(k.installed);
+    assert!(!k.tombstone);
+}

@@ -508,10 +508,18 @@ where
     builder.body(Body::empty()).unwrap()
 }
 
-async fn healthz<C>(State(state): State<AppState<C>>) -> impl IntoResponse
+async fn healthz<C>(State(state): State<AppState<C>>, RawQuery(query): RawQuery) -> impl IntoResponse
 where
     C: Clock + Clone,
 {
+    // One key on demand (`?key=<raw key>`): the operator view of a single
+    // object — is it installed, what is staged for it, who is watching it —
+    // so answering "why is this thing being refetched?" does not need a
+    // debugger. Absent the parameter the body is unchanged.
+    let key_view = match query.as_deref().and_then(key_param) {
+        Some(key) => Some(key_state_json(&state.cache.inspect(&key).await)),
+        None => None,
+    };
     // Live-machinery view (spec §8: the queue-ish counters operators watch
     // when a node misbehaves) — read through the Cache snapshot, not the
     // internals (C4).
@@ -561,31 +569,75 @@ where
         }
     };
     let degraded = !reasons.is_empty();
-    (
-        StatusCode::OK,
-        Json(json!({
-            "status": if degraded { "degraded" } else { "ok" },
-            "degraded": degraded,
-            "degraded_reasons": reasons,
-            "plane": "business",
-            "version": env!("CARGO_PKG_VERSION"),
-            "entries": count,
-            "bytes": bytes,
-            "segment_bytes": segment_bytes,
-            "stray_bytes": stray_bytes,
-            "flights_active": flights,
-            "dirty_access_flushes": dirty_access,
-            "coverage_keys": coverage_keys,
-            "coverage_intervals": coverage_intervals,
-            "store": store,
-            "rebuilt_rows": snap.rebuilt_rows,
-            "prewarm_inflight": snap.prewarm_inflight,
-            "disk_free_bytes": snap.disk_free_bytes,
-            "disk_reserve_bytes": snap.disk_reserve_bytes,
-            "sigv4_enabled": state.sigv4_config.is_some(),
-            "upstreams": upstreams,
-        })),
-    )
+    let mut body = json!({
+        "status": if degraded { "degraded" } else { "ok" },
+        "degraded": degraded,
+        "degraded_reasons": reasons,
+        "plane": "business",
+        "version": env!("CARGO_PKG_VERSION"),
+        "entries": count,
+        "bytes": bytes,
+        "segment_bytes": segment_bytes,
+        "stray_bytes": stray_bytes,
+        "flights_active": flights,
+        "dirty_access_flushes": dirty_access,
+        "coverage_keys": coverage_keys,
+        "coverage_intervals": coverage_intervals,
+        "store": store,
+        "rebuilt_rows": snap.rebuilt_rows,
+        "prewarm_inflight": snap.prewarm_inflight,
+        "disk_free_bytes": snap.disk_free_bytes,
+        "disk_reserve_bytes": snap.disk_reserve_bytes,
+        "sigv4_enabled": state.sigv4_config.is_some(),
+        "upstreams": upstreams,
+    });
+    if let Some(k) = key_view {
+        body["key"] = k;
+    }
+    (StatusCode::OK, Json(body))
+}
+
+/// The `key=` parameter of a query string, percent-decoded (`media/a b.bin`
+/// arrives as `media%2Fa+b.bin`). `form_urlencoded` rather than a split on `=`
+/// for exactly that reason: a key is arbitrary bytes and the query is not.
+fn key_param(query: &str) -> Option<String> {
+    form_urlencoded::parse(query.as_bytes())
+        .find(|(k, _)| k == "key")
+        .map(|(_, v)| v.into_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// [`crate::cache::cache::KeyState`] as JSON: the operator view, with the
+/// disk's view and the ledger's view kept apart because they answer different
+/// questions (what exists vs. what the policy believes).
+fn key_state_json(k: &crate::cache::cache::KeyState) -> serde_json::Value {
+    let spans = |v: &[(u64, u64)]| -> Vec<serde_json::Value> {
+        v.iter().map(|(s, e)| json!({"start": s, "end": e})).collect()
+    };
+    json!({
+        "installed": k.installed,
+        "tombstone": k.tombstone,
+        "entry_bytes": k.entry_bytes,
+        "oversize": k.oversize,
+        "last_access_millis": k.last_access_millis,
+        "staged_spans": spans(&k.staged_spans),
+        "staged_bytes": k.staged_bytes,
+        "ledger_spans": k
+            .ledger_spans
+            .iter()
+            .map(|s| json!({
+                "start": s.start,
+                "end": s.end,
+                "last_read_millis": s.last_read_millis,
+                "reads": s.reads,
+            }))
+            .collect::<Vec<_>>(),
+        "ledger_total": k.ledger_total,
+        "ledger_etag": k.ledger_etag,
+        "ledger_last_touch_millis": k.ledger_last_touch_millis,
+        "pin": k.pin.map(|(s, e, a)| json!({"start": s, "end": e, "anchor": a})),
+        "leased": k.leased,
+    })
 }
 
 async fn prewarm<C>(
@@ -1096,12 +1148,12 @@ mod tests {
         assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 1);
         // Background fill installs the entry without any viewer attached.
         for _ in 0..crate::testsupport::WAIT_TRIES {
-            if fx.state.cache.state.read().await.entries.contains_key("new.bin") {
+            if fx.state.cache.entry_exists("new.bin").await {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert!(fx.state.cache.state.read().await.entries.contains_key("new.bin"));
+        assert!(fx.state.cache.entry_exists("new.bin").await);
     }
 
     #[tokio::test]
@@ -1158,25 +1210,25 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         assert!(body.contains("accepted"), "{body}");
         for _ in 0..crate::testsupport::WAIT_TRIES {
-            if fx.state.cache.state.read().await.entries.contains_key("w.bin") {
+            if fx.state.cache.entry_exists("w.bin").await {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(
-            fx.state.cache.state.read().await.entries.contains_key("w.bin"),
+            fx.state.cache.entry_exists("w.bin").await,
             "the background fetch must still install the row"
         );
         // The in-flight count must come back down on its own, or healthz
         // would report a queue that never drains.
         for _ in 0..100 {
-            if fx.state.cache.prewarm_inflight.load(Ordering::SeqCst) == 0 {
+            if fx.state.cache.snapshot().await.prewarm_inflight == 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(
-            fx.state.cache.prewarm_inflight.load(Ordering::SeqCst),
+            fx.state.cache.snapshot().await.prewarm_inflight,
             0,
             "the prewarm in-flight count must return to zero"
         );
@@ -1192,7 +1244,7 @@ mod tests {
         let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("hit"), "{body}");
-        assert_eq!(fx.state.cache.prewarm_inflight.load(Ordering::SeqCst), 0);
+        assert_eq!(fx.state.cache.snapshot().await.prewarm_inflight, 0);
     }
 
     #[tokio::test]
@@ -1211,19 +1263,18 @@ mod tests {
         assert_eq!(body, "2345");
         assert_eq!(h.get("content-range").unwrap(), "bytes 2-5/10");
         // No flight, no entry: pure passthrough.
-        assert!(!fx.state.cache.state.read().await.entries.contains_key("a.bin"));
+        assert!(!fx.state.cache.entry_exists("a.bin").await);
         assert_eq!(fx.open_calls.load(Ordering::SeqCst), 1);
         // The run's window was staged as one sidecar (the seal lands after the
         // last byte, hence the wait); ledger merged.
         wait_ledger(&fx, "a.bin", &[(2, 6)]).await;
         assert_eq!(staged_segments(&fx, "a.bin"), vec![(2, 6)]);
-        let cov = fx.state.cache.coverage.lock().await;
-        let c = cov.get("a.bin").unwrap();
-        assert_eq!(c.intervals.len(), 1);
-        assert_eq!((c.intervals[0].0, c.intervals[0].1), (2, 6));
-        assert_eq!(c.total, 10);
-        assert_eq!(c.etag.as_deref(), Some("v1"));
-        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 4);
+        let k = fx.state.cache.inspect("a.bin").await;
+        assert_eq!(k.ledger_spans.len(), 1);
+        assert_eq!((k.ledger_spans[0].start, k.ledger_spans[0].end), (2, 6));
+        assert_eq!(k.ledger_total, Some(10));
+        assert_eq!(k.ledger_etag.as_deref(), Some("v1"));
+        assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 4);
     }
 
     #[tokio::test]
@@ -1237,16 +1288,15 @@ mod tests {
         wait_ledger(&fx, "a.bin", &[(0, 2), (4, 6)]).await;
         assert_eq!(staged_segments(&fx, "a.bin"), vec![(0, 2), (4, 6)]);
         {
-            let cov = fx.state.cache.coverage.lock().await;
-            let iv = &cov.get("a.bin").unwrap().intervals;
-            assert_eq!(iv.len(), 2);
-            assert_eq!((iv[0].0, iv[0].1), (0, 2));
-            assert_eq!((iv[1].0, iv[1].1), (4, 6));
+            let k = fx.state.cache.inspect("a.bin").await;
+            assert_eq!(k.ledger_spans.len(), 2);
+            assert_eq!((k.ledger_spans[0].start, k.ledger_spans[0].end), (0, 2));
+            assert_eq!((k.ledger_spans[1].start, k.ledger_spans[1].end), (4, 6));
         }
         wait_segment_bytes(&fx, 4).await;
-        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 4);
+        assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 4);
         // Still no cache entry: staging is not filling.
-        assert!(!fx.state.cache.state.read().await.entries.contains_key("a.bin"));
+        assert!(!fx.state.cache.entry_exists("a.bin").await);
     }
 
     #[tokio::test]
@@ -1288,14 +1338,11 @@ mod tests {
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
         assert_eq!(body, "234567");
         assert_eq!(h.get("content-range").unwrap(), "bytes 2-7/10");
-        {
-            let cov = fx.state.cache.coverage.lock().await;
-            assert_eq!(
-                cov.get("a.bin").unwrap().last_touch_millis,
-                5_000,
-                "a staged read refreshes the row's age, so a watched window is not swept"
-            );
-        }
+        assert_eq!(
+            fx.state.cache.inspect("a.bin").await.ledger_last_touch_millis,
+            Some(5_000),
+            "a staged read refreshes the row's age, so a watched window is not swept"
+        );
         assert_eq!(
             fx.open_calls.load(Ordering::SeqCst),
             0,
@@ -1358,7 +1405,7 @@ mod tests {
             "both spans stay staged: the ledger is now fully covered"
         );
         assert!(
-            fx.state.cache.state.read().await.entries.is_empty(),
+            fx.state.cache.snapshot().await.entries == 0,
             "no promotion: the staged spans ARE the cache"
         );
     }
@@ -1449,9 +1496,9 @@ mod tests {
         // The run covers the request's own window FROM WHERE THE REQUEST
         // STARTS (nothing was staged before it), so the span is [2, 10).
         wait_ledger(&fx, "a.bin", &[(2, 10)]).await;
-        let s = fx.state.cache.state.read().await;
-        assert!(
-            s.entries.is_empty(),
+        assert_eq!(
+            fx.state.cache.snapshot().await.entries,
+            0,
             "a ranged read stages a window; it does not install an entry"
         );
     }
@@ -1475,7 +1522,7 @@ mod tests {
         fx.state.cache.clock.advance(1_201_000);
         fx.state.cache.tick().await;
         assert!(staged_segments(&fx, "a.bin").is_empty());
-        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 0);
+        assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 0);
     }
 
     #[tokio::test]
@@ -1491,7 +1538,7 @@ mod tests {
         .await;
         body_text(resp).await;
         wait_segment_bytes(&fx, 4).await;
-        let resp = healthz(State(fx.state.clone())).await.into_response();
+        let resp = healthz(State(fx.state.clone()), RawQuery(None)).await.into_response();
         let (_, _, body) = body_text(resp).await;
         assert!(body.contains("\"segment_bytes\":4"), "{body}");
         assert!(body.contains("\"flights_active\":"), "{body}");
@@ -1507,7 +1554,7 @@ mod tests {
     #[tokio::test]
     async fn healthz_reports_a_verdict_and_disk_state() {
         let fx = fixture(b"x", None, Vec::new(), false);
-        let resp = healthz(State(fx.state.clone())).await.into_response();
+        let resp = healthz(State(fx.state.clone()), RawQuery(None)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK, "liveness stays 200");
         let (_, _, body) = body_text(resp).await;
         assert!(body.contains("\"degraded\":false"), "{body}");
@@ -1523,10 +1570,73 @@ mod tests {
     #[tokio::test]
     async fn healthz_reports_nocache_profile() {
         let fx = fixture_nocache(b"0123456789");
-        let resp = healthz(State(fx.state.clone())).await.into_response();
+        let resp = healthz(State(fx.state.clone()), RawQuery(None)).await.into_response();
         let (_, _, body) = body_text(resp).await;
         assert!(body.contains("\"profile\":\"nocache\""), "{body}");
         assert!(body.contains("\"entries\":0"), "{body}");
+    }
+
+    /// `?key=` answers the questions an investigation actually starts with: is
+    /// this object installed, which spans are staged for it, who is watching
+    /// it. It rides the same seam the tests read state through
+    /// (`Cache::inspect`), so "what is this key's state" has one answer rather
+    /// than one per consumer.
+    #[tokio::test]
+    async fn healthz_answers_for_one_key_on_demand() {
+        let fx = fixture_efficient(b"0123456789", 4);
+        let resp = get_key(
+            State(fx.state.clone()),
+            Path("a.bin".into()),
+            headers(&[("range", "bytes=2-5")]),
+            RawQuery(None),
+            OriginalUri(DEFAULT_TEST_URI.clone()),
+        )
+        .await;
+        body_text(resp).await;
+        wait_spans(&fx, "a.bin", 1).await;
+
+        // A key with nothing on this node, and one with a staged span. The
+        // parameter is percent-encoded here, because that is how it arrives.
+        let resp = healthz(State(fx.state.clone()), RawQuery(Some("key=absent.bin".into())))
+            .await
+            .into_response();
+        let (_, _, body) = body_text(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let key = v.get("key").expect("the key section");
+        assert_eq!(key["installed"], json!(false));
+        assert_eq!(key["staged_bytes"], json!(0));
+        assert_eq!(key["staged_spans"], json!([]));
+
+        let resp = healthz(State(fx.state.clone()), RawQuery(Some("key=a.bin".into())))
+            .await
+            .into_response();
+        let (_, _, body) = body_text(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let key = v.get("key").expect("the key section");
+        // The disk's view and the ledger's view of the same span, kept apart.
+        assert_eq!(key["installed"], json!(false), "no entry was installed");
+        assert_eq!(key["staged_spans"], json!([{"start": 2, "end": 6}]));
+        assert_eq!(key["staged_bytes"], json!(4));
+        assert_eq!(key["ledger_spans"][0]["start"], json!(2));
+        assert_eq!(key["ledger_spans"][0]["end"], json!(6));
+        assert_eq!(key["ledger_total"], json!(10));
+        assert_eq!(key["ledger_etag"], json!("v1"));
+
+        // No parameter: the body is what it always was.
+        let resp = healthz(State(fx.state.clone()), RawQuery(None)).await.into_response();
+        let (_, _, body) = body_text(resp).await;
+        assert!(!body.contains("\"key\":"), "no key section without the query: {body}");
+    }
+
+    /// A key is arbitrary bytes, so the query is percent-decoded rather than
+    /// split on `=`: `media/a b.bin` has to reach the same key the object
+    /// plane would route.
+    #[test]
+    fn healthz_key_parameter_decodes() {
+        assert_eq!(key_param("key=media%2Fa+b.bin").as_deref(), Some("media/a b.bin"));
+        assert_eq!(key_param("key=a.bin&other=1").as_deref(), Some("a.bin"));
+        assert_eq!(key_param("other=1"), None);
+        assert_eq!(key_param("key="), None);
     }
 
     /// Version flip between transfers: history resets, no mixed-version entry
@@ -1556,9 +1666,11 @@ mod tests {
         // span is the request's WINDOW (50 bytes here), not its own 30 bytes:
         // the seek starts a run (ADR-0016).
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(50, 100)]);
-        let cov = fx.state.cache.coverage.lock().await;
-        assert_eq!(cov.get("f.bin").unwrap().etag.as_deref(), Some("v2"));
-        assert!(!fx.state.cache.state.read().await.entries.contains_key("f.bin"));
+        assert_eq!(
+            fx.state.cache.inspect("f.bin").await.ledger_etag.as_deref(),
+            Some("v2")
+        );
+        assert!(!fx.state.cache.entry_exists("f.bin").await);
     }
 
     /// A drift discovered WHILE the key is being watched must not cut the
@@ -1593,7 +1705,7 @@ mod tests {
             "the old version's spans are still on disk, untouched"
         );
         assert_eq!(
-            fx.state.cache.coverage.lock().await.get("f.bin").unwrap().etag.as_deref(),
+            fx.state.cache.inspect("f.bin").await.ledger_etag.as_deref(),
             Some("v1"),
             "the ledger was not re-anchored under the viewer: nothing was mixed"
         );
@@ -1605,7 +1717,7 @@ mod tests {
         wait_ledger(&fx, "f.bin", &[(50, 100)]).await;
         assert_eq!(staged_segments(&fx, "f.bin"), vec![(50, 100)], "the old spans went once nobody was reading");
         assert_eq!(
-            fx.state.cache.coverage.lock().await.get("f.bin").unwrap().etag.as_deref(),
+            fx.state.cache.inspect("f.bin").await.ledger_etag.as_deref(),
             Some("v2")
         );
     }
@@ -1696,9 +1808,9 @@ mod tests {
         assert_eq!(fx.stat_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fx.open_calls.load(Ordering::SeqCst), 1);
         // Zero disk: no entries, no segment bytes, no stray cache files.
-        assert!(!fx.state.cache.state.read().await.entries.contains_key("a.bin"));
-        assert_eq!(fx.state.cache.state.read().await.total_bytes, 0);
-        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 0);
+        assert!(!fx.state.cache.entry_exists("a.bin").await);
+        assert_eq!(fx.state.cache.snapshot().await.total_bytes, 0);
+        assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 0);
         assert_eq!(stray_cache_files(&fx), 0);
     }
 
@@ -1712,8 +1824,8 @@ mod tests {
         assert_eq!(body, "2345");
         assert_eq!(h.get("content-range").unwrap(), "bytes 2-5/10");
         assert_eq!(stray_cache_files(&fx), 0);
-        assert_eq!(fx.state.cache.state.read().await.total_bytes, 0);
-        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 0);
+        assert_eq!(fx.state.cache.snapshot().await.total_bytes, 0);
+        assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 0);
     }
 
     /// Nocache HEAD: one stat, no open, no disk state.
@@ -1743,13 +1855,13 @@ mod tests {
         assert!(body.contains("accepted"), "{body}");
         // Let the background task run before judging what it did.
         for _ in 0..20 {
-            if fx.state.cache.prewarm_inflight.load(Ordering::SeqCst) == 0 {
+            if fx.state.cache.snapshot().await.prewarm_inflight == 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
-        assert!(!fx.state.cache.state.read().await.entries.contains_key("w.bin"));
+        assert!(!fx.state.cache.entry_exists("w.bin").await);
     }
 
     /// A malformed object key is a client error: 400 with the S3
@@ -1953,7 +2065,7 @@ mod tests {
         fx.state.cache.clock.advance(1_000);
         stage(&fx, "b.bin", "bytes=0-4").await;
         wait_segment_bytes(&fx, 15).await;
-        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 15);
+        assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 15);
 
         // Age both rows past the eviction guard so they are evictable.
         fx.state.cache.clock.advance(120_000);
@@ -1965,7 +2077,7 @@ mod tests {
             "heat keeps the span that was re-read; the colder fresh one goes"
         );
         assert_eq!(staged_segments(&fx, "b.bin"), vec![(0, 5)], "the newer row is untouched");
-        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 10);
+        assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 10);
     }
 
     /// The same shape under lru (the default): the stalest span goes, reads
@@ -1993,7 +2105,7 @@ mod tests {
         fx.state.cache.clock.advance(1_000);
         stage(&fx, "b.bin", "bytes=0-4").await;
         wait_segment_bytes(&fx, 15).await;
-        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 15);
+        assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 15);
 
         fx.state.cache.clock.advance(120_000);
         fx.state.cache.tick().await;
@@ -2006,7 +2118,7 @@ mod tests {
         assert_eq!(staged_segments(&fx, "b.bin"), vec![(0, 5)], "the newer row is untouched");
         // Span-level: the row survives with its other span, and the byte
         // account drops by one span rather than by a whole window.
-        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 10);
+        assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 10);
     }
 
     /// Sealing is asynchronous: the run's driver renames the span and merges
@@ -2017,35 +2129,40 @@ mod tests {
     async fn wait_ledger(fx: &Fixture, key: &str, expect: &[(u64, u64)]) {
         for _ in 0..crate::testsupport::WAIT_TRIES {
             {
-                let cov = fx.state.cache.coverage.lock().await;
-                if let Some(c) = cov.get(key) {
-                    let got: Vec<(u64, u64)> = c.intervals.iter().map(|(s, e, ..)| (*s, *e)).collect();
-                    if got == expect {
-                        return;
-                    }
+                let got = ledger_spans(fx, key).await;
+                if got == expect {
+                    return;
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let cov = fx.state.cache.coverage.lock().await;
-        let got: Vec<(u64, u64)> = cov
-            .get(key)
-            .map(|c| c.intervals.iter().map(|(s, e, ..)| (*s, *e)).collect())
-            .unwrap_or_default();
+        let got = ledger_spans(fx, key).await;
         panic!("ledger for {key} never became {expect:?}; got {got:?}");
+    }
+
+    /// The ledger's spans as `(start, end)`, off the same view an operator reads.
+    async fn ledger_spans(fx: &Fixture, key: &str) -> Vec<(u64, u64)> {
+        fx.state
+            .cache
+            .inspect(key)
+            .await
+            .ledger_spans
+            .iter()
+            .map(|s| (s.start, s.end))
+            .collect()
     }
 
     /// The same wait for the staged-byte counter (healthz-level assertions).
     async fn wait_segment_bytes(fx: &Fixture, expect: u64) {
         for _ in 0..crate::testsupport::WAIT_TRIES {
-            if fx.state.cache.state.read().await.segment_bytes == expect {
+            if fx.state.cache.snapshot().await.segment_bytes == expect {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!(
             "segment_bytes never became {expect}; got {}",
-            fx.state.cache.state.read().await.segment_bytes
+            fx.state.cache.snapshot().await.segment_bytes
         );
     }
 
@@ -2066,10 +2183,14 @@ mod tests {
 
     /// The ledger's `(start, end, reads)` triples, for the heat assertions.
     async fn span_reads(fx: &Fixture, key: &str) -> Vec<(u64, u64, u64)> {
-        let cov = fx.state.cache.coverage.lock().await;
-        cov.get(key)
-            .map(|c| c.intervals.iter().map(|(s, e, _, r)| (*s, *e, *r)).collect())
-            .unwrap_or_default()
+        fx.state
+            .cache
+            .inspect(key)
+            .await
+            .ledger_spans
+            .iter()
+            .map(|s| (s.start, s.end, s.reads))
+            .collect()
     }
 
     /// Heat must see the reads a scrub actually makes. Two rules, both of
@@ -2140,7 +2261,7 @@ mod tests {
         fx.state.cache.clock.advance(1_200_001);
         fx.state.cache.tick().await;
         assert!(staged_segments(&fx, "a.bin").is_empty(), "with no reader, idleness applies");
-        assert_eq!(fx.state.cache.state.read().await.segment_bytes, 0);
+        assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 0);
     }
 
     /// Every response holds its key's lease, whatever end of the pipe filled
@@ -2290,7 +2411,7 @@ mod tests {
             wait_spans(&fx, "b.bin", (off / 262_144 + 1) as usize).await;
         }
         assert_eq!(
-            fx.state.cache.state.read().await.segment_bytes,
+            fx.state.cache.snapshot().await.segment_bytes,
             2_097_152,
             "a={:?} b={:?}",
             staged_segments(&fx, "a.bin"),
@@ -2302,7 +2423,7 @@ mod tests {
         fx.state.cache.tick().await;
 
         let a = staged_segments(&fx, "a.bin");
-        let seg = fx.state.cache.state.read().await.segment_bytes;
+        let seg = fx.state.cache.snapshot().await.segment_bytes;
         assert!(
             seg <= 1_048_576,
             "the budget must be enforced while a viewer is watching (segment_bytes={seg})"
@@ -2341,14 +2462,13 @@ mod tests {
         .await;
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let s = fx.state.cache.state.read().await;
-        assert!(
-            s.entries.is_empty(),
-            "a nocache 404 must leave no row, not even a tombstone: {:?}",
-            s.entries.keys().collect::<Vec<_>>()
+        let snap = fx.state.cache.snapshot().await;
+        assert_eq!(
+            snap.entries, 0,
+            "a nocache 404 must leave no row, not even a tombstone"
         );
-        assert_eq!(s.total_bytes, 0);
-        assert_eq!(s.segment_bytes, 0);
+        assert_eq!(snap.total_bytes, 0);
+        assert_eq!(snap.segment_bytes, 0);
     }
 
     /// Router construction smoke test: every route path must survive

@@ -405,6 +405,56 @@ pub struct CacheSnapshot {
     pub disk_reserve_bytes: u64,
 }
 
+/// One staged interval as the LEDGER knows it: the byte span, when it was last
+/// read (the window's decay clock), and how many times (heat, the eviction
+/// policy's input). A merged interval carries the sum of its parts' reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpanReads {
+    pub start: u64,
+    pub end: u64,
+    pub last_read_millis: u64,
+    pub reads: u64,
+}
+
+/// One key's state, as the operator view and the tests both need it: what is
+/// installed, what is staged, what is protected, and where the reader is.
+///
+/// It exists because the tests used to project the machinery's fields directly
+/// — 99 times — including WRITING them to invent a state (`segment_bytes = N`)
+/// and moving `CacheState` wholesale between caches. A read-only snapshot is
+/// the honest version of that: one lock pass plus one scan of this key's
+/// sidecars, so a caller sees a consistent picture instead of a sequence of
+/// them, and the disk stays the authority on what exists (ADR-0015).
+#[derive(Debug, Clone)]
+pub struct KeyState {
+    /// An entry row is present: a real object, or a negative tombstone.
+    pub installed: bool,
+    pub tombstone: bool,
+    pub entry_bytes: Option<u64>,
+    pub last_access_millis: Option<u64>,
+    /// The row was admitted knowing it is larger than the whole magazine
+    /// budget (ADR-0014), so the byte budget neither counts nor evicts it.
+    pub oversize: bool,
+    /// The sidecars on DISK for this key, `(start, end)`, sorted.
+    pub staged_spans: Vec<(u64, u64)>,
+    /// Their total length: what this key costs the staged-byte budget.
+    pub staged_bytes: u64,
+    /// The ledger's map for the same key: the spans it believes in, with their
+    /// read clock and count, and the object version they were staged under.
+    pub ledger_spans: Vec<SpanReads>,
+    pub ledger_total: Option<u64>,
+    pub ledger_etag: Option<String>,
+    /// When the ledger row was last staged or touched: the AGE the sweep and
+    /// the min-age guard read. Not to be confused with the entry's
+    /// `last_access_millis`, which is a different clock on a different row.
+    pub ledger_last_touch_millis: Option<u64>,
+    /// The watch pin `(start, end, anchor)` while this key is being watched
+    /// (ADR-0018). `None` = nobody is watching, or the pin is empty.
+    pub pin: Option<(u64, u64, u64)>,
+    /// A response body for this key is alive (ADR-0017).
+    pub leased: bool,
+}
+
 /// The Cache is the only seam between the HTTP layer and the cache
 /// machinery (ADR-0002). Its interface is the request path (get / head /
 /// resolve / per-profile serves), lifecycle (load_and_start / tick), the
@@ -745,6 +795,70 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     /// Whether any entry row (positive or negative tombstone) exists.
     pub async fn entry_exists(&self, key: &str) -> bool {
         self.state.read().await.entries.contains_key(key)
+    }
+
+    /// The operator view of ONE key (see [`KeyState`]), and the seam the tests
+    /// read state through instead of projecting the machinery's fields.
+    ///
+    /// One lock pass, one ledger read, one directory scan of the key's
+    /// sidecars: the scan is the authority on what is staged, so a span whose
+    /// file vanished is simply absent here, while the ledger still lists it as
+    /// the policy's map of the same bytes.
+    pub async fn inspect(&self, key: &str) -> KeyState {
+        let now = self.clock.now_millis();
+        let (installed, tombstone, entry_bytes, last_access_millis, oversize) = {
+            let s = self.state.read().await;
+            match s.entries.get(key) {
+                Some(m) => (
+                    true,
+                    m.is_negative(now),
+                    Some(m.size_bytes),
+                    Some(m.last_access_millis),
+                    m.oversize,
+                ),
+                None => (false, false, None, None, false),
+            }
+        };
+        let staged_spans: Vec<(u64, u64)> = store::segments_for_key(&self.config.cache_dir, key)
+            .into_iter()
+            .map(|(start, end, _)| (start, end))
+            .collect();
+        let staged_bytes = staged_spans.iter().map(|(s, e)| e - s).sum();
+        let (ledger_spans, ledger_total, ledger_etag, ledger_last_touch_millis) = {
+            let cov = self.coverage.lock().await;
+            match cov.get(key) {
+                Some(c) => (
+                    c.intervals
+                        .iter()
+                        .map(|(start, end, last_read_millis, reads)| SpanReads {
+                            start: *start,
+                            end: *end,
+                            last_read_millis: *last_read_millis,
+                            reads: *reads,
+                        })
+                        .collect(),
+                    Some(c.total),
+                    c.etag.clone(),
+                    Some(c.last_touch_millis),
+                ),
+                None => (Vec::new(), None, None, None),
+            }
+        };
+        KeyState {
+            installed,
+            tombstone,
+            entry_bytes,
+            last_access_millis,
+            oversize,
+            staged_spans,
+            staged_bytes,
+            ledger_spans,
+            ledger_total,
+            ledger_etag,
+            ledger_last_touch_millis,
+            pin: self.watches.pin(key, now).map(|p| (p.start, p.end, p.anchor)),
+            leased: self.leases.is_protected(key, now),
+        }
     }
 
     /// Relief-valve link lookup (A: redirect cold misses): bounded
@@ -2260,7 +2374,7 @@ mod tests {
         assert_eq!(b, b"hello");
         // wait for the driver to seal + install
         for _ in 0..100 {
-            if cache.state.read().await.entries.contains_key("a.png") {
+            if cache.entry_exists("a.png").await {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -2283,7 +2397,7 @@ mod tests {
         let cache = Arc::new(cache);
         let rk = cache.resolve("a.png").unwrap();
         assert!(
-            !cache.state.read().await.entries.contains_key("a.png"),
+            !cache.entry_exists("a.png").await,
             "the first serve must really be a miss, or this test proves nothing"
         );
         let served = match cache.serve(&rk, None, None).await.unwrap() {
@@ -2298,7 +2412,7 @@ mod tests {
         let mut body = served.plan.body;
         assert_eq!(crate::testsupport::collect(&mut body).await, b"hello");
         for _ in 0..100 {
-            if cache.state.read().await.entries.contains_key("a.png") {
+            if cache.entry_exists("a.png").await {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -2321,13 +2435,17 @@ mod tests {
         let mut hit = cache.get_by_key("a.png", None).await.unwrap();
         assert_eq!(crate::testsupport::collect(&mut hit.body).await, b"cached");
         for _ in 0..100 {
-            if cache.state.read().await.entries.contains_key("a.png") {
+            if cache.entry_exists("a.png").await {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        // Swap state into a cache whose backend 500s (same dir + clock).
-        let state = RwLock::new(std::mem::take(&mut *cache.state.write().await));
+        // Restart with the object on disk and an upstream that 500s. The old
+        // shape of this test MOVED `CacheState` from the first cache into the
+        // second, which is the one thing production never does — and it hid
+        // whether the row survives a restart at all. `load_and_start` is the
+        // real path: rows come back from the metadata store, or from the object
+        // tree when the store lost them.
         let calls2 = Arc::new(AtomicUsize::new(0));
         let backend2 = crate::testsupport::MockBackend::counting(b"ignored".to_vec(), None, Arc::clone(&calls2), Some(BackendError::ServerError("boom".into())));
         let mut slots = HashMap::new();
@@ -2335,11 +2453,9 @@ mod tests {
             "primary".to_string(),
             Arc::new(BackendSlot::new(Arc::new(backend2), 3)),
         );
-        let cache2 = Cache::new(Arc::clone(&cfg), Arc::clone(&clock), BackendRegistry::new(slots));
-        {
-            let mut s2 = cache2.state.write().await;
-            *s2 = std::mem::take(&mut *state.write().await);
-        }
+        // A long reaper interval: this test is about the restart, not the tick.
+        let cache2 = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), BackendRegistry::new(slots)));
+        cache2.load_and_start_with(std::time::Duration::from_secs(3_600)).await;
         clock.advance(61_000);
         let mut hit2 = cache2.get_by_key("a.png", None).await.unwrap();
         assert_eq!(hit2.outcome, CacheOutcome::Stale);
@@ -2365,7 +2481,7 @@ mod tests {
         let mut hit = cache.get_by_key("a.png", None).await.unwrap();
         crate::testsupport::collect(&mut hit.body).await;
         for _ in 0..100 {
-            if cache.state.read().await.entries.contains_key("a.png") {
+            if cache.entry_exists("a.png").await {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
