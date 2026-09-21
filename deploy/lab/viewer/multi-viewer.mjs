@@ -37,6 +37,11 @@ const chunkBytes = Number(arg('chunk-bytes', String(256 * 1024)));
 const seeks = Number(arg('seeks', '4'));
 const gapMs = Number(arg('gap-ms', '1500'));
 const size = Number(arg('size', '0'));
+// `--objects a,b,c` gives each viewer its OWN object (the permit-queue case).
+// `--unique-seeds` gives each viewer its own jump positions (the one-pin-per-key
+// case: several viewers on ONE key at DIFFERENT places).
+const objects = (arg('objects', '') || '').split(',').filter(Boolean);
+const uniqueSeeds = args.includes('--unique-seeds');
 const chrome = process.env.CHROME || '/usr/bin/chromium';
 const pwDir = process.env.PW || '/home/archivalera/.npm/_npx/9833c18b2d85bc59/node_modules/playwright-core';
 
@@ -44,6 +49,7 @@ const { chromium } = await import(join(pwDir, 'index.mjs')).catch(async () => aw
 const readerSrc = readFileSync(join(here, 'reader.js'), 'utf8');
 
 const base = target.replace(/\/$/, '');
+const pathFor = (i) => (objects.length ? objects[i % objects.length] : objectPath);
 const url = `${base}/${objectPath}?size=${size}`;
 const pageUrl = `${base}/${pagePath}`;
 
@@ -60,7 +66,14 @@ const results = await Promise.all(
     // CDN in front of it) may send a Content-Security-Policy that blocks inline
     // scripts, and devtools-style evaluation is not subject to CSP. Same code
     // path for every target.
-    const opts = { chunkBytes, chunks, seeks, gapMs, url };
+    const opts = {
+      chunkBytes,
+      chunks,
+      seeks,
+      gapMs,
+      url: objects.length ? `${base}/${pathFor(i)}?size=${size}` : url,
+      seed: uniqueSeeds ? 12345 + i * 7919 : 12345,
+    };
     const stats = await page.evaluate(
       `(async () => { ${readerSrc}\n return await window.__readRange(${JSON.stringify(opts)}); })()`,
     );
