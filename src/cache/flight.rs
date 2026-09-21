@@ -414,8 +414,22 @@ pub async fn pump_and_seal(
         e
     };
     let mut published: u64 = 0;
+    // Read at most what this stream was PROMISED. For a full-file pull that is
+    // the object; for a run it is the WINDOW (ADR-0016), and the span that gets
+    // sealed is sized from what was written — so an upstream that streams past
+    // the length it was asked for (a reused connection whose 206 carries a
+    // Content-Length but no EOF at that boundary) would otherwise stage the
+    // rest of the object into a "window" and walk straight through the
+    // retention budget. The limit is on the READ, not a truncation after it, so
+    // the extra bytes are never taken off the stream in the first place.
+    let expected = src.total_len;
     loop {
-        let n = match src.stream.read(&mut buf).await {
+        let allow = expected
+            .map_or(buf.len(), |e| e.saturating_sub(written).min(buf.len() as u64) as usize);
+        if allow == 0 {
+            break;
+        }
+        let n = match src.stream.read(&mut buf[..allow]).await {
             Ok(n) => n,
             Err(e) => return Err(fail_cleanup(BackendError::ServerError(format!("read stream: {e}"))).await),
         };
@@ -448,9 +462,9 @@ pub async fn pump_and_seal(
     }
     // A SHORT upstream body must never be sealed into the cache: readers
     // were promised `total_len` bytes, and a truncated file would poison
-    // every later hit. Delete the tmp and fail the flight instead. An
-    // over-long body is harmless — every serving read is bounded by the
-    // promised length — so only the short side fails.
+    // every later hit. Delete the tmp and fail the flight instead. The
+    // over-long side is cut at the promised length by the read loop above,
+    // which is why only the short case can reach here.
     if let Some(expected) = src.total_len {
         if written < expected {
             let _ = tokio::fs::remove_file(tmp_path).await;

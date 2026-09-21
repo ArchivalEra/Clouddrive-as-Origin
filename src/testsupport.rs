@@ -299,6 +299,20 @@ impl<C: crate::clock::Clock + Clone> CacheTestExt<C> for crate::cache::cache::Ca
 // MockBackend.
 // ---------------------------------------------------------------------------
 
+/// How many times a test polls for state that lands ASYNCHRONOUSLY (a seal, a
+/// ledger merge, an install) before it calls the wait a failure, and how long
+/// it sleeps between polls.
+///
+/// This is a liveness budget, not a performance one: a mechanism that never
+/// lands still fails the test, just later. Making it generous is what keeps a
+/// loaded machine from producing false reds — these tests run in parallel on
+/// every core, and a 2-second budget was tight enough to fail a correct run
+/// about one time in ten. Sealing IS asynchronous (the driver renames the span
+/// after the body's last byte reaches the viewer), so a test must never sample
+/// staged state the instant a response returns.
+pub const WAIT_TRIES: usize = 4000;
+pub const WAIT_STEP_MS: u64 = 5;
+
 /// Collect a body into bytes (the test-side shape of `flight::drain`).
 pub async fn collect(body: &mut BodyStream) -> Vec<u8> {
     use futures::StreamExt;
@@ -329,7 +343,7 @@ pub async fn collect_allow_error(body: BodyStream) -> (Vec<u8>, bool) {
 
 /// Wait until the driver task has installed the metadata row for `key`.
 pub async fn wait_entry(cache: &Cache<impl crate::clock::Clock>, key: &str) {
-    for _ in 0..200 {
+    for _ in 0..WAIT_TRIES {
         if cache.state.read().await.entries.contains_key(key) {
             return;
         }
@@ -473,6 +487,7 @@ pub struct SizedBackend {
     opens: Arc<AtomicUsize>,
     chunk: usize,
     pace: std::time::Duration,
+    overlong: bool,
 }
 
 impl SizedBackend {
@@ -482,6 +497,7 @@ impl SizedBackend {
             opens,
             chunk: 4096,
             pace: std::time::Duration::ZERO,
+            overlong: false,
         }
     }
 
@@ -491,6 +507,18 @@ impl SizedBackend {
     pub fn paced(mut self, chunk: usize, pace: std::time::Duration) -> Self {
         self.chunk = chunk.max(1);
         self.pace = pace;
+        self
+    }
+
+    /// Ignore the END of the requested range: the stream runs to the end of the
+    /// object instead of stopping at `offset + length`.
+    ///
+    /// That is not a hypothetical — a reused connection whose 206 carries a
+    /// Content-Length but no EOF at that boundary (rclone serve webdav) streams
+    /// past the length it was asked for. A reader that trusts EOF rather than
+    /// the length it requested over-serves its viewer and over-claims its span.
+    pub fn overlong(mut self) -> Self {
+        self.overlong = true;
         self
     }
 }
@@ -510,7 +538,12 @@ impl StorageBackend for SizedBackend {
                 if r.offset >= total {
                     return Err(BackendError::RangeNotSatisfiable);
                 }
-                (r.offset, r.length.map_or(total, |l| (r.offset + l).min(total)))
+                let end = if self.overlong {
+                    total
+                } else {
+                    r.length.map_or(total, |l| (r.offset + l).min(total))
+                };
+                (r.offset, end)
             }
         };
         // Chunked and lazy: a window can be far larger than any buffer a test
@@ -565,9 +598,12 @@ impl StorageBackend for VersionedBackend {
     async fn open(&self, _key: &Key, _range: Option<ByteRange>) -> Result<StreamSource, BackendError> {
         let v = self.version.load(Ordering::SeqCst);
         let bytes = format!("bytes-v{v}").into_bytes();
+        // The promise is the body it is about to hand over. This used to say
+        // `Some(7)` while serving 8 bytes: a pump that trusts the promise
+        // (short-read guard, and the read cap) made the lie truncate the body.
         Ok(StreamSource {
-            stream: Box::new(std::io::Cursor::new(bytes)),
-            total_len: Some(7),
+            stream: Box::new(std::io::Cursor::new(bytes.clone())),
+            total_len: Some(bytes.len() as u64),
         })
     }
     async fn refresh_if_needed(&self) -> Result<(), BackendError> {
@@ -855,7 +891,7 @@ pub async fn body_text(resp: axum::response::Response) -> (StatusCode, HeaderMap
 /// public interface exposes "is this installed" — a real gap, recorded here
 /// rather than papered over with an accessor invented for tests.
 pub async fn wait_installed(fx: &Fixture, key: &str) {
-    for _ in 0..200 {
+    for _ in 0..super::WAIT_TRIES {
         if fx.state.cache.state.read().await.entries.contains_key(key) {
             return;
         }
