@@ -83,6 +83,17 @@ decision and the measurements.
   cannot flood the receiver.
 
 
+## Looking at ONE key (2026-09-21)
+
+`curl -s 'http://127.0.0.1:8080/_internal/healthz?key=googledrive1%2Fround3.mp4' | jq .key`
+answers the questions an investigation starts with, without a debugger: is the
+object installed here, which spans are staged on disk (`staged_spans`,
+`staged_bytes`), what does the ledger believe (`ledger_spans` with each span's
+last read and read count, `ledger_total`, `ledger_etag`, the row's age), where is
+the viewer pinned (`pin`), and is a body holding the key (`leased`). The key is
+percent-decoded, so a path with `/` goes in as `%2F`. Without `?key=` the body is
+what it always was.
+
 ## Retiring the old unit name (standard -> efficient, 2026-09-21)
 
 The main plane's unit and config used to be named after the `standard` profile,
