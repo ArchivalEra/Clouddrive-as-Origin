@@ -689,6 +689,30 @@ pub(crate) fn pieces_then(
 
 #[cfg(test)]
 mod tests {
+    /// The load-bearing numbers that live in prose. Every one of them is quoted
+    /// in an ADR or in the spec, and NO behaviour test would notice one of them
+    /// changing — so this test exists to make such a change DELIBERATE: it fails
+    /// until the author updates the number here and, by habit, the document that
+    /// promised it. (Each module pins its own constants; the defaults that come
+    /// from config are pinned here, where the staged-byte policy reads them.)
+    ///
+    /// Asserting values is normally a tautology. That is the point: the survey
+    /// found these justified only by comments, and one comment claiming test
+    /// coverage it did not have.
+    #[test]
+    fn constant_decisions_are_pinned() {
+        use crate::config::Config;
+        let c = Config::default();
+        assert_eq!(c.session_window_bytes, 64 * 1024 * 1024, "one second of transfer (ADR-0016)");
+        assert_eq!(c.watch_pin_bytes, 128 * 1024 * 1024, "the viewer's neighbourhood (ADR-0018)");
+        assert_eq!(c.watch_idle_secs, 900, "longer than a phone call (ADR-0018)");
+        assert_eq!(c.read_grace_secs, 300, "covers a viewer who is thinking (ADR-0017)");
+        assert_eq!(c.inactive_ttl_secs, 1200, "the idle TTL the sweep uses");
+        assert_eq!(c.concurrency_per_upstream, 3, "the upstream stream budget (ADR-0004)");
+        assert_eq!(STAGE_MIN_AGE_MS, 60_000, "the span-level min-age guard (ADR-0019)");
+        assert_eq!(HEAT_TRAILING_WINDOW, 20, "spans the heat policy compares (ADR-0015)");
+    }
+
     use super::*;
     use crate::cache::{leases::Leases, watch::Watches};
     use crate::config::EvictionPolicy;
