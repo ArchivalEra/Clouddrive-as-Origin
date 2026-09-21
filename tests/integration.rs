@@ -2058,3 +2058,127 @@ async fn inspect_reports_a_negative_row_as_a_tombstone() {
     assert!(k.installed);
     assert!(!k.tombstone);
 }
+
+// ---------------------------------------------------------------------------
+// Protection vs the budget: why a per-key pin needs no global cap.
+// ---------------------------------------------------------------------------
+
+/// A pin is spent only after the bytes OUTSIDE it. Three spans per key against a
+/// magazine that holds half of them: the reaper has enough outside the pins to
+/// meet the budget, so every pinned span survives — the ordering a global pin
+/// ceiling would otherwise have to enforce by arithmetic.
+#[tokio::test]
+async fn a_pin_is_spent_only_after_the_bytes_outside_it() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ..Config::default()
+    };
+    // 6 KiB staged, a 4 KiB magazine: exactly the two spans that lie entirely
+    // OUTSIDE the pins have to go, which is the ordering under test.
+    cfg.max_size_bytes = 4_096;
+    cfg.watch_pin_bytes = 1_024; // a neighbourhood around the viewer, both sides
+    cfg.watch_idle_secs = 3_600; // the watches stay live across the tick
+    cfg.read_grace_secs = 0; // leases are not part of this question
+    let cfg = Arc::new(cfg);
+    let backend =
+        CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+
+    let mut spans = Vec::new();
+    for key in ["a.bin", "b.bin"] {
+        for i in 0..3u64 {
+            spans.push((key, i * 1024, (i + 1) * 1024));
+        }
+    }
+    install_staged(&cache, &spans).await;
+    assert_eq!(cache.snapshot().await.segment_bytes, 6_144, "the premise is an overrun");
+
+    for key in ["a.bin", "b.bin"] {
+        // The viewer sits in the SECOND span, so the pin has bytes on both sides.
+        let watch = cache.watches.acquire_at(key, (1024, 2048), Arc::clone(&clock));
+        drop(watch);
+    }
+    clock.advance(120_000); // past the min-age guard, inside the watch budget
+    cache.tick().await;
+
+    assert_eq!(
+        cache.snapshot().await.segment_bytes,
+        4_096,
+        "the magazine must come back inside its budget"
+    );
+    for key in ["a.bin", "b.bin"] {
+        let k = cache.inspect(key).await;
+        let (ps, pe, anchor) = k.pin.expect("a live watch has a pin");
+        // Exactly the span the viewer has already passed went; the two spans the
+        // pin touches stayed — a pin is spent only once nothing outside it can
+        // cover the need.
+        assert_eq!(
+            k.staged_spans,
+            vec![(1024, 2048), (2048, 3072)],
+            "{key}: only the span outside the pin [{ps}, {pe}) may go"
+        );
+        assert!(
+            k.staged_spans.iter().any(|(s, e)| *s <= anchor && anchor < *e),
+            "{key}: the byte under the viewer survives"
+        );
+    }
+}
+
+/// EVERY byte pinned and the budget overrun: the magazine still comes back
+/// inside it. This is the property that makes a per-key pin safe with no global
+/// ceiling — N watched keys cannot RESERVE N × `watch_pin_bytes`, they only order
+/// the eviction, and when nothing outside a pin is left the reaper spends the
+/// pins themselves (ADR-0012: a deadline, not an exemption). The two passes in
+/// `evict_staged` are the mechanism; a rule that skipped everything protected
+/// would free nothing here and leave the budget overrun.
+#[tokio::test]
+async fn protection_orders_eviction_and_never_exempts_it() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ..Config::default()
+    };
+    cfg.max_size_bytes = 2_048; // half of the 4 KiB staged below
+    cfg.watch_pin_bytes = 1 << 20; // the pin covers whole rows: nothing is outside
+    cfg.watch_idle_secs = 3_600;
+    cfg.read_grace_secs = 0;
+    let cfg = Arc::new(cfg);
+    let backend =
+        CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+
+    let spans = [
+        ("a.bin", 0u64, 1024u64),
+        ("a.bin", 1024, 2048),
+        ("b.bin", 0, 1024),
+        ("b.bin", 1024, 2048),
+    ];
+    install_staged(&cache, &spans).await;
+    assert_eq!(cache.snapshot().await.segment_bytes, 4_096, "the premise is an overrun");
+
+    for key in ["a.bin", "b.bin"] {
+        let watch = cache.watches.acquire_at(key, (0, 1024), Arc::clone(&clock));
+        drop(watch);
+    }
+    clock.advance(120_000);
+    cache.tick().await;
+
+    assert_eq!(
+        cache.snapshot().await.segment_bytes,
+        2_048,
+        "protection must not turn into an exemption: the budget is the budget"
+    );
+    let (a, b) = (cache.inspect("a.bin").await, cache.inspect("b.bin").await);
+    assert_eq!(
+        a.staged_bytes + b.staged_bytes,
+        2_048,
+        "the accounting moved with the files"
+    );
+    // Which of the two rows paid is the age order's business; that a watched row
+    // paid WHILE EVERYTHING WAS PINNED is the property. It is also what the
+    // second pass exists for: with `inside_pins` reduced to one pass, nothing
+    // here would be freed and the assertion above would read 4096.
+}
