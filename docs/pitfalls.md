@@ -206,3 +206,12 @@ entry for being obvious in hindsight — hindsight is the point.
     (`timeout 100 git push origin HEAD`) inside the loop, and check the exit code
     rather than the tail of the output; the next attempt then runs on a fresh
     connection and usually succeeds first try.
+
+33. **The vantage decides the POP, so it decides the verdict.** One hostname
+    served this workstation an overseas IPv4 POP (0.4-1.4 MB/s, hard stalls) and
+    the origin node a domestic IPv6 POP (steady, TTFB ~0.2 s) — because the
+    workstation has no IPv6 route, GeoDNS classified it overseas. A player test
+    from that vantage fails no matter what the origin, the edge or the object
+    do. *Fix:* before reading a CDN verdict, record `remote_ip` of the leg you
+    actually got (`curl -w '%{remote_ip}'`), and treat a vantage whose route you
+    cannot choose as a different experiment, not a failed one.
