@@ -18,7 +18,15 @@ pub enum KeyError {
     BadPercent,
     #[error("reserved name")]
     ReservedName,
+    #[error("key too long for a cache filename")]
+    TooLong,
 }
+
+/// The longest cache filename this node will create. `escape_key` expands `%`
+/// and `/` threefold, so a key of at most this many BYTES (as a raw string)
+/// still fits; anything longer is refused as a bad request rather than failing
+/// later as an opaque filesystem error.
+pub const NAME_MAX_BYTES: usize = 255;
 
 /// Validate a cache key per spec §2 / ADR 0001.
 /// - Non-empty, not absolute, no `..` segments, no backslash, no NUL.
@@ -59,6 +67,15 @@ pub fn validate_key(raw: &str) -> Result<String, KeyError> {
         if seg == ".." || seg == "%2e%2e" || seg == "%2E%2E" {
             return Err(KeyError::Traversal);
         }
+    }
+    // And a key whose CACHE FILENAME could not exist. Every sidecar and object
+    // file is `escape_key(key)` in one flat directory, and `%` and `/` expand
+    // threefold there, so a key that passes every other check can still be
+    // un-storable: the failure would surface as an opaque ENAMETOOLONG deep in
+    // a transfer instead of a 400 here. 255 is NAME_MAX on the filesystems this
+    // runs on; the escaped length is what has to fit.
+    if crate::cache::store::escape_key(raw).len() > NAME_MAX_BYTES {
+        return Err(KeyError::TooLong);
     }
     Ok(raw.to_string())
 }
@@ -183,6 +200,24 @@ mod tests {
         assert_eq!(validate_key("%2Fetc/passwd"), Err(KeyError::Absolute));
         assert_eq!(validate_key("a\\b"), Err(KeyError::Backslash));
         assert_eq!(validate_key("a%5Cb"), Err(KeyError::Backslash));
+    }
+
+    /// A key is only useful if its cache FILENAME can exist, and escaping
+    /// expands `%` and `/` threefold in one flat directory. A key that passes
+    /// every other check but cannot be stored must be a 400 here, not an opaque
+    /// ENAMETOOLONG deep inside a transfer.
+    #[test]
+    fn rejects_a_key_whose_cache_filename_cannot_exist() {
+        let at_limit = "a".repeat(NAME_MAX_BYTES);
+        assert!(validate_key(&at_limit).is_ok(), "a key at the limit still fits");
+
+        let over = "a".repeat(NAME_MAX_BYTES + 1);
+        assert!(matches!(validate_key(&over), Err(KeyError::TooLong)));
+
+        // Short in raw bytes, but every separator triples on the way to disk.
+        let slashes = vec!["ab"; 60].join("/");
+        assert!(slashes.len() < NAME_MAX_BYTES);
+        assert!(matches!(validate_key(&slashes), Err(KeyError::TooLong)));
     }
 
     #[test]

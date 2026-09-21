@@ -657,7 +657,11 @@ where
             .get("x-prewarm-token")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if expected.is_empty() || got != expected {
+        // Compared in constant time: the token is a shared secret sent on every
+        // request, and `==` on a String stops at the first differing byte.
+        // Equal-length inputs only is fine here — `constant_time_eq` returns
+        // false for a length mismatch, which is the answer anyway.
+        if expected.is_empty() || !crate::sigv4::constant_time_eq(got.as_bytes(), expected.as_bytes()) {
             return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
         }
     }
