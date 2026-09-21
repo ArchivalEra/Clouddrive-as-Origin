@@ -6,12 +6,13 @@ use tempfile::tempdir;
 // The mock lives in the lib now: one implementation for the whole tree.
 use origin_cache::testsupport::{
     collect, collect_allow_error, install_staged, install_staged_aged, rebuild_staged_bytes,
-    wait_entry,
+    wait_entry, WAIT_TRIES,
     BlockingOpenBackend, CacheTestExt, MockBackend as CountingBackend, SizedBackend, StormBackend,
     StormMode, VersionedBackend,
 };
 
 use origin_cache::{
+    cache::cache::KeyState,
     backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, ListEntry, StreamSource, StorageBackend},
     cache::cache::{Cache, CacheOutcome},
     cache::flight::FlightProgress,
@@ -2182,3 +2183,158 @@ async fn protection_orders_eviction_and_never_exempts_it() {
     // second pass exists for: with `inside_pins` reduced to one pass, nothing
     // here would be freed and the assertion above would read 4096.
 }
+
+// ---------------------------------------------------------------------------
+// The invariant everything else rests on: the account, the ledger and the DISK
+// describe the same bytes.
+// ---------------------------------------------------------------------------
+
+/// A tiny deterministic PRNG. No dependency, and a fixed seed means a failure
+/// is reproducible: the same walk, every time.
+struct Xorshift(u64);
+
+impl Xorshift {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+}
+
+/// Wait until the staged-byte account stops moving. Sealing is asynchronous (the
+/// run's driver renames the span after the body's last byte), so a sample taken
+/// the instant a response returns would read a half-settled state — the same
+/// discipline the wait helpers document, in miniature.
+async fn wait_settled(cache: &Arc<Cache<MockClock>>) {
+    let mut last = cache.snapshot().await.segment_bytes;
+    let mut stable = 0;
+    for _ in 0..WAIT_TRIES {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let now = cache.snapshot().await.segment_bytes;
+        if now == last {
+            stable += 1;
+            if stable >= 3 {
+                return;
+            }
+        } else {
+            stable = 0;
+            last = now;
+        }
+    }
+    panic!("the staged-byte account never settled");
+}
+
+/// Is every ledger interval covered by spans that exist on disk? The ledger is
+/// allowed to FORGET bytes (window decay drops the interval while the file
+/// stays), but it must never claim bytes that are not there.
+fn ledger_is_backed_by_disk(k: &KeyState) -> bool {
+    for iv in &k.ledger_spans {
+        let mut at = iv.start;
+        for (s, e) in &k.staged_spans {
+            if *s <= at && at < *e {
+                at = *e;
+            }
+        }
+        if at < iv.end {
+            return false;
+        }
+    }
+    true
+}
+
+/// A seeded random walk over the real request path — reads, evictions and a
+/// restart — with the three invariants checked as it goes:
+///
+/// 1. `segment_bytes` equals the sum of what `inspect` finds ON DISK;
+/// 2. every ledger interval is backed by disk spans;
+/// 3. after a tick, the magazine is inside its budget.
+///
+/// The failure this is written against is the one no targeted test covers: the
+/// account and the disk drifting apart over an arbitrary interleaving of reads,
+/// seals and evictions. The seed makes a failure reproducible; the checks name
+/// which invariant broke.
+#[tokio::test]
+async fn the_account_the_ledger_and_the_disk_never_disagree() {
+    let dir = tempdir().unwrap();
+    // A 1 MiB object with an 8 KiB window and a magazine that holds three
+    // windows: the walk stages constantly and evicts as it goes.
+    let (cache, _opens) = run_fixture_capped(dir.path(), 1 << 20, 8192, 0, 24 * 1024);
+
+    let mut rng = Xorshift(0xC0FFEE_1234_5678);
+    for round in 0..120u64 {
+        // One 1 KiB read at a random window boundary.
+        let off = (rng.next() % 1024) * 1024;
+        let mut served = get_range(&cache, off, 1024).await;
+        // Borrowed, not moved: the lease and the watch live in `served` (their
+        // fields are private on purpose — `Cache::protect` is the only way to
+        // get them), and holding either one keeps this key out of the reaper's
+        // reach. Dropping the whole response here is what lets the walk evict.
+        assert_eq!(
+            collect(&mut served.plan.body).await,
+            synthetic(off, 1024),
+            "round {round}: bytes served"
+        );
+        drop(served);
+
+        wait_settled(&cache).await;
+        let snap = cache.snapshot().await;
+        let k: KeyState = cache.inspect("a.bin").await;
+        assert_eq!(
+            snap.segment_bytes, k.staged_bytes,
+            "round {round}: the account must equal what is on disk"
+        );
+        assert!(
+            ledger_is_backed_by_disk(&k),
+            "round {round}: the ledger claims bytes the disk does not have: ledger={:?} disk={:?}",
+            k.ledger_spans,
+            k.staged_spans
+        );
+
+        // Every few rounds, run the reaper — the budget must come back inside.
+        if round % 20 == 19 {
+            cache.tick().await;
+            wait_settled(&cache).await;
+            let snap = cache.snapshot().await;
+            let budget = cache.config.max_size_bytes;
+            assert!(
+                snap.total_bytes + snap.segment_bytes <= budget,
+                "round {round}: after a tick the magazine is over budget ({} + {} > {budget})",
+                snap.total_bytes,
+                snap.segment_bytes
+            );
+            let k = cache.inspect("a.bin").await;
+            assert_eq!(
+                snap.segment_bytes, k.staged_bytes,
+                "round {round}: the account drifted across an eviction"
+            );
+        }
+    }
+
+    // And the restart: a second Cache over the same directory rebuilds the
+    // account from the FILES (the disk is the authority), so the invariants must
+    // hold in the new process's books too.
+    let before = {
+        let k = cache.inspect("a.bin").await;
+        (cache.snapshot().await.segment_bytes, k.staged_spans)
+    };
+    let clock2 = Arc::new(MockClock::new(cache.clock.now_millis()));
+    let cache2 = Arc::new(Cache::new(
+        Arc::clone(&cache.config),
+        clock2,
+        BackendRegistry::new(HashMap::new()),
+    ));
+    cache2.load_and_start_with(std::time::Duration::from_secs(3_600)).await;
+    let snap2 = cache2.snapshot().await;
+    assert_eq!(
+        snap2.segment_bytes, before.0,
+        "the account must survive a restart (the disk is the authority)"
+    );
+    assert_eq!(
+        cache2.inspect("a.bin").await.staged_spans, before.1,
+        "and the spans must be rediscovered, not re-invented"
+    );
+}
+

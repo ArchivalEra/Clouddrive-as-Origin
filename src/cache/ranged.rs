@@ -25,7 +25,10 @@ use crate::cache::staging::{FinalizedSpan, Staging};
 use crate::cache::store;
 use crate::clock::Clock;
 
-/// Bytes moved per read: one size for every reader-to-body copy in the tree.
+/// Bytes moved per read. Deliberately a second literal next to `flight.rs`'s
+/// and `pieces_then`'s: they are three different jobs (an upstream pump, a disk
+/// slice, a sidecar replay), and one shared constant would invite a change to
+/// one to be justified by another (ADR-0021, "Not covered here").
 const CHUNK: usize = 256 * 1024;
 
 /// Take one upstream stream permit (ADR-0004), for as long as the body this is
@@ -149,4 +152,17 @@ async fn seal<C: Clock>(sink: StageSink<C>, written: u64) {
             },
         )
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The read granularity this module moves bytes in — pinned so a change is
+    /// deliberate (see the note in `staging.rs`), and because it is duplicated
+    /// on purpose next to `flight.rs`'s and `pieces_then`'s.
+    #[test]
+    fn constant_decisions_are_pinned() {
+        assert_eq!(CHUNK, 256 * 1024, "read granularity");
+    }
 }

@@ -448,8 +448,11 @@ pub async fn pump_and_seal(
         // The FIRST chunk is always published (`published == 0`): without
         // that, a short object or a stall right after a small write leaves
         // readers at watermark 0 while bytes already sit on disk, and a
-        // reader waiting for them would never be woken. A test pins it
-        // (a stall after 64 bytes must still deliver those 64).
+        // reader waiting for them would never be woken. A test pins THAT rule
+        // (`small_write_is_published_before_a_stall`, which stalls after 64
+        // bytes); the 1 MiB interval itself is a wakeup-rate choice and no test
+        // depends on its value — it is pinned as a decision in
+        // `constant_decisions_are_pinned`, not as behaviour.
         if published == 0 || written - published >= PUBLISH_INTERVAL {
             published = written;
             let _ = tx.send(FlightProgress::Growing(written));
@@ -713,6 +716,16 @@ mod tests {
     /// write. A driver that writes 64 bytes and then stalls must still
     /// publish that watermark, so a reader waiting on those bytes is woken
     /// and can read them before the stall budget expires.
+    /// This module's own load-bearing numbers: the wakeup interval and the read
+    /// granularity. Neither is behaviour-pinned (the tests inject their own
+    /// budgets), and both are quoted in ADRs — see the note in `staging.rs`.
+    #[test]
+    fn constant_decisions_are_pinned() {
+        assert_eq!(PUBLISH_INTERVAL, 1024 * 1024, "a flight's watermark wakeup rate");
+        assert_eq!(CHUNK, 256 * 1024, "read granularity");
+        assert_eq!(DEFAULT_STALL_BUDGET, std::time::Duration::from_secs(30));
+    }
+
     #[tokio::test]
     async fn small_write_is_published_before_a_stall() {
         use futures::StreamExt;
