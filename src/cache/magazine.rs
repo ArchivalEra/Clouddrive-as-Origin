@@ -36,15 +36,49 @@ pub(crate) const DISK_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 /// "make room" step rare instead of routine.
 const DISK_PRESSURE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Whether a staged-read run may write `run_len` bytes (ADR-0019).
+///
+/// Two questions, and neither is the OBJECT's size:
+///
+/// - the write must fit the retention budget (`max_size_bytes`): a window
+///   larger than the magazine can never be kept — it would be evicted the
+///   moment it sealed, having cost a full write;
+/// - the disk must be able to afford it, with the same reserve the cold-pull
+///   path asks for.
+///
+/// The object's size is deliberately NOT asked. This predicate used to be
+/// `fits_magazine(size_bytes)`, whose premise — "staging an object the magazine
+/// cannot hold writes bytes nobody can ever read back" — died with ADR-0015:
+/// staged spans are served directly now, so a bounded window of an object too
+/// large to keep whole is not pure cost, it is the sliding window a reader
+/// walks through. For a large object that is the normal case, and refusing it
+/// meant one upstream open PER REQUEST on exactly the objects the product is
+/// about (a 200 GiB object: 1.2 s per 1 MiB shard, one per request).
+///
+/// Pure, so the arithmetic is testable without a full disk: the caller supplies
+/// the free-space reading.
+pub(crate) fn run_admits(
+    run_len: u64,
+    max_size_bytes: u64,
+    free: Option<u64>,
+    reserve: u64,
+) -> bool {
+    run_len > 0
+        && run_len <= max_size_bytes
+        && free.is_none_or(|f| f.saturating_sub(reserve) >= run_len)
+}
+
 /// Whether the magazine can hold an object of this size at all. An object
 /// that cannot fit is never made to fit by evicting anyone, so the byte
 /// budget cannot govern it — such an object is admitted as a *resident
 /// stray* instead (ADR-0014): cached while the disk allows it, refused by
 /// the byte budget neither as a victim nor as pressure.
 ///
-/// One predicate, three call sites that must agree: promotion's fit guard,
-/// staging admission, and cold-pull admission (which decides
-/// `EntryMeta::oversize`).
+/// One predicate, two call sites that must agree: cold-pull admission (which
+/// decides `EntryMeta::oversize`) and the metadata-loss rebuild. The staged-read
+/// run asks a different question — `run_admits`, about the WRITE rather than the
+/// object (ADR-0019) — because a window of an object too large to keep is still
+/// worth staging and serving.
 pub(crate) fn fits_magazine(size_bytes: u64, config: &Config) -> bool {
     size_bytes > 0 && size_bytes <= config.max_size_bytes
 }

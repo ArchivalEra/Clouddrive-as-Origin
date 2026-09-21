@@ -137,68 +137,149 @@ impl Staging {
         let order = self.rows_by_age().await;
         let mut freed_total = 0u64;
         let mut touched = 0usize;
-        // Two passes over the whole cache, not one pass into each row:
-        // everything a viewer is NOT looking at first, and the pins only if the
-        // rest of the cache could not cover the need. Per row, the first
-        // watched row would be trimmed inside its own pin while a later row
-        // still had bytes to give — a deadline, but the last one (ADR-0012,
-        // ADR-0018).
+
+        // (1) The global budget. Two passes over the whole cache, not one pass
+        // into each row: everything a viewer is NOT looking at first, and the
+        // pins only if the rest of the cache could not cover the need. Per row,
+        // the first watched row would be trimmed inside its own pin while a
+        // later row still had bytes to give — a deadline, but the last one
+        // (ADR-0012, ADR-0018).
         for inside_pins in [false, true] {
-        for (_, key) in &order {
-            if freed_total >= need_bytes {
-                break;
-            }
-            // A watched key keeps its neighbourhood, not its whole row
-            // (ADR-0018): the tail the viewer has already passed is exactly
-            // what the budget should be able to spend. A key with a body but
-            // no look at it keeps the older, coarser rule.
-            let pin = pins.get(key).copied();
-            if pin.is_none() && protected.contains(key) {
-                continue;
-            }
-            let (age, prior) = {
-                let cov = self.coverage.lock().await;
-                match cov.get(key) {
-                    Some(c) => (now.saturating_sub(c.last_touch_millis), c.intervals.clone()),
-                    None => continue,
+            for (_, key) in &order {
+                if freed_total >= need_bytes {
+                    break;
                 }
-            };
-            // Never evict a row that is actively staging right now.
-            if age < STAGE_MIN_AGE_MS {
-                continue;
+                // A watched key keeps its neighbourhood, not its whole row
+                // (ADR-0018). A key with a body but no look at it keeps the
+                // older, coarser rule.
+                let pin = pins.get(key).copied();
+                if pin.is_none() && protected.contains(key) {
+                    continue;
+                }
+                let freed = self
+                    .trim_row(key, need_bytes.saturating_sub(freed_total), pin, inside_pins, None, now)
+                    .await;
+                if freed > 0 {
+                    freed_total += freed;
+                    touched += 1;
+                }
             }
-            let picks = self
-                .pick_spans(key, &prior, need_bytes - freed_total, pin, inside_pins)
-                .await;
-            if picks.is_empty() {
-                continue;
-            }
-            let freed = self.drop_spans(&key, &picks, now).await;
-            if freed == 0 {
-                continue;
-            }
-            {
-                let mut s = self.state.write().await;
-                s.segment_bytes = s.segment_bytes.saturating_sub(freed);
-            }
-            freed_total += freed;
-            touched += 1;
-            // A row that lost every span has nothing left to protect: drop it
-            // with its version marker so the next request re-stats upstream
-            // instead of gating on an etag for bytes that no longer exist.
-            self.drop_empty_row(key).await;
         }
+
+        // (2) The per-key working window (ADR-0019). A key whose object the
+        // magazine can never hold whole is capped at `watch_pin_bytes + one
+        // window`: the neighbourhood its reader is on, plus the window that is
+        // its read-ahead. The cap holds even while the magazine is globally
+        // UNDER budget — otherwise "one open per window" for a large object
+        // would come with an unbounded disk cost, and a single walk would fill
+        // the magazine and evict everyone else.
+        //
+        // Only rows the ledger already knows are un-keepable are visited, so
+        // the hot path above is unchanged and this pass costs nothing on a
+        // cache that holds only keepable objects. The cap is >= the pin by
+        // construction (pin + one window), so a row within its cap can never
+        // force the pin to be spent: the bytes outside the pin are enough.
+        let cap = self.working_window_bytes();
+        for key in self.unkeepable_rows().await {
+            if protected.contains(&key) && !pins.contains_key(&key) {
+                continue; // a live body with no watch: ADR-0017's rule
+            }
+            if freed_total >= need_bytes {
+                // The global need is met; the cap is the only reason left.
+                // Still enforced, which is the point of this pass.
+            }
+            let pin = pins.get(&key).copied();
+            let freed = self.trim_row(&key, 0, pin, false, Some(cap), now).await;
+            if freed > 0 {
+                freed_total += freed;
+                touched += 1;
+                crate::metrics::observe_transient_trim(freed);
+            }
         }
         (touched, freed_total)
     }
 
+    /// `watch_pin_bytes + session_window_bytes`: how much one key whose object
+    /// the magazine can never hold may keep staged (ADR-0019). >= the pin by
+    /// construction, so the cap never forces the pin to be spent.
+    fn working_window_bytes(&self) -> u64 {
+        self.config
+            .watch_pin_bytes
+            .saturating_add(self.config.session_window_bytes)
+    }
+
+    /// How many keys are in the un-keepable class right now (the gauge).
+    pub(crate) async fn unkeepable_keys(&self) -> usize {
+        self.unkeepable_rows().await.len()
+    }
+
+    /// The keys whose object cannot fit the magazine — the working-window
+    /// class. Read from the ledger (no disk scan), so a cache of keepable
+    /// objects pays nothing for the rule.
+    async fn unkeepable_rows(&self) -> Vec<String> {
+        let cov = self.coverage.lock().await;
+        cov.iter()
+            .filter(|(_, c)| c.total > self.config.max_size_bytes)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Trim one row towards `want` bytes (and, when `cap` is given, towards its
+    /// working window). Shared by the global budget pass and the per-key pass so
+    /// the selection, the deletion and the single `segment_bytes` subtraction
+    /// exist once.
+    async fn trim_row(
+        &self,
+        key: &str,
+        want: u64,
+        pin: Option<super::watch::Pin>,
+        inside_pins: bool,
+        cap: Option<u64>,
+        now: u64,
+    ) -> u64 {
+        let prior = {
+            let cov = self.coverage.lock().await;
+            match cov.get(key) {
+                Some(c) => c.intervals.clone(),
+                None => return 0,
+            }
+        };
+        let picks = self.pick_spans(key, &prior, want, pin, inside_pins, cap, now).await;
+        if picks.is_empty() {
+            return 0;
+        }
+        let freed = self.drop_spans(key, &picks, now).await;
+        if freed == 0 {
+            return 0;
+        }
+        {
+            let mut s = self.state.write().await;
+            s.segment_bytes = s.segment_bytes.saturating_sub(freed);
+        }
+        // A row that lost every span has nothing left to protect: drop it with
+        // its version marker so the next request re-stats upstream instead of
+        // gating on an etag for bytes that no longer exist.
+        self.drop_empty_row(key).await;
+        freed
+    }
+
     /// Rows oldest-touched-first — the cross-key LRU both policies share.
     async fn rows_by_age(&self) -> Vec<(u64, String)> {
+        let max = self.config.max_size_bytes;
         let cov = self.coverage.lock().await;
-        let mut rows: Vec<(u64, String)> =
-            cov.iter().map(|(k, c)| (c.last_touch_millis, k.clone())).collect();
+        // The un-keepable class first: a key whose object cannot fit the
+        // magazine has no long-term claim on its bytes, so its excess is spent
+        // before any keepable key's span (ADR-0019). Within a class this is the
+        // cross-key LRU both policies share.
+        let mut rows: Vec<(u8, u64, String)> = cov
+            .iter()
+            .map(|(k, c)| {
+                let class = u8::from(c.total <= max);
+                (class, c.last_touch_millis, k.clone())
+            })
+            .collect();
         rows.sort();
-        rows
+        rows.into_iter().map(|(_, t, k)| (t, k)).collect()
     }
 
     /// The spans to delete, in deletion order, until at least `need_bytes` is
@@ -227,6 +308,11 @@ impl Staging {
         pin: Option<super::watch::Pin>,
         // Whether this pass may spend the pin itself. Pass one may not.
         inside_pins: bool,
+        // The row's working window, when it has one (ADR-0019): the span
+        // selection is asked for `want` OR for the bytes over this cap,
+        // whichever is more.
+        cap: Option<u64>,
+        now: u64,
     ) -> Vec<(u64, u64)> {
         let files: Vec<(u64, u64)> = store::segments_for_key(&self.config.cache_dir, key)
             .into_iter()
@@ -245,6 +331,29 @@ impl Staging {
                 None => (0, 0),
             })
             .collect();
+        // A span younger than the guard is not a candidate, however the ROW's
+        // own age reads. This replaces a row-level guard that protected the
+        // whole row of a key whose `last_touch` is refreshed by every read and
+        // every seal — which is every key a viewer is walking — so the budget
+        // could never be enforced against exactly the key that was filling the
+        // disk, and only the other keys paid (ADR-0019).
+        //
+        // The age of a span is when it was SEALED (`add_read` counts reads
+        // without moving `t`), and the in-flight part is safe by construction:
+        // an unsealed `.segpart` is neither in `segment_bytes` nor a candidate,
+        // so no transfer is endangered by trimming a row mid-walk.
+        let min_sealed = now.saturating_sub(STAGE_MIN_AGE_MS);
+        let young = |i: usize| policy[i].0 > 0 && policy[i].0 > min_sealed;
+
+        // The working window: what the caller asked for, or the bytes over the
+        // cap, whichever is more.
+        let need_bytes = match cap {
+            Some(cap) => {
+                let row_bytes: u64 = files.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+                need_bytes.max(row_bytes.saturating_sub(cap))
+            }
+            None => need_bytes,
+        };
         let newest = files.len().saturating_sub(1);
         let mut ordered: Vec<usize> = (0..files.len()).collect();
         match self.config.eviction_policy {
@@ -285,10 +394,14 @@ impl Staging {
                 Some(p) if s >= p.anchor => (2u8, std::cmp::Reverse(s - p.anchor)),
                 _ => (1u8, std::cmp::Reverse(0u64)),
             };
+            ordered.retain(|i| !young(*i));
             ordered.sort_by_key(|i| rank(files[*i]));
             ordered
         } else {
-            ordered.into_iter().filter(|i| outside(files[*i])).collect()
+            ordered
+                .into_iter()
+                .filter(|i| !young(*i) && outside(files[*i]))
+                .collect()
         };
         let mut picked = Vec::new();
         let mut acc = 0u64;
@@ -648,6 +761,16 @@ mod tests {
             s.segment_bytes += end - start;
         }
 
+        /// Age the ROW without touching its spans: what a walking key looks
+        /// like from the trim's point of view (every read and every seal stamps
+        /// the row).
+        async fn touch_row(&self, key: &str, t: u64) {
+            let mut cov = self.coverage.lock().await;
+            if let Some(row) = cov.get_mut(key) {
+                row.last_touch_millis = t;
+            }
+        }
+
         fn spans(&self, key: &str) -> Vec<(u64, u64)> {
             store::segments_for_key(&self.cache_dir(), key)
                 .into_iter()
@@ -721,6 +844,31 @@ mod tests {
         assert_eq!(freed, 400, "the whole row goes when the need is bigger than the tail");
         assert!(h.spans("a.bin").is_empty());
         assert_eq!(h.state.read().await.segment_bytes, 0);
+    }
+
+    /// A key being walked is trimmable OUTSIDE its pin. The row-level guard this
+    /// replaces protected the WHOLE row of a key whose `last_touch` is refreshed
+    /// by every read and every seal — which is every key a viewer is walking — so
+    /// the budget could never be enforced against the key that was filling the
+    /// disk, and only the other keys paid. The in-flight part is already safe
+    /// (an unsealed `.segpart` is neither in `segment_bytes` nor a candidate) and
+    /// the age of a span is its seal time (`add_read` counts reads without
+    /// moving it), so the guard belongs on the span.
+    #[tokio::test]
+    async fn a_walk_in_progress_is_trimmable_outside_its_pin() {
+        let h = harness(EvictionPolicy::Lru, 0, 0);
+        let now = 400_000u64;
+        h.stage_span("a.bin", 0, 100, now - 120_000, 1).await; // older than the guard
+        h.stage_span("a.bin", 100, 200, now, 1).await; // just sealed
+        h.touch_row("a.bin", now).await; // ...and the row itself is fresh
+
+        let (_, freed) = h.staging.evict_staged(100, now).await;
+        assert_eq!(freed, 100, "the old span goes even though its row was touched a moment ago");
+        assert_eq!(
+            h.spans("a.bin"),
+            vec![(100, 200)],
+            "and the span that was just sealed is not a candidate yet"
+        );
     }
 
     /// A leased key with NO watch keeps the older, coarser rule: the whole row

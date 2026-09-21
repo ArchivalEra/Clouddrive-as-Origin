@@ -69,6 +69,14 @@ read_grace_secs = 300
 # watching off, leaving a key protected only while a body streams it.
 watch_idle_secs = 900              # 15 min
 
+# An object larger than `max_size_bytes` gets a staged-read run on a bounded
+# working window (ADR-0019): it may keep `watch_pin_bytes + session_window_bytes`
+# staged, and its excess is spent before any keepable key's span. What admission
+# asks is whether the WRITE is affordable (a window no larger than the budget,
+# plus disk room) — not whether the object fits: an object too large to keep whole
+# is served from a sliding window, one upstream open per window instead of one per
+# request. Nothing here is content-aware; the rule is a size relationship.
+
 # Bytes pinned around a watching viewer's position (ADR-0018): half behind
 # (what a small scrub back needs) and half ahead (the window the chain fetches
 # before the player asks). A pin is a PREFERENCE, not an exemption — when

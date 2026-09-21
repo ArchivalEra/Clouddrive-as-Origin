@@ -199,7 +199,21 @@ repo** — it is injected at runtime via an environment variable (e.g.
    the byte budget stopped being enforceable against exactly the key a long
    watch was filling).
 
-   **An object larger than the magazine is never cached, and never gets a run.**
+   **An object larger than the magazine gets a run on a bounded working window
+   (ADR-0019).** What admission asks is whether the WRITE is affordable — a
+   window no larger than the retention budget, and disk room for it — not
+   whether the object fits: staged spans are served directly, so a bounded
+   window of an object too large to keep whole is the sliding window its reader
+   is walking through. Such a key may keep `watch_pin_bytes +
+   session_window_bytes` staged (192 MiB by default) and its excess is spent
+   before any keepable key's span, on every tick rather than only when the
+   magazine is globally over budget. Measured on the node against a real 200 GiB
+   object: a walk of 24 shards costs 1 upstream open (was 24), 400 shards cost 10
+   (was 400), and the staged bytes settle at exactly the cap once the
+   minimum-age guard has passed.
+
+   **An object larger than the magazine is never cached WHOLE, and its reader
+   still pays for random seeks.**
    Measured against a real 200 GiB video: admission logs "passthrough without
    staging: the magazine cannot hold this object" for every request, the cache
    holds nothing for the key (`segment_bytes`, `entries`, `stray_bytes` all
@@ -207,8 +221,8 @@ repo** — it is injected at runtime via an environment variable (e.g.
    0.82-0.92 s per random seek, while a stageable object walks at about one open
    per 64 MiB window. Playback survives on larger ranges (16 MiB = one open,
    1.5 s), scrubbing pays a provider round trip per gesture. `big-object-probe.sh`
-   is the account, and the run machinery being gated on staging admission is the
-   gap it exposes.
+   is the account; ADR-0019's run closes the walk half of it, and full coverage
+   stays unreachable by construction (the magazine cannot hold the object).
 
    The pin is a preference, not an exemption: a trim takes bytes outside every
    pin first and spends a pin only when the rest of the cache cannot cover the

@@ -1227,6 +1227,18 @@ fn run_fixture(
     window: u64,
     pace_ms: u64,
 ) -> (Arc<Cache<MockClock>>, Arc<AtomicUsize>) {
+    run_fixture_capped(dir, object_bytes, window, pace_ms, 64 * 1024 * 1024)
+}
+
+/// The same, with a magazine the object does NOT fit (ADR-0019): the object can
+/// never be retained whole, which is the case a run has to work in too.
+fn run_fixture_capped(
+    dir: &std::path::Path,
+    object_bytes: u64,
+    window: u64,
+    pace_ms: u64,
+    max_size_bytes: u64,
+) -> (Arc<Cache<MockClock>>, Arc<AtomicUsize>) {
     let clock = Arc::new(MockClock::new(0));
     let mut cfg = Config {
         cache_dir: dir.to_path_buf(),
@@ -1238,7 +1250,7 @@ fn run_fixture(
         origin_cache::config::CacheProfile { min_file_size: 1, coverage_window_secs: 3600 },
     );
     cfg.session_window_bytes = window;
-    cfg.max_size_bytes = 64 * 1024 * 1024;
+    cfg.max_size_bytes = max_size_bytes;
     let cfg = Arc::new(cfg);
     let opens = Arc::new(AtomicUsize::new(0));
     let backend = Arc::new(
@@ -1280,6 +1292,175 @@ async fn wait_staged(cache: &Arc<Cache<MockClock>>, bytes: u64) {
         "segment_bytes never became {bytes}; got {}",
         cache.state.read().await.segment_bytes
     );
+}
+
+/// An object the magazine can NEVER hold whole still gets a run (ADR-0019).
+///
+/// Before this, `magazine.fits` refused every request on such a key, so each
+/// one opened its own upstream Range — for the product's object (a video, a
+/// tarball, an image, any object larger than the magazine) that means one
+/// ~1.2 s provider open per request instead of one per window.
+#[tokio::test]
+async fn a_run_starts_for_an_object_larger_than_the_magazine() {
+    let dir = tempdir().unwrap();
+    // 4 MiB object, 1 MiB magazine (so it can never be held), 256 KiB window.
+    let (cache, opens) = run_fixture_capped(dir.path(), 4 << 20, 256 << 10, 0, 1 << 20);
+
+    // Three seeks inside the first window: one run, one open. The bodies are
+    // drained, not just planned: a plan only says where the bytes WILL come
+    // from, and the run's own open happens in its driver task.
+    for offset in [0u64, 65_536, 131_072] {
+        let plan = get_range(&cache, offset, 65_536).await;
+        assert_eq!(
+            plan.source,
+            origin_cache::cache::cache::BodySource::Stage,
+            "a window of an object too large to keep is still staged and served"
+        );
+        let mut body = plan.body;
+        assert_eq!(collect(&mut body).await, synthetic(offset, 65_536), "seek at {offset}");
+    }
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        1,
+        "three seeks inside one window of an un-keepable object must share one upstream open"
+    );
+}
+
+/// A run is a WRITE, and the write is what has to be affordable: a window
+/// larger than the retention budget can never be kept (it would be evicted the
+/// moment it sealed), so the request streams through instead. This is the
+/// question that replaced the old object-size test, and it is what keeps a
+/// whole-object request on a huge object from writing a huge file.
+#[tokio::test]
+async fn a_range_larger_than_the_magazine_streams_through_without_a_run() {
+    let dir = tempdir().unwrap();
+    let (cache, opens) = run_fixture_capped(dir.path(), 4 << 20, 256 << 10, 0, 1 << 20);
+    // The whole object in one request: run_len = 4 MiB > 1 MiB magazine.
+    let plan = get_range(&cache, 0, 4 << 20).await;
+    assert_eq!(
+        plan.source,
+        origin_cache::cache::cache::BodySource::Upstream,
+        "a window bigger than the retention budget is not written"
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 1, "one open, straight through");
+    assert_eq!(
+        cache.state.read().await.segment_bytes,
+        0,
+        "and nothing was staged for it"
+    );
+}
+
+/// The escape must not re-fetch what it already holds. When a run is refused
+/// (the window is bigger than the retention budget, or the disk cannot afford
+/// it) the request still streams through — but the staged prefix rides along
+/// and only the gap is opened upstream. Before this the escape handed the
+/// provider the ORIGINAL range, so every byte of the prefix was fetched twice.
+#[tokio::test]
+async fn an_admission_escape_does_not_refetch_the_staged_prefix() {
+    let dir = tempdir().unwrap();
+    let payload: Vec<u8> = (0..(4u64 << 20)).map(|i| (i % 251) as u8).collect();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ..Config::default()
+    };
+    cfg.upstreams[0].cache_profile = "efficient".into();
+    cfg.cache_profiles.insert(
+        "efficient".into(),
+        origin_cache::config::CacheProfile { min_file_size: 1, coverage_window_secs: 3600 },
+    );
+    cfg.session_window_bytes = 256 << 10;
+    cfg.max_size_bytes = 1 << 20;
+    cfg.read_grace_secs = 0;
+    cfg.watch_idle_secs = 0;
+    cfg.watch_pin_bytes = 0;
+    let cfg = Arc::new(cfg);
+    let open_calls = Arc::new(AtomicUsize::new(0));
+    let opens_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(
+        CountingBackend::counting(payload.clone(), Some("v1".into()), Arc::clone(&calls), None)
+            .counters(
+                Arc::clone(&open_calls),
+                Arc::clone(&open_calls),
+                Arc::clone(&open_calls),
+                Arc::clone(&opens_log),
+            ),
+    );
+    let mut slots = HashMap::new();
+    slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
+    let cache = Arc::new(Cache::new(cfg, clock, BackendRegistry::new(slots)));
+
+    // Stage the first window with an ordinary small read.
+    get_range(&cache, 0, 65_536).await;
+    wait_staged(&cache, 262_144).await;
+
+    // Ask for the whole object: the run would write 4 MiB against a 1 MiB
+    // budget, so it streams through — with the prefix served locally.
+    let plan = get_range(&cache, 0, 4 << 20).await;
+    let opens = opens_log.lock().unwrap().clone();
+    let last = *opens.last().expect("an upstream open happened");
+    assert_eq!(
+        last.0, 262_144,
+        "the open starts at the staged frontier, not at the requested start: {opens:?}"
+    );
+    assert_eq!(plan.content_length, Some(4 << 20), "the response still promises the whole range");
+    let mut body = plan.body;
+    let bytes = collect(&mut body).await;
+    assert_eq!(bytes.len() as u64, 4 << 20, "and delivers it");
+    assert_eq!(&bytes[..262_144], &payload[..262_144], "byte-exact across the prefix boundary");
+}
+
+/// A key being walked trims itself to a bounded working window even while the
+/// magazine is globally under budget: the object can never be kept, so what a
+/// reader may hold is the neighbourhood it is reading plus one window — not
+/// everything it has written since the session began.
+#[tokio::test]
+async fn an_unkeepable_key_trims_itself_to_its_working_window() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ..Config::default()
+    };
+    cfg.upstreams[0].cache_profile = "efficient".into();
+    cfg.cache_profiles.insert(
+        "efficient".into(),
+        origin_cache::config::CacheProfile { min_file_size: 1, coverage_window_secs: 3600 },
+    );
+    cfg.session_window_bytes = 256 << 10;
+    cfg.max_size_bytes = 1 << 20; // the 4 MiB object cannot fit
+    cfg.read_grace_secs = 0;
+    cfg.watch_idle_secs = 0;
+    cfg.watch_pin_bytes = 65_536; // cap = pin + window = 320 KiB
+    let cfg = Arc::new(cfg);
+    let opens = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(SizedBackend::new(&[("a.bin", 4 << 20)], Arc::clone(&opens)));
+    let mut slots = HashMap::new();
+    slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
+    let cache = Arc::new(Cache::new(cfg, clock.clone(), BackendRegistry::new(slots)));
+
+    // Walk all four windows of the magazine-sized first MiB.
+    for offset in [0u64, 262_144, 524_288, 786_432] {
+        get_range(&cache, offset, 65_536).await;
+        let want = offset / 262_144 + 1;
+        wait_staged(&cache, want * 262_144).await;
+    }
+    // Exactly at the global limit, not over it: 1 MiB staged against a 1 MiB
+    // cap with no durable entries is `resident + segment_bytes - max_size = 0`.
+    // The trim asserted below is therefore the PER-KEY rule, not the global one.
+    assert_eq!(cache.state.read().await.segment_bytes, 1 << 20, "four windows staged");
+
+    // The spans are older than the minimum age, so they are candidates.
+    clock.advance(120_000);
+    cache.tick().await;
+
+    let staged = cache.state.read().await.segment_bytes;
+    assert!(
+        staged <= 320 << 10,
+        "the key holds its working window (pin + one window = 320 KiB), not the whole walk: {staged}"
+    );
+    assert!(staged > 0, "and it holds something: the newest window is the read-ahead");
 }
 
 /// The headline of ADR-0016: seeks that land inside a live run's window ride
