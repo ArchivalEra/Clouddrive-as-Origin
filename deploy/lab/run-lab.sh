@@ -84,7 +84,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- 0. build -----------------------------------------------------------------
+# --- setup: build the release binary ---
 note "build release (may reuse cache)"
 (cd "$REPO" && cargo build --release 2>&1 | tail -1) || { echo "FAIL: build"; exit 1; }
 [ -x "$BIN" ] || { echo "FAIL: no binary"; exit 1; }
@@ -103,7 +103,7 @@ for port in 7777 7778 7779 7780 7781 7782 7783 8081 8082 8083 8084 8085 8086 808
   done
 done
 
-# --- 1. test data -------------------------------------------------------------
+# --- setup: test data (fixtures the assertions below read) ---
 # The cache dirs must start EMPTY: they persist across runs, the ledger is
 # rebuilt from whatever sidecars are on disk at boot, and every staged-bytes
 # assertion below would otherwise be measuring the previous run.
@@ -136,7 +136,7 @@ if [ ! -f "$LAB/dav-data/media/big3g.bin" ]; then
 fi
 DAV_ROOT="$LAB/dav-data"
 
-# --- 2. fake OpenList (rclone serve webdav) -----------------------------------
+# --- setup: a fake OpenList (rclone serve webdav) ---
 note "starting rclone webdav on 5244"
 pkill -f "rclone serve webdav" 2>/dev/null; sleep 1
 cd "$DAV_ROOT"
@@ -152,7 +152,7 @@ for i in $(seq 1 20); do
 done
 [ "$dav_ok" = 1 ] || { echo "FAIL: dav not reachable"; tail -3 "$LAB/dav.log"; exit 1; }
 
-# --- 3. start all profiles ---------------------------------------------------
+# --- setup: start every profile ---
 export CDN_LAB_DAV_USER=$DAV_USER CDN_LAB_DAV_PASS=labpass CDN_LAB_PREWARM_SECRET=$PREWARM_SECRET
 cd "$REPO"
 "$BIN" "$REPO/deploy/lab/config-a.toml" > "$LAB/cache-a/serve.log" 2>&1 & PID_A=$!
@@ -243,7 +243,7 @@ settle_opens() {
   echo "$prev"
 }
 
-# --- 4. acceptance matrix ------------------------------------------------------
+# --- the acceptance matrix (notes 1-8) ---
 note "1. cold small-file GET (standard)"
 code=$(H -o /dev/null -w "%{http_code}" http://127.0.0.1:7777/media/hello.txt)
 [ "$code" = 200 ] && ok "cold GET 200" || bad "cold GET got $code"
@@ -357,7 +357,7 @@ code=$(head -1 /tmp/lab-badsig-hdr.txt | grep -oE "[0-9]{3}")
 cc=$(grep -i "^cache-control:" /tmp/lab-badsig-hdr.txt | tr -d "\r")
 case "$code$cc" in 403*no-store*) ok "sigv4 bad sig 403 no-store" ;; *) bad "sigv4 bad sig: code=$code cc=$cc" ;; esac
 
-# --- 4b. coverage window (map #30 T2): efficient profile on 7779 ---------------
+# --- the coverage window: the efficient profile on 7779 (notes 9-14) ---
 note "9. one upstream stream per key: seeks inside a window share an open"
 # config-c: efficient profile, 256 KiB window, 1 MiB object. The first seek
 # starts a run (one open, one span of the window); the next two ride its
@@ -708,7 +708,7 @@ else
   echo "    skipped: node, playwright-core or the test object is missing"
 fi
 
-# --- 15. a real player's request shape ---------------------------------------
+# --- a real player's request shape (note 15) ---
 # The one shape the harnesses above cannot produce: a browser deciding its own
 # ranges, in its own order, with its own retries. Recorded from the resource
 # timing buffer (page JS cannot see the video's requests), with the player's own
@@ -732,7 +732,7 @@ else
   note "15. skipped (node, playwright-core or the clip is missing)"
 fi
 
-# --- 16. the front's own guards ----------------------------------------------
+# --- the front's own guards (note 16) ---
 # The front's pure helpers are unit-tested (CIDR parsing, the rate gate's
 # `exceeds`, the metric families). What had no test was the WIRING: whether the
 # gate and the body cap are consulted on a live connection, and whether healthz
@@ -780,7 +780,7 @@ code=$(H -o /dev/null -w "%{http_code}" -X POST --data-binary @"$LAB/oversize-pr
 [ "$code" = 413 ] && ok "an oversized prewarm body is 413 at the front" \
   || bad "oversized prewarm returned $code (want 413)"
 
-# --- 17. the production DEFAULT window against the CDN's shard shape ----------
+# --- the production DEFAULT window against the CDN's shard shape (note 17) ---
 # Every other efficient config here sets a 256 KiB window so its numbers are
 # quick, which left the value the node actually runs (the 64 MiB default)
 # justified by prose and hand-run probes only. This walks config-g the way the
@@ -818,7 +818,7 @@ echo "    walk: ${walk_ms} ms for 24 MiB, opens=$opened, staged=$gbytes" >&2
 fi
 fi
 
-# --- 5. summary ---------------------------------------------------------------
+# --- summary ---
 echo "======================================"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ]
