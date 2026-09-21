@@ -1032,6 +1032,86 @@ async fn staged_segment_bytes_join_the_disk_budget() {
 }
 
 // ---------------------------------------------------------------------------
+// Watches (ADR-0018): the viewing SESSION, which outlives its bodies.
+// ---------------------------------------------------------------------------
+
+/// The horizon a lease cannot give. A viewing session lasts hours while its
+/// bodies last milliseconds (EdgeOne asks for ascending 1 MiB shards, so the
+/// origin sees one request per shard), and protection anchored to the last body
+/// plus `read_grace_secs` therefore lapses MID-WATCH: the viewer's own window
+/// becomes ordinary eviction material while the viewer is still there. A watch
+/// says the session is still alive and pins a bounded neighbourhood of where
+/// the viewer is, so the budget takes somebody else's bytes first.
+#[tokio::test]
+async fn a_watch_keeps_the_viewers_window_while_the_budget_takes_other_keys() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config::default();
+    cfg.cache_dir = dir.path().to_path_buf();
+    cfg.max_size_bytes = 3_072; // 4 KiB staged = 1 KiB over the cap
+    cfg.inactive_ttl_secs = 3_600; // long enough that the sweep is not the cause
+    cfg.read_grace_secs = 300;
+    cfg.watch_idle_secs = 900;
+    cfg.watch_pin_bytes = 4_096;
+    let cfg = Arc::new(cfg);
+    let backend =
+        CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
+    let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
+
+    clock.advance(120_000);
+    let watched = origin_cache::cache::store::seg_path(&cfg.cache_dir, "live.bin", 0, 2048);
+    let other = origin_cache::cache::store::seg_path(&cfg.cache_dir, "other.bin", 0, 2048);
+    std::fs::write(&watched, vec![0u8; 2048]).unwrap();
+    std::fs::write(&other, vec![0u8; 2048]).unwrap();
+    {
+        let mut cov = cache.coverage.lock().await;
+        // The watched key is the OLDER row, so the cross-key LRU visits it
+        // first: without the pin it is the one the budget takes.
+        let mut live =
+            origin_cache::cache::store::Coverage { total: 4096, last_touch_millis: 10_000, ..Default::default() };
+        live.add_interval(0, 2048, 10_000);
+        cov.insert("live.bin".to_string(), live);
+        let mut o = origin_cache::cache::store::Coverage {
+            total: 4096,
+            last_touch_millis: 120_000,
+            ..Default::default()
+        };
+        o.add_interval(0, 2048, 120_000);
+        cov.insert("other.bin".to_string(), o);
+    }
+    cache.state.write().await.segment_bytes = 4_096;
+
+    // The viewer watched [0, 2048) and is between two requests of the same
+    // session: no body holds the key, the watch does.
+    let watch = cache.watches.acquire_at("live.bin", (0, 2048), Arc::clone(&clock));
+    drop(watch);
+    // Past the read grace (300 s), inside the watch budget (900 s).
+    clock.advance(400_000);
+    cache.tick().await;
+
+    assert!(watched.exists(), "the viewer's window survives the pause");
+    assert!(!other.exists(), "the budget took the other key instead");
+    assert_eq!(cache.state.read().await.segment_bytes, 2_048, "accounting moved with the file");
+
+    // Past the watch budget the key is ordinary material again: the pin is a
+    // deadline, not an exemption (ADR-0012's rule, third application).
+    clock.advance(900_001);
+    std::fs::write(&other, vec![0u8; 2048]).unwrap();
+    {
+        let mut cov = cache.coverage.lock().await;
+        let now = clock.now_millis();
+        let mut o =
+            origin_cache::cache::store::Coverage { total: 4096, last_touch_millis: now, ..Default::default() };
+        o.add_interval(0, 2048, now);
+        cov.insert("other.bin".to_string(), o);
+    }
+    cache.state.write().await.segment_bytes = 4_096;
+    cache.tick().await;
+    assert!(!watched.exists(), "after its budget a watch protects nothing");
+    assert_eq!(cache.state.read().await.segment_bytes, 2_048);
+}
+
+// ---------------------------------------------------------------------------
 // Read leases (ADR-0017): what a viewer is streaming is not evicted.
 // ---------------------------------------------------------------------------
 

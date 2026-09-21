@@ -6,6 +6,10 @@ a policy knob.
 
 ## Context
 
+> Amended by ADR-0018: the candidate rule below gains a pin input. A watched
+> key's spans outside the viewer's neighbourhood are candidates first; the
+> neighbourhood is taken only when the rest of the cache cannot cover the need.
+
 The efficient profile stages the bytes it serves as `.seg` sidecars and
 records them in a per-key coverage ledger. Until this decision the only reader
 of those sidecars was **promotion**: when coverage passed a threshold, a

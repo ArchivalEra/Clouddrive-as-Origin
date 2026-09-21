@@ -219,6 +219,10 @@ pub(crate) struct Magazine {
     /// Read leases: policy eviction spares what a viewer is streaming
     /// (ADR-0017). Disk pressure deliberately does not consult them.
     leases: Arc<super::leases::Leases>,
+    /// Watches (ADR-0018): a viewing session, which outlives its bodies. A
+    /// watched key's *object file* is what a durable install holds, so here —
+    /// unlike the staged spans — the granularity is the whole key.
+    watches: Arc<super::watch::Watches>,
 }
 
 impl Magazine {
@@ -227,8 +231,20 @@ impl Magazine {
         config: Arc<Config>,
         meta: Arc<crate::cache::persist::MetaStore>,
         leases: Arc<super::leases::Leases>,
+        watches: Arc<super::watch::Watches>,
     ) -> Self {
-        Self { state, config, meta, leases }
+        Self { state, config, meta, leases, watches }
+    }
+
+    /// Keys policy eviction must leave alone right now: bodies streaming a
+    /// key (ADR-0017) plus keys being watched inside their idle budget
+    /// (ADR-0018). The two are computed together because every caller that
+    /// needs one needs both, and because two answers is how one of them ends
+    /// up forgotten at a call site.
+    fn spared(&self, now: u64) -> std::collections::HashSet<String> {
+        let mut spared = self.leases.protected(now);
+        spared.extend(self.watches.live_keys(now));
+        spared
     }
 
     /// Whether the magazine can hold an object this size (see
@@ -293,7 +309,13 @@ impl Magazine {
             let mut s = self.state.write().await;
             s.total_bytes = s.total_bytes.saturating_sub(old_size) + entry.size_bytes;
             s.entries.insert(key.to_string(), entry);
-            evict_pick(&mut s, &self.config, &std::collections::HashSet::new())
+            // The install's own overshoot is a byte/count eviction like any
+            // other, so it asks the same question: this used to pass an EMPTY
+            // protection set, which made one install able to unlink the file a
+            // viewer was streaming (and, at the margin, the row it had just
+            // installed). A lease or a watch is not a reason to overrun the
+            // budget, but it is a reason to pick a different victim.
+            evict_pick(&mut s, &self.config, &self.spared(now))
         };
         self.delete(&evicted).await;
     }
@@ -403,7 +425,7 @@ impl Magazine {
     /// Inactive-expiry pass: returns the victims whose redb rows and files
     /// the caller must remove via [`Magazine::delete`].
     pub(crate) async fn reap(&self, ttl_ms: u64, now: u64) -> Vec<(String, u64)> {
-        let protected = self.leases.protected(now);
+        let protected = self.spared(now);
         let mut s = self.state.write().await;
         reap_collect(&mut s, ttl_ms, now, &protected)
     }
@@ -411,7 +433,7 @@ impl Magazine {
     /// Byte/count budget pass: returns the victims that bring the magazine
     /// back under its caps.
     pub(crate) async fn evict_budget(&self, now: u64) -> Vec<(String, u64)> {
-        let protected = self.leases.protected(now);
+        let protected = self.spared(now);
         let mut s = self.state.write().await;
         evict_pick(&mut s, &self.config, &protected)
     }
@@ -553,6 +575,67 @@ mod tests {
 
 
 
+    /// The install's own overshoot is a byte/count eviction like every other,
+    /// and it must ask the same question: this call site passed an EMPTY
+    /// protection set, which let a concurrent install unlink the object file a
+    /// viewer was streaming (ADR-0017 for the lease, ADR-0018 for the watch).
+    /// The victim must be a different key.
+    #[tokio::test]
+    async fn an_install_does_not_unlink_a_file_under_a_live_lease() {
+        let dir = tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.cache_dir = dir.path().to_path_buf();
+        cfg.max_size_bytes = 250;
+        let meta = MetaStore::open(&dir.path().join(store::META_STORE_FILE)).unwrap();
+        let state = Arc::new(RwLock::new(CacheState::default()));
+        {
+            let mut s = state.write().await;
+            // A is the stalest row, so the byte budget's own order picks it
+            // first — and it is the one being watched.
+            s.entries.insert("a.bin".into(), row("a.bin", 100, 10, false));
+            s.entries.insert("b.bin".into(), row("b.bin", 100, 20, false));
+            s.total_bytes = 200;
+        }
+        let leases = Arc::new(crate::cache::leases::Leases::new(0));
+        let watches = Arc::new(crate::cache::watch::Watches::new(0, 0));
+        let magazine = Magazine::new(
+            Arc::new(RwLock::new(CacheState::default())).clone(),
+            Arc::new(cfg),
+            Arc::new(meta),
+            Arc::clone(&leases),
+            Arc::clone(&watches),
+        );
+        // The magazine above owns its own state; give it the one this test
+        // filled in — the constructor takes the receiver, not a copy.
+        let magazine = Magazine {
+            state: Arc::clone(&state),
+            ..magazine
+        };
+        let _lease = leases.acquire("a.bin", Arc::new(|| 30));
+
+        magazine
+            .install(
+                "c.bin",
+                "primary",
+                &ObjectMeta {
+                    size_bytes: 100,
+                    etag: Some("v1".into()),
+                    last_modified: None,
+                    mime_hint: None,
+                },
+                30,
+                false,
+            )
+            .await;
+
+        // The install pushed the magazine 50 bytes over its cap, so exactly
+        // one row has to go — and it must be the unprotected one.
+        let s = state.read().await;
+        assert!(s.entries.contains_key("a.bin"), "the watched key is not the victim");
+        assert!(!s.entries.contains_key("b.bin"), "the budget took the unprotected row");
+        assert!(s.entries.contains_key("c.bin"), "the install landed");
+    }
+
     /// Last-resort guard on the single deletion site: even if a store key
     /// reaches the victim list, the reaper must refuse it.
     #[tokio::test]
@@ -579,6 +662,7 @@ mod tests {
             Arc::new(cfg),
             Arc::new(meta),
             Arc::new(crate::cache::leases::Leases::new(0)),
+            Arc::new(crate::cache::watch::Watches::new(0, 0)),
         );
         magazine
             .delete(&[

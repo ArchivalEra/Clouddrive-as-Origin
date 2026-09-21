@@ -626,6 +626,9 @@ pub struct FixtureBuilder {
     coverage: Option<u64>,
     session_window: Option<u64>,
     eviction: Option<crate::config::EvictionPolicy>,
+    read_grace: Option<u64>,
+    watch_idle: Option<u64>,
+    watch_pin: Option<u64>,
     max_size_bytes: Option<u64>,
     mime: Option<String>,
     last_modified: Option<String>,
@@ -637,6 +640,9 @@ impl FixtureBuilder {
             bytes: bytes.to_vec(),
             session_window: None,
             eviction: None,
+            read_grace: None,
+            watch_idle: None,
+            watch_pin: None,
             etag: None,
             extra: Vec::new(),
             missing: false,
@@ -699,6 +705,26 @@ impl FixtureBuilder {
         self
     }
 
+    /// Grace after the last body before a key is evictable again (ADR-0017).
+    /// 0 isolates the live-body rule in tests that assert on the lease itself.
+    pub fn read_grace(mut self, secs: u64) -> Self {
+        self.read_grace = Some(secs);
+        self
+    }
+
+    /// How long a key stays watched after its last body (ADR-0018). 0 is the
+    /// pre-ADR-0018 rule: only bodies streaming the key protect it.
+    pub fn watch_idle(mut self, secs: u64) -> Self {
+        self.watch_idle = Some(secs);
+        self
+    }
+
+    /// Bytes pinned around a watched viewer's position (ADR-0018).
+    pub fn watch_pin(mut self, bytes: u64) -> Self {
+        self.watch_pin = Some(bytes);
+        self
+    }
+
     /// Efficient-profile knobs; implies `profile("efficient")`.
     pub fn coverage(mut self, min_file_size: u64) -> Self {
         self.profile = Some("efficient".into());
@@ -731,6 +757,15 @@ impl FixtureBuilder {
         }
         if let Some(bytes) = self.session_window {
             cfg.session_window_bytes = bytes;
+        }
+        if let Some(secs) = self.read_grace {
+            cfg.read_grace_secs = secs;
+        }
+        if let Some(secs) = self.watch_idle {
+            cfg.watch_idle_secs = secs;
+        }
+        if let Some(bytes) = self.watch_pin {
+            cfg.watch_pin_bytes = bytes;
         }
         if let Some(min_file_size) = self.coverage {
             cfg.cache_profiles.insert(

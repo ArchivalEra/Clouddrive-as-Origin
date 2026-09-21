@@ -59,6 +59,26 @@ session_window_bytes = 67108864    # 64 MiB
 # disk is the last resort and an open descriptor survives the unlink.
 read_grace_secs = 300
 
+# How long a key stays WATCHED after its last body ended (ADR-0018). A viewing
+# session lasts hours while its bodies last milliseconds — EdgeOne asks for
+# ascending 1 MiB shards, so the origin sees one request per shard — and a
+# protection anchored to the last request alone therefore lapses mid-watch:
+# pause for longer than read_grace_secs and the window the chain had already
+# fetched becomes ordinary eviction material. A watch remembers where the
+# viewer is for this long, and holds the read-ahead across the pause. 0 turns
+# watching off, leaving a key protected only while a body streams it.
+watch_idle_secs = 900              # 15 min
+
+# Bytes pinned around a watching viewer's position (ADR-0018): half behind
+# (what a small scrub back needs) and half ahead (the window the chain fetches
+# before the player asks). A pin is a PREFERENCE, not an exemption — when
+# nothing else can cover a trim the pin is spent too, from its back, because
+# forward progress is continuous while a scrub back is deliberate. This is what
+# keeps the byte budget real for a 200 GB object on a 10 GiB magazine.
+# 0 disables pinning, which restores ADR-0017's coarser rule: a key being read
+# keeps all of its spans, and the policy governs everything else.
+watch_pin_bytes = 134217728        # 128 MiB, two default windows
+
 # --- per-upstream throttling ---
 concurrency_per_upstream = 3
 retry_max_attempts = 4
