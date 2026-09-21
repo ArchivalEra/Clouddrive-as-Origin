@@ -159,3 +159,40 @@ the second restores ADR-0017's coarser whole-key rule.
   what `cache_watch_pinned_bytes` reports.
 - `Watches` is `pub` like `leases` and `flight`: the tests drive it directly,
   production goes through the response path.
+
+## A global pin ceiling: measured, and not added (2026-09-21)
+
+The pin is per key. N watched keys therefore name N x `watch_pin_bytes` of
+preferred bytes, and nothing caps N. That was left as "measure it before
+deciding", and it has now been measured on the node: `cache_watch_pinned_bytes`
+reads 134 217 728 with one live watch — exactly the 128 MiB default — and
+`cache_watch_active` tracks the number of watched keys, so the total is
+N x 128 MiB with no ceiling of its own.
+
+**No ceiling is the right answer, because the number is not a reservation.** A
+pin does not hold bytes; it orders the eviction. `evict_staged` walks the cache
+twice: everything outside every pin first, the pins only if the rest could not
+cover the need. So the disk stays bounded by the magazine (`max_size_bytes`) plus
+the transient caps (ADR-0019) whatever N is — the pin decides *which* bytes go,
+never *whether* they go. Two tests pin the property:
+
+- `a_pin_is_spent_only_after_the_bytes_outside_it`: 6 KiB staged against a 4 KiB
+  magazine, both keys watched, the pin's neighbourhood straddling two spans. The
+  two spans lying entirely outside the pins are exactly what the budget needs, so
+  they go and the pin is untouched.
+- `protection_orders_eviction_and_never_exempts_it`: the pin covers whole rows —
+  nothing is outside — and the magazine STILL comes back inside its budget, each
+  key spending the span behind its viewer first. Removing the second pass (making
+  a pin an exemption) turns this test red, which is the reverse verification.
+
+**What N does affect is the eviction's freedom**, and that is the intended
+trade: with every key watched, the reaper spends pins sooner, so a node under
+heavy multi-viewer load degrades to "keep each playhead, drop the history"
+rather than "drop somebody's playhead". A ceiling would have to choose which
+viewer's neighbourhood to sacrifice, and it would do it with less information
+than the two passes already have.
+
+The one cost worth watching is not bytes but the map: one entry per watched key,
+pruned on every pass, each holding a few words. It cannot grow with the keys the
+node has served — only with the viewers present in the last `watch_idle_secs`.
+
