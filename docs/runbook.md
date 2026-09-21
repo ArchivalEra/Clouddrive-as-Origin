@@ -83,6 +83,30 @@ decision and the measurements.
   cannot flood the receiver.
 
 
+## Would rate limiting be safe to enable? (2026-09-21)
+
+`front_rate_rps` is 0 in production today (off). Enabling it has two halves, and
+only one of them is a test:
+
+```sh
+# ON the node: the half that can be measured without touching production.
+bash deploy/oracle/rate-limit-probe.sh
+```
+
+It starts a loopback-only instance of its own (own cache dir and ports, the
+production binary, the same OpenList) with `front_rate_rps = 2`, probes it, and
+removes it. Measured 2026-09-21: the third request in a second is refused
+(`200 200 429`), the ceiling recovers after a second, five concurrent requests are
+counted rather than raced past (three refused), and the business plane is not
+rate limited — the gate is the front's own, on the front's port.
+
+The other half is a decision, because a 429 arrives at the EDGE: whether EdgeOne
+retries it (and how hard) is its contract, not ours to discover unattended.
+Enabling it is one line in the production config plus a restart; watch
+`front_requests_total{status="429"}` on 9090 and the origin's access log for a
+retry pattern (a rising request rate on unchanged keys), and roll back by
+removing the same line. The probe prints this procedure too.
+
 ## Looking at ONE key (2026-09-21)
 
 `curl -s 'http://127.0.0.1:8080/_internal/healthz?key=googledrive1%2Fround3.mp4' | jq .key`
