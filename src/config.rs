@@ -62,7 +62,11 @@ pub enum ColdMiss {
 }
 
 fn default_cache_profile() -> String {
-    "standard".into()
+    // Efficient by default: a ranged read is the shape every viewer produces,
+    // and staging its window is what makes one upstream open serve many
+    // requests (ADR-0016/0019). `"standard"` remains available and unchanged
+    // for an operator who wants full-file fills.
+    "efficient".into()
 }
 
 fn default_min_file_size() -> u64 {
@@ -119,6 +123,18 @@ impl EffectiveProfile {
 
     pub fn nocache() -> Self {
         Self { efficient: false, nocache: true, min_file_size: 0, coverage_window_secs: 0 }
+    }
+
+    /// The built-in `efficient` profile: stage every ranged read (no
+    /// `min_file_size` floor), with the default ledger window. A
+    /// `[cache_profiles.efficient]` table still overrides both knobs.
+    pub fn efficient() -> Self {
+        Self {
+            efficient: true,
+            nocache: false,
+            min_file_size: 0,
+            coverage_window_secs: default_coverage_window_secs(),
+        }
     }
 }
 
@@ -389,6 +405,15 @@ impl Config {
         match name {
             "standard" => EffectiveProfile::standard(),
             "nocache" => EffectiveProfile::nocache(),
+            "efficient" => match self.cache_profiles.get("efficient") {
+                Some(p) => EffectiveProfile {
+                    efficient: true,
+                    nocache: false,
+                    min_file_size: p.min_file_size,
+                    coverage_window_secs: p.coverage_window_secs,
+                },
+                None => EffectiveProfile::efficient(),
+            },
             other => match self.cache_profiles.get(other) {
                 Some(p) => EffectiveProfile {
                     efficient: true,
@@ -494,7 +519,9 @@ impl Config {
         for u in &raw.upstreams {
             // Built-in profile names need no [cache_profiles] table;
             // anything else must resolve to a declared table.
-            let builtin = u.cache_profile == "standard" || u.cache_profile == "nocache";
+            let builtin = u.cache_profile == "standard"
+            || u.cache_profile == "nocache"
+            || u.cache_profile == "efficient";
             if !builtin && !profiles.contains_key(&u.cache_profile) {
                 anyhow::bail!(
                     "upstream {}: cache_profile {:?} has no [cache_profiles.<name>] table",
@@ -836,8 +863,17 @@ mod tests {
         let cfg = Config::from_toml_str(&ok).unwrap();
         let p = cfg.cache_profile("a");
         assert!(p.efficient);
-        // Standard is the default everywhere.
-        assert!(!Config::from_toml_str(&upstream_toml("http://127.0.0.1:5244/dav")).unwrap().cache_profile("a").efficient);
+        assert_eq!(p.min_file_size, 4, "a table of that name tunes the built-in");
+        // Efficient IS the default now (a ranged read is the shape every viewer
+        // produces), and the built-in stages everything: no min_file_size floor.
+        let default = Config::from_toml_str(&upstream_toml("http://127.0.0.1:5244/dav")).unwrap();
+        let p = default.cache_profile("a");
+        assert!(p.efficient, "the default profile must be efficient");
+        assert_eq!(p.min_file_size, 0);
+        // ...and `standard` is still available, unchanged.
+        let std_toml = profile_toml("", "cache_profile = \"standard\"");
+        let std = Config::from_toml_str(&std_toml).unwrap();
+        assert!(!std.cache_profile("a").efficient);
     }
 
     #[test]

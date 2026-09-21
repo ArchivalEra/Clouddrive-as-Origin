@@ -817,6 +817,13 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     /// Pure memory peek at a cached entry's size: no upstream call, no
     /// state mutation. Used only for best-effort `Content-Range: bytes
     /// */size` hints on 416 responses (SHOULD-level per R1).
+    /// Whether this key has a whole object on disk — the one thing that keeps a
+    /// ranged request on the ordinary path. Deliberately NOT a freshness check:
+    /// whether those bytes need revalidating is the ordinary path's business.
+    pub(crate) async fn has_durable_entry(&self, raw_key: &str) -> bool {
+        self.state.read().await.entries.contains_key(raw_key)
+    }
+
     pub(crate) async fn memory_size(&self, raw_key: &str) -> Option<u64> {
         let key = validate_key(raw_key).ok()?;
         let s = self.state.read().await;
@@ -853,26 +860,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         }
     }
 
-    /// Whether we already hold this object at all: any row for the key, a
-    /// negative tombstone included (an answer is an answer — the ordinary
-    /// path renders it 404).
-    ///
-    /// Deliberately NOT a freshness check: it answers "does this key have a
-    /// whole object on disk", which is what decides whether a ranged request
-    /// can be answered from it. Whether those bytes need revalidating is the
-    /// ordinary path's business — it stats, compares etags and either serves
-    /// the file or refetches it.
-    ///
-    /// Pure peek: no upstream call, no mutation, no flights, and no
-    /// filesystem call — a row whose file vanished falls through the
-    /// ordinary path's own disk check.
-    pub(crate) async fn has_durable_entry(&self, raw_key: &str) -> bool {
-        let key = match validate_key(raw_key) {
-            Ok(k) => k,
-            Err(_) => return false,
-        };
-        self.state.read().await.entries.contains_key(&key)
-    }
 
     /// One coalesced upstream stat per key, holding the METADATA gate inside
     /// the coalescer: the permit is taken by whichever caller actually runs
@@ -1588,12 +1575,19 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             }
         }
 
-        // 3. Efficient profile: a ranged miss streams origin bytes while the
-        // served interval is staged. Always 206 (this path only runs with a
-        // range). An object we already hold goes to the ordinary path
-        // instead, so a durable entry keeps serving ranges for its whole
-        // life rather than only for the revalidate window.
-        if prof.efficient && range.is_some() && !self.has_durable_entry(&rk.cache_key).await {
+        // 3. THE ranged path: the served window is staged, so the next request
+        // inside it costs no upstream open (ADR-0016/0019), and the response is
+        // always 206.
+        //
+        // It used to be gated on the profile NAME as well, which meant a ranged
+        // request only got a run if the upstream happened to be configured
+        // `efficient` — the profile that nobody deployed. The gate that stays is
+        // the one with a real reason: a key with a DURABLE entry is the ordinary
+        // path's (only it revalidates, and serving the range from the file it
+        // already holds costs no upstream open at all). Objects below
+        // `min_file_size` fall through for the same reason — a small object is
+        // worth a durable entry, a large one is worth windows.
+        if range.is_some() && !self.has_durable_entry(&rk.cache_key).await {
             if let Ok(hit) = self.serve_passthrough(rk, range, prof.min_file_size).await {
                 tracing::info!(key = %rk.cache_key, size = hit.meta.size, "passthrough response");
                 // Always 206: this path only runs with a range, and its hit

@@ -134,16 +134,18 @@ password_env = "OPENLIST_PASSWORD"
 # link_api_token_env = "OPENLIST_LINK_TOKEN"  # OpenList static admin token
                                               # (Settings → Other → Token)
 
-# Fill-policy profiles (P2 efficientcache): orthogonal to cold_miss
-# (serve behavior). Upstreams opt in with `cache_profile = "<name>"`;
-# "standard" (default) = legacy full-file water-pipe on every miss.
-# An efficient profile stages served intervals as .seg sidecars and serves
-# later ranged reads from them (ADR-0015), so the ledger acts as a sliding
-# window for objects the magazine cannot hold whole.
-# cache_profile = "efficient"
-# [cache_profiles.efficient]
-# min_file_size = 67108864   # below this, miss goes B (small files fill cheap)
-# coverage_window_secs = 3600  # staged spans older than this decay out
+# Fill-policy profiles: orthogonal to cold_miss (serve behavior). Upstreams opt
+# in with `cache_profile = "<name>"`; the names "efficient", "standard" and
+# "nocache" are built in.
+#
+# "efficient" IS THE DEFAULT. A ranged read stages the window it served as .seg
+# sidecars and serves later reads inside that window from them (ADR-0015/0016),
+# so one upstream open covers a whole window instead of one request — and the
+# ledger acts as a sliding window for objects the magazine cannot hold whole
+# (ADR-0019). Set `cache_profile = "standard"` for the old full-file water-pipe.
+# [cache_profiles.efficient]      # tunes the built-in; stages everything by default
+# min_file_size = 0             # objects below this take the ordinary path
+# coverage_window_secs = 3600   # staged spans older than this decay out
 
 # "nocache" is a built-in profile for small-footprint nodes: pure
 # water-pipe, zero cache-object disk writes (no entries, no segments,
