@@ -36,6 +36,13 @@ session_window_bytes = 262144
 # be protected from the budget when the tick runs (ADR-0017). Live bodies are
 # protected regardless — that part is not a timer.
 read_grace_secs = 0
+
+# And the watch is off for the same reason (ADR-0018): the section measures what
+# the POLICY does with a staged window, so the viewer's protections must not be
+# part of the answer. `watch_pin_bytes = 0` restores ADR-0017's rule for a live
+# body and leaves everything else to the policy — the pair to config-e, which
+# turns them on and measures what they cost.
+watch_pin_bytes = 0
 [cache_profiles.efficient]
 min_file_size = 4
 
