@@ -502,6 +502,46 @@ applies. One identifier was deliberately NOT renamed: `cache_dir =
 /opt/origin-cache/cache-standard`, which holds the live metadata database and
 every staged sidecar.
 
+### Multi-viewer accounts through the CDN: from the NODE
+
+A "N viewers through the CDN" number taken from a workstation measures the
+workstation's path to the edge, not the origin or the edge. Reproduce it:
+
+```sh
+# From the workstation: 3 concurrent GETs of the SAME small object.
+P=https://cdn-oracle.isui.ren/googledrive1/test-page.html
+for i in 1 2 3; do curl -s --noproxy '*' -m 90 -o /dev/null \
+  -w "v$i ttfb=%{time_starttransfer}s total=%{time_total}s\n" "$P" & done; wait
+```
+
+Three rounds, 2026-09-21: one of the three waited 10.2 s (total 11.9 s), one
+waited over 300 s, and one round was clean — while the origin's own counters
+(`backend_call_duration_seconds_count`, `cache_session_total`) did not move at
+all, i.e. the stalled request never reached the origin. The same three ranges
+from the NODE answer in 0.21-0.23 s, every round.
+
+So the concurrent account comes from the node:
+
+```sh
+# ON the node: N viewers, each walking a fresh band and then jumping.
+bash deploy/lab/probe-edgeone-viewers.sh round3.mp4 3 6 6
+```
+
+It prints a per-request TTFB distribution and the origin-side deltas for the same
+window (upstream opens, sessions sealed/chained, reader attachments). Measured
+2026-09-21 against the real 200 GiB object, fresh bands (the edge cannot answer):
+
+| shape | requests | TTFB p50 | p90 | max | origin opens |
+|---|---|---|---|---|---|
+| 1 viewer, 3+3 | 6 | 0.213 s | 0.216 s | 0.221 s | +5 |
+| 3 viewers, 6+6 | 36 | 0.208 s | 0.212 s | 0.245 s | +27 |
+
+Concurrency costs nothing at the client's first byte, and the origin pays opens
+per WINDOW rather than per request (27 opens for 36 requests: the three viewers
+walk overlapping windows). `deploy/lab/viewer/multi-viewer.mjs` (real browsers)
+is for the LAB and loopback targets; through the CDN its page loads hit exactly
+the stall above.
+
 ### Multi-viewer accounts (browsers, both paths)
 
 `deploy/lab/viewer/` is a generic large-object reader (`reader.js`, EVALUATED in
