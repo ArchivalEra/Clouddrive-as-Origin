@@ -92,3 +92,32 @@ counts runs by outcome and `cache_session_reader_total` counts requests as
   session (~1 open per session). The chain already pays the open ahead of the
   reader, so the remaining gain is bounded by the open cost per window; that
   trade can be revisited once real traffic gives the account.
+
+## The account, and what is left (2026-09-21)
+
+Measured on the real 200 GiB object through the CDN, from the node, with fresh
+bands so the edge cannot answer for them:
+
+| shape | requests | origin opens | provider stats | TTFB p50 | reader escapes |
+|---|---|---|---|---|---|
+| sequential walk, 6 MiB | 24 | **2** | 24 | 0.206 s | 0 |
+| 3 viewers, mixed walk + long jumps | 36 | 27 | 24 | 0.208 s | attached only |
+
+**The open side is at its floor.** A sequential walk pays opens per WINDOW, not
+per request: 24 requests cost 2 opens, and every one of them was `attached` (no
+escape). The residual this ADR left open — "a single continuous stream spanning a
+whole session" — would save the 640 ms of the window's own open, which is the
+cost of reading the window from upstream at all, not a redundancy. Chasing it
+would change what a run IS (one open for an unbounded span, with the window
+bookkeeping that currently bounds speculation). **Not worth it on this account.**
+
+**What the walk does still pay per request is a provider `stat`** — 24 of them for
+24 requests, and 24 for the 3-viewer shape. It is not gratuitous: the stat is the
+version gate (an object replaced under a viewer must not serve mixed bytes) and it
+carries `Last-Modified`, which the ledger does not store (the ledger holds `etag`
+and `total` only). So the covered-read path cannot simply answer from the ledger;
+skipping the stat would need a metadata TTL with a freshness story, which is a
+design decision rather than a cleanup. Recorded here as the next candidate, with
+that acceptance: a covered read answers from the ledger only if the ledger can
+produce every header the response promises AND the version gate still runs.
+
