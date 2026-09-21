@@ -12,6 +12,13 @@
 #   object: a key under googledrive1/, e.g. coverage-test-3g.bin
 #   shards: 1 MiB shard count (default 512 = 512 MiB walked)
 #
+# PAUSE_SECS=N pauses the walk in the middle for N seconds with NO requests at
+# all — the viewer walked away. That is the watch account (ADR-0018): with a
+# watch the key stays protected and its read-ahead stays in place across the
+# gap, so the re-read of the shard under the playhead costs no upstream open;
+# with `watch_idle_secs = 0` the same pause protects nothing.
+# PAUSE_AT=K says after which shard (default: half).
+#
 # The account it prints is the one the mechanism exists for: upstream opens
 # divided by shard requests. One open per `session_window_bytes` window is the
 # target; one per request is the behaviour it replaced.
@@ -31,12 +38,42 @@ mline() { curl -s -m 5 "$MET" | grep -E "^$1" | sed 's/^/    /'; }
 hz() { curl -s -m 5 "$HZ"; }
 
 echo "profile: $(hz | grep -oE '"profile":"[a-z]*"' | head -1)"
+PAUSE_SECS=${PAUSE_SECS:-0}
+PAUSE_AT=${PAUSE_AT:-$((SHARDS / 2))}
 before=$(opens)
 t0=$(date +%s)
 for i in $(seq 0 $((SHARDS - 1))); do
   off=$((i * CHUNK))
   code=$(curl -s -m 120 -o /dev/null -w "%{http_code}" -H "Range: bytes=$off-$((off + CHUNK - 1))" "$EFF")
   [ "$code" = 206 ] || { echo "FAIL: shard $i -> $code"; exit 1; }
+  if [ "$PAUSE_SECS" -gt 0 ] && [ "$i" = "$PAUSE_AT" ]; then
+    # The viewer walks away: no requests at all for PAUSE_SECS.
+    pb=$(opens)
+    sleep "$PAUSE_SECS"
+    pa=$(opens)
+    echo "pause: ${PAUSE_SECS}s with no requests after shard $i -> opens +$((pa - pb))"
+    # The shard under the playhead, re-read after the gap: with a watch this is
+    # bytes already on this node, so it costs no open.
+    rb=$(opens)
+    code=$(curl -s -m 120 -o /tmp/walk-pause.bin -w "%{http_code}" -H "Range: bytes=$off-$((off + CHUNK - 1))" "$EFF")
+    ra=$(opens)
+    echo "post-pause re-read of shard $i: $code, opens +$((ra - rb))"
+    [ "$code" = 206 ] || echo "FAIL: post-pause re-read -> $code"
+    if [ $((ra - rb)) = 0 ]; then
+      echo "PASS: the pause cost no upstream open (the bytes were still here)"
+    else
+      echo "FAIL: the pause cost $((ra - rb)) upstream open(s): the window was not held"
+    fi
+    if [ -n "${OPENLIST_USERNAME:-}" ] && [ -n "${OPENLIST_PASSWORD:-}" ]; then
+      curl -s -m 120 -u "$OPENLIST_USERNAME:$OPENLIST_PASSWORD" -o /tmp/walk-pause-ref.bin \
+        -H "Range: bytes=$off-$((off + CHUNK - 1))" "$DAV"
+      cmp -s /tmp/walk-pause.bin /tmp/walk-pause-ref.bin \
+        && echo "post-pause re-read: byte-exact against the provider" \
+        || echo "FAIL: post-pause re-read differs from the provider"
+      rm -f /tmp/walk-pause.bin /tmp/walk-pause-ref.bin
+    fi
+    echo "watch account: $(curl -s -m 5 "$MET" | grep -E '^cache_watch' | tr '\n' ' ')"
+  fi
 done
 t1=$(date +%s)
 after=$(opens)

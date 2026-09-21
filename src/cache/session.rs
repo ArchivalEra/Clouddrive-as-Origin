@@ -218,6 +218,13 @@ impl<C: Clock + 'static> Sessions<C> {
         total: u64,
         start: u64,
         need: u64,
+        // Where the viewer already IS, when the caller knows better than the
+        // run's own start: a chained window inherits its predecessor's
+        // playhead, which is what keeps a stalled viewer's chain to the
+        // read-ahead it is owed. Without it every successor starts at zero,
+        // its own end satisfies the bound, and a paused watch pulls the file
+        // (measured on the node: 25 opens during one 90 s pause).
+        playhead_seed: Option<u64>,
     ) -> Option<Arc<Run>> {
         {
             let mut slots = self.slots.lock().await;
@@ -274,7 +281,7 @@ impl<C: Clock + 'static> Sessions<C> {
                 window,
             },
             readers: AtomicUsize::new(0),
-            playhead: AtomicU64::new(start),
+            playhead: AtomicU64::new(playhead_seed.unwrap_or(start)),
             finished: std::sync::atomic::AtomicBool::new(false),
         });
         let driver_run = Arc::clone(&run);
@@ -400,6 +407,7 @@ impl<C: Clock + 'static> Sessions<C> {
                         successor.total,
                         next_start,
                         successor.window,
+                        Some(run.playhead()),
                     )
                     .await
                     .is_some();
@@ -486,7 +494,7 @@ mod tests {
 
     async fn start(sessions: &Arc<Sessions<MockClock>>, slot: &Arc<BackendSlot>, total: u64) -> Arc<Run> {
         sessions
-            .start(slot, "a.bin", key(), "primary", Some("v1".into()), total, 0, 0)
+            .start(slot, "a.bin", key(), "primary", Some("v1".into()), total, 0, 0, None)
             .await
             .expect("a run must start when the key has no live one")
     }
@@ -577,7 +585,7 @@ mod tests {
         let (sessions, slot) = sessions(dir.path(), 4096, 10_000, Arc::clone(&opens));
         // A seek 1000 bytes before the end asks for a 4096-byte window.
         let run = sessions
-            .start(&slot, "a.bin", key(), "primary", Some("v1".into()), 10_000, 9000, 1000)
+            .start(&slot, "a.bin", key(), "primary", Some("v1".into()), 10_000, 9000, 1000, None)
             .await
             .unwrap();
         assert_eq!((run.start, run.end), (9000, 10_000), "clamped to the object");
@@ -622,6 +630,42 @@ mod tests {
         assert_eq!(opens.load(Ordering::SeqCst), 2, "the read-ahead was fetched during the pause");
     }
 
+    /// The chain is bounded by the VIEWER's position, not by the window it is
+    /// chaining: a successor inherits its predecessor's playhead, so a stalled
+    /// viewer buys the one window of read-ahead it is owed and nothing more.
+    /// Without the inheritance every successor starts at zero, its own end
+    /// satisfies the bound, and a paused watch pulls the object — measured on
+    /// the node as 25 upstream opens during a single 90 s pause.
+    #[tokio::test]
+    async fn a_stalled_watch_buys_one_window_and_no_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let (sessions, slot, watches) =
+            sessions_watching(dir.path(), 4096, 1 << 20, Arc::clone(&opens), 900_000);
+        let run = start(&sessions, &slot, 1 << 20).await;
+
+        // A viewer consumes a little of the first window and then walks away:
+        // the body drops, the watch stays.
+        let watch = watches.acquire_at("a.bin", (0, 512), Arc::new(MockClock::new(0)));
+        {
+            let mut body = Sessions::<MockClock>::reader(Arc::clone(&run), 0, 512);
+            let _ = futures::StreamExt::next(&mut body).await;
+        }
+        drop(watch);
+        wait_terminal(&run).await;
+
+        // Many ticks over the gap: the chain must not keep going.
+        for _ in 0..6 {
+            sessions.tick().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            2,
+            "one window, plus the one window of read-ahead a stalled viewer is owed"
+        );
+    }
+
     /// The reverse verification for the rule above: with watching turned off
     /// (`watch_idle_secs = 0`) a departed body stops the chain exactly as it
     /// did before ADR-0018. One config flip, two opposite outcomes.
@@ -654,7 +698,7 @@ mod tests {
         let opens = Arc::new(AtomicUsize::new(0));
         let (sessions, slot) = sessions(dir.path(), 1024, 1 << 20, Arc::clone(&opens));
         let run = sessions
-            .start(&slot, "a.bin", key(), "primary", Some("v1".into()), 1 << 20, 0, 8192)
+            .start(&slot, "a.bin", key(), "primary", Some("v1".into()), 1 << 20, 0, 8192, None)
             .await
             .unwrap();
         assert_eq!(run.end, 8192, "the request's own need is the floor");

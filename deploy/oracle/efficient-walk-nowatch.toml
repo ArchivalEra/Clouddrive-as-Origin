@@ -1,0 +1,50 @@
+# The same walk with the viewer protections OFF: the reverse verification of
+# efficient-walk.toml. `watch_idle_secs = 0` and `watch_pin_bytes = 0` restore
+#
+# ADR-0017's rule exactly: a key is protected only while a body is streaming it,
+# and its spans are trimmed like any other the moment the body ends.
+#
+# Deliberately a PAIR with efficient-walk-nowatch.toml. This one has the viewer
+# protections ON; the other has them OFF, and the walk is run once against each.
+# Both leave `read_grace_secs = 0` so nothing except the WATCH can explain a
+# span surviving a gap, and both set the idle TTL to 60 s so a minute-scale
+# pause gives the age sweep a chance to take it: that is what makes the pause
+# account in the two runs differ.
+front_listen = "127.0.0.1:7792"
+front_metrics_listen = "127.0.0.1:9095"
+front_ip_block = []
+front_ip_allow = []
+front_rate_rps = 0
+listen_addr = "127.0.0.1:8092"
+cache_dir = "/home/opc/eff-cache-b"
+# The magazine has to hold the object being walked whole (ADR-0013): staging
+# refuses an object it cannot hold, and the walk object is 3 GiB.
+max_size_bytes = 6442450944
+inactive_ttl_secs = 60
+revalidate_ttl_secs = 60
+negative_ttl_secs = 60
+concurrency_per_upstream = 3
+prewarm_shared_secret_env = "ORIGIN_PREWARM_SECRET"
+
+# Top level ON PURPOSE: a TOML key written after a table header belongs to that
+# table and is silently ignored, which the node config fell for twice.
+session_window_bytes = 67108864
+read_grace_secs = 0
+watch_idle_secs = 0
+watch_pin_bytes = 0
+
+[cache_profiles.efficient]
+min_file_size = 1048576
+
+[[upstreams]]
+id = "googledrive1"
+type = "openlist"
+base_url = "http://127.0.0.1:5244/dav"
+root_path = "googledrive1"
+username_env = "OPENLIST_USERNAME"
+password_env = "OPENLIST_PASSWORD"
+cache_profile = "efficient"
+
+[[routes]]
+prefix = ""
+upstream = "googledrive1"
