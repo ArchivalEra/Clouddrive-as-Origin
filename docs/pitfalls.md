@@ -225,3 +225,12 @@ entry for being obvious in hindsight — hindsight is the point.
     `--noproxy '*'` (or `--no-proxy-server` for a browser) AND prove it — curl
     prints `Established connection to <host> (<pop-ip>) from <local-ip>` when it
     goes direct, and prints `Uses proxy env variable` when it does not.
+
+35. **A per-request latency is not a rate.** A cold 1 MiB read from the origin
+    took 1.1-1.2 s, which reads as "0.9 MB/s, the upstream is the cap" — until a
+    cold 64 MiB read of the same object took 3.3 s, i.e. 20 MB/s: the 1.1 s was
+    the upstream OPEN's latency, paid once per stream, not a throughput ceiling.
+    *Fix:* measure throughput with a span big enough to amortise the open (tens of
+    MiB), and measure latency separately, before naming either one the bottleneck.
+    The same trap sat in the other direction all night: the CDN's 0.4-1.4 MB/s
+    "ceiling" was one bad moment on one leg, not a property of the path.

@@ -656,6 +656,34 @@ origin closer to the audience. Until one of those lands, a 30-hour film cannot
 play smoothly for a Chinese viewer however correct the origin is: 200 GiB over
 30 h needs about 1.9 MB/s sustained, and the leg measured here peaks at 1.4.
 
+**Why a pony season played fine on the same path (measured the same night).**
+A challenge worth taking seriously: this workstation watched a season of My
+Little Pony smoothly through the same hostname. Measured leg by leg, that is
+consistent — the two objects differ by 3.2x in what they demand.
+
+| leg | measured |
+| --- | --- |
+| Google Drive -> origin, cold 64 MiB | 20.3 MB/s for the film (3.31 s), 25.5 MB/s for MLP |
+| origin -> edge, bytes already staged | 12 MB/s (1 MiB in 86 ms) |
+| origin -> edge, cold 1 MiB | ~1.1 s, which is the upstream OPEN's latency, not a rate |
+| edge -> Phoenix client, same minute, same object | 793 KB/s |
+| edge -> Zhejiang client, same minute, same object | 792 B/s (best seen all night: 1.5 MB/s) |
+
+What each object needs, computed from its own bytes:
+
+- the 30-hour film: 214,748,364,800 B / 110,716 s = 15.5 Mbit/s = **1.94 MB/s sustained**
+- `mlp-s02-concat.mkv`: 13,009,202,351 B / 21,184 s = 4.9 Mbit/s = **0.61 MB/s sustained**
+
+So the pony season fits inside the good phase of the route AND rides the edge's
+cache (0.61 MB/s is well under every leg above); a film needing 3.2x more, from
+an object no edge can ever fully cache, does not. The origin is not the cap, the
+edge is not the cap, the object is playable, and the code answers every shape
+correctly — the variable leg is the client's route to the POP it was given, and
+it swings across three orders of magnitude within one minute. That is the
+topology finding: mainland acceleration (filing required) or a POP that is not
+across the border, plus — for a film this long — an origin that is not two
+crossings away from it.
+
 ### Multi-viewer accounts through the CDN: from the NODE
 
 A "N viewers through the CDN" number taken from a workstation measures the
