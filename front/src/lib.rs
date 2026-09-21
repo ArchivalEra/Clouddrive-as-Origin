@@ -224,14 +224,40 @@ fn status_of(session: &Session) -> String {
         .unwrap_or_else(|| "0".to_string())
 }
 
-/// Resolve TLS material from config env pointers. `Ok(None)` = plaintext
-/// proxy (warned, not failed — loopback/edge-terminated deployments).
+/// What the configured env-var NAMES say to do about TLS, decided without
+/// touching the environment. Split out so all three arms are testable: the
+/// lookup itself reads process-global state that parallel tests share, and a
+/// test that sets env vars to check a decision races every other test.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TlsChoice<'a> {
+    /// Both names given: read the cert path from the first, the key from the second.
+    FromEnv(&'a str, &'a str),
+    /// Neither given: plaintext proxy (warned, not failed — loopback and
+    /// edge-terminated deployments are both shapes this repo runs).
+    Plaintext,
+}
+
+/// The TLS decision for a pair of env-var names. Exactly one name is a
+/// configuration mistake, not a preference: it would silently run plaintext for
+/// an operator who wrote half of the pair.
+pub fn tls_choice<'a>(
+    tls_cert_env: Option<&'a str>,
+    tls_key_env: Option<&'a str>,
+) -> anyhow::Result<TlsChoice<'a>> {
+    match (tls_cert_env, tls_key_env) {
+        (Some(cert_env), Some(key_env)) => Ok(TlsChoice::FromEnv(cert_env, key_env)),
+        (None, None) => Ok(TlsChoice::Plaintext),
+        _ => anyhow::bail!("tls_cert_env and tls_key_env must be set together"),
+    }
+}
+
+/// Resolve TLS material from config env pointers. `Ok(None)` = plaintext proxy.
 pub fn acceptor_from_env(
     tls_cert_env: Option<&str>,
     tls_key_env: Option<&str>,
 ) -> anyhow::Result<Option<(String, String)>> {
-    match (tls_cert_env, tls_key_env) {
-        (Some(cert_env), Some(key_env)) => {
+    match tls_choice(tls_cert_env, tls_key_env)? {
+        TlsChoice::FromEnv(cert_env, key_env) => {
             let cert_path = std::env::var(cert_env)
                 .with_context(|| format!("env {cert_env} not set"))?;
             let key_path = std::env::var(key_env)
@@ -239,11 +265,10 @@ pub fn acceptor_from_env(
             info!(cert = %cert_path, "front plane TLS enabled");
             Ok(Some((cert_path, key_path)))
         }
-        (None, None) => {
+        TlsChoice::Plaintext => {
             warn!("front plane without TLS (plaintext proxy) — terminate HTTPS at the edge");
             Ok(None)
         }
-        _ => anyhow::bail!("tls_cert_env and tls_key_env must be set together"),
     }
 }
 
@@ -584,7 +609,6 @@ mod tests {
     }
 
     fn rendered() -> String {
-        use std::io::Write;
         use prometheus::Encoder as _;
         let families = prometheus::gather();
         let mut buf = vec![];
@@ -592,6 +616,31 @@ mod tests {
             .encode(&families, &mut buf)
             .unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    /// The three TLS arms, decided without touching the environment — plus the
+    /// lookup's own failure, which is the one an operator actually meets: a
+    /// config that names an env var the unit never sets.
+    #[test]
+    fn tls_choice_covers_all_three_arms() {
+        assert_eq!(
+            tls_choice(Some("CERT_ENV"), Some("KEY_ENV")).unwrap(),
+            TlsChoice::FromEnv("CERT_ENV", "KEY_ENV")
+        );
+        assert_eq!(tls_choice(None, None).unwrap(), TlsChoice::Plaintext);
+        assert!(tls_choice(Some("CERT_ENV"), None).is_err(), "half a pair is a config bug");
+        assert!(tls_choice(None, Some("KEY_ENV")).is_err(), "half a pair is a config bug");
+    }
+
+    /// A missing env var is an error with the variable's NAME in it, not a
+    /// silent fallback to plaintext. The name below is never set, so this test
+    /// touches no shared state and cannot race the rest of the suite.
+    #[test]
+    fn a_named_but_unset_env_var_is_an_error() {
+        let err = acceptor_from_env(Some("ORIGIN_TEST_ABSENT_CERT"), Some("ORIGIN_TEST_ABSENT_KEY"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ORIGIN_TEST_ABSENT_CERT"), "{err}");
     }
 
     #[test]
