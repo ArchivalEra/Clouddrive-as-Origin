@@ -13,8 +13,8 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use prometheus::{
-    register_histogram_vec, register_int_counter_vec, register_int_gauge, HistogramVec,
-    IntCounterVec, IntGauge,
+    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
+    HistogramVec, IntCounter, IntCounterVec, IntGauge,
 };
 
 /// Same bucket span as the front plane (1 ms through 3 min).
@@ -152,6 +152,41 @@ pub static WATCH_RESUME: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register cache_watch_resume_total")
 });
 
+/// Keys whose object the magazine can never hold whole (ADR-0019), i.e. the
+/// keys on a bounded working window, and the bytes that rule has freed.
+///
+/// The pair answers "what is this class of object costing us": the count says
+/// how many large objects have staged bytes right now, the counter says how
+/// much the cap has reclaimed. There is deliberately no byte GAUGE — the ledger
+/// under-reports staged bytes by design (`segment_bytes` is the exact total,
+/// and it is already published), so a per-class byte gauge would be a number
+/// that disagrees with the truth.
+pub static TRANSIENT_KEYS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "cache_unkeepable_keys",
+        "keys whose object is larger than the retention budget (bounded working window)"
+    )
+    .expect("register cache_unkeepable_keys")
+});
+
+pub static TRANSIENT_TRIMMED_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "cache_unkeepable_trim_bytes_total",
+        "bytes reclaimed from un-keepable keys by their working-window cap"
+    )
+    .expect("register cache_unkeepable_trim_bytes_total")
+});
+
+/// Publish how many keys are on a bounded working window (the tick's account).
+pub fn set_unkeepable_keys(n: usize) {
+    TRANSIENT_KEYS.set(n as i64);
+}
+
+/// Record bytes reclaimed by a working-window cap.
+pub fn observe_transient_trim(bytes: u64) {
+    TRANSIENT_TRIMMED_BYTES.inc_by(bytes);
+}
+
 /// Observe one backend call. The closure runs the actual call; we time
 /// around it so callers stay one-line.
 pub async fn observe_backend<T, F, Fut>(op: &'static str, f: F) -> T
@@ -250,6 +285,23 @@ mod tests {
             for forbidden in ["key=", "path=", "ip=", "addr="] {
                 assert!(!line.contains(forbidden), "high-cardinality {forbidden} in {line}");
             }
+        }
+    }
+
+    /// The working-window account (ADR-0019) exists and is named for the
+    /// mechanism, not for any kind of content.
+    #[test]
+    fn unkeepable_account_is_exposed() {
+        set_unkeepable_keys(3);
+        observe_transient_trim(4096);
+        let text = rendered();
+        assert!(text.contains("cache_unkeepable_keys 3"), "{text}");
+        assert!(text.contains("cache_unkeepable_trim_bytes_total 4096"), "{text}");
+        for forbidden in ["video", "media", "mp4", "player"] {
+            assert!(
+                !text.contains(forbidden),
+                "the metric names must stay general-purpose, found {forbidden}"
+            );
         }
     }
 

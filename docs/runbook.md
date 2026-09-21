@@ -428,6 +428,64 @@ Read the pause lines together with the totals: the walk costs the same either
 way, so the read-ahead is not extra upstream traffic, only differently timed —
 during the gap instead of at the resume.
 
+### A run for an object the node can never hold (ADR-0019)
+
+`efficient-walk.sh` against a loopback efficient instance, real provider, the same
+200 GiB object, after the run path was opened to un-keepable objects:
+
+```
+24 shards  -> 1 upstream open   (was 24), 2 s, 24/24 requests rode a run
+400 shards -> 10 upstream opens (was 400), 17 s for 400 MiB (was ~450 s)
+staged footprint: rises to ~515 MiB while spans are younger than the
+                  minimum-age guard, then the cap takes it to EXACTLY
+                  201 326 592 bytes (128 MiB pin + 64 MiB window) and it stays
+cache_unkeepable_keys=1, cache_unkeepable_trim_bytes_total=338 690 048
+```
+
+Sample `segment_bytes` every 15 s for three minutes after a walk to watch the cap
+land. Two facts make the numbers make sense: the cap is enforced on every reaper
+tick, but a span is a candidate only once it is older than `STAGE_MIN_AGE_MS`
+(60 s); and the chain's read-ahead means staged bytes can grow for a little while
+after the last request.
+
+The production upstream uses the `standard` profile, whose ranged misses do not go
+through the run machinery at all — so this win is the efficient profile's today,
+and whether production should switch is a deployment decision with the numbers
+above as its evidence.
+
+### Multi-viewer accounts (browsers, both paths)
+
+`deploy/lab/viewer/` is a generic large-object reader (`reader.js`, EVALUATED in
+the page rather than injected as a script, so a CSP in front of the origin cannot
+block it) plus a driver (`multi-viewer.mjs`) that gives every viewer its OWN
+browser context — its own cache, its own connection pool — driving the system
+chromium through `playwright-core`. Nothing in it is media-aware: it reads byte
+ranges sequentially and jumps, and records what a viewer feels (gaps between
+bytes) and what a request costs (time to first byte after a jump).
+
+```
+node deploy/lab/viewer/multi-viewer.mjs --target <base> --object <path> \
+  --page <path-of-a-small-object-on-the-same-origin> --size <bytes> \
+  --viewers 3 --chunks 4 --chunk-bytes 262144 --seeks 3
+```
+
+The page MUST be an object the target itself serves (same origin, no CORS, and
+nothing is uploaded). Measured:
+
+```
+LAB (7779, keepable object)     1 viewer:  8 opens / 7 requests
+                                3 viewers: 9 opens / 21 requests, 0 gaps, one checksum
+LAB (7781, un-keepable object)  3 viewers: 11 opens / 21 requests, staged bounded
+CDN, 200 GiB object, cold       1 viewer:  7 requests, seek TTFB p50 1341 ms, +7 origin opens
+CDN, the SAME regions           3 viewers: 9 requests, 0 gaps, seek TTFB p50 87 ms,
+                                           IDENTICAL checksums, ZERO extra origin opens
+```
+
+The last two lines are the product story for a large object: the origin pays for
+the first pull of a region, and overlapping viewer traffic is absorbed by the
+edge. `--no-proxy-server` is passed to the browser, and nothing here may run
+through an HTTP proxy: the proxy's RTT is the thing being measured.
+
 ### The target-scale account: an object the node can never hold
 
 The product's object is a 3-hour video of 30-200 GB. Measured on the node against

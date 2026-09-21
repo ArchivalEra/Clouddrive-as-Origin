@@ -939,6 +939,67 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     /// Callers own the metadata protocol (single-flight stat, negative
     /// tombstones, whether a refused request may still be served): this owns
     /// the gate, the open, and the read loop.
+    /// Stream a response whose head is already staged: the pieces from disk,
+    /// then ONE upstream open covering `[frontier, end)`, and nothing written.
+    ///
+    /// This is the shape a ranged miss takes when a run is refused (ADR-0019).
+    /// The escape used to hand the provider the ORIGINAL range, so every staged
+    /// byte was fetched a second time — paid on every seek of exactly the
+    /// objects a run is most often refused for.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_staged_prefix_and_tail(
+        &self,
+        slot: &Arc<BackendSlot>,
+        rk: &ResolvedKey,
+        start: u64,
+        end: u64,
+        had_range: bool,
+        meta: crate::backend::ObjectMeta,
+        plan: staging::StagedPlan,
+    ) -> Result<PassthroughHit, BackendError> {
+        let bkey = Key::from_validated(rk.backend_key.clone());
+        let total = meta.size_bytes;
+        let stream_permit = Arc::clone(&slot.stream_gate).acquire_owned().await;
+        let src = match slot
+            .backend
+            .open(&bkey, Some(ByteRange::bounded(plan.frontier, end - plan.frontier)))
+            .await
+        {
+            Ok(s) => s,
+            Err(BackendError::NotFound) => {
+                self.magazine
+                    .install_negative(&rk.cache_key, &rk.upstream_id, self.clock.now_millis())
+                    .await;
+                return Err(BackendError::NotFound);
+            }
+            Err(e) => return Err(e),
+        };
+        let tail: BodyStream = Box::pin(async_stream::try_stream! {
+            // The gate is held by the transfer itself.
+            let _stream_permit = stream_permit;
+            let mut s = src.stream;
+            use tokio::io::AsyncReadExt;
+            let mut buf = bytes::BytesMut::with_capacity(256 * 1024);
+            loop {
+                buf.clear();
+                let n = s.read_buf(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                yield buf.split().freeze();
+            }
+        });
+        Ok(PassthroughHit {
+            meta: hit_meta_remote(&rk.cache_key, &meta),
+            etag: meta.etag,
+            total,
+            content_range: had_range.then(|| ContentRange { first: start, last: end - 1, total }),
+            content_length: Some(end - start),
+            body: staging::pieces_then(plan.pieces, tail),
+            source: BodySource::Stage,
+        })
+    }
+
     async fn serve_upstream_range(
         &self,
         slot: &Arc<BackendSlot>,
@@ -1139,34 +1200,40 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             // heat policy would otherwise see zero reads for the whole walk.
             self.staging.add_read(&rk.cache_key, start, plan.frontier).await;
         }
-        // Staging admission (ADR-0013). Staged segments have exactly one
-        // reader - promotion - and promotion is refused for an object the
-        // magazine cannot hold, so staging such an object writes bytes
-        // nobody can ever read back: pure cost, paid on every seek. The disk
-        // gets the same question the cold-pull path asks, because a staged
-        // stream is a disk write like any other. A staged PREFIX changes the
-        // fetch to `[frontier, end)`, so that is the write the disk is asked
-        // about.
-        // A run writes a WINDOW, not this request's remainder (it is the
-        // read-ahead that makes one open serve many shards), so the disk is
-        // asked about what will actually be written — clamped to the object,
-        // exactly as `Sessions::start` computes it. The request's own
-        // remainder is the floor.
+        // Run admission (ADR-0019). A run writes a WINDOW, not this request's
+        // remainder — that read-ahead is what makes one open serve many shards
+        // — so what has to be affordable is the WRITE: it must fit the
+        // retention budget (a window the magazine cannot keep would be evicted
+        // the moment it sealed) and the disk. The OBJECT's size is not part of
+        // the question: staged spans are served directly (ADR-0015), so a
+        // bounded window of an object too large to keep whole is the sliding
+        // window its reader is walking through, not bytes nobody can read back.
         let run_len = self
             .config
             .session_window_bytes
             .max(1)
             .max(end - plan.frontier)
             .min(meta.size_bytes.saturating_sub(plan.frontier));
-        if !self.magazine.fits(meta.size_bytes)
-            || !store::has_room_for(&self.config.cache_dir, run_len, magazine::DISK_RESERVE_BYTES)
-        {
+        if !magazine::run_admits(
+            run_len,
+            self.config.max_size_bytes,
+            store::free_bytes(&self.config.cache_dir),
+            magazine::DISK_RESERVE_BYTES,
+        ) {
             tracing::info!(
                 key = %rk.cache_key,
                 size = meta.size_bytes,
-                "passthrough without staging: the magazine cannot hold this object"
+                run_len,
+                "serving without a run: this window cannot be kept"
             );
-            return self.serve_upstream_range(&slot, rk, range, meta).await;
+            // Nothing already staged is fetched twice: the head rides along and
+            // only `[frontier, end)` is opened upstream.
+            if plan.pieces.is_empty() {
+                return self.serve_upstream_range(&slot, rk, range, meta).await;
+            }
+            return self
+                .serve_staged_prefix_and_tail(&slot, rk, start, end, range.is_some(), meta, plan)
+                .await;
         }
         // One upstream stream per key (ADR-0016). An upstream `open` costs a
         // fixed ~640 ms, so paying it per ranged request is the whole cost of a
@@ -1965,12 +2032,13 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         //     delete path below; that routing deleted every remaining span
         //     of an evicted key and charged its bytes twice.
         let overrun = self.magazine.staged_overrun(self.state.read().await.segment_bytes).await;
-        let (staged_keys, stage_freed) = if overrun > 0 {
-            self.staging.evict_staged(overrun, now).await
-        } else {
-            (0, 0)
-        };
-        if staged_keys > 0 {
+        // Every pass, not only when the magazine is over budget: the per-key
+        // working window (ADR-0019) has to hold while the cache is globally
+        // under budget too, or a single walk of an un-keepable object would
+        // accumulate until the global rule noticed.
+        let (staged_keys, stage_freed) = self.staging.evict_staged(overrun, now).await;
+        crate::metrics::set_unkeepable_keys(self.staging.unkeepable_keys().await);
+        if stage_freed > 0 {
             tracing::info!(
                 keys = staged_keys,
                 bytes = stage_freed,

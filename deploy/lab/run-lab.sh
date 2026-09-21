@@ -87,6 +87,17 @@ head -c 1048576 /dev/urandom > "$LAB/dav-data/media/big1mb-b.bin"
 # A third, for the watch section: its own key so the eviction section's rows
 # cannot be what explains its numbers.
 head -c 1048576 /dev/urandom > "$LAB/dav-data/media/big1mb-w.bin"
+# One object bigger than config-e's magazine (3.3 MiB against 1 MiB), for the
+# multi-viewer section: an un-keepable object has to behave as well as a
+# keepable one. Made once — the media dir is not wiped between runs.
+if [ ! -f "$LAB/dav-data/media/viewer-object-b.mp4" ] && [ -f "$LAB/dav-data/media/viewer-object.mp4" ]; then
+  cp "$LAB/dav-data/media/viewer-object.mp4" "$LAB/dav-data/media/viewer-object-b.mp4"
+fi
+if [ ! -f "$LAB/dav-data/media/viewer-object.mp4" ]; then
+  ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=854x480:rate=24:duration=30 \
+    -c:v libx264 -preset ultrafast -b:v 900k -pix_fmt yuv420p -y "$LAB/dav-data/media/viewer-object.mp4" \
+    2>/dev/null || echo "    (ffmpeg unavailable: the viewer section will be skipped)"
+fi
 if [ ! -f "$LAB/dav-data/media/big3g.bin" ]; then
   dd if=/dev/zero bs=1M count=3072 2>/dev/null | tr '\0' 'B' > "$LAB/dav-data/media/big3g.bin"
 fi
@@ -169,6 +180,23 @@ wait_segment_bytes() { # port bytes tries
 }
 # Upstream open count for a delta assertion, with the absent-label case = 0.
 opens() { local v; v=$(served_opens "$1"); echo "${v:-0}"; }
+# Baseline for an open-count delta. Since ADR-0018 the chain fetches the NEXT
+# window while a viewer is watched, and that open can land inside the few
+# milliseconds a delta is measured over — so the count is allowed to settle
+# first (two equal samples a second apart, up to 12 s). Without this an
+# assertion about "what THIS request cost" measures the read-ahead's timing: it
+# passed four runs and failed the fifth on exactly that race.
+settle_opens() {
+  local prev cur i
+  prev=$(opens "$1")
+  for i in $(seq 1 12); do
+    sleep 1
+    cur=$(opens "$1")
+    [ "$cur" = "$prev" ] && { echo "$cur"; return 0; }
+    prev=$cur
+  done
+  echo "$prev"
+}
 
 # --- 4. acceptance matrix ------------------------------------------------------
 note "1. cold small-file GET (standard)"
@@ -290,7 +318,7 @@ note "9. one upstream stream per key: seeks inside a window share an open"
 # starts a run (one open, one span of the window); the next two ride its
 # watermark for free. An `open` costs ~640 ms measured whatever the range, so
 # this ratio is what makes a scrub cheap.
-before=$(opens 9092)
+before=$(settle_opens 9092)
 for off in 0 65536 131072; do
   code=$(H -o /dev/null -w "%{http_code}" -H "Range: bytes=$off-$((off+65535))" "http://127.0.0.1:7779/media/big1mb.bin")
   [ "$code" = 206 ] && ok "seek at $off -> 206" || bad "seek at $off -> $code"
@@ -318,7 +346,7 @@ cspans=$(seg_files "$LAB/cache-c" big1mb.bin)
 [ -f "$LAB/cache-c/.seg.media%2Fbig1mb.bin.0-262144" ] && ok "the requested window's span is there (0-262144)" \
   || bad "the requested window's span is missing"
 # A covered re-read of the same window: byte-exact, zero upstream opens.
-before=$(opens 9092)
+before=$(settle_opens 9092)
 code=$(H -o /tmp/lab-staged.bin -w "%{http_code}" -H "Range: bytes=32768-98303" "http://127.0.0.1:7779/media/big1mb.bin")
 after=$(opens 9092)
 [ "$code" = 206 ] && ok "covered re-read 206" || bad "covered re-read code=$code"
@@ -328,7 +356,7 @@ cmp -s /tmp/lab-staged.bin /tmp/lab-staged-ref.bin && ok "covered re-read is byt
 [ $((after - before)) = 0 ] && ok "covered re-read: zero upstream opens" \
   || bad "covered re-read opened upstream $((after-before)) time(s)"
 # Outside the window the escape applies: one open of its own.
-before=$(opens 9092)
+before=$(settle_opens 9092)
 H -o /dev/null -H "Range: bytes=524288-589823" "http://127.0.0.1:7779/media/big1mb.bin"
 after=$(opens 9092)
 [ $((after - before)) = 1 ] && ok "a seek outside the window opens its own Range" \
@@ -355,7 +383,7 @@ done
   || bad "no new span for the later window"
 [ "$(seg_files "$LAB/cache-c" big1mb.bin)" -ge 2 ] && ok "both windows' files are on disk" \
   || bad "expected 2+ staged files, found $(seg_files "$LAB/cache-c" big1mb.bin)"
-before=$(opens 9092)
+before=$(settle_opens 9092)
 H -o /dev/null -H "Range: bytes=0-65535" "http://127.0.0.1:7779/media/big1mb.bin"
 after=$(opens 9092)
 [ $((after - before)) = 0 ] && ok "the older window still serves with no open" \
@@ -467,7 +495,7 @@ ls -a "$LAB/cache-e" | grep '^\.seg\.' | sed 's/^/    sidecar: /' >&2
 [ ! -f "$LAB/cache-e/.seg.media%2F$WKEY.0-262144" ] && ok "the pin was spent from the back, not from the playhead" \
   || bad "the trim did not take the window behind the viewer"
 # Re-reading the window after the pause: no upstream open, and byte-exact.
-before=$(opens 9094)
+before=$(settle_opens 9094)
 # A range inside the window that SURVIVED (the window ahead of the pause point).
 code=$(H -o /tmp/lab-watch.bin -w "%{http_code}" -H "Range: bytes=262144-327679" "http://127.0.0.1:7781/media/$WKEY")
 after=$(opens 9094)
@@ -511,6 +539,88 @@ rm -f "$LAB/stampede-codes.txt"
 # 50 responses all 200, and the upstream saw exactly ONE stat for the key.
 [ "$codes" = "200" ] && ok "stampede: all 50 responses 200" || bad "stampede codes: $codes"
 [ $((AFTER - BEFORE)) -le 2 ] && ok "stampede: upstream PROPFIND delta=$((AFTER-BEFORE)) (<=2)" || bad "stampede: PROPFIND delta=$((AFTER-BEFORE))"
+
+note "14. N browser viewers of one object (ADR-0016/0019)"
+# Real Chromium, one ISOLATED CONTEXT per viewer (own cache, own connection
+# pool), each reading byte ranges the way any client of a large object does:
+# sequentially, then jumping. The page each viewer runs in is an object the
+# origin under test serves, so nothing is uploaded and no CORS header is needed;
+# the reader script is injected into that page's context.
+#
+# What is asserted is what a viewer feels (no stall, identical bytes read) and
+# what the origin pays (opens per window, not per request) — the same claims the
+# single-client sections make, now with several viewers at once. Skipped, not
+# failed, where node or playwright-core is absent: this section measures.
+PW_DIR=${PW_DIR:-/home/archivalera/.npm/_npx/9833c18b2d85bc59/node_modules/playwright-core}
+VIEWER_OBJ=viewer-object.mp4
+VIEWER_SIZE=3416888
+if command -v node >/dev/null 2>&1 && [ -d "$PW_DIR" ] && [ -f "$LAB/dav-data/media/$VIEWER_OBJ" ]; then
+  vrun() { # front object size viewers chunks seeks
+    node "$REPO/deploy/lab/viewer/multi-viewer.mjs" --target "http://127.0.0.1:$1" --object "media/$2" \
+      --page media/hello.txt --size "$3" --viewers "$4" --chunks "$5" --chunk-bytes 262144 --seeks "$6" 2>&1
+  }
+  vsum() { grep -oE "$1=[0-9-]+" <<<"$2" | head -1 | cut -d= -f2; }   # one viewer
+  vtot() { grep -oE "$1=[0-9-]+" <<<"$2" | tail -1 | cut -d= -f2; }   # the aggregate line
+
+  # S1/S2: the same object, the same byte ranges, one viewer then three. The
+  # opens must NOT scale with the viewers: they share the window's stream.
+  o1=$(settle_opens 9092); out1=$(vrun 7779 "$VIEWER_OBJ" "$VIEWER_SIZE" 1 4 3); o1b=$(opens 9092)
+  opens1=$((o1b - o1))
+  echo "$out1" | sed 's/^/    /' >&2
+  # A SECOND object for the three-viewer run, so it is as cold as the first:
+  # re-reading the same object would measure the cache, not the sharing.
+  o3=$(settle_opens 9092); out3=$(vrun 7779 "${VIEWER_OBJ%.mp4}-b.mp4" "$VIEWER_SIZE" 3 4 3); o3b=$(opens 9092)
+  opens3=$((o3b - o3))
+  echo "$out3" | sed 's/^/    /' >&2
+  [ "$(vsum errors "$out3")" = 0 ] && ok "three viewers finished with no read errors" \
+    || bad "viewer errors: $(vsum errors "$out3")"
+  [ "$(vsum gaps "$out3")" = 0 ] && ok "three viewers: no gap over 1.5 s" \
+    || bad "three viewers saw $(vsum gaps "$out3") gaps"
+  [ "$(vsum checksums "$out3")" = 1 ] && ok "three viewers read identical bytes (one checksum)" \
+    || bad "the viewers read different bytes: $(vsum checksums "$out3") checksums"
+  # The mechanism's claim is that opens follow WINDOWS (and the occasional
+  # escape), not viewers: three readers of the same ranges must cost about what
+  # one costs, so the opens PER REQUEST must fall. A cold multi-viewer run does
+  # pay a few escapes — a request that arrives while another viewer's run is in
+  # flight takes its own Range — which is why this is a ratio, not an equality.
+  req1=$(vtot requests "$out1")
+  req3=$(vtot requests "$out3")
+  per1=$((opens1 * 100 / req1)); per3=$((opens3 * 100 / req3))
+  [ "$per3" -lt "$per1" ] && ok "opens per request fall with viewers ($opens1/$req1 -> $opens3/$req3)" \
+    || bad "opens per request did not improve: $opens1/$req1 -> $opens3/$req3"
+  [ "$opens3" -le $((req3 / 2 + 1)) ] && ok "three viewers stayed near half an open per request ($opens3 for $req3)" \
+    || bad "three viewers cost $opens3 opens for $req3 requests"
+  echo "    standalone readers: $(curl -s -m 5 http://127.0.0.1:9092/metrics | grep -E '^cache_session_reader_total' | tr '\n' ' ')" >&2
+
+  # S5: an object the magazine can NEVER hold (1 MiB magazine, 3.3 MiB object).
+  # The opens must follow WINDOWS, not requests, and the staged footprint must
+  # stay bounded by what the walk actually read.
+  o5=$(settle_opens 9094); out5=$(vrun 7781 "$VIEWER_OBJ" "$VIEWER_SIZE" 3 4 3); o5b=$(opens 9094)
+  opens5=$((o5b - o5))
+  req5=$(vtot requests "$out5")
+  echo "$out5" | sed 's/^/    /' >&2
+  [ "$(vsum errors "$out5")" = 0 ] && ok "un-keepable object: three viewers, no errors" \
+    || bad "un-keepable object errors: $(vsum errors "$out5")"
+  [ "$(vsum gaps "$out5")" = 0 ] && ok "un-keepable object: no gap over 1.5 s" \
+    || bad "un-keepable object saw $(vsum gaps "$out5") gaps"
+  [ "$opens5" -lt "$req5" ] && ok "un-keepable object: $opens5 opens for $req5 requests (window-shaped)" \
+    || bad "un-keepable object cost $opens5 opens for $req5 requests (should be window-shaped)"
+  vstaged=$(hz_field 8085 segment_bytes)
+  [ "${vstaged:-999999999}" -le $((VIEWER_SIZE * 4)) ] && ok "un-keepable object staged ${vstaged} bytes (bounded by the walk)" \
+    || bad "un-keepable object staged ${vstaged} bytes (runaway?)"
+  # The class gauge is published by the reaper tick, and the row was created by
+  # the run just above — so it is polled, not sampled.
+  ukeys=0
+  for i in $(seq 1 15); do
+    ukeys=$(curl -s -m 5 http://127.0.0.1:9094/metrics | awk '/^cache_unkeepable_keys /{print $2+0}' | head -1)
+    [ "${ukeys:-0}" -ge 1 ] && break
+    sleep 5
+  done
+  [ "${ukeys:-0}" -ge 1 ] && ok "the working-window class is visible (cache_unkeepable_keys=$ukeys)" \
+    || bad "cache_unkeepable_keys=${ukeys:-0} (want >=1)"
+else
+  echo "    skipped: node, playwright-core or the test object is missing"
+fi
 
 # --- 5. summary ---------------------------------------------------------------
 echo "======================================"
