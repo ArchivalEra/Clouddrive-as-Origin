@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 // Constant-time equality without the subtle crate: fold XOR over bytes
 // (branch-free, equal-length inputs only — SigV4 signatures are always
 // 64 lowercase hex chars before comparison).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

@@ -1004,6 +1004,35 @@ async fn prewarm_secret_gate_blocks_anonymous() {
     std::env::remove_var("TEST_PW_SECRET");
 }
 
+/// The branch the token gate takes when the CONFIG names a secret but the
+/// environment does not define it: `expected` is empty, and an empty expected
+/// secret must refuse everything rather than wave it through — a node that lost
+/// its env file would otherwise expose an unauthenticated upstream fetcher.
+/// `main` bails on that case at startup; this is the handler's own backstop, and
+/// it had no test.
+#[tokio::test]
+async fn prewarm_401s_when_the_named_secret_is_missing() {
+    let fx = fixture(b"0123456789", None, vec![], false);
+    std::env::remove_var("TEST_PW_MISSING");
+    let mut cfg = fx.state.config.as_ref().clone();
+    cfg.prewarm_shared_secret_env = Some("TEST_PW_MISSING".into());
+    let state = AppState {
+        cache: fx.state.cache.clone(),
+        config: Arc::new(cfg),
+        sigv4_config: None,
+        listings: Default::default(),
+    };
+    // Even a caller who guesses the (empty) secret cannot get through.
+    let resp = prewarm(State(state.clone()), Path("m.bin".into()), headers(&[("x-prewarm-token", "")]))
+        .await
+        .into_response();
+    assert_eq!(body_text(resp).await.0, StatusCode::UNAUTHORIZED);
+    let resp = prewarm(State(state), Path("m.bin".into()), headers(&[("x-prewarm-token", "anything")]))
+        .await
+        .into_response();
+    assert_eq!(body_text(resp).await.0, StatusCode::UNAUTHORIZED);
+}
+
 /// SigV4 gate end-to-end at the business seam: anonymous passes, a
 /// correctly-signed request passes, a tampered signature 403s with a
 /// no-store XML error.

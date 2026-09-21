@@ -4,7 +4,13 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use crate::routing::{RouteRule, RouteTable};
 
+/// `deny_unknown_fields`: a typo'd or misplaced key is a CONFIG BUG, and the
+/// alternative is what this repo has been bitten by twice — serde drops the key
+/// silently and the node serves with a setting nobody meant (a key appended
+/// after the first table header belongs to that table, so `session_window_bytes`
+/// under `[cache_profiles.x]` is not an error, it is ignored).
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     pub id: String,
     /// Upstream kind. v1 ships "openlist" (WebDAV native-proxy against an
@@ -89,6 +95,7 @@ fn default_coverage_window_secs() -> u64 {
 /// worth windows). `coverage_window_secs` is how long a staged interval
 /// keeps counting for the ledger's eviction policy before it decays.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RawCacheProfile {
     #[serde(default = "default_profile_min_file_size")]
     pub min_file_size: u64,
@@ -230,6 +237,7 @@ fn upstream_url_policy(base_url: &str, upstream_id: &str) -> anyhow::Result<()> 
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RawConfig {
     #[serde(default = "default_front_listen")]
     pub front_listen: SocketAddr,
@@ -375,7 +383,8 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {        let raw: RawConfig = toml::from_str(s).context("parse TOML config")?;
+    pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
+        let raw: RawConfig = toml::from_str(s).context("parse TOML config")?;
         Self::from_raw(raw)
     }
 
@@ -483,6 +492,27 @@ impl Config {
                          one entry silently overwrites the other",
                         u.id
                     );
+                }
+                // The bucket alias strips a request path's first segment only
+                // when it EQUALS this upstream's id, and `root_path` is then
+                // prepended to what is left. When the two names differ, a client
+                // that mounts the provider-side name (the one it sees in the
+                // provider's own URLs) gets `root_path/root_path/...`: the
+                // double-prefix trap the runbook records as a 404 that is then
+                // tombstoned. The config alone cannot know which name clients
+                // use, so this warns instead of refusing to start.
+                if let Some(rp) = &u.root_path {
+                    if let Some(first) = rp.split('/').find(|s| !s.is_empty()) {
+                        if first != u.id {
+                            tracing::warn!(
+                                upstream = %u.id,
+                                root_path = %rp,
+                                "upstream id and root_path disagree: a request mounting {:?} gets the double-prefixed provider path {:?}",
+                                first,
+                                format!("{rp}/{first}/...")
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -623,6 +653,73 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A typo'd or misplaced key must be a CONFIG BUG, not a silently dropped
+    /// setting: `deny_unknown_fields` is what makes that true, and this pins it
+    /// for every struct a deployment touches. The snippets are built on the
+    /// existing `upstream_toml` shape so that the ONLY unknown thing in each is
+    /// the key under test.
+    #[test]
+    fn unknown_keys_are_refused_not_ignored() {
+        // `{:#}` walks the whole anyhow chain: the top line is the context
+        // ("parse TOML config") and the key name lives in the serde detail.
+        let base = upstream_toml("http://127.0.0.1:5244/dav");
+
+        let typo = base.replace("username_env", "usernme_env");
+        let err = format!("{:#}", Config::from_toml_str(&typo).unwrap_err());
+        assert!(err.contains("usernme_env"), "the message must name the key: {err}");
+
+        // Misplaced: after the first table header a key belongs to THAT table,
+        // so a top-level key appended there is unknown to it — the trap that has
+        // bitten this repo twice.
+        let misplaced = base.replace(
+            "username_env = \"A_USER\"",
+            "username_env = \"A_USER\"\n            session_window_bytes = 1024",
+        );
+        let err = format!("{:#}", Config::from_toml_str(&misplaced).unwrap_err());
+        assert!(err.contains("session_window_bytes"), "{err}");
+
+        // A profile table's own fields are strict too: the section is built
+        // here rather than taken from the helper, which has no fields to misspell.
+        let bad_profile = profile_toml(
+            "[cache_profiles.a]\n            coverge_window_secs = 60",
+            "cache_profile = \"a\"",
+        );
+        let err = format!("{:#}", Config::from_toml_str(&bad_profile).unwrap_err());
+        assert!(err.contains("coverge_window_secs"), "{err}");
+
+        // And a route's.
+        let bad_route = base.replace("prefix = \"\"", "prefix = \"\"\n            upstreams = \"a\"");
+        assert!(Config::from_toml_str(&bad_route).is_err(), "a [[routes]] typo must not load");
+    }
+
+    /// Every TOML this repo SHIPS must parse under the strict reader — the
+    /// deployed configs and the LAB's included. That is the safety net for
+    /// `deny_unknown_fields`: the node refuses to start on an unknown key, so a
+    /// config that only the tests never read would be a surprise at deploy time.
+    #[test]
+    fn every_shipped_config_parses_strictly() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("config.example.toml")];
+        let mut stack = vec![root.join("deploy")];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).expect("deploy/ is readable") {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "toml") {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        for f in &files {
+            let raw = std::fs::read_to_string(f).unwrap();
+            Config::from_toml_str(&raw)
+                .unwrap_or_else(|e| panic!("{} must parse: {e}", f.display()));
+        }
+        assert!(files.len() >= 8, "expected the shipped configs, found {}", files.len());
+    }
 
     #[test]
     fn parses_example() {
