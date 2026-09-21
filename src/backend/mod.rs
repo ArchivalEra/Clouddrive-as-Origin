@@ -100,6 +100,21 @@ pub struct ListEntry {
 }
 
 impl ContentRange {
+    /// The ONE constructor for a served span, and the only clamp in the tree.
+    /// `end` is exclusive (the shape every range resolver in this crate
+    /// produces); `last` is therefore `end - 1`.
+    ///
+    /// `None` means "this response carries no Content-Range", which happens
+    /// two ways: the request asked for the whole object (`range_requested`
+    /// false ⇒ 200), or the span is empty. An empty span has no last byte —
+    /// `end - 1` would underflow, and `last < first` renders a header no
+    /// client can use — so callers that can produce one answer 416 with
+    /// [`ContentRange::unsatisfiable`]. The invariant on the struct is
+    /// enforced here rather than argued at nine call sites.
+    pub fn for_span(total: u64, first: u64, end: u64, range_requested: bool) -> Option<Self> {
+        (range_requested && end > first).then(|| Self { first, last: end - 1, total })
+    }
+
     /// Render `bytes first-last/total` (206 responses).
     pub fn header_value(&self) -> String {
         format!("bytes {}-{}/{}", self.first, self.last, self.total)

@@ -2,6 +2,7 @@ pub mod cache;
 pub mod flight;
 pub mod leases;
 pub(crate) mod magazine;
+pub(crate) mod ranged;
 pub(crate) mod session;
 pub(crate) mod staging;
 pub mod watch;

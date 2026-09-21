@@ -7,6 +7,7 @@ use crate::{
         flight::{self, BodyStream, FlightProgress, FlightShared},
         magazine::{self, Magazine},
         meta::EntryMeta,
+        ranged,
         session::{self, Sessions},
         staging::{self, FinalizedSpan, Staging},
         store,
@@ -934,20 +935,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         Ok(())
     }
 
-    /// Stream a byte range straight from the origin: the one water pipe
-    /// behind every path that serves bytes without holding them.
-    ///
-    /// It owns the per-upstream STREAM gate (ADR-0004) and holds it for as
-    /// long as the body can move bytes — that budget is what bounds
-    /// bandwidth-bound upstream work, and a passthrough that skipped it left
-    /// upstream pressure set by the client count: the same range requested
-    /// twice opened two upstream streams. The permit is moved INTO the body
-    /// rather than held in this scope, so it lives exactly as long as the
-    /// transfer does and not one request longer.
-    ///
-    /// Callers own the metadata protocol (single-flight stat, negative
-    /// tombstones, whether a refused request may still be served): this owns
-    /// the gate, the open, and the read loop.
     /// Stream a response whose head is already staged: the pieces from disk,
     /// then ONE upstream open covering `[frontier, end)`, and nothing written.
     ///
@@ -968,7 +955,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     ) -> Result<PassthroughHit, BackendError> {
         let bkey = Key::from_validated(rk.backend_key.clone());
         let total = meta.size_bytes;
-        let stream_permit = Arc::clone(&slot.stream_gate).acquire_owned().await;
+        let stream_permit = ranged::stream_permit(slot).await?;
         let src = match slot
             .backend
             .open(&bkey, Some(ByteRange::bounded(plan.frontier, end - plan.frontier)))
@@ -983,26 +970,12 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             }
             Err(e) => return Err(e),
         };
-        let tail: BodyStream = Box::pin(async_stream::try_stream! {
-            // The gate is held by the transfer itself.
-            let _stream_permit = stream_permit;
-            let mut s = src.stream;
-            use tokio::io::AsyncReadExt;
-            let mut buf = bytes::BytesMut::with_capacity(256 * 1024);
-            loop {
-                buf.clear();
-                let n = s.read_buf(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                yield buf.split().freeze();
-            }
-        });
+        let tail = ranged::upstream_body::<C>(src.stream, None, stream_permit, None);
         Ok(PassthroughHit {
             meta: hit_meta_remote(&rk.cache_key, &meta),
             etag: meta.etag,
             total,
-            content_range: had_range.then(|| ContentRange { first: start, last: end - 1, total }),
+            content_range: ContentRange::for_span(total, start, end, had_range),
             content_length: Some(end - start),
             body: staging::pieces_then(plan.pieces, tail),
             source: BodySource::Stage,
@@ -1019,33 +992,15 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         let bkey = Key::from_validated(rk.backend_key.clone());
         let total = meta.size_bytes;
         let (start, end) = resolve_range(range, total)?;
-        let stream_permit = Arc::clone(&slot.stream_gate).acquire_owned().await;
+        let stream_permit = ranged::stream_permit(slot).await?;
         let src = slot.backend.open(&bkey, range).await?;
-        let content_range = range.map(|_| ContentRange { first: start, last: end.saturating_sub(1), total });
-        let content_length = Some(end.saturating_sub(start));
-        let mut src_stream = src.stream;
-        let body: BodyStream = Box::pin(async_stream::try_stream! {
-            // The gate is held by the transfer itself.
-            let _stream_permit = stream_permit;
-            // Read straight into a fresh BytesMut and freeze it (P8): the
-            // served bytes are handed over with no copy step.
-            use tokio::io::AsyncReadExt;
-            let mut buf = bytes::BytesMut::with_capacity(256 * 1024);
-            loop {
-                buf.clear();
-                let n = src_stream.read_buf(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                yield buf.split().freeze();
-            }
-        });
+        let body = ranged::upstream_body::<C>(src.stream, None, stream_permit, None);
         Ok(PassthroughHit {
             meta: hit_meta_remote(&rk.cache_key, &meta),
             etag: meta.etag,
             total,
-            content_range,
-            content_length,
+            content_range: ContentRange::for_span(total, start, end, range.is_some()),
+            content_length: Some(end - start),
             body,
             source: BodySource::Upstream,
         })
@@ -1193,8 +1148,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                 meta: hit_meta_remote(&rk.cache_key, &meta),
                 etag: meta.etag,
                 total: meta.size_bytes,
-                content_range: range
-                    .map(|_| ContentRange { first: start, last: end - 1, total: meta.size_bytes }),
+                content_range: ContentRange::for_span(meta.size_bytes, start, end, range.is_some()),
                 content_length: Some(end - start),
                 body: staging::staged_body(plan.pieces),
                 source: BodySource::Stage,
@@ -1286,8 +1240,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                 "served from a staged-read run"
             );
             let total = meta.size_bytes;
-            let content_range =
-                range.map(|_| ContentRange { first: start, last: end.saturating_sub(1), total });
+            let content_range = ContentRange::for_span(total, start, end, range.is_some());
             return Ok(PassthroughHit {
                 meta: hit_meta_remote(&rk.cache_key, &meta),
                 etag: meta.etag,
@@ -1305,7 +1258,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         // The open and the transfer below are a stream, not metadata (B1):
         // this used to take the METADATA gate, which is the head-of-line
         // class ADR-0004 split off, and it released it before a byte moved.
-        let stream_permit = Arc::clone(&slot.stream_gate).acquire_owned().await;
+        let stream_permit = ranged::stream_permit(&slot).await?;
         // Fetch only the uncovered remainder, at ONE exact Range: a staged
         // prefix rides along in the response and the open count stays at one
         // per request regardless of how many sidecars it rode on.
@@ -1327,8 +1280,8 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         let total = meta.size_bytes;
         let etag = meta.etag.clone();
         let meta_out = hit_meta_remote(&rk.cache_key, &meta);
-        let content_range = range.map(|_| ContentRange { first: start, last: end.saturating_sub(1), total });
-        let content_length = Some(end.saturating_sub(start));
+        let content_range = ContentRange::for_span(total, start, end, range.is_some());
+        let content_length = Some(end - start);
         // First byte from a staged prefix counts as stage-sourced; any
         // upstream open still shows up in the bytes ledger as upstream.
         let source = if staged_prefix { BodySource::Stage } else { BodySource::Upstream };
@@ -1341,12 +1294,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         let cache_key = rk.cache_key.clone();
         let upstream_id = rk.upstream_id.clone();
         let segpart = store::segpart_path(&cache_dir, &cache_key, fetch_start, end);
-        let mut src_stream = src.stream;
-        // The upstream 206 stream may not signal EOF at the Content-Length
-        // boundary (keep-alive reuse, e.g. rclone serve webdav): read at
-        // most `end - start` bytes, then seal. Waiting for EOF would hang
-        // the staging loop and leave the segpart unsealed forever.
-        let want = end.saturating_sub(fetch_start);
         // Viewer disconnect drops the whole body stream (axum drops the
         // async block), so the seal code below never runs on abort. A
         // detached watcher polls the segpart and seals it once it stops
@@ -1409,80 +1356,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                 }
             })
         };
-        let body: BodyStream = Box::pin(async_stream::try_stream! {
-            // The upstream stream gate is held by the transfer itself, not
-            // by the request that built it.
-            let _stream_permit = stream_permit;
-            use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-            // The staged prefix goes first: the viewer starts on local bytes
-            // while the upstream remainder is fetched. It is served from the
-            // planned sidecars, exactly as the staged-read path would.
-            for (path, off, len) in plan.pieces {
-                let mut f = tokio::fs::File::open(&path).await?;
-                f.seek(std::io::SeekFrom::Start(off)).await?;
-                let mut remaining = len;
-                while remaining > 0 {
-                    let want_read = (256 * 1024).min(remaining as usize);
-                    let mut piece = bytes::BytesMut::with_capacity(want_read);
-                    let n = f.read_buf(&mut piece).await?;
-                    if n == 0 {
-                        Err(std::io::Error::other(
-                            "staged segment is shorter than the ledger's range",
-                        ))?;
-                    }
-                    remaining -= n as u64;
-                    yield piece.freeze();
-                }
-            }
-            let mut file: Option<tokio::fs::File> = None;
-            let mut written: u64 = 0;
-            while written < want {
-                // The staged copy must reach the sidecar file AND the
-                // viewer, so this is the one path that needs both a file
-                // write and a served buffer (P8: the serve side is the
-                // frozen bytes, no extra copy).
-                let mut chunk = bytes::BytesMut::with_capacity(256 * 1024);
-                let n = src_stream.read_buf(&mut chunk).await?;
-                if n == 0 {
-                    break;
-                }
-                if file.is_none() {
-                    if let Some(parent) = segpart.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    file = Some(tokio::fs::File::create(&segpart).await?);
-                }
-                file.as_mut().unwrap().write_all(&chunk).await?;
-                written += n as u64;
-                yield chunk.freeze();
-            }
-            if written > 0 {
-                drop(file);
-                let seg = store::seg_path(&cache_dir, &cache_key, fetch_start, fetch_start + written);
-                // The rename and the claim are one step: a swallowed failure
-                // here left the ledger and `segment_bytes` describing a span
-                // with no file behind it (see [`Staging::seal_renamed`]).
-                staging
-                    .seal_renamed(
-                        &segpart,
-                        &seg,
-                        FinalizedSpan {
-                            cache_dir,
-                            key: cache_key,
-                            upstream_id,
-                            etag,
-                            total,
-                            start: fetch_start,
-                            end: fetch_start + written,
-                            bytes: written,
-                            now_millis: clock.now_millis(),
-                        },
-                    )
-                    .await;
-            } else if file.is_some() {
-                let _ = tokio::fs::remove_file(&segpart).await;
-            }
-        });
         let _ = watcher;
         Ok(PassthroughHit {
             meta: meta_out,
@@ -1490,7 +1363,30 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             total,
             content_range,
             content_length,
-            body,
+            body: staging::pieces_then(
+                plan.pieces,
+                ranged::upstream_body(
+                    src.stream,
+                    // The upstream 206 may not signal EOF at the
+                    // Content-Length boundary (keep-alive reuse, e.g. rclone
+                    // serve webdav): cap the read at this request's remainder,
+                    // then seal. Waiting for EOF would hang the staging loop
+                    // and leave the segpart unsealed forever.
+                    Some(end.saturating_sub(fetch_start)),
+                    stream_permit,
+                    Some(ranged::StageSink {
+                        segpart,
+                        staging,
+                        cache_dir,
+                        key: cache_key,
+                        upstream_id,
+                        etag,
+                        total,
+                        start: fetch_start,
+                        clock,
+                    }),
+                ),
+            ),
             source,
         })
     }
@@ -1838,7 +1734,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         let size = m.size_bytes;
         let (offset, end) = resolve_range(range, size)?;
         let len = end - offset;
-        let content_range = range.map(|_| ContentRange { first: offset, last: end - 1, total: size });
+        let content_range = ContentRange::for_span(size, offset, end, range.is_some());
         Ok(Some(CacheHit {
             outcome,
             meta: hit_meta_entry(key, &m),
@@ -1936,18 +1832,23 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                             if r.offset >= meta.size_bytes {
                                 return Err(BackendError::RangeNotSatisfiable);
                             }
-                            let end = r
-                                .length
-                                .map_or(meta.size_bytes.saturating_sub(1), |l| (r.offset + l - 1).min(meta.size_bytes - 1));
-                            let want = end.saturating_sub(r.offset).saturating_add(1);
+                            // The last byte asked for, inclusive, clamped to the
+                            // object: this is the one site whose range is
+                            // resolved here rather than by `resolve_range`, and
+                            // the shared constructor takes an exclusive end.
+                            let last = r.length.map_or(meta.size_bytes.saturating_sub(1), |l| {
+                                (r.offset + l).saturating_sub(1).min(meta.size_bytes - 1)
+                            });
+                            let want = last.saturating_sub(r.offset).saturating_add(1);
                             return Ok(CacheHit {
                                 outcome: CacheOutcome::Miss,
                                 meta: meta_out,
-                                content_range: Some(ContentRange {
-                                    first: r.offset,
-                                    last: end,
-                                    total: meta.size_bytes,
-                                }),
+                                content_range: ContentRange::for_span(
+                                    meta.size_bytes,
+                                    r.offset,
+                                    r.offset + want,
+                                    true,
+                                ),
                                 content_length: Some(want),
                                 body: flight::growing_reader_from(flight, r.offset, Some(want)),
                                 source: BodySource::Upstream,
