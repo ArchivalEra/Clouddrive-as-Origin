@@ -1441,8 +1441,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_ranged_miss_waterpipes() {
-        let fx = fixture(b"0123456789", None, vec![], false);
+    async fn a_ranged_miss_stages_its_window_on_the_default_profile() {
+        // The default profile is `efficient`: a ranged read stages the window
+        // it served, so the next request inside that window costs no upstream
+        // open. It used to be `standard`, which water-piped the whole file and
+        // installed an entry — that shape is still what a FULL GET does, and is
+        // pinned by `miss_then_hit` and the cold-miss tests.
+        let bytes: Vec<u8> = (0..40u8).collect();
+        let fx = base(&bytes).session_window(8).max_size_bytes(1024).build();
         let resp = get_key(
             State(fx.state.clone()),
             Path("a.bin".into()),
@@ -1451,10 +1457,17 @@ mod tests {
             OriginalUri(DEFAULT_TEST_URI.clone()),
         )
         .await;
-        let (status, _, _) = body_text(resp).await;
+        let (status, _, body) = body_text(resp).await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
-        wait_installed(&fx, "a.bin").await;
-        assert!(staged_segments(&fx, "a.bin").is_empty());
+        assert_eq!(body.as_bytes(), &bytes[2..6]);
+        // The run covers the request's own window FROM WHERE THE REQUEST
+        // STARTS (nothing was staged before it), so the span is [2, 10).
+        wait_ledger(&fx, "a.bin", &[(2, 10)]).await;
+        let s = fx.state.cache.state.read().await;
+        assert!(
+            s.entries.is_empty(),
+            "a ranged read stages a window; it does not install an entry"
+        );
     }
 
     #[tokio::test]

@@ -751,9 +751,7 @@ async fn an_object_larger_than_the_magazine_is_cached_as_a_stray() {
 
 /// The cache never refuses to SERVE, only to cache (ADR-0013). An object no
 /// disk could hold — and with no stray to evict for it — is answered through
-/// the pipe: no flight, no entry, no bytes on disk, no 502.
-#[tokio::test]
-async fn a_cold_pull_the_disk_cannot_hold_is_served_without_caching() {
+async fn a_window_bigger_than_the_retention_budget_is_not_written() {
     use origin_cache::cache::cache::{BodySource, ServeOutcome};
 
     let dir = tempdir().unwrap();
@@ -762,16 +760,22 @@ async fn a_cold_pull_the_disk_cannot_hold_is_served_without_caching() {
     let mut slots = HashMap::new();
     slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
     let clock = Arc::new(MockClock::new(0));
-    let cache = Arc::new(Cache::new(test_config(dir.path().to_path_buf()), Arc::clone(&clock), BackendRegistry::new(slots)));
+    let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+    // A window this large could never be KEPT (it is bigger than the magazine),
+    // so the run is refused and the request streams through: that is the rule
+    // that stops a whole-object request on a huge object from writing a huge
+    // file, and it is asked about the WRITE, not about the object (ADR-0019).
+    cfg.session_window_bytes = cfg.max_size_bytes.saturating_add(1 << 30);
+    let cache = Arc::new(Cache::new(Arc::new(cfg), Arc::clone(&clock), BackendRegistry::new(slots)));
 
     let rk = cache.resolve("huge.bin").unwrap();
     let out = cache
         .serve(&rk, Some(ByteRange::bounded(0, 8)), None)
         .await
-        .expect("a cache that cannot hold an object must still serve it");
+        .expect("a cache that cannot keep this window must still serve the range");
     let plan = match out {
         ServeOutcome::Stream(plan) => plan,
-        _ => panic!("a ranged cold miss must stream"),
+        _ => panic!("a ranged miss must stream"),
     };
     assert_eq!(plan.source, BodySource::Upstream, "the bytes came straight from upstream");
     let mut body = plan.body;
@@ -779,13 +783,51 @@ async fn a_cold_pull_the_disk_cannot_hold_is_served_without_caching() {
         collect(&mut body).await,
         (0..8u64).map(|i| (i % 251) as u8).collect::<Vec<u8>>()
     );
-    assert_eq!(cache.flights.active().await, 0, "no flight for an object that cannot be kept");
+    assert_eq!(opens.load(Ordering::SeqCst), 1, "one upstream open, no fill");
+    assert_eq!(cache.state.read().await.segment_bytes, 0, "nothing was staged");
     assert!(cache.state.read().await.entries.is_empty(), "and nothing was installed");
-    assert_eq!(opens.load(Ordering::SeqCst), 1, "one ranged upstream open, no fill");
-    assert!(
-        !dir.path().join("huge.bin").exists() && !dir.path().join("huge.bin").is_file(),
-        "nothing was written to the cache disk"
+}
+
+/// The other half of the same decision: when the window IS affordable, a ranged
+/// request on an object the disk can never hold stages exactly ONE WINDOW — the
+/// sliding window its reader walks through — and never the object. Byte-exactness
+/// and the read-ahead story for this shape live in the run tests.
+#[tokio::test]
+async fn an_unkeepable_object_stages_one_window_and_never_the_object() {
+    use origin_cache::cache::cache::{BodySource, ServeOutcome};
+
+    let dir = tempdir().unwrap();
+    let opens = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(SizedBackend::new(&[("huge.bin", u64::MAX / 4)], Arc::clone(&opens)));
+    let mut slots = HashMap::new();
+    slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+    cfg.session_window_bytes = 1 << 20; // one mebibyte of window, and quick
+    let cache = Arc::new(Cache::new(Arc::new(cfg), Arc::clone(&clock), BackendRegistry::new(slots)));
+
+    let rk = cache.resolve("huge.bin").unwrap();
+    let out = cache
+        .serve(&rk, Some(ByteRange::bounded(0, 8)), None)
+        .await
+        .expect("a ranged read of an un-keepable object must still serve");
+    let plan = match out {
+        ServeOutcome::Stream(plan) => plan,
+        _ => panic!("a ranged miss must stream"),
+    };
+    assert_eq!(plan.source, BodySource::Stage, "the run's watermark served it");
+    let mut body = plan.body;
+    assert_eq!(
+        collect(&mut body).await,
+        (0..8u64).map(|i| (i % 251) as u8).collect::<Vec<u8>>()
     );
+    assert_eq!(opens.load(Ordering::SeqCst), 1, "one run, one upstream open");
+    wait_staged(&cache, 1 << 20).await;
+    assert!(
+        !dir.path().join("huge.bin").exists(),
+        "the OBJECT is never written; only its window is"
+    );
+    assert!(cache.state.read().await.entries.is_empty());
 }
 
 /// The efficient passthrough MOVES BYTES, so it must hold the STREAM gate
@@ -1299,6 +1341,55 @@ async fn wait_staged(cache: &Arc<Cache<MockClock>>, bytes: u64) {
         "segment_bytes never became {bytes}; got {}",
         cache.state.read().await.segment_bytes
     );
+}
+
+/// The PROFILE NAME no longer decides whether a ranged request gets a run. It
+/// used to: only an upstream configured `efficient` reached the run path, so a
+/// `standard` upstream paid one upstream open per request on exactly the objects
+/// a window helps most. What decides now is the request (ranged?), whether the
+/// key already has a durable entry (then the ordinary path owns it, and only it
+/// revalidates), and the object's size against the profile's `min_file_size`.
+#[tokio::test]
+async fn a_standard_profile_upstream_gets_runs_for_ranged_reads() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+    // Standard is the default everywhere, so ask for it explicitly.
+    cfg.upstreams[0].cache_profile = "standard".into();
+    cfg.session_window_bytes = 1 << 20;
+    let cfg = Arc::new(cfg);
+    let opens = Arc::new(AtomicUsize::new(0));
+    // 128 MiB: above standard's `min_file_size` floor, and generated rather than
+    // stored, so the fixture costs nothing.
+    let backend = Arc::new(SizedBackend::new(&[("big.bin", 128 << 20)], Arc::clone(&opens)));
+    let mut slots = HashMap::new();
+    slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
+    let cache = Arc::new(Cache::new(cfg, clock, BackendRegistry::new(slots)));
+
+    let rk = cache.resolve("big.bin").unwrap();
+    let out = cache
+        .serve(&rk, Some(ByteRange::bounded(0, 65536)), None)
+        .await
+        .unwrap();
+    let plan = match out {
+        origin_cache::cache::cache::ServeOutcome::Stream(p) => p,
+        _ => panic!("a ranged miss must stream"),
+    };
+    assert_eq!(
+        plan.source,
+        origin_cache::cache::cache::BodySource::Stage,
+        "a ranged read of a large object stages its window whatever the profile is named"
+    );
+    let mut body = plan.body;
+    let _ = collect(&mut body).await;
+    assert_eq!(opens.load(Ordering::SeqCst), 1, "one run, one upstream open");
+    for _ in 0..400 {
+        if cache.state.read().await.segment_bytes == 1 << 20 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(cache.state.read().await.segment_bytes, 1 << 20, "one window staged");
 }
 
 /// An object the magazine can NEVER hold whole still gets a run (ADR-0019).

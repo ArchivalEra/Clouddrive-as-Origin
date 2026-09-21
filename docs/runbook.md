@@ -11,8 +11,9 @@ SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
   Encrypt `cdn-oracle.isui.ren` (DNS-01 via dnspod). Port 80 is **not** an
   origin path: it is filtered at the cloud layer and nothing listens on it
   (see "Retired: port-80 helper").
-- **origin-cache** (2 systemd units): standard `[::]:7777` TLS / nocache
-  `[::]:7778`.
+- **origin-cache** (2 systemd units): `origin-cache-standard` `[::]:7777` TLS
+  (the name is historical — it runs the default, `efficient`, profile) /
+  `origin-cache-nocache` `[::]:7778`.
 
   The port-80 helper was retired 2026-09-12 (see "Retired: port-80 helper"
   below). :80 is filtered at the cloud layer and the certificate renews via
@@ -219,8 +220,9 @@ sudo journalctl -u openlist --no-pager -n 30
 sudo systemctl restart openlist
 ```
 
-origin-cache serves stale-if-error from disk while OpenList is down
-(standard profile); nocache profile has no disk fallback (by design).
+origin-cache serves stale-if-error from disk while OpenList is down (any cached
+profile — for an object it can hold, a durable entry is served regardless of
+upstream health); nocache has no disk fallback (by design).
 
 ## Node acceptance after a deploy
 
@@ -448,10 +450,13 @@ tick, but a span is a candidate only once it is older than `STAGE_MIN_AGE_MS`
 (60 s); and the chain's read-ahead means staged bytes can grow for a little while
 after the last request.
 
-The production upstream uses the `standard` profile, whose ranged misses do not go
-through the run machinery at all — so this win is the efficient profile's today,
-and whether production should switch is a deployment decision with the numbers
-above as its evidence.
+The production upstream gets this win without a config change: `efficient` is the
+default profile, and a ranged request takes the run path whatever its upstream is
+named (the profile no longer selects the response shape — it carries `min_file_size`
+and the ledger window). The deployed unit and its config file are still NAMED
+`standard` for historical reasons; the name says nothing about the profile, and
+`deploy/oracle/config-standard.toml` sets no `cache_profile` so the default
+applies.
 
 ### Multi-viewer accounts (browsers, both paths)
 
