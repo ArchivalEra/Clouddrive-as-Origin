@@ -54,14 +54,26 @@ const url = `${base}/${objectPath}?size=${size}`;
 const pageUrl = `${base}/${pagePath}`;
 
 const browser = await chromium.launch({ executablePath: chrome, args: ['--no-proxy-server'] });
+// Pages first, ONE AT A TIME. Three concurrent GETs of the SAME small object is
+// the one shape the edge in front of this origin stalls — measured against the
+// real CDN: of three concurrent page loads, two were served in 0.1-0.7 s and one
+// waited 8.7 s, 11.9 s and once over 300 s, with the origin's own counters flat
+// the whole time (no open, no stat, no session). A reader is not a page load:
+// the concurrency this harness exists to measure starts after the warm-up, and
+// its wall clock starts there too.
+const pages = [];
+for (let i = 0; i < viewers; i++) {
+  const ctx = await browser.newContext(); // isolated: its own cache and pool
+  const page = await ctx.newPage();
+  // The page must be same-origin with the object, so the reader's fetch needs
+  // no CORS header. It is an ordinary small object the target serves.
+  await page.goto(pageUrl, { waitUntil: 'domcontentloaded' });
+  pages.push({ ctx, page });
+}
 const started = Date.now();
 const results = await Promise.all(
   Array.from({ length: viewers }, async (_, i) => {
-    const ctx = await browser.newContext(); // isolated: its own cache and pool
-    const page = await ctx.newPage();
-    // The page must be same-origin with the object, so the reader's fetch needs
-    // no CORS header. It is an ordinary small object the target serves.
-    await page.goto(pageUrl, { waitUntil: 'domcontentloaded' });
+    const { ctx, page } = pages[i];
     // The reader is EVALUATED, not injected as a <script> tag: an origin (or a
     // CDN in front of it) may send a Content-Security-Policy that blocks inline
     // scripts, and devtools-style evaluation is not subject to CSP. Same code
