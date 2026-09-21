@@ -550,25 +550,66 @@ through the CDN, from a workstation:
 ```sh
 curl -s -r 0- -D- -o /dev/null http://127.0.0.1:8080/googledrive1/round3.mp4 | head -4
 ```
-- Through the CDN the player then **never loads metadata** (`readyState` 0, a
-  `stalled` event, 300 bytes delivered in 8.9 s): playback never begins. The same
-  object in BOUNDED ranges is served in 0.2 s, so the shard shape is fine and the
-  open-ended one is not.
+- Through the CDN the player never loads metadata (`readyState` 0, a `stalled`
+  event, 300 bytes in 8.9 s). That was recorded here as an open-ended-range
+  problem. It is not, and the rest of this section is the correction.
 
-This is a product-shape finding, not a bug in the ranged path: `bytes=N-` means
-"to the end" per HTTP, and the origin honors it. But a browser's first request is
-always that shape, the object is faststart (`ftyp` 28 B + `moov` 1242 B at offset
-28, so 1.3 KB is all the player needs to start), and a 200 GiB promise is a shape
-no CDN relays well. The options are a decision, not a cleanup:
+**What the edge does with an open-ended range (measured 2026-09-21).** From the
+node (`deploy/lab/probe-edgeone-range-shape.sh`), on this object:
 
-1. Answer an open-ended range with a bounded window (`bytes=N-(N+W-1)/total`):
-   CDN- and player-friendly, mildly non-conformant, and a downloader that wanted
-   "the rest" then re-requests.
-2. Leave it (correct HTTP) and require the CDN in front to cap what it pulls.
-3. Measure another CDN's handling of the same request before choosing.
+| ask | what EdgeOne answers |
+| --- | --- |
+| `Range: bytes=0-` | 206, `content-range: bytes 0-214748364799/214748364800`, `content-length: 214748364800` |
+| `Range: bytes=118111608559-`, an offset never requested before | 206, `content-length: 96636756241` |
+| `Range: bytes=0-1048575` | 206, 1 MiB in 0.50 s |
+| the same 1300 bytes, CDN vs origin | identical sha256 |
+| a 3 s open-ended pull, then idle | one more upstream open inside 12 s, then flat for 24 s |
 
-`player-probe.mjs` is the tool for whichever is chosen, and the domestic-vantage
-run still needs a viewer outside this network.
+The edge relays the promise literally and does not cap what it pulls, so "let the
+CDN cap it" is dead on this CDN; it also does not run away pulling the whole
+object after the client leaves. What it does add is granularity: an 8 s
+open-ended pull made the origin do +6 upstream opens and +9 stats for ~14 MB
+delivered, where a bounded 1 MiB range makes exactly +1 open and +1 stat. The
+edge pulls in ~2 MB pieces, so the origin's one-open-per-window win is spent at
+the edge's granularity whatever shape the client asked in.
+
+**Why the player still does not start.** `deploy/lab/viewer/cdn-wire-probe.mjs`
+records, per media request, the bytes the browser actually received and who ended
+the request. Through the CDN every request is a 206 carrying the literal promise
+and every one is cancelled by the BROWSER (`net::ERR_ABORTED (canceled)`) after a
+few hundred KB, in 29 532 992-byte steps — Chromium's block size for a 200 GiB
+total. Rewriting each open-ended request into a bounded 1 MiB one (CDP `Fetch`,
+`--window 1048576`) changes nothing: same steps, same failure. Answering
+`bytes=N-` with a bounded window would not have fixed this.
+
+Three local controls say what did:
+
+- The same object's head, served by a plain local server, PLAYS: readyState 4,
+  duration known, video decoded until the transfer was cut. The object is
+  playable and the browser is capable.
+- The same 33 MB of bytes with only the advertised total changed to 214748364800
+  reproduce the 29.5 MiB block stepping exactly and then die with
+  `PIPELINE_ERROR_READ: FFmpegDemuxer: data source error` once the server runs out
+  of data (`deploy/lab/fake-total-server.py`). The advertised total decides the
+  player's block size and the offsets it plans against.
+- An unindexed fragmented MP4 built locally (ftyp + moov with `duration=0`, no
+  `sidx`) plays from a fast local server, but its trace reads the file's tail
+  before settling: with no index, a player has to scan for the duration.
+
+And the object is not what the test assumed. `round3.mp4` is 214748364800 bytes —
+exactly 200 GiB — of which the real content is a two-fragment, ~5-second fMP4
+clip: `ftyp` + `moov` (`duration=0`) + two `moof`/`mdat` pairs ending by ~31 MB,
+and 0xFF filler from there to the end (verified at 33 MB, 50 MB, 1 GB, 50 GB,
+150 GB and the last 8 KB: all 0xFF). A player that must scan for a duration walks
+a 200 GiB address space of filler in 29.5 MiB blocks and never starts. Nothing the
+origin answers can change that, and the same bytes with a true total play fine.
+
+So all three options recorded here are resolved, none of them by a change in the
+origin: (1) a bounded window does not make this player start, measured; (2) the
+CDN does not cap, measured; (3) another CDN is not needed, because the failure is
+not the shape. What the criterion needs is a REAL long video — one with an index
+or a real `mvhd` duration. The object in the bucket never was a 30-hour film, and
+the domestic-vantage run still needs a viewer outside this network.
 
 ### Multi-viewer accounts through the CDN: from the NODE
 

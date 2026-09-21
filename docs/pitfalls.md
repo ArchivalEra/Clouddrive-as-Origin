@@ -158,10 +158,14 @@ entry for being obvious in hindsight — hindsight is the point.
 
 27. **An open-ended `Range: bytes=N-` is what a browser player sends first**, and
     answering it literally on a 200 GiB object means promising 200 GiB
-    (`content-range: bytes 0-214748364799/…`). Through a CDN the player then never
-    loads metadata, while the same object in bounded ranges is served in 0.2 s.
-    *Fix:* the shape is a product decision, recorded in the runbook; measure with
-    `player-probe.mjs` rather than guessing.
+    (`content-range: bytes 0-214748364799/…`). It is tempting to blame the shape
+    for the player that then never starts. Measured 2026-09-21, it is not the
+    shape: the edge relays the promise and returns correct bytes, rewriting the
+    player's requests into bounded windows changes nothing, and the real cause was
+    the object (a ~5-second clip padded with 0xFF to exactly 200 GiB, no index, so
+    a player must scan 200 GiB for a duration). *Fix:* measure the object before
+    the transport — `fake-total-server.py` changes only the advertised total, and
+    `cdn-wire-probe.mjs` says who ended each request.
 
 28. **A bare `wait` waits for the long-lived process the script itself started.**
     A probe that launches an instance in the background (`&`) and then fires its
@@ -176,3 +180,21 @@ entry for being obvious in hindsight — hindsight is the point.
     there until the wrapper's 1600 s ceiling — twice, before the shared `H` helper
     grew `--connect-timeout 5 --max-time 120`. A failure you can read beats a hang
     you cannot: bound the request, then assert on the status.
+
+30. **A "200 GiB test object" is not a long video until its bytes say so.** The
+    object this project tested players against is 200 GiB exactly, and its real
+    content is a two-fragment 5-second clip; everything past ~31 MB is 0xFF
+    padding. Every conclusion about "a huge object plays badly" drawn from it is
+    really a conclusion about an unindexed clip plus filler. *Fix:* before
+    blaming a path, a CDN or a range shape for a player that will not start, look
+    at the object (`ffprobe` its head, `od` a few offsets, `fake-total-server.py`
+    to change only the advertised total) and at who ended the requests
+    (`cdn-wire-probe.mjs`).
+
+31. **A `pkill -f <pattern>` kills the process whose command line contains the
+    pattern — including the shell that is running the command.** Pitfall #1 in a
+    new costume: the pattern was inside a heredoc in the same command, so the
+    tool's own shell matched and died mid-script, printing nothing at all. *Fix:*
+    put the killer in a script file (`bash /tmp/x.sh`) so no live command line
+    contains the pattern, or kill by port (`fuser -k 7811/tcp`) or by recorded
+    PID.
