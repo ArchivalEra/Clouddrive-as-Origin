@@ -162,3 +162,17 @@ entry for being obvious in hindsight — hindsight is the point.
     loads metadata, while the same object in bounded ranges is served in 0.2 s.
     *Fix:* the shape is a product decision, recorded in the runbook; measure with
     `player-probe.mjs` rather than guessing.
+
+28. **A bare `wait` waits for the long-lived process the script itself started.**
+    A probe that launches an instance in the background (`&`) and then fires its
+    requests in parallel cannot use `wait` to join them: it also waits for the
+    instance, so the script never returns and the ssh channel stays open (the
+    first rate-limit probe hung exactly there, after printing pass lines into a
+    log nobody could read). *Fix:* collect the request PIDs and `wait <pid>` each,
+    or keep the instance and the join in separate steps.
+
+29. **Every request a suite or probe makes must be bounded.** One stalled request
+    hung the whole LAB with no output at all — the log stopped mid-section and sat
+    there until the wrapper's 1600 s ceiling — twice, before the shared `H` helper
+    grew `--connect-timeout 5 --max-time 120`. A failure you can read beats a hang
+    you cannot: bound the request, then assert on the status.
