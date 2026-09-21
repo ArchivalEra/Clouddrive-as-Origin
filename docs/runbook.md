@@ -632,11 +632,29 @@ at the head with real sample tables (stts/stss/ctts/stsc/stsz/stco) plus
   headers only. The node reaches a domestic IPv6 POP (240d:c010::/32) and gets
   steady service from the same hostname.
 
-So the last unknown for the criterion is precisely the domestic vantage: a real
-viewer on a domestic route should resolve to the domestic POP the node sees,
-where the edge is proven healthy. Worth checking in the EdgeOne console that the
-acceleration area/GeoDNS actually puts domestic users on domestic POPs — this
-workstation, on a domestic-ish ISP, was classified overseas.
+So the last unknown for the criterion is the vantage — and asking where the
+vantage actually lands corrected the guess above:
+
+- This workstation's DIRECT egress is 39.172.36.80 = China Mobile, Zhejiang
+  Huzhou (three services agree), and all three domestic public resolvers
+  (223.5.5.5, 119.29.29.29, 114.114.114.114) return the same Singapore addresses
+  for this hostname. Nothing classified it as overseas: **the zone has no
+  mainland acceleration, so a Chinese viewer is served from Singapore.**
+- The origin itself is in Phoenix, Arizona (Oracle Cloud, 129.146.127.22), and
+  the NODE's own lookup also lands on a Singapore POP. A Chinese viewer's bytes
+  therefore cross the border twice — Zhejiang -> Singapore -> Phoenix — which is
+  exactly what 0.4-1.4 MB/s with stalls looks like.
+- For the record on the 2080 proxy: it exits at 129.146.127.22, the ORIGIN host
+  itself. Every measurement in this document is direct — `--noproxy '*'`,
+  verified by curl's own `Established connection to cdn-oracle.isui.ren
+  (43.174.246.108) from 10.194.6.139`, and the browser probes pass
+  `--no-proxy-server`. No CDN account here is a proxy account.
+
+What the criterion needs next is a deployment decision, not a code change:
+mainland acceleration for the zone (which needs the domain's filing), or an
+origin closer to the audience. Until one of those lands, a 30-hour film cannot
+play smoothly for a Chinese viewer however correct the origin is: 200 GiB over
+30 h needs about 1.9 MB/s sustained, and the leg measured here peaks at 1.4.
 
 ### Multi-viewer accounts through the CDN: from the NODE
 

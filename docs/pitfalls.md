@@ -207,11 +207,21 @@ entry for being obvious in hindsight — hindsight is the point.
     rather than the tail of the output; the next attempt then runs on a fresh
     connection and usually succeeds first try.
 
-33. **The vantage decides the POP, so it decides the verdict.** One hostname
-    served this workstation an overseas IPv4 POP (0.4-1.4 MB/s, hard stalls) and
-    the origin node a domestic IPv6 POP (steady, TTFB ~0.2 s) — because the
-    workstation has no IPv6 route, GeoDNS classified it overseas. A player test
-    from that vantage fails no matter what the origin, the edge or the object
-    do. *Fix:* before reading a CDN verdict, record `remote_ip` of the leg you
-    actually got (`curl -w '%{remote_ip}'`), and treat a vantage whose route you
-    cannot choose as a different experiment, not a failed one.
+33. **Record where each end of a CDN path actually IS before drawing a
+    verdict.** The same hostname gave this workstation a POP in Singapore
+    (43.174.246/247.108, AS139341) and the origin node also a POP in Singapore,
+    while the origin itself is in Phoenix, Arizona — so a Chinese viewer's bytes
+    cross the border twice and the measured 0.4-1.4 MB/s says nothing about the
+    origin's code. Three checks, each one command: the leg's POP
+    (`curl -w '%{remote_ip}'`), the client's own egress (`myip.ipip.net`), and
+    what the audience's resolvers return (`dig @223.5.5.5 <host>`). *Fix:* when
+    all three are overseas for a domestic audience, the finding is a deployment
+    topology finding, and no amount of origin work will move it.
+
+34. **A proxy can hide which vantage you are measuring — and this one exits from
+    the origin host.** `http_proxy`/`ALL_PROXY` here point at 127.0.0.1:2080,
+    whose egress is 129.146.127.22, the origin node itself; a CDN measurement
+    taken through it would look like the origin talking to the edge. *Fix:* use
+    `--noproxy '*'` (or `--no-proxy-server` for a browser) AND prove it — curl
+    prints `Established connection to <host> (<pop-ip>) from <local-ip>` when it
+    goes direct, and prints `Uses proxy env variable` when it does not.
