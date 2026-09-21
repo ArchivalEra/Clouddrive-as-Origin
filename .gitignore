@@ -15,6 +15,7 @@
 !/.gitignore
 !/LICENSE
 !/README.md
+!/CONTEXT.md
 
 # --- Project directories ---
 !/hooks/**
