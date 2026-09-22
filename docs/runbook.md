@@ -805,6 +805,32 @@ band and a fresh jump seed per viewer per run, and the report's `edgeHIT`/
 | 6 viewers, fresh bands | 120 MiB, one viewer 0 bytes in 240 s | 8, worst 2460 ms | 1479 ms |
 | 1 viewer, a fresh band | 30 MiB in 16.5 s (1.8 MB/s) | 0 | 1463 ms |
 
+**The upstream concurrency gate is not what limits the cold fill** (asked
+directly on 2026-09-22, because "more parallelism upstream" is the obvious
+suspicion). `concurrency_per_upstream` was raised 3 -> 12 on the node and the
+same 4-viewer cold-band run repeated: the origin's per-ask service time did not
+move (**p50 225 ms at 3, 223 ms at 12**), its ask count did not rise, and the
+delivered aggregate did not improve. Then the link itself was measured from the
+node — a vantage whose path to the edge is clean — with 16 MiB in ONE request:
+
+| shape from the node | measured |
+| --- | --- |
+| 16 MiB in one Range, sample 1 | 26.6 s = **0.63 MB/s** (TTFB 0.21 s) |
+| 16 MiB in one Range, sample 2 | 12.9 s = **1.31 MB/s** (TTFB 0.25 s) |
+| a fresh 1 MiB Range (three samples) | TTFB 0.21-0.94 s, total 1.75-2.74 s |
+| 5 MB shards, four viewers, warm at the edge | 5.3 MB/s aggregate, zero gaps |
+
+So the origin answers in ~0.2 s and the bytes then crawl: **the constraint is the
+path between this origin and the edge** (the tunnel over Phoenix <-> Singapore),
+0.6-1.3 MB/s per connection and 2-3.4 MB/s with a few — and in a cold run the
+edge's *fill* and its delivery both cross that same path. Raising the gate cannot
+exceed the pipe; Google Drive's parallelism is irrelevant for the same reason (a
+contiguous read from it measures 20 MB/s). It also shows why the shard shape is
+worth what it is: 5 MB shards move 5-10x what one large Range does on this link.
+The lever is the deployment's topology — an origin near the edge — which is the
+same conclusion the domestic-vantage section reached from the other end. The gate
+was restored to 3.
+
 Three things follow. **The origin is not the limit**: its side of the 4-viewer
 cold run is 141 asks for 115.5 MiB at p50 225 ms (each ask is a 1 MiB fill, most
 served from staged bytes). **The edge's cold fill is the limit and it is shared**:
