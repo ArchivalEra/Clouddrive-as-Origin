@@ -381,6 +381,32 @@ Verdict: a clean, well-instrumented multiplexer (its own doctor passes at
 the wrong instrument for this deployment's bottleneck — every limit measured on
 2026-09-22 sits in the link, not in the framing or the number of logical streams.
 
+**With the window their deployment uses, and several streams (measured later the
+same day).** A temporary spike (`/tmp/mux-spike`, path-dependent on their crates,
+policy from env) replaces the harness's library default: same front, same shim,
+same ssh tunnel to this origin, 10 MiB per stream, padding off.
+
+| streams on ONE carrier | window 4 MiB | window 32 MiB | plain HTTP, N connections |
+| --- | --- | --- | --- |
+| 1 | 3.15 MB/s | - | 3.5 MB/s |
+| 4 | 7.54 MB/s | - | 8.8 MB/s |
+| 8 | **12.50 MB/s** | 9.59 MB/s | 9.87 MB/s |
+| 16 | 13.18 MB/s | 11.80 MB/s | **15.22 MB/s** |
+
+Every run: zero errors, zero stream timeouts — their flow control held sixteen
+10 MiB streams over a ~250 ms leg. Read it as: both shapes plateau at the leg
+(13-15 MB/s), the mux is *not* faster, and it is better at 8 than eight separate
+connections (12.5 vs 9.9); its real property is delivering that aggregate over
+ONE client-facing carrier (two TCP connections, POST + GET) instead of N. Their
+production window (4 MiB) beats 32 MiB here, which matches their own sizing note
+that the window has to cover the BDP and no more.
+
+So for this project the mux is a *connection-count* tool, not a speed tool: it
+would matter to a client that cannot open many connections (a browser has six per
+host) and not to one that can (our shard clients do). And through EdgeOne it
+cannot be terminated at the edge at all, so the hop it would help is the one a CDN
+splits in two.
+
 ## One command from source to a serving node
 
 `deploy/oracle/deploy-node.sh` (run on the workstation) does the whole path and
