@@ -362,3 +362,23 @@ entry for being obvious in hindsight — hindsight is the point.
     separates "the edge asked for this" from "we asked ourselves". *Fix:* split on
     `xff=` before attributing anything to the edge -- a value there is the client as
     EdgeOne saw it, `-` is a direct hit.
+
+49. **A `spawn_blocking` round trip inside a response body's poll stalls the
+    drain.** Sealing runs at the tail of the body's own stream
+    (`ranged::upstream_body`), so a `tokio::fs::metadata(..).await` there — a
+    blocking-pool hop from inside a `Stream` — left the body undrained:
+    `a_read_credits_every_staged_span_it_touches` failed with `flight stalled: no
+    progress for 30s` in ~35% of runs, and 0% once the same `stat` was made
+    synchronous. The house style in this area is already `std::fs::metadata`
+    (the sweep, the version-change cleanup, the disk-covers check). *Fix:* when a
+    future hangs in a body path, look for an async filesystem call first, and
+    prefer the synchronous one where the file is page-cached anyway.
+
+50. **A test that samples after a response races the seal.** The seal lands when
+    the body's tail runs or the disconnect watcher fires — after the response the
+    test is holding. `a_read_credits_every_staged_span_it_touches` asserted the
+    ledger straight after a request and failed **4 of 6 runs on the tree as it
+    stood before this was noticed**; the file already had `wait_ledger` for
+    exactly this, used by ten other tests. *Fix:* wait for the record, not for
+    the response — and when a test is flaky, check the baseline first (this one
+    was not the change's fault).

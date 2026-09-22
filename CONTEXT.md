@@ -73,7 +73,30 @@ keepable key's span.
 
 **ledger / coverage** — the per-key record of what is staged, when it was last
 read, and how often. The ledger is the policy's coarse map; the DISK is the
-authority for what exists.
+authority for what exists. Since the staged state moved behind one receiver
+(`cache::ledger`), the ledger also holds the **account** — how many bytes are
+staged — because that number is a function of the records and two places for one
+fact is how they came to drift. The account changes only by measurement: a file's
+real length when bytes arrive, the sweep's measured `freed` when they leave, a
+fresh inventory at startup.
+
+**adopt** — the ledger's only way in. Bytes enter a record only after the disk is
+asked to back them, and the count comes from the file rather than the caller's
+claim, so a short write claims short and a span the disk does not cover is
+refused. **Sealing is this same rule**: a rename that landed is a disk fact like
+any other, which is why the live path and a test fixture cross the same
+interface. What the record cannot express, the account cannot charge for.
+
+**served / touch** — two read-side rules that look alike and are not. `served`
+(bytes left the disk for a reader) feeds heat and the interval's read time;
+`touch` (the key was reached at all) refreshes only the row's age, so an actively
+watched window is not swept for inactivity while its own bytes stay untouched.
+
+**the guard never leaves** — the ledger's lock is taken and released inside the
+module: every query, every selection (the sweep's candidates, the eviction's
+order, the un-keepable class) and every mutation finishes there. No caller holds
+the staged state across an await, and no call site has to know that ADR-0008's
+ordering rule exists — that is what "structural" means here.
 
 ## Architecture terms
 
