@@ -369,8 +369,14 @@ for off in 0 65536 131072; do
   [ "$code" = 206 ] && ok "seek at $off -> 206" || bad "seek at $off -> $code"
 done
 after=$(opens 9092)
-[ $((after - before)) = 1 ] && ok "three seeks inside one window: 1 upstream open" \
-  || bad "three seeks cost $((after - before)) upstream opens (want 1)"
+# AT MOST two, not exactly one: the key is WATCHED (ADR-0018), and the chain
+# pre-fetches the next window once this run seals — a read-ahead that is owed
+# and costs an open of its own. Whether that open lands before this sample is a
+# race, so the bound is what the claim actually is: the three seeks SHARE a run
+# (a per-seek open would be 3).
+opens_used=$((after - before))
+[ "$opens_used" -le 2 ] && ok "three seeks inside one window: $opens_used upstream open(s) (want 1, at most 2 with the watched chain's read-ahead)" \
+  || bad "three seeks cost $opens_used upstream opens (want 1)"
 # The request's own window must land, and it must land as ONE span — but the
 # count is no longer exactly one: with the key WATCHED (ADR-0018) the chain
 # pre-fetches the next window after the run seals, so a walk can leave one extra
@@ -811,7 +817,11 @@ opened=$(( $(opens 9096) - before_g ))
 # (one per three shards), which is what this assertion is here to catch: the
 # failure mode is a walk that stops riding windows, not a walk that takes one
 # more window than the old policy.
-[ "$opened" -le 3 ] && ok "24 ascending 1 MiB shards cost $opened upstream open(s) (the ramp climbs 8+16 MiB, want 3, at most 3)" \
+# At most FOUR, for the same reason as the three-seek assertion above: 3 for the
+# ramp (8 -> 16 MiB plus the boundary handover) and at most one more for the
+# watched chain's read-ahead. What this catches is unchanged — a walk that
+# stopped riding windows measures 8 or 24 here, not 4.
+[ "$opened" -le 4 ] && ok "24 ascending 1 MiB shards cost $opened upstream open(s) (the ramp climbs 8+16 MiB, want 3, at most 4 with the read-ahead)" \
   || bad "24 shards on the default window cost $opened opens (want 3)"
 # The window SEALS asynchronously — the run's driver keeps pumping the 64 MiB
 # window after the last shard was served — so this polls rather than samples.
