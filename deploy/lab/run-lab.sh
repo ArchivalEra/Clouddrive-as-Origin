@@ -747,6 +747,12 @@ WALK_OBJ=big3g.bin
 code=$(H -o /dev/null -w "%{http_code}" "http://127.0.0.1:7782/_internal/healthz")
 [ "$code" = 404 ] && ok "the front refuses healthz with 404 (not 403: it should not even admit the surface exists)" \
   || bad "front healthz returned $code (want 404)"
+# The rule is the prefix, not the name: an internal route this front has never
+# heard of is refused too, so growing or renaming one in the business plane
+# cannot republish it on the public hostname.
+code=$(H -o /dev/null -w "%{http_code}" "http://127.0.0.1:7782/_internal/an-internal-route-nobody-registered")
+[ "$code" = 404 ] && ok "and an unknown internal path with it: the rule is the prefix, not a name" \
+  || bad "an unregistered internal path returned $code (want 404)"
 # The assertion is that the BUSINESS plane answers on its own port (`hz_field`
 # reads numeric fields only, and `status` is a string). It must NOT require
 # `status:"ok"`: a fresh cache directory whose files predate the metadata store

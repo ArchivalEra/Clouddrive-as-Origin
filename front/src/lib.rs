@@ -304,23 +304,27 @@ impl ProxyHttp for BusinessProxy {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> ProxyResult<bool> {
-        // healthz is not part of the public surface (D2, #54). It discloses
-        // the upstream topology and configuration and is meant for the
-        // node's own operator and tooling, both of which read it on the
-        // business plane's loopback port. Refusing here removes the path
+        // Everything under /_internal/ is the node's own surface, and exactly
+        // ONE entry in it belongs on the public hostname: prewarm, an
+        // authenticated write-side entry point the upload pipeline calls there,
+        // with every deployed config setting its shared secret. healthz -- and
+        // whatever internal route is added next -- discloses the upstream
+        // topology and configuration and is read on the business plane's
+        // loopback port instead. Refusing it here removes the path
         // structurally rather than adding a token that can be leaked or
         // misconfigured.
         //
-        // 404, not 403: a caller should not learn that a private surface
-        // exists here at all.
+        // The rule is the PREFIX, not a name. It used to name healthz exactly,
+        // so this front had to be told about every internal route the business
+        // plane grew -- and a rename on either side silently republished the
+        // route, because the two crates cannot see each other's spelling (this
+        // crate does not depend on the plane at all). A refusal that has to be
+        // kept in sync is not a refusal.
         //
-        // Scope note: this deliberately covers healthz ONLY. prewarm is a
-        // different case -- it is an authenticated write-side entry point
-        // that the (separate, later) upload pipeline is expected to call
-        // through the public hostname, and every deployed config sets its
-        // shared secret. Refusing it here would break a documented
-        // integration to close a hole that authentication already closes.
-        if session.req_header().uri.path() == "/_internal/healthz" {
+        // 404, not 403: a caller should not learn that a private surface exists
+        // here at all.
+        let path = session.req_header().uri.path();
+        if path.starts_with("/_internal/") && !path.starts_with("/_internal/prewarm/") {
             return Err(Error::new(ErrorType::HTTPStatus(404)));
         }
         if let Some(gate) = self.rate.as_ref() {
