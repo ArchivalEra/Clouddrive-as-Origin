@@ -250,13 +250,10 @@ pub(crate) struct Magazine {
     state: Arc<RwLock<CacheState>>,
     config: Arc<Config>,
     meta: Arc<crate::cache::persist::MetaStore>,
-    /// Read leases: policy eviction spares what a viewer is streaming
-    /// (ADR-0017). Disk pressure deliberately does not consult them.
-    leases: Arc<super::leases::Leases>,
-    /// Watches (ADR-0018): a viewing session, which outlives its bodies. A
+    /// What is protected right now (ADR-0017 leases + ADR-0018 watches). A
     /// watched key's *object file* is what a durable install holds, so here —
     /// unlike the staged spans — the granularity is the whole key.
-    watches: Arc<super::watch::Watches>,
+    protection: super::protection::Protection,
 }
 
 impl Magazine {
@@ -264,21 +261,17 @@ impl Magazine {
         state: Arc<RwLock<CacheState>>,
         config: Arc<Config>,
         meta: Arc<crate::cache::persist::MetaStore>,
-        leases: Arc<super::leases::Leases>,
-        watches: Arc<super::watch::Watches>,
+        protection: super::protection::Protection,
     ) -> Self {
-        Self { state, config, meta, leases, watches }
+        Self { state, config, meta, protection }
     }
 
     /// Keys policy eviction must leave alone right now: bodies streaming a
     /// key (ADR-0017) plus keys being watched inside their idle budget
-    /// (ADR-0018). The two are computed together because every caller that
-    /// needs one needs both, and because two answers is how one of them ends
-    /// up forgotten at a call site.
+    /// (ADR-0018), which is `cache::protection`'s union — the two are one
+    /// question, and the module is where that lives now.
     fn spared(&self, now: u64) -> std::collections::HashSet<String> {
-        let mut spared = self.leases.protected(now);
-        spared.extend(self.watches.live_keys(now));
-        spared
+        self.protection.spared(now)
     }
 
     /// Whether the magazine can hold an object this size (see
@@ -636,8 +629,7 @@ mod tests {
             Arc::new(RwLock::new(CacheState::default())).clone(),
             Arc::new(cfg),
             Arc::new(meta),
-            Arc::clone(&leases),
-            Arc::clone(&watches),
+            crate::cache::protection::Protection::new(Arc::clone(&leases), Arc::clone(&watches)),
         );
         // The magazine above owns its own state; give it the one this test
         // filled in — the constructor takes the receiver, not a copy.
@@ -695,8 +687,10 @@ mod tests {
             Arc::new(RwLock::new(CacheState::default())),
             Arc::new(cfg),
             Arc::new(meta),
-            Arc::new(crate::cache::leases::Leases::new(0)),
-            Arc::new(crate::cache::watch::Watches::new(0, 0)),
+            crate::cache::protection::Protection::new(
+                Arc::new(crate::cache::leases::Leases::new(0)),
+                Arc::new(crate::cache::watch::Watches::new(0, 0)),
+            ),
         );
         magazine
             .delete(&[

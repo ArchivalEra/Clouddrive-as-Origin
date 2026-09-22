@@ -550,8 +550,8 @@ mod tests {
         let ledger = Arc::new(crate::cache::ledger::Ledger::new(dir.to_path_buf()));
         let leases = Arc::new(crate::cache::leases::Leases::new(0));
         let watches = Arc::new(crate::cache::watch::Watches::new(watch_idle_ms, 4096));
-        let staging =
-            Staging::new(Arc::clone(&ledger), Arc::clone(&cfg), leases, Arc::clone(&watches));
+        let protection = crate::cache::protection::Protection::new(leases, Arc::clone(&watches));
+        let staging = Staging::new(Arc::clone(&ledger), Arc::clone(&cfg), protection);
         let flights = Flights::new(flight::DEFAULT_STALL_BUDGET);
         let sessions =
             Arc::new(Sessions::new(cfg, Arc::clone(&clock), staging, flights, Arc::clone(&watches)));
