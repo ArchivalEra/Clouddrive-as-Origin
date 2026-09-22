@@ -321,25 +321,25 @@ entry for being obvious in hindsight — hindsight is the point.
     `HTTPS_PROXY=http://127.0.0.1:2080` are exported globally, so a `tccli` call
     goes through the same proxy every measurement here must avoid — and it fails
     quietly, as a network error against a hostname that looks unrelated to the
-    proxy. *Fix:* strip the proxy variables in one wrapper (`deploy/edge/eo.sh`)
-    rather than at each call site. Prove it with a black-hole proxy: point
+    proxy. *Fix:* `unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy` in the
+    shell that makes the call. Prove it with a black-hole proxy: point
     `HTTP_PROXY` at a closed port, and a call that still reaches the API (a real
-    `requestId` comes back) is a call that did not use the proxy — the same call
-    through raw tccli dies on the proxy.
+    `requestId` comes back) is a call that did not use the proxy — with the
+    variables set, the same call dies on the proxy instead.
 
 45. **The right key against the wrong endpoint reads as a wrong key.** EdgeOne
     International is served by `teo.intl.tencentcloudapi.com`; tccli has no
     international routing at all and defaults to the domestic endpoint, which
     answers `AuthFailure.SecretIdNotFound`. That is an error about the credential
     for a problem that is the endpoint, and it sends you to regenerate a key that
-    was fine. *Fix:* set the endpoint explicitly before believing anything an
-    auth error says about the key.
+    was fine. *Fix:* pass `--endpoint teo.intl.tencentcloudapi.com` explicitly,
+    and do not believe what an auth error says about the key until the endpoint
+    is known to be right.
 
 46. **A read response is not a write request.** EdgeOne spells the same setting
     differently on the two sides — the read returns `ZoneSetting.UpstreamHttp2`,
     the write takes `ZoneConfig.UpstreamHTTP2` — so round-tripping a read into a
     write silently *drops* settings instead of erroring, which is the failure
     mode that costs an afternoon and a serving domain. *Fix:* send only the block
-    you intend to change, then re-read and diff the whole setting object, and
-    treat any field that moved unasked-for as a failure with a non-zero exit
-    (`deploy/edge/eo-origin-pull.sh` exits 3 and names the field).
+    you intend to change, then re-read and diff the whole setting object; any
+    field that moved unasked-for means stop and read the diff, not carry on.

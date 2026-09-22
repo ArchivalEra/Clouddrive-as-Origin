@@ -448,15 +448,18 @@ cacheable, and deliverable in our own client code.
 ## The edge's control plane, from here (tccli, 2026-09-22)
 
 The remaining origin-leg levers are EdgeOne settings rather than code, so the
-console was the only door to them. `deploy/edge/` opens a second one.
+console was the only door to them. It is not the only one now: `tccli` reaches the
+same API. It is used directly, with no local wrapper -- a shell wrapper around a
+cloud vendor's own CLI is a maintenance liability that buys nothing, and the two
+things it would "encapsulate" are one flag and one `unset`.
 
 ```sh
 uv tool install tccli        # tccli 3.1.172.1, the version tested here
 ```
 
-Credentials come from the environment and nowhere else -- `TENCENTCLOUD_SECRET_ID`
-and `TENCENTCLOUD_SECRET_KEY`, plus `TENCENTCLOUD_TOKEN` for a temporary key.
-Nothing in `deploy/edge/` writes, echoes or stores them.
+Credentials come from the environment: `TENCENTCLOUD_SECRET_ID`,
+`TENCENTCLOUD_SECRET_KEY`, plus `TENCENTCLOUD_TOKEN` for a temporary key. Never in
+a file, never in the repository.
 
 ```sh
 export TENCENTCLOUD_SECRET_ID=...    # environment, not a file in the repo
@@ -466,18 +469,28 @@ export TENCENTCLOUD_SECRET_KEY=...
 ### Two traps, both already paid for
 
 **The endpoint.** EdgeOne International is served by
-`teo.intl.tencentcloudapi.com`. tccli 3.x has no international routing at all and
+`teo.intl.tencentcloudapi.com`, and tccli 3.x has no international routing: it
 defaults to the domestic endpoint, where an international key answers
-`AuthFailure.SecretIdNotFound` -- which reads as "wrong key" and is actually
-"wrong endpoint". `eo.sh` sets the international endpoint; override with
-`EO_ENDPOINT` for a domestic account. Confirmed with a black-hole proxy: the same
-call through raw tccli dies trying to reach the proxy, through `eo.sh` it reaches
-the API and comes back with a real `requestId`.
+`AuthFailure.SecretIdNotFound`. That is an error about the key for a problem that
+is the endpoint, and it sends you off to regenerate a key that was fine. Pass
+`--endpoint teo.intl.tencentcloudapi.com` on every call (or set `EO_ENDPOINT` in
+your shell and paste it). Checked with a black-hole proxy: point `HTTP_PROXY` at a
+closed port and a call still returns a real `requestId` only when the proxy
+variables are unset; with them set, the same call dies trying to reach the proxy.
 
 **The proxy.** This workstation exports `HTTP(S)_PROXY=http://127.0.0.1:2080`
-globally, and nothing here may travel through it. `eo.sh` unsets the proxy
-variables before every call, in one place, rather than at each call site where
-one of them would eventually be forgotten.
+globally, and nothing here may travel through it. Unset the proxy variables in the
+shell that makes the call:
+
+```sh
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+tccli teo DescribeZones --Offset 0 --Limit 100 \
+  --endpoint teo.intl.tencentcloudapi.com --region ap-hongkong
+```
+
+**The parameter names.** teo's CLI parameters are capitalised (`--Offset`, not
+`--offset`), and an unknown option gets a bare usage message rather than an error
+naming it.
 
 ### Where each knob lives
 
@@ -491,48 +504,35 @@ one of them would eventually be forgotten.
 Note the asymmetry that makes a round trip dangerous: the read returns
 `ZoneSetting.UpstreamHttp2` while the write takes `ZoneConfig.UpstreamHTTP2`.
 Copying a read response straight back into a write request drops settings
-silently, so `eo-origin-pull.sh` sends only the block named on the command line
-and diffs the whole setting object afterwards.
+silently, so write only the block you are changing, then re-read and diff the
+whole setting object.
 
-### The three scripts
-
-```sh
-deploy/edge/eo.sh <Action> [...]      # one door: proxy stripped, intl endpoint, creds from env
-deploy/edge/eo-audit.sh [ZoneId ...]  # read-only; dumps land in /tmp/eo-audit, outside the repo
-
-deploy/edge/eo-origin-pull.sh --zone <id> --upstream-http2 on              # dry run
-deploy/edge/eo-origin-pull.sh --zone <id> --upstream-http2 on --yes        # apply, re-read, diff
-deploy/edge/eo-origin-pull.sh --zone <id> --range-origin-pull on --rule-id <id> --yes
-deploy/edge/eo-origin-pull.sh --zone <id> --upstream-timeout 60 --rule-id <id> --yes
-```
-
-The write path is dry-run by default and refuses to write without `--yes`. After
-a write it re-reads and prints every field that moved. If the zone is not in the
-state the command asked for -- `upstream-http2` not moving, `upstream-http2`
-moving something else as well, or a *rule* write moving the site-wide setting at
-all -- it exits 3 and names the field. Before and after dumps stay in
-`$EO_DUMP_DIR` (default `/tmp/eo-audit`, deliberately outside the repository, so
-the origin address can never be committed), which is also where the revert value
-sits.
-
-`RangeOriginPull` is rule-scoped on purpose: without `--rule-id` the script
-refuses instead of inventing a rule, because a rule carries a match condition and
-a match condition is an operator's decision. If the zone turns out to have no
-rule to hang it on, that is a finding to report rather than something to paper
-over.
-
-### Proving it without an account
+### Calling it
 
 ```sh
-bash deploy/edge/selftest.sh
+# the site-wide setting, and the rules (RangeOriginPull lives only in the rules)
+tccli teo DescribeL7AccSetting --ZoneId <zone> --endpoint ... --region ...
+tccli teo DescribeL7AccRules   --ZoneId <zone> --Limit 200 --endpoint ... --region ...
+# which domains, and where each one pulls from
+tccli teo DescribeAccelerationDomains --ZoneId <zone> --Offset 0 --Limit 200 --endpoint ... --region ...
+
+# HTTP/2 to the origin: send only this block
+tccli teo ModifyL7AccSetting --ZoneId <zone> \
+  --ZoneConfig '{"UpstreamHTTP2":{"Switch":"on"}}' --endpoint ... --region ...
+
+# sharded origin pull, on an existing rule (ModifyL7AccRule wants the whole Rule object)
+tccli teo ModifyL7AccRule --ZoneId <zone> --Rule '{"RuleId":"...","Status":"enable",...}' --endpoint ... --region ...
 ```
 
-stands a stub `eo.sh` in place of the wrapper, replays recorded responses from
-fixtures, and asserts 25 behaviours -- that the audit names both knobs, that a
-dry run makes no write call, that the after-read shows the intended field moving,
-that an unasked-for change exits 3 and is named, and that the guards refuse a
-rule knob without a rule, an out-of-range timeout, and a missing zone. No
-network, no credentials, no account touched: `VERDICT PASS 25/25` on 2026-09-22.
+`RangeOriginPull` cannot be set site-wide -- it is absent from the site-wide
+request schema entirely and exists only as a rule action, so it needs a rule to
+hang on and a rule carries a match condition. That is an operator's decision; if
+the zone has no rule to put it on, that is a finding to report rather than
+something to invent.
+
+Dumps of the raw responses carry the origin address, so keep them out of the
+repository (`/tmp/eo/` is fine; the `.gitignore` is a whitelist, but a file named
+by hand into `deploy/` would still be tracked).
 
 ## One command from source to a serving node
 
