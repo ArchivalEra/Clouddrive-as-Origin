@@ -582,6 +582,48 @@ UTC, hourly:
 The other domain in the zone (`pure-dns.isui.ren`, origin `baidu.com`) is unrelated
 to this project and was not touched.
 
+### Who pulls, and how to tell (2026-09-22)
+
+Asking "does the edge ever pull from us with no viewer?" through the CDN's own
+hourly metric gives the wrong answer, so the instrument matters more than the
+number.
+
+The metric (`DescribeTimingL7OriginPullData`, hourly) reads roughly 15% above the
+origin's own body-byte count, and at a bucket boundary it smears a burst into the
+next hour: one bucket reported 49.61 MB while the origin's access log shows **zero
+pulls** in that same hour. A "viewerless pull" found from a one-hour bucket is a
+bucketing artifact.
+
+The authority is the origin's own log, because it is per request and carries the
+key and the byte count:
+
+```sh
+ssh oracle-cdn 'journalctl -u origin-cache-efficient -u origin-cache-nocache \
+  --since "2026-09-20 00:00:00" --until "2026-09-22 08:00:00" --no-pager \
+  | grep "front access"'
+```
+
+Split it on `xff=`. **A value means the request came through the edge** (and that
+value is the client as EdgeOne saw it); **`xff=-` means it arrived directly at the
+node** -- our own `accept.sh` contract checks (`/`, reserved names 400, nested
+look-alikes 404, HEAD, `/favicon.ico`) and the LAB probes never leave the box.
+Read the other way, a 4 KB hour of self-checks looks exactly like the edge pulling
+without viewers.
+
+Attribution over 09-20 00:00 to 09-22 08:00 UTC: 2,080 via-edge pulls from this
+workstation's own egress, 277 from a Google Cloud address walking `.env` and
+`phpinfo` paths (404s -- a scanner, not a viewer), 150 from the node's own IPv6
+(our node-side probes), 91 direct, plus single pulls from a few crawlers. Pull
+sizes are not constant: 1 MiB pieces in one burst, 260 KiB ones in another, both
+around a second per pull.
+
+**Verdict on `CachePrefresh` (on, at 90% of TTL): no viewerless origin pull.**
+Every non-trivial via-edge pull falls in an hour that also has client requests, and
+the hours with no client requests have no via-edge pulls at all. It stays a config
+item to understand rather than a measured load source. Caveat: the node's journal
+only reached back to 09-20 00:00, so the window examined is about two and a half
+days rather than the full history.
+
 ## One command from source to a serving node
 
 `deploy/oracle/deploy-node.sh` (run on the workstation) does the whole path and
@@ -1005,6 +1047,19 @@ hits are served at line rate; cold bytes are a shared budget. One viewer of this
 read) do not — a run that asked for exactly that was stopped after five minutes
 rather than allowed to finish, and its `page.evaluate` exception is the kill, not
 a harness failure.
+
+**A/B on the rule change of 2026-09-22 (origin-read timeout).**
+`HTTPUpstreamTimeout` was unset on the one rule, so the platform default applied;
+it now reads 600 s (`ModifyL7AccRule`, then re-read and diffed: that action is the
+only thing that moved). Re-running the player probe against this film from the
+workstation changes nothing -- `bytes=0-` gets a 206, a second request at
+`bytes=1572864-` never gets a status, 300 bytes are delivered, `readyState` stays
+0, `stalled` -- so whatever this leg suffers, it is not an origin-read timeout.
+
+The probe did sharpen *where* the leg is: that first response came back
+`edge=HIT`, so the POP already had the object and still delivered only headers.
+The stall is therefore on client <-> POP, not POP <-> origin. Same object, same
+route, same night: 300 bytes open-ended against 7.1 MB/s in shards.
 
 ### The window decision: a jump pays the floor (ADR-0024, 2026-09-22)
 
