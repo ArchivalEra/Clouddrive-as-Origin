@@ -6,6 +6,7 @@ use crate::{
     cache::{
         flight::{self, BodyStream, FlightProgress, FlightShared},
         ledger::Ledger,
+        protection::Protection,
         magazine::{self, Magazine},
         meta::EntryMeta,
         ranged,
@@ -483,6 +484,10 @@ pub struct Cache<C: Clock> {
     /// the account — see `cache::ledger` for the rules. Crate-visible on
     /// purpose: the operator view (`snapshot`, `inspect`) is the public seam.
     pub(crate) ledger: Arc<Ledger>,
+    /// What is protected right now (ADR-0017 leases + ADR-0018 watches), behind
+    /// one interface. The two receivers below keep their own views because the
+    /// operator's `?key=` answer distinguishes them; every DECISION asks this.
+    pub(crate) protection: Protection,
     /// The magazine: every byte-budget decision (admission, eviction,
     /// pressure reclaim, install, delete) lives behind this receiver.
     pub(crate) magazine: Magazine,
@@ -534,19 +539,17 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             config.watch_idle_secs.saturating_mul(1000),
             config.watch_pin_bytes,
         ));
+        // One answer to "what is protected right now", shared by both decisions:
+        // the two protections are only useful together (ADR-0017/0018).
+        let protection = Protection::new(Arc::clone(&leases), Arc::clone(&watches));
         let magazine = Magazine::new(
             Arc::clone(&state),
             Arc::clone(&config),
             Arc::clone(&meta),
-            Arc::clone(&leases),
-            Arc::clone(&watches),
+            protection.clone(),
         );
-        let staging = Staging::new(
-            Arc::clone(&ledger),
-            Arc::clone(&config),
-            Arc::clone(&leases),
-            Arc::clone(&watches),
-        );
+        let staging =
+            Staging::new(Arc::clone(&ledger), Arc::clone(&config), protection.clone());
         let flights = crate::cache::flight::Flights::new(crate::cache::flight::DEFAULT_STALL_BUDGET);
         let sessions = Arc::new(Sessions::new(
             Arc::clone(&config),
@@ -564,6 +567,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             dirty_access,
             flights,
             ledger,
+            protection,
             staging,
             sessions,
             leases,
@@ -1217,7 +1221,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                 // answer this request from upstream and let the drift be
                 // settled by the next request that arrives when nobody is.
                 let now = self.clock.now_millis();
-                if self.watches.live(&rk.cache_key, now) || self.leases.is_protected(&rk.cache_key, now) {
+                if self.protection.in_use(&rk.cache_key, now) {
                     tracing::info!(
                         key = %rk.cache_key,
                         "version drifted while this key is being read: serving upstream, settling the ledger later"

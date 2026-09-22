@@ -25,6 +25,7 @@ use crate::{
 };
 
 use super::ledger::Ledger;
+use super::protection::Protection;
 
 /// Never evict a staging ledger row younger than this (P56): an active
 /// transfer's row is touched continuously and must not be yanked mid-flight.
@@ -60,23 +61,15 @@ pub(crate) struct FinalizedSpan {
 pub(crate) struct Staging {
     ledger: Arc<Ledger>,
     config: Arc<Config>,
-    leases: Arc<super::leases::Leases>,
-    /// Watches: a key being VIEWED, which outlives its response bodies
-    /// (ADR-0018). A lease says a body is alive; a watch says the viewer is
-    /// still there and where — and that position is what turns "spare the
-    /// whole key" into a bounded neighbourhood the budget can still spend
-    /// around.
-    watches: Arc<super::watch::Watches>,
+    /// What is protected right now (ADR-0017 leases + ADR-0018 watches), behind
+    /// one interface: the two rules are only useful together, and a pass that
+    /// knew about one of them would silently lose the other.
+    protection: Protection,
 }
 
 impl Staging {
-    pub(crate) fn new(
-        ledger: Arc<Ledger>,
-        config: Arc<Config>,
-        leases: Arc<super::leases::Leases>,
-        watches: Arc<super::watch::Watches>,
-    ) -> Self {
-        Self { ledger, config, leases, watches }
+    pub(crate) fn new(ledger: Arc<Ledger>, config: Arc<Config>, protection: Protection) -> Self {
+        Self { ledger, config, protection }
     }
 
     /// The etag the ledger last saw for a key: the version gate's peek.
@@ -93,11 +86,7 @@ impl Staging {
     /// A row with a live read lease, or one read inside `read_grace_secs`, is
     /// not idle however old its last request is (ADR-0017).
     pub(crate) async fn expired(&self, ttl_ms: u64, now: u64) -> Vec<String> {
-        let mut spared = self.leases.protected(now);
-        // A key mid-watch is not idle however old its last request is. That is
-        // the whole point of a watch outliving its bodies (ADR-0018): a viewer
-        // who pauses for longer than the read grace is still watching.
-        spared.extend(self.watches.live_keys(now));
+        let spared = self.protection.spared(now);
         self.ledger.expired_candidates(ttl_ms, now, &spared).await
     }
 
@@ -125,8 +114,6 @@ impl Staging {
     ///
     /// Returns `(keys touched, bytes freed)`.
     pub(crate) async fn evict_staged(&self, need_bytes: u64, now: u64) -> (usize, u64) {
-        let protected = self.leases.protected(now);
-        let pins = self.watches.pins(now);
         let order = self.ledger.rows_by_age(self.config.max_size_bytes).await;
         let mut freed_total = 0u64;
         let mut touched = 0usize;
@@ -145,8 +132,9 @@ impl Staging {
                 // A watched key keeps its neighbourhood, not its whole row
                 // (ADR-0018). A key with a body but no look at it keeps the
                 // older, coarser rule.
-                let pin = pins.get(key).copied();
-                if pin.is_none() && protected.contains(key) {
+                let verdict = self.protection.verdict(key, now);
+                let pin = verdict.pin;
+                if pin.is_none() && verdict.leased {
                     continue;
                 }
                 let freed = self
@@ -174,15 +162,15 @@ impl Staging {
         // force the pin to be spent: the bytes outside the pin are enough.
         let cap = self.working_window_bytes();
         for key in self.ledger.unkeepable_rows(self.config.max_size_bytes).await {
-            if protected.contains(&key) && !pins.contains_key(&key) {
+            let verdict = self.protection.verdict(&key, now);
+            if verdict.leased && verdict.pin.is_none() {
                 continue; // a live body with no watch: ADR-0017's rule
             }
             if freed_total >= need_bytes {
                 // The global need is met; the cap is the only reason left.
                 // Still enforced, which is the point of this pass.
             }
-            let pin = pins.get(&key).copied();
-            let freed = self.trim_row(&key, 0, pin, false, Some(cap), now).await;
+            let freed = self.trim_row(&key, 0, verdict.pin, false, Some(cap), now).await;
             if freed > 0 {
                 freed_total += freed;
                 touched += 1;
@@ -653,12 +641,11 @@ mod tests {
         let ledger = Arc::new(Ledger::new(dir.path().to_path_buf()));
         let leases = Arc::new(Leases::new(0));
         let watches = Arc::new(Watches::new(watch_idle_ms, pin_bytes));
-        let staging = Staging::new(
-            Arc::clone(&ledger),
-            Arc::clone(&cfg),
+        let protection = crate::cache::protection::Protection::new(
             Arc::clone(&leases),
             Arc::clone(&watches),
         );
+        let staging = Staging::new(Arc::clone(&ledger), Arc::clone(&cfg), protection);
         Harness { staging, ledger, leases, watches, dir }
     }
 

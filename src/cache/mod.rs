@@ -3,6 +3,7 @@ pub mod flight;
 pub(crate) mod ledger;
 pub mod leases;
 pub(crate) mod magazine;
+pub(crate) mod protection;
 pub(crate) mod ranged;
 pub(crate) mod session;
 pub(crate) mod staging;
