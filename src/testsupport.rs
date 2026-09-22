@@ -354,10 +354,10 @@ pub async fn wait_entry(cache: &Cache<impl crate::clock::Clock + Clone + 'static
     panic!("entry {key} never installed");
 }
 
-/// Fill the coverage ledger and the staged-byte account from the sidecars on
-/// disk, exactly as a RESTART does: one `store::scan_segments`, which merges
-/// touching intervals the way a request's own merge does and derives the byte
-/// account from the files that exist.
+/// Fill the ledger and the staged-byte account from the sidecars on disk,
+/// exactly as a RESTART does: `Ledger::adopt_all`, which merges touching
+/// intervals the way a request's own merge does and derives the byte account
+/// from the files that exist.
 ///
 /// The account is never a number a test passes in. Tests used to poke
 /// `segment_bytes` directly, which invents the one figure the budget math reads
@@ -365,24 +365,13 @@ pub async fn wait_entry(cache: &Cache<impl crate::clock::Clock + Clone + 'static
 /// age stamp is the clock's now, so a caller controls age by advancing the
 /// clock first.
 pub async fn rebuild_staged(cache: &Cache<impl crate::clock::Clock + Clone + 'static>) {
-    let now = cache.clock.now_millis();
-    let (ledger, staged) = crate::cache::store::scan_segments(&cache.config.cache_dir, now);
-    *cache.coverage.lock().await = ledger;
-    cache.state.write().await.segment_bytes = staged;
+    cache.ledger.adopt_all(cache.clock.now_millis()).await;
 }
 
-/// The staged-byte account on its own, derived from the sidecars. For a test
-/// that has to build its own LEDGER row — a decayed interval is a state no scan
-/// produces — while still taking the account off the disk rather than inventing
-/// it.
-pub async fn rebuild_staged_bytes(cache: &Cache<impl crate::clock::Clock + Clone + 'static>) {
-    let staged =
-        crate::cache::store::scan_segments(&cache.config.cache_dir, cache.clock.now_millis()).1;
-    cache.state.write().await.segment_bytes = staged;
-}
-
-/// Write the sidecars for `(key, start, end)` spans, then [`rebuild_staged`]:
-/// the shape a node has after it restarts holding these bytes.
+/// Write the sidecars for `(key, start, end)` spans, then adopt them: the shape
+/// a node has after it restarts holding these bytes, with no version recorded
+/// (the `.segmeta` a restart reads is absent, which is exactly the state that
+/// must not promote until a fresh transfer rewrites it).
 pub async fn install_staged(
     cache: &Cache<impl crate::clock::Clock + Clone + 'static>,
     spans: &[(&str, u64, u64)],
@@ -390,42 +379,85 @@ pub async fn install_staged(
     for (key, start, end) in spans {
         let path = crate::cache::store::seg_path(&cache.config.cache_dir, key, *start, *end);
         std::fs::write(&path, vec![0u8; (end - start) as usize]).unwrap();
+        let at = cache.clock.now_millis();
+        assert!(cache.ledger.adopt(key, (*start, *end), at).await, "the sidecar must back the span");
     }
-    rebuild_staged(cache).await;
 }
 
-/// The same, with a per-key ledger AGE — the one premise a single scan cannot
-/// express, since `scan_segments` stamps everything with one clock, and a few
-/// tests turn on one key being staged earlier than another.
+/// The same, with a per-key AGE — the one premise a single scan cannot express,
+/// since the disk carries no age and `adopt_all` stamps everything with one
+/// clock, and a few tests turn on one key being staged earlier than another.
 ///
-/// The files are still real and the byte account is still summed from them;
-/// only the ages are supplied. Everything else in the tree uses
-/// [`install_staged`], so this helper is what a reader can grep for when
-/// asking "which tests decide their own clock on staged state".
+/// The files are real and the byte account is still measured from them; only the
+/// ages are supplied, as the moment each span was staged. Everything else in the
+/// tree uses [`install_staged`], so this helper is what a reader can grep for
+/// when asking "which tests decide their own clock on staged state".
 pub async fn install_staged_aged(
     cache: &Cache<impl crate::clock::Clock + Clone + 'static>,
     spans: &[(&str, u64, u64, u64)],
 ) {
-    for (key, start, end, _) in spans {
+    for (key, start, end, stamp) in spans {
         let path = crate::cache::store::seg_path(&cache.config.cache_dir, key, *start, *end);
         std::fs::write(&path, vec![0u8; (end - start) as usize]).unwrap();
+        assert!(
+            cache.ledger.adopt(key, (*start, *end), *stamp).await,
+            "the sidecar must back the span"
+        );
+        // The row's object size is a premise these tests set (it decides the
+        // un-keepable class), not something the disk can answer.
+        cache.ledger.set_version(key, None, *end).await;
     }
-    {
-        let mut cov = cache.coverage.lock().await;
-        for (key, start, end, stamp) in spans {
-            let row = cov.entry(key.to_string()).or_insert_with(|| crate::cache::store::Coverage {
-                total: 0,
-                last_touch_millis: *stamp,
-                ..Default::default()
-            });
-            row.total = row.total.max(*end);
-            row.last_touch_millis = *stamp;
-            row.add_interval(*start, *end, *stamp);
-        }
+}
+
+/// The ledger's interval ceiling: how many spans one key may keep records for.
+/// Re-exported so a test can drive a walk PAST it through the real path
+/// (`compact` fires inside adoption) instead of inventing a compacted row.
+pub const LEDGER_INTERVAL_CEILING: usize = crate::cache::ledger::MAX_INTERVALS_PER_KEY;
+
+/// A row whose claim is WIDER than any single file: what `compact` leaves behind
+/// after a long sequential walk, and a state no scan produces. The files are real
+/// and their union backs the claim, which is how adoption checks it — the same
+/// rule that refuses a claim the disk does not cover.
+pub async fn install_staged_merged(
+    cache: &Cache<impl crate::clock::Clock + Clone + 'static>,
+    key: &str,
+    files: &[(u64, u64)],
+    claim: (u64, u64),
+    total: u64,
+    stamp: u64,
+) {
+    for (start, end) in files {
+        let path = crate::cache::store::seg_path(&cache.config.cache_dir, key, *start, *end);
+        std::fs::write(&path, vec![0u8; (end - start) as usize]).unwrap();
+        // Each file is adopted first: that is what puts its bytes in the
+        // account, and the wider claim below describes them without counting
+        // them twice.
+        assert!(cache.ledger.adopt(key, (*start, *end), stamp).await, "the sidecar backs the file");
     }
-    // The account comes off the disk, not from the caller: sum what exists.
-    let staged = crate::cache::store::scan_segments(&cache.config.cache_dir, cache.clock.now_millis()).1;
-    cache.state.write().await.segment_bytes = staged;
+    assert!(cache.ledger.adopt(key, claim, stamp).await, "the union of the files backs the claim");
+    cache.ledger.set_version(key, None, total).await;
+}
+
+/// A row whose every record decayed away while its files stayed: window expiry
+/// removes ledger counts, not bytes, so the account still counts them. Built
+/// through the operations that produce it — stage each span at `stamp`, then let
+/// a window shorter than the elapsed time drop the records.
+pub async fn install_staged_decayed(
+    cache: &Cache<impl crate::clock::Clock + Clone + 'static>,
+    key: &str,
+    files: &[(u64, u64)],
+    total: u64,
+    stamp: u64,
+) {
+    for (start, end) in files {
+        let path = crate::cache::store::seg_path(&cache.config.cache_dir, key, *start, *end);
+        std::fs::write(&path, vec![0u8; (end - start) as usize]).unwrap();
+        assert!(cache.ledger.adopt(key, (*start, *end), stamp).await, "the sidecar backs it");
+    }
+    let covered = cache.ledger.decayed_coverage(key, stamp + 10_000, 1_000).await;
+    assert_eq!(covered, 0, "the premise is that every record is gone");
+    cache.ledger.set_version(key, None, total).await;
+    cache.ledger.touch(key, stamp).await;
 }
 
 /// Storm-suite backend: counts stat+open calls, delays a real open so
@@ -1006,11 +1038,11 @@ pub fn reset(fx: &Fixture) {
 /// shorthand of `Cache::inspect` (which adds the ledger, the pin and the
 /// lease), and sync so it can sit inside an assertion. Goes through the store
 /// rather than re-deriving the filename shape.
-pub fn staged_segments(fx: &Fixture, key: &str) -> Vec<(u64, u64)> {
-    crate::cache::store::segments_for_key(&fx.state.config.cache_dir, key)
-        .into_iter()
-        .map(|(start, end, _)| (start, end))
-        .collect()
+pub async fn staged_segments(fx: &Fixture, key: &str) -> Vec<(u64, u64)> {
+    // The operator view answers this (ADR-0022). The helper used to walk the
+    // directory itself, which made it a second implementation of the same
+    // answer — fine while both agreed, a trap the moment they did not.
+    fx.state.cache.inspect(key).await.staged_spans
 }
 
 /// Count of files in the cache dir that are not the metadata store.

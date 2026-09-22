@@ -227,194 +227,6 @@ pub fn prune_empty_parents(cache_dir: &Path, file: &Path) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// efficientcache (P2): staged segments + coverage ledger.
-// C transfers stage exactly the bytes they serve as flat sidecar files;
-// the ledger (intervals per key) is what a staged read is planned against.
-// Segment files are the source of truth — the in-memory ledger is a view,
-// rebuilt by scan on startup (crash/abort-safe by construction).
-// ---------------------------------------------------------------------------
-
-/// Transfer history for one key: which byte intervals have been served and
-/// staged, under which object version. The coverage ledger entry.
-#[derive(Debug, Clone, Default)]
-pub struct Coverage {
-    pub etag: Option<String>,
-    pub total: u64,
-    /// Merged, sorted, non-overlapping `[start, end)` intervals, each with
-    /// the clock-domain time it was last read (window decay) and its READ
-    /// COUNT (heat, the eviction policy's input). Heat survives a merge as a
-    /// SUM: a merged span was served `reads` times across its whole range.
-    pub intervals: Vec<(u64, u64, u64, u64)>,
-    /// Clock-domain last touch (stage or rebuild time): drives age sweep
-    /// in MockClock-testable time, unlike fs mtime.
-    pub last_touch_millis: u64,
-}
-
-/// Ceiling on the intervals one key's ledger may hold. Adjacent staged shards
-/// are deliberately kept apart (each keeps its own read time for window
-/// decay), so a sequential scrub in 1 MiB shards grew this vector with the
-/// request count — and the vector is walked on every staged transfer under
-/// the single process-wide ledger lock.
-///
-/// Generous: a key that reaches this many spans has staged far more than any
-/// viewer will re-read (the eviction policy trims by bytes, and a
-/// budget's worth of spans is far more than this for any real object).
-pub const MAX_INTERVALS_PER_KEY: usize = 4096;
-
-impl Coverage {
-    /// Merge `[start, end)` (empty ranges ignored), stamped with the read
-    /// time. Overlapping intervals merge and keep the max timestamp;
-    /// adjacent (touching) intervals stay separate so each keeps its own
-    /// read time — a stale interval must not be "revived" by a fresh
-    /// neighbor (window decay semantics).
-    pub fn add_interval(&mut self, start: u64, end: u64, now_millis: u64) {
-        if start >= end {
-            return;
-        }
-        // Insert at the sorted position and merge only the touched
-        // neighbours (P10). The previous shape pushed then re-sorted and
-        // rebuilt the whole vector, so a session of k staged shards cost
-        // O(k^2 log k) for one key.
-        // Overlaps can only touch the interval before and the ones after
-        // the insertion point (the list is sorted and non-overlapping), so
-        // merge locally instead of rebuilding the vector.
-        let idx = self.intervals.partition_point(|(s, ..)| *s < start);
-        let (lo, merged_start, mut merged_end, mut merged_at, mut merged_reads) = if idx > 0
-            && self.intervals[idx - 1].1 > start
-        {
-            let (ps, pe, pt, pr) = self.intervals[idx - 1];
-            (idx - 1, ps, pe.max(end), pt.max(now_millis), pr)
-        } else {
-            self.intervals.insert(idx, (start, end, now_millis, 0));
-            (idx, start, end, now_millis, 0)
-        };
-        // Absorb every following interval the merged span now reaches.
-        let mut hi = lo + 1;
-        while hi < self.intervals.len() && self.intervals[hi].0 < merged_end {
-            merged_end = merged_end.max(self.intervals[hi].1);
-            merged_at = merged_at.max(self.intervals[hi].2);
-            merged_reads += self.intervals[hi].3;
-            hi += 1;
-        }
-        if hi > lo + 1 {
-            self.intervals.drain(lo + 1..hi);
-        }
-        self.intervals[lo] = (merged_start, merged_end, merged_at, merged_reads);
-        self.compact();
-    }
-
-    /// Rebuild this row's intervals from the sidecar files that remain on
-    /// disk, carrying the policy input across: each survivor inherits the read
-    /// time and count of the interval that covered it before the rebuild
-    /// (none ⇒ `(now_millis, 0)` — a file the ledger had no record of, which
-    /// only happens when `decay` or the ceiling dropped that record).
-    ///
-    /// The ledger's own invariants are re-established by the same code that
-    /// maintains them on the insert path: the list ends up sorted,
-    /// non-overlapping and bounded by [`MAX_INTERVALS_PER_KEY`] (a rebuilt row
-    /// can hold more files than the ceiling allows, and `compact` merges the
-    /// touching runs back down without inventing coverage).
-    ///
-    /// Existence lives on disk; this list is the policy's map of it.
-    pub fn adopt_files(&mut self, files: &[(u64, u64)], now_millis: u64) {
-        let prior = std::mem::take(&mut self.intervals);
-        self.intervals = files
-            .iter()
-            .map(|(start, end)| match prior.iter().find(|(ps, pe, ..)| *ps <= *start && *end <= *pe)
-            {
-                Some((_, _, t, r)) => (*start, *end, *t, *r),
-                None => (*start, *end, now_millis, 0),
-            })
-            .collect();
-        self.compact();
-    }
-
-    /// Keep the vector under [`MAX_INTERVALS_PER_KEY`] — exactly, or not at
-    /// all, because both steps here are lossless-then-conservative:
-    ///
-    /// 1. Merge touching pairs (`[a,b) + [b,c) = [a,c)`, read time = max),
-    ///    which changes no byte count at all — this is what a sequential
-    ///    scrub produces, so it is the step that actually fires.
-    /// 2. If spans with GAPS remain (a scrubber jumping around), merging
-    ///    them would claim coverage of bytes we do not hold, so the coldest
-    ///    spans are dropped instead. Under-reporting coverage is the safe
-    ///    direction: the ledger under-reports rather than claiming a gap it
-    ///    cannot fill, and this is the same trade `decay` already makes
-    ///    ("window expiry only removes ledger counts — the disk sidecars
-    ///    stay for the natural sweep").
-    fn compact(&mut self) {
-        while self.intervals.len() > MAX_INTERVALS_PER_KEY {
-            if !self.merge_touching_once() {
-                self.drop_coldest(self.intervals.len() - MAX_INTERVALS_PER_KEY);
-            }
-        }
-    }
-
-    /// One halving pass over touching neighbours. Returns whether anything
-    /// merged, so the caller can tell "no exact merge left" from "still too
-    /// long".
-    fn merge_touching_once(&mut self) -> bool {
-        let mut out: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(self.intervals.len());
-        let mut merged = false;
-        let mut i = 0;
-        while i < self.intervals.len() {
-            let (s, e, t, r) = self.intervals[i];
-            match self.intervals.get(i + 1).copied() {
-                Some((s2, e2, t2, r2)) if s2 == e => {
-                    out.push((s, e2, t.max(t2), r + r2));
-                    merged = true;
-                    i += 2;
-                }
-                _ => {
-                    out.push((s, e, t, r));
-                    i += 1;
-                }
-            }
-        }
-        self.intervals = out;
-        merged
-    }
-
-    /// Drop the `n` spans with the oldest read time (the ones window decay
-    /// would take first anyway), then restore start order.
-    fn drop_coldest(&mut self, n: usize) {
-        self.intervals.sort_by_key(|(.., t, _)| *t);
-        self.intervals.drain(..n.min(self.intervals.len()));
-        self.intervals.sort_by_key(|(s, ..)| *s);
-    }
-
-    /// One pass instead of three: drop intervals whose last read is older
-    /// than `window_millis` and return the bytes still covered. Callers used
-    /// to run `decay` and then `covered_bytes`, twice over, on every
-    /// completed transfer while holding the process-wide ledger lock.
-    ///
-    /// Window expiry only removes ledger counts — the disk sidecars stay for
-    /// the natural sweep.
-    pub fn decay_and_covered(&mut self, now_millis: u64, window_millis: u64) -> u64 {
-        if window_millis == 0 {
-            return self.covered_bytes();
-        }
-        let cutoff = now_millis.saturating_sub(window_millis);
-        let mut kept = 0usize;
-        let mut covered = 0u64;
-        for i in 0..self.intervals.len() {
-            let (s, e, t, r) = self.intervals[i];
-            if t >= cutoff {
-                self.intervals[kept] = (s, e, t, r);
-                kept += 1;
-                covered += e - s;
-            }
-        }
-        self.intervals.truncate(kept);
-        covered
-    }
-
-    pub fn covered_bytes(&self) -> u64 {
-        self.intervals.iter().map(|(s, e, ..)| e - s).sum()
-    }
-
-}
 
 /// Reversible flattening for segment filenames (`%` first, then `/`).
 /// tmp files flatten lossily; segments must map back to the key.
@@ -491,20 +303,34 @@ fn mtime_millis(path: &Path) -> Option<u64> {
         .map(|d| d.as_millis() as u64)
 }
 
-/// Startup rebuild: fold completed on-disk segments back into the ledger
-/// (etag/total from each key's `.segmeta.*`; absent meta → unknown version,
-/// never promotes until a fresh transfer rewrites it). In-flight
-/// `.segpart.*` orphans and unparseable `.seg.*` junk are deleted.
-/// Returns `(ledger, staged_bytes)`. Rebuilt entries touch at `now_millis`.
-pub fn scan_segments(cache_dir: &Path, now_millis: u64) -> (std::collections::HashMap<String, Coverage>, u64) {
-    use std::collections::HashMap;
-    let mut ledger: HashMap<String, Coverage> = HashMap::new();
-    let mut staged_bytes = 0u64;
+/// One completed `.seg` sidecar found on disk, with the version its key's
+/// `.segmeta` claims.
+#[derive(Debug, Clone)]
+pub struct SegmentFile {
+    pub key: String,
+    pub start: u64,
+    pub end: u64,
+    /// The file's REAL length. The name says what was promised; this says what
+    /// is there, and it is the number the ledger records.
+    pub len: u64,
+    pub etag: Option<String>,
+    pub total: u64,
+}
+
+/// Startup inventory: the completed segments on disk, with the version each
+/// key's `.segmeta.*` claims (absent meta → unknown version, never promotes
+/// until a fresh transfer rewrites it).
+///
+/// This is also where the sweep happens, and the sweep is narrow on purpose:
+/// in-flight `.segpart.*` orphans and unparseable `.seg.*` junk are deleted,
+/// because they are our own crashes' leftovers and nothing can claim them.
+/// What those bytes COST is the ledger's question (`Ledger::adopt_all`); this
+/// function answers only what is there.
+pub fn scan_segment_files(cache_dir: &Path) -> Vec<SegmentFile> {
+    let mut out = Vec::new();
     if !cache_dir.exists() {
-        return (ledger, staged_bytes);
+        return out;
     }
-    // Stage 1: drop in-flight orphans (never completed, no ledger claim).
-    // Stage 2: fold completed segments; unparseable names are our own junk.
     let mut seg_files: Vec<PathBuf> = Vec::new();
     for path in top_level_files(cache_dir) {
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -519,7 +345,8 @@ pub fn scan_segments(cache_dir: &Path, now_millis: u64) -> (std::collections::Ha
             }
         }
     }
-    let mut metas: HashMap<String, SegMeta> = HashMap::new();
+    // The version is read once per key, not once per file.
+    let mut metas: std::collections::HashMap<String, SegMeta> = std::collections::HashMap::new();
     for path in seg_files {
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let (key, start, end) = match parse_seg_name(&name) {
@@ -527,22 +354,18 @@ pub fn scan_segments(cache_dir: &Path, now_millis: u64) -> (std::collections::Ha
             None => continue,
         };
         let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let meta = metas.entry(key.clone()).or_insert_with(|| {
-            std::fs::read(segmeta_path(cache_dir, &key))
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or(SegMeta { etag: None, total: 0 })
-        });
-        let cov = ledger.entry(key).or_insert_with(|| Coverage {
-            etag: meta.etag.clone(),
-            total: meta.total,
-            intervals: Vec::new(),
-            last_touch_millis: now_millis,
-        });
-        cov.add_interval(start, end.min(start.saturating_add(len)), now_millis);
-        staged_bytes += len;
+        let meta = metas
+            .entry(key.clone())
+            .or_insert_with(|| {
+                std::fs::read(segmeta_path(cache_dir, &key))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+                    .unwrap_or(SegMeta { etag: None, total: 0 })
+            })
+            .clone();
+        out.push(SegmentFile { key, start, end, len, etag: meta.etag, total: meta.total });
     }
-    (ledger, staged_bytes)
+    out
 }
 
 /// Completed segment files for one key (for size accounting on sweep).
@@ -879,176 +702,15 @@ mod tests {
     /// P10: the incremental merge must produce exactly what the old
     /// sort-and-rebuild did — overlaps merged, distinct intervals kept,
     /// timestamps taking the max.
-    #[test]
-    fn add_interval_merges_locally_and_equivalently() {
-        let mut c = Coverage::default();
-        c.add_interval(100, 200, 10);
-        c.add_interval(300, 400, 20);
-        assert_eq!(c.intervals, vec![(100, 200, 10, 0), (300, 400, 20, 0)]);
-
-        // Bridge the gap (overlapping both) -> one merged span, max time.
-        c.add_interval(150, 350, 30);
-        assert_eq!(c.intervals, vec![(100, 400, 30, 0)]);
-
-        // Adjacent but NOT overlapping: stays a separate interval so it
-        // keeps its own read time (window-decay semantics, by design).
-        c.add_interval(400, 500, 40);
-        assert_eq!(c.intervals, vec![(100, 400, 30, 0), (400, 500, 40, 0)]);
-
-        // An earlier disjoint interval inserts in sorted position.
-        c.add_interval(10, 20, 5);
-        assert_eq!(c.intervals, vec![(10, 20, 5, 0), (100, 400, 30, 0), (400, 500, 40, 0)]);
-
-        // A contained interval absorbs without changing the bounds.
-        c.add_interval(200, 250, 99);
-        assert_eq!(c.intervals.len(), 3);
-        assert_eq!(c.intervals[1], (100, 400, 99, 0));
-
-        // Empty ranges are ignored.
-        let before = c.intervals.clone();
-        c.add_interval(600, 600, 1);
-        assert_eq!(c.intervals, before);
-
-        // Many sequential disjoint shards stay sorted and single.
-        let mut d = Coverage::default();
-        for i in 0..1000u64 {
-            d.add_interval(i * 10, i * 10 + 5, i);
-        }
-        assert_eq!(d.intervals.len(), 1000);
-        assert!(d.intervals.windows(2).all(|w| w[0].1 <= w[1].0));
-    }
 
     #[test]
-    fn coverage_merges_and_reports_covered_bytes() {
-        let mut c = Coverage::default();
-        c.total = 100;
-        c.add_interval(0, 30, 1000);
-        c.add_interval(50, 80, 2000);
-        assert_eq!(c.covered_bytes(), 60);
-        c.add_interval(20, 60, 3000); // bridges the gap (overlap)
-        assert_eq!(c.intervals, vec![(0, 80, 3000, 0)]);
-        c.add_interval(80, 100, 4000); // adjacent: stays separate (own ts)
-        assert_eq!(c.intervals, vec![(0, 80, 3000, 0), (80, 100, 4000, 0)]);
-        assert_eq!(c.covered_bytes(), 100);
-        c.add_interval(200, 200, 5000); // empty ignored
-        assert_eq!(c.intervals, vec![(0, 80, 3000, 0), (80, 100, 4000, 0)]);
-    }
-
-    /// The rebuild path: files are existence, the interval list is the
-    /// policy's map of them. Survivors inherit the read time and count of the
-    /// interval that covered them; bytes the ledger has no record of get a
-    /// fresh stamp and zero reads; and the ceiling still holds even when the
-    /// disk holds more files than a row may describe.
-    #[test]
-    fn adopt_files_keeps_the_invariants_and_carries_policy() {
-        let mut c = Coverage::default();
-        c.add_interval(0, 100, 10); // one merged interval over two files
-        c.add_interval(500, 600, 20);
-        c.intervals[0].3 = 3; // it was read three times
-        c.adopt_files(&[(0, 50), (50, 100), (500, 600)], 99);
-        assert_eq!(
-            c.intervals,
-            vec![(0, 50, 10, 3), (50, 100, 10, 3), (500, 600, 20, 0)],
-            "survivors keep the policy input of the interval that named them"
-        );
-
-        // No record at all (decay or the ceiling dropped it): fresh, unread.
-        c.adopt_files(&[(700, 800)], 77);
-        assert_eq!(c.intervals, vec![(700, 800, 77, 0)]);
-
-        // A rebuild can find more files than a row may hold; the ceiling is
-        // re-established by the same merge the insert path uses.
-        let files: Vec<(u64, u64)> =
-            (0..MAX_INTERVALS_PER_KEY as u64 + 10).map(|i| (i, i + 1)).collect();
-        c.adopt_files(&files, 5);
-        assert!(c.intervals.len() <= MAX_INTERVALS_PER_KEY, "{}", c.intervals.len());
-        assert_eq!(c.covered_bytes(), MAX_INTERVALS_PER_KEY as u64 + 10);
-    }
-
-    #[test]
-    fn coverage_window_decay_drops_stale_intervals() {
-        let mut c = Coverage::default();
-        c.total = 100;
-        c.add_interval(0, 30, 1000);
-        c.add_interval(50, 80, 2000);
-        // Window 1000ms, now=2500: interval [0,30) read at 1000 is stale.
-        // One pass reports the surviving coverage, so a caller does not have
-        // to walk the ledger again to learn what is left.
-        assert_eq!(c.decay_and_covered(2500, 1000), 30);
-        assert_eq!(c.intervals, vec![(50, 80, 2000, 0)]);
-        assert_eq!(c.covered_bytes(), 30);
-        // Everything stale: ledger empties, coverage 0.
-        assert_eq!(c.decay_and_covered(5000, 1000), 0);
-        assert!(c.intervals.is_empty());
-        assert_eq!(c.covered_bytes(), 0);
-        // Zero window = no decay, but coverage is still reported.
-        c.add_interval(0, 10, 100);
-        assert_eq!(c.decay_and_covered(999999, 0), 10);
-        assert_eq!(c.intervals.len(), 1);
-    }
-
-    /// A sequential scrub stages adjacent shards, which stay separate on
-    /// purpose (each keeps its own read time) — so the vector grew with the
-    /// request count and was walked under the one process-wide ledger lock.
-    /// Compaction must bound it WITHOUT changing a byte of coverage: the
-    /// spans here are contiguous, so merging them is exact.
-    #[test]
-    fn a_sequential_walk_is_bounded_and_loses_no_coverage() {
-        let mut c = Coverage::default();
-        const SHARD: u64 = 16;
-        let shards = (MAX_INTERVALS_PER_KEY as u64) + 500;
-        // The whole object is the walk, so full coverage is the expectation.
-        c.total = shards * SHARD;
-        for i in 0..shards {
-            // Contiguous 16-byte shards, each read at its own time.
-            c.add_interval(i * SHARD, (i + 1) * SHARD, i);
-        }
-        assert!(
-            c.intervals.len() <= MAX_INTERVALS_PER_KEY,
-            "the ledger must stay under its ceiling, got {}",
-            c.intervals.len()
-        );
-        assert_eq!(
-            c.covered_bytes(),
-            shards * SHARD,
-            "compaction must not lose (or invent) coverage"
-        );
-        assert!(
-            c.intervals.windows(2).all(|w| w[0].1 <= w[1].0),
-            "still sorted and non-overlapping"
-        );
-    }
-
-    /// With gaps between the spans there is nothing exact left to merge:
-    /// merging across a gap would claim bytes we do not hold, so the coldest
-    /// spans are dropped. Under-reporting coverage is the safe direction —
-    /// the ledger under-reports rather than claiming a gap it cannot fill.
-    #[test]
-    fn a_gapped_ledger_is_bounded_by_dropping_the_coldest_spans() {
-        let mut c = Coverage::default();
-        c.total = 1_000_000;
-        let n = MAX_INTERVALS_PER_KEY + 100;
-        for i in 0..n as u64 {
-            c.add_interval(i * 100, i * 100 + 10, i); // 10 read, 90 gap
-        }
-        assert!(c.intervals.len() <= MAX_INTERVALS_PER_KEY);
-        let covered = c.covered_bytes();
-        assert!(covered <= n as u64 * 10, "coverage may only be under-reported");
-        assert!(
-            c.intervals.windows(2).all(|w| w[0].1 <= w[1].0),
-            "still sorted and non-overlapping"
-        );
-        // The surviving spans are the most recently read ones.
-        let last = c.intervals.last().unwrap();
-        assert_eq!((last.0, last.1), ((n as u64 - 1) * 100, (n as u64 - 1) * 100 + 10));
-    }
-
-    #[test]
-    fn scan_rebuilds_ledger_and_drops_orphans() {
+    fn scan_inventories_segments_and_drops_orphans() {
         let dir = tempdir().unwrap();
-        // Two segments for one key + meta, one orphan part, one junk file.
+        // Two segments for one key + meta, one orphan part, one junk file, and
+        // one file whose NAME promises more than its content holds.
         std::fs::write(seg_path(dir.path(), "v/f.bin", 0, 30), vec![0u8; 30]).unwrap();
         std::fs::write(seg_path(dir.path(), "v/f.bin", 50, 80), vec![0u8; 30]).unwrap();
+        std::fs::write(seg_path(dir.path(), "v/f.bin", 900, 1000), vec![0u8; 10]).unwrap();
         std::fs::write(
             segmeta_path(dir.path(), "v/f.bin"),
             // A row written by an older build, with fields this one no longer
@@ -1064,14 +726,15 @@ mod tests {
         .unwrap();
         std::fs::write(segpart_path(dir.path(), "v/f.bin", 80, 100), vec![0u8; 5]).unwrap();
         std::fs::write(dir.path().join(".seg.garbage"), b"x").unwrap();
-        let (ledger, staged) = scan_segments(dir.path(), 0);
-        assert_eq!(staged, 60);
-        let cov = ledger.get("v/f.bin").unwrap();
-        assert_eq!(cov.etag.as_deref(), Some("e1"));
-        assert_eq!(cov.total, 100);
-        assert_eq!(cov.intervals.len(), 2);
-        assert_eq!((cov.intervals[0].0, cov.intervals[0].1), (0, 30));
-        assert_eq!((cov.intervals[1].0, cov.intervals[1].1), (50, 80));
+        let found = scan_segment_files(dir.path());
+        // The name is a promise; `len` is what is there.
+        let mut spans: Vec<(u64, u64, u64)> =
+            found.iter().map(|f| (f.start, f.end, f.len)).collect();
+        spans.sort();
+        assert_eq!(spans, vec![(0, 30, 30), (50, 80, 30), (900, 1000, 10)]);
+        let f = found.iter().find(|f| f.key == "v/f.bin").unwrap();
+        assert_eq!(f.etag.as_deref(), Some("e1"));
+        assert_eq!(f.total, 100);
         assert!(!segpart_path(dir.path(), "v/f.bin", 80, 100).exists());
         assert!(!dir.path().join(".seg.garbage").exists());
     }

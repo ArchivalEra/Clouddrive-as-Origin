@@ -336,7 +336,7 @@ async fn head_on_nocache_reports_shape_without_touching_disk() {
     assert_eq!(h.get("content-length").unwrap(), "10");
     assert_eq!(fx.stat_calls.load(Ordering::SeqCst), 1, "one stat, no bytes");
     assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
-    assert!(staged_segments(&fx, "a.bin").is_empty(), "nocache stages nothing");
+    assert!(staged_segments(&fx, "a.bin").await.is_empty(), "nocache stages nothing");
     assert_eq!(stray_cache_files(&fx), 0, "and writes nothing");
 }
 
@@ -521,7 +521,7 @@ async fn efficient_ranged_miss_passthrough_and_stages() {
     // The run's window was staged as one sidecar (the seal lands after the
     // last byte, hence the wait); ledger merged.
     wait_ledger(&fx, "a.bin", &[(2, 6)]).await;
-    assert_eq!(staged_segments(&fx, "a.bin"), vec![(2, 6)]);
+    assert_eq!(staged_segments(&fx, "a.bin").await, vec![(2, 6)]);
     let k = fx.state.cache.inspect("a.bin").await;
     assert_eq!(k.ledger_spans.len(), 1);
     assert_eq!((k.ledger_spans[0].start, k.ledger_spans[0].end), (2, 6));
@@ -539,7 +539,7 @@ async fn efficient_second_pull_merges_ledger() {
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     }
     wait_ledger(&fx, "a.bin", &[(0, 2), (4, 6)]).await;
-    assert_eq!(staged_segments(&fx, "a.bin"), vec![(0, 2), (4, 6)]);
+    assert_eq!(staged_segments(&fx, "a.bin").await, vec![(0, 2), (4, 6)]);
     {
         let k = fx.state.cache.inspect("a.bin").await;
         assert_eq!(k.ledger_spans.len(), 2);
@@ -561,7 +561,7 @@ async fn efficient_full_get_still_waterpipes() {
     assert_eq!(body, "0123456789");
     // Full GETs fill normally (a whole file needs no promotion dance).
     wait_installed(&fx, "a.bin").await;
-    assert!(staged_segments(&fx, "a.bin").is_empty());
+    assert!(staged_segments(&fx, "a.bin").await.is_empty());
 }
 
 /// Staged reads: a seek whose bytes are already staged is answered from the
@@ -653,7 +653,7 @@ async fn a_partially_covered_range_needs_one_open_and_stages_the_rest() {
         "the remainder is one exact-Range open, not one per gap"
     );
     assert_eq!(
-        staged_segments(&fx, "a.bin"),
+        staged_segments(&fx, "a.bin").await,
         vec![(0, 5), (5, 10)],
         "both spans stay staged: the ledger is now fully covered"
     );
@@ -698,7 +698,7 @@ async fn efficient_complete_entry_keeps_serving_ranges_after_the_revalidate_wind
         "stale means one revalidation stat and no bytes"
     );
     assert!(
-        staged_segments(&fx, "a.bin").is_empty(),
+        staged_segments(&fx, "a.bin").await.is_empty(),
         "nothing to stage: the bytes are already in one file"
     );
 }
@@ -723,7 +723,7 @@ async fn efficient_min_size_bypass_goes_waterpipe() {
     assert_eq!(body, "2345");
     // Bypass: B path installs the entry, stages nothing.
     wait_installed(&fx, "a.bin").await;
-    assert!(staged_segments(&fx, "a.bin").is_empty());
+    assert!(staged_segments(&fx, "a.bin").await.is_empty());
 }
 
 #[tokio::test]
@@ -770,11 +770,11 @@ async fn tick_sweeps_old_segments() {
     let (status, _, _) = body_text(resp).await;
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     wait_ledger(&fx, "a.bin", &[(2, 6)]).await;
-    assert_eq!(staged_segments(&fx, "a.bin"), vec![(2, 6)]);
+    assert_eq!(staged_segments(&fx, "a.bin").await, vec![(2, 6)]);
     // Age past inactive_ttl: tick sweeps segments, zeroes accounting.
     fx.state.cache.clock.advance(1_201_000);
     fx.state.cache.tick().await;
-    assert!(staged_segments(&fx, "a.bin").is_empty());
+    assert!(staged_segments(&fx, "a.bin").await.is_empty());
     assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 0);
 }
 
@@ -903,7 +903,7 @@ async fn etag_flip_resets_staged_history() {
     let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=0-49")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
     body_text(resp).await;
     wait_ledger(&fx, "f.bin", &[(0, 50)]).await;
-    assert_eq!(staged_segments(&fx, "f.bin"), vec![(0, 50)]);
+    assert_eq!(staged_segments(&fx, "f.bin").await, vec![(0, 50)]);
     // The viewer is gone and its watch has lapsed, so the drifted ledger is
     // settled where it stands rather than deferred.
     fx.state.cache.clock.advance(1_000_000);
@@ -918,7 +918,7 @@ async fn etag_flip_resets_staged_history() {
     // Old segments dropped, ledger re-anchored on v2, no entry yet. The
     // span is the request's WINDOW (50 bytes here), not its own 30 bytes:
     // the seek starts a run (ADR-0016).
-    assert_eq!(staged_segments(&fx, "f.bin"), vec![(50, 100)]);
+    assert_eq!(staged_segments(&fx, "f.bin").await, vec![(50, 100)]);
     assert_eq!(
         fx.state.cache.inspect("f.bin").await.ledger_etag.as_deref(),
         Some("v2")
@@ -953,7 +953,7 @@ async fn a_version_drift_waits_for_a_watcher_to_leave() {
         "a drifted read is answered from upstream while a watcher holds the key"
     );
     assert_eq!(
-        staged_segments(&fx, "f.bin"),
+        staged_segments(&fx, "f.bin").await,
         vec![(0, 50)],
         "the old version's spans are still on disk, untouched"
     );
@@ -968,7 +968,7 @@ async fn a_version_drift_waits_for_a_watcher_to_leave() {
     let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[("range", "bytes=50-79")]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
     body_text(resp).await;
     wait_ledger(&fx, "f.bin", &[(50, 100)]).await;
-    assert_eq!(staged_segments(&fx, "f.bin"), vec![(50, 100)], "the old spans went once nobody was reading");
+    assert_eq!(staged_segments(&fx, "f.bin").await, vec![(50, 100)], "the old spans went once nobody was reading");
     assert_eq!(
         fx.state.cache.inspect("f.bin").await.ledger_etag.as_deref(),
         Some("v2")
@@ -1341,7 +1341,7 @@ async fn heat_eviction_keeps_the_hot_span_lru_would_eject() {
     // asynchronous (see `wait_ledger`), and a missing span here would be
     // read as a policy answer rather than a timing artifact.
     wait_spans(&fx, "a.bin", 2).await;
-    assert_eq!(staged_segments(&fx, "a.bin"), vec![(0, 5), (5, 10)]);
+    assert_eq!(staged_segments(&fx, "a.bin").await, vec![(0, 5), (5, 10)]);
     // b.bin stages 5 more bytes, and its row is the NEWER one: the 5-byte
     // overshoot must come out of a.bin, under both policies.
     fx.state.cache.clock.advance(1_000);
@@ -1354,11 +1354,11 @@ async fn heat_eviction_keeps_the_hot_span_lru_would_eject() {
     fx.state.cache.tick().await;
 
     assert_eq!(
-        staged_segments(&fx, "a.bin"),
+        staged_segments(&fx, "a.bin").await,
         vec![(0, 5)],
         "heat keeps the span that was re-read; the colder fresh one goes"
     );
-    assert_eq!(staged_segments(&fx, "b.bin"), vec![(0, 5)], "the newer row is untouched");
+    assert_eq!(staged_segments(&fx, "b.bin").await, vec![(0, 5)], "the newer row is untouched");
     assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 10);
 }
 
@@ -1393,11 +1393,11 @@ async fn lru_eviction_ejects_the_stale_span_even_when_it_is_hot() {
     fx.state.cache.tick().await;
 
     assert_eq!(
-        staged_segments(&fx, "a.bin"),
+        staged_segments(&fx, "a.bin").await,
         vec![(5, 10)],
         "lru ejects by the clock: the older span goes even though it is hot"
     );
-    assert_eq!(staged_segments(&fx, "b.bin"), vec![(0, 5)], "the newer row is untouched");
+    assert_eq!(staged_segments(&fx, "b.bin").await, vec![(0, 5)], "the newer row is untouched");
     // Span-level: the row survives with its other span, and the byte
     // account drops by one span rather than by a whole window.
     assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 10);
@@ -1493,7 +1493,14 @@ async fn a_read_credits_every_staged_span_it_touches() {
         .build();
 
     stage(&fx, "a.bin", "bytes=0-4").await;
+    // A seal lands asynchronously (the body's tail, or the disconnect watcher),
+    // so the next request waits for the span to be recorded first: otherwise it
+    // plans against a disk that does not have it yet and takes the standalone
+    // escape instead of being served from the stage, which is a different read
+    // than the one this test is about.
+    wait_ledger(&fx, "a.bin", &[(0, 5)]).await;
     stage(&fx, "a.bin", "bytes=5-9").await;
+    wait_ledger(&fx, "a.bin", &[(0, 5), (5, 10)]).await;
     // Straddles the [0,5)/[5,10) boundary: fully covered, so it is served
     // from the stage, and it touches two spans.
     stage(&fx, "a.bin", "bytes=3-7").await;
@@ -1501,6 +1508,7 @@ async fn a_read_credits_every_staged_span_it_touches() {
 
     // A partial hit: [0,10) comes from the stage, [10,20) from upstream.
     stage(&fx, "a.bin", "bytes=0-19").await;
+    wait_ledger(&fx, "a.bin", &[(0, 5), (5, 10), (10, 20)]).await;
     assert_eq!(
         span_reads(&fx, "a.bin").await,
         vec![(0, 5, 2), (5, 10, 2), (10, 20, 0)],
@@ -1526,13 +1534,13 @@ async fn a_body_in_flight_keeps_its_bytes_alive_past_the_ttl() {
     // while the bytes are queued on their side of the connection.
     let body = resp.into_body();
     wait_ledger(&fx, "a.bin", &[(0, 8)]).await;
-    assert_eq!(staged_segments(&fx, "a.bin"), vec![(0, 8)]);
+    assert_eq!(staged_segments(&fx, "a.bin").await, vec![(0, 8)]);
 
     // Idle long past the TTL: the sweep must spare what is being read.
     fx.state.cache.clock.advance(1_201_000);
     fx.state.cache.tick().await;
     assert_eq!(
-        staged_segments(&fx, "a.bin"),
+        staged_segments(&fx, "a.bin").await,
         vec![(0, 8)],
         "a body in flight keeps its bytes past the inactivity TTL"
     );
@@ -1542,7 +1550,7 @@ async fn a_body_in_flight_keeps_its_bytes_alive_past_the_ttl() {
     drop(body);
     fx.state.cache.clock.advance(1_200_001);
     fx.state.cache.tick().await;
-    assert!(staged_segments(&fx, "a.bin").is_empty(), "with no reader, idleness applies");
+    assert!(staged_segments(&fx, "a.bin").await.is_empty(), "with no reader, idleness applies");
     assert_eq!(fx.state.cache.snapshot().await.segment_bytes, 0);
 }
 
@@ -1633,7 +1641,7 @@ async fn a_request_inside_the_watch_budget_is_counted_as_a_watch_resume() {
 /// asynchronous, so the count is polled rather than sampled).
 async fn wait_spans(fx: &Fixture, key: &str, n: usize) {
     for _ in 0..crate::testsupport::WAIT_TRIES {
-        if staged_segments(fx, key).len() == n {
+        if staged_segments(fx, key).await.len() == n {
             // The seal lands before the driver marks its run terminal, and
             // a request that arrives in between finds a live run that does
             // not cover it and takes the standalone escape (one span of the
@@ -1644,7 +1652,7 @@ async fn wait_spans(fx: &Fixture, key: &str, n: usize) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    panic!("{key} never reached {n} staged spans: {:?}", staged_segments(fx, key));
+    panic!("{key} never reached {n} staged spans: {:?}", staged_segments(fx, key).await);
 }
 
 /// The LAB's watch account with a movable clock: two keys stage four
@@ -1696,15 +1704,15 @@ async fn the_trim_takes_the_tail_and_leaves_the_window_the_viewer_is_on() {
         fx.state.cache.snapshot().await.segment_bytes,
         2_097_152,
         "a={:?} b={:?}",
-        staged_segments(&fx, "a.bin"),
-        staged_segments(&fx, "b.bin")
+        staged_segments(&fx, "a.bin").await,
+        staged_segments(&fx, "b.bin").await
     );
 
     // Past the minimum age, so the trim is allowed to look at both rows.
     fx.state.cache.clock.advance(120_000);
     fx.state.cache.tick().await;
 
-    let a = staged_segments(&fx, "a.bin");
+    let a = staged_segments(&fx, "a.bin").await;
     let seg = fx.state.cache.snapshot().await.segment_bytes;
     assert!(
         seg <= 1_048_576,

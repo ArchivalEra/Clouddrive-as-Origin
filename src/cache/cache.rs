@@ -5,6 +5,7 @@ use crate::{
     backend::{BackendError, BackendRegistry, BackendSlot, ByteRange, ContentRange, DirectUrl, Key, ObjectMeta},
     cache::{
         flight::{self, BodyStream, FlightProgress, FlightShared},
+        ledger::Ledger,
         magazine::{self, Magazine},
         meta::EntryMeta,
         ranged,
@@ -19,6 +20,11 @@ use crate::{
     key::{ResolvedKey, resolve_key, validate_key},
     routing::RouteTable,
 };
+
+/// One staged interval, as the operator view and the tests read it. Defined by
+/// the ledger, which is where the record's shape lives (ADR-0022's key view is
+/// the only reader).
+pub use super::ledger::SpanReads;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheOutcome {
@@ -295,16 +301,12 @@ impl StreamPlan {
 pub struct CacheState {
     pub entries: HashMap<String, EntryMeta>,
     pub total_bytes: u64,
-    /// Bytes held as `.seg` sidecars: served directly, trimmed by the staged
-    /// budget (span by span, ADR-0015/0019) and swept by age. A separate
-    /// counter from `total_bytes` so entry eviction math stays exact.
-    pub segment_bytes: u64,
     pub segment_sweep_at_millis: u64,
 }
 
 impl Default for CacheState {
     fn default() -> Self {
-        Self { entries: HashMap::new(), total_bytes: 0, segment_bytes: 0, segment_sweep_at_millis: 0 }
+        Self { entries: HashMap::new(), total_bytes: 0, segment_sweep_at_millis: 0 }
     }
 }
 
@@ -406,17 +408,6 @@ pub struct CacheSnapshot {
     pub disk_reserve_bytes: u64,
 }
 
-/// One staged interval as the LEDGER knows it: the byte span, when it was last
-/// read (the window's decay clock), and how many times (heat, the eviction
-/// policy's input). A merged interval carries the sum of its parts' reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SpanReads {
-    pub start: u64,
-    pub end: u64,
-    pub last_read_millis: u64,
-    pub reads: u64,
-}
-
 /// One key's state, as the operator view and the tests both need it: what is
 /// installed, what is staged, what is protected, and where the reader is.
 ///
@@ -486,10 +477,12 @@ pub struct Cache<C: Clock> {
     /// module owns joining, driver spawning, panic guarding and map
     /// hygiene; the Cache only supplies the driver policy.
     pub flights: crate::cache::flight::Flights,
-    /// Coverage ledger (efficientcache): staged byte intervals per cache
-    /// key. Segment files on disk are the source of truth; this map is
-    /// the working view, rebuilt by scan on startup.
-    pub coverage: Arc<Mutex<HashMap<String, store::Coverage>>>,
+    /// The staged state (efficientcache): which bytes of a key exist as `.seg`
+    /// sidecars, under which object version, and what they cost. The disk is
+    /// the authority, and this receiver is the only writer of the record and of
+    /// the account — see `cache::ledger` for the rules. Crate-visible on
+    /// purpose: the operator view (`snapshot`, `inspect`) is the public seam.
+    pub(crate) ledger: Arc<Ledger>,
     /// The magazine: every byte-budget decision (admission, eviction,
     /// pressure reclaim, install, delete) lives behind this receiver.
     pub(crate) magazine: Magazine,
@@ -532,7 +525,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         let meta = Arc::new(crate::cache::persist::MetaStore::open(&config.cache_dir.join(store::META_STORE_FILE)).expect("open redb metadata store"));
         let dirty_access = Arc::new(AccessClock::new());
         let state = Arc::new(RwLock::new(CacheState::default()));
-        let coverage = Arc::new(Mutex::new(HashMap::new()));
+        let ledger = Arc::new(Ledger::new(config.cache_dir.clone()));
         let leases = Arc::new(crate::cache::leases::Leases::new(
             config.read_grace_secs.saturating_mul(1000),
         ));
@@ -549,8 +542,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             Arc::clone(&watches),
         );
         let staging = Staging::new(
-            Arc::clone(&coverage),
-            Arc::clone(&state),
+            Arc::clone(&ledger),
             Arc::clone(&config),
             Arc::clone(&leases),
             Arc::clone(&watches),
@@ -571,7 +563,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             meta,
             dirty_access,
             flights,
-            coverage,
+            ledger,
             staging,
             sessions,
             leases,
@@ -599,10 +591,10 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         // Startup self-heal (spec §3.10): temp files from crashed downloads.
         let _ = store::cleanup_tmps(&self.config.cache_dir);
 
-        // Coverage rebuild (P2-a): staged segments regroup into the ledger
-        // (segment files authoritative; orphans already swept by scan).
-        let (ledger, staged) = store::scan_segments(&self.config.cache_dir, self.clock.now_millis());
-        *self.coverage.lock().await = ledger;
+        // Staged-state rebuild (P2-a): the disk is the only input, and the
+        // ledger recomputes the account from it (segment files authoritative;
+        // orphans and unparseable junk already swept by the scan).
+        self.ledger.adopt_all(self.clock.now_millis()).await;
 
         // Metadata load failures used to be swallowed by
         // `unwrap_or_default()` (ticket #57): a corrupt store started the
@@ -652,7 +644,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             }
         }
         let mut state = self.state.write().await;
-        state.segment_bytes = staged;
         for m in live_rows {
             state.total_bytes += m.size_bytes;
             state.entries.insert(m.key.clone(), m);
@@ -769,10 +760,11 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     /// Owned view of the live machinery for healthz: operators read a
     /// snapshot, never the internals (C4).
     pub async fn snapshot(&self) -> CacheSnapshot {
-        let (entries, total_bytes, segment_bytes) = {
+        let (entries, total_bytes) = {
             let s = self.state.read().await;
-            (s.entries.len(), s.total_bytes, s.segment_bytes)
+            (s.entries.len(), s.total_bytes)
         };
+        let segment_bytes = self.ledger.total_staged().await;
         let stray_bytes = self.magazine.strays_bytes().await;
         let (coverage_keys, coverage_intervals) = self.staging.summary().await;
         CacheSnapshot {
@@ -825,26 +817,16 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             .map(|(start, end, _)| (start, end))
             .collect();
         let staged_bytes = staged_spans.iter().map(|(s, e)| e - s).sum();
-        let (ledger_spans, ledger_total, ledger_etag, ledger_last_touch_millis) = {
-            let cov = self.coverage.lock().await;
-            match cov.get(key) {
-                Some(c) => (
-                    c.intervals
-                        .iter()
-                        .map(|(start, end, last_read_millis, reads)| SpanReads {
-                            start: *start,
-                            end: *end,
-                            last_read_millis: *last_read_millis,
-                            reads: *reads,
-                        })
-                        .collect(),
-                    Some(c.total),
-                    c.etag.clone(),
-                    Some(c.last_touch_millis),
+        let (ledger_spans, ledger_total, ledger_etag, ledger_last_touch_millis) =
+            match self.ledger.view(key).await {
+                Some(v) => (
+                    v.spans,
+                    Some(v.total),
+                    v.etag,
+                    Some(v.last_touch_millis),
                 ),
                 None => (Vec::new(), None, None, None),
-            }
-        };
+            };
         KeyState {
             installed,
             tombstone,
@@ -2104,7 +2086,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         //     site never holds a span list it could route into the row-level
         //     delete path below; that routing deleted every remaining span
         //     of an evicted key and charged its bytes twice.
-        let overrun = self.magazine.staged_overrun(self.state.read().await.segment_bytes).await;
+        let overrun = self.magazine.staged_overrun(self.ledger.total_staged().await).await;
         // Every pass, not only when the magazine is over budget: the per-key
         // working window (ADR-0019) has to hold while the cache is globally
         // under budget too, or a single walk of an un-keepable object would
@@ -2125,25 +2107,28 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         // Only age-expired rows reach this path: staged-byte eviction is
         // span-level and has already deleted its own files.
         let victims: Vec<String> = expired.clone();
-        // `segment_bytes` is accounted from the LEDGER (finalize_coverage
-        // adds to it, scan_segments rebuilds it), so the age sweep subtracts
-        // what the disk scan finds for the rows it drops.
-        let freed = {
+        // The swept bytes are measured off the disk (the account is a record of
+        // what the disk holds, so the caller measures and the ledger gives up
+        // exactly that — `Ledger::forget`). Per key, because the row and its
+        // bytes leave together.
+        let swept: Vec<(String, u64)> = {
             let cache_dir = self.config.cache_dir.clone();
             let victims = victims.clone();
             tokio::task::spawn_blocking(move || {
                 // One top-level index for the whole batch (P4): the old
                 // shape walked the entire cache once per expired key.
                 let index = store::segment_index(&cache_dir);
-                let mut freed: u64 = 0;
+                let mut out: Vec<(String, u64)> = Vec::with_capacity(victims.len());
                 for key in &victims {
+                    let mut bytes: u64 = 0;
                     if let Some(paths) = index.get(key) {
                         for path in paths {
-                            freed += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                            bytes += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                             let _ = std::fs::remove_file(path);
                         }
                     }
                     let _ = std::fs::remove_file(store::segmeta_path(&cache_dir, key));
+                    out.push((key.clone(), bytes));
                 }
                 if do_sweep {
                     store::sweep_segparts(&cache_dir, ttl_ms, now);
@@ -2153,25 +2138,23 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                 // at boot (P56): a mid-write failure leaves the tmp behind
                 // and the next restart could be days away.
                 let _ = store::cleanup_stale_tmps(&cache_dir, ttl_ms, now);
-                freed
+                out
             })
             .await
-            .unwrap_or(0)
+            .unwrap_or_default()
         };
         // 3. State mutation — memory only, no awaits under the write
         // guard (C3); deletes for reaped/evicted rows run guard-free.
         let reaped = self.magazine.reap(ttl_ms, now).await;
-        // `freed` is what the age sweep removed from disk. Span eviction
-        // subtracted its own bytes inside the staging module, so this is the
-        // only place the two accounts could ever meet — keep them added, not
-        // max-ed: they are disjoint (expired rows vs. evicted spans of live
-        // rows) and a max would silently forgive a real shortage.
-        if do_sweep || freed > 0 {
-            let mut s = self.state.write().await;
-            if do_sweep {
-                s.segment_sweep_at_millis = now;
-            }
-            s.segment_bytes = s.segment_bytes.saturating_sub(freed);
+        if do_sweep {
+            self.state.write().await.segment_sweep_at_millis = now;
+        }
+        // The age sweep leaves the ledger: one row and one measurement per
+        // victim. Staged-byte eviction already gave up its own bytes inside the
+        // module that owns them, so there is no second account to reconcile
+        // here — and nothing left to get wrong about how the two meet.
+        for (key, bytes) in &swept {
+            self.ledger.forget(key, *bytes).await;
         }
         self.magazine.delete(&reaped).await;
         let evicted = self.magazine.evict_budget(now).await;
@@ -2185,12 +2168,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         //     make the disk a second, silent eviction budget for them.
         let pressure_victims = self.magazine.reclaim_under_pressure().await;
         self.magazine.delete(&pressure_victims).await;
-        // 4. Ledger removal (coverage only) for the age sweep. Staged-byte
-        //    eviction removes the rows it empties itself, inside the module
-        //    that owns the ledger.
-        if do_sweep && !expired.is_empty() {
-            self.staging.drop_rows(&expired).await;
-        }
         // 5. Publish what the cache is holding for viewers (ADR-0018). These
         //    are gauges, not counters: the question they answer is "how much
         //    of the budget is currently spoken for by viewing sessions", and a
