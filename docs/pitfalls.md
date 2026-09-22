@@ -256,3 +256,13 @@ entry for being obvious in hindsight — hindsight is the point.
     out at line rate. *Fix:* state which one a number is. "Zero gaps for one
     viewer on 5 MB shards" and "six viewers, 390 MB of distinct cold ranges" are
     different experiments with different answers.
+
+38. **A smaller read-ahead window is not an optimization until the boundary hands
+    over.** Cutting the floor from a whole window (64 MiB) to 8 MiB looked like a
+    pure win — a 5 MiB jump stages 8 MiB instead of 64 — and the LAB measured it
+    as a LOSS: a 24 MiB ascending shard walk cost **8 opens** (one per three
+    shards) against 1, because every request that landed exactly at a live
+    window's end escaped to its own Range while it waited for that window to
+    seal. It only pays once `Sessions::start` takes the key over at the boundary
+    (ADR-0024). *Fix:* when a change makes a boundary more frequent, measure the
+    boundary, not the steady state — a walk is a sequence of boundaries.

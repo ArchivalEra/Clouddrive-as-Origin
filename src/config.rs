@@ -180,6 +180,18 @@ fn default_session_window_bytes() -> u64 {
     64 * 1024 * 1024
 }
 
+/// How far ahead a run reads when nothing precedes it (the window decision's
+/// floor, `cache::window`). One eighth of the default window: eight of the
+/// 1 MiB shards a CDN asks for, which is the smallest read-ahead that still
+/// serves a shard walk at one open per eight shards. A jump pays this instead
+/// of a whole window; a window read out doubles towards
+/// `session_window_bytes`.
+pub(crate) const DEFAULT_WINDOW_FLOOR_BYTES: u64 = 8 * 1024 * 1024;
+
+fn default_window_floor_bytes() -> u64 {
+    DEFAULT_WINDOW_FLOOR_BYTES
+}
+
 /// How long a key stays watched after its last body ends (ADR-0018). A
 /// viewing session lasts hours while its bodies last milliseconds (EdgeOne
 /// asks for ascending 1 MiB shards), so the protection a viewer needs has to
@@ -300,6 +312,12 @@ pub struct RawConfig {
     /// How much one staged-read run fetches (ADR-0016). Default 64 MiB.
     #[serde(default = "default_session_window_bytes")]
     pub session_window_bytes: u64,
+    /// How far ahead a run reads when nothing precedes it: a jump pays this
+    /// much read-ahead instead of a whole window, and a window that gets read
+    /// out doubles towards `session_window_bytes`. Clamped to it, so a config
+    /// with a smaller window keeps its behaviour exactly. Default 8 MiB.
+    #[serde(default = "default_window_floor_bytes")]
+    pub window_floor_bytes: u64,
     /// Grace after the last read before a key becomes evictable again
     /// (ADR-0017). Default 300; 0 disables (live bodies are still protected).
     #[serde(default = "default_read_grace_secs")]
@@ -364,6 +382,10 @@ pub struct Config {
     /// Bytes one staged-read run fetches (ADR-0016): one upstream `open` per
     /// window, shared by every reader inside it.
     pub session_window_bytes: u64,
+    /// Bytes a run reads ahead when nothing precedes it (the window decision's
+    /// floor), clamped to `session_window_bytes`. One open per eight 1 MiB
+    /// shards for a jump; a window read out doubles towards the window.
+    pub window_floor_bytes: u64,
     /// Seconds a key stays un-evictable after the last body reading it ended.
     pub read_grace_secs: u64,
     /// Seconds a key stays WATCHED after its last body ended (ADR-0018): its
@@ -589,6 +611,7 @@ impl Config {
             negative_ttl_secs: raw.negative_ttl_secs,
             eviction_policy: raw.eviction_policy,
             session_window_bytes: raw.session_window_bytes,
+            window_floor_bytes: raw.window_floor_bytes,
             read_grace_secs: raw.read_grace_secs,
             watch_idle_secs: raw.watch_idle_secs,
             watch_pin_bytes: raw.watch_pin_bytes,
@@ -624,6 +647,7 @@ impl Default for Config {
             negative_ttl_secs: default_negative_ttl(),
             eviction_policy: EvictionPolicy::default(),
             session_window_bytes: default_session_window_bytes(),
+            window_floor_bytes: default_window_floor_bytes(),
             read_grace_secs: default_read_grace_secs(),
             watch_idle_secs: default_watch_idle_secs(),
             watch_pin_bytes: default_watch_pin_bytes(),

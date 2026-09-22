@@ -1363,6 +1363,81 @@ async fn the_default_profile_gets_runs_for_ranged_reads() {
     assert_eq!(cache.snapshot().await.segment_bytes, 1 << 20, "one window staged");
 }
 
+/// A read that JUMPS to a cold offset stages the window decision's floor, not
+/// a whole window, and the next read inside it stages nothing new.
+///
+/// Measured on the node before this rule (2026-09-22, a real 200 GiB object):
+/// one 5 MiB cold jump took `segment_bytes` up by exactly 67,108,864 — the
+/// configured window — a 12.8x amplification, while the next 5 MiB inside that
+/// window cost 0.04 s. The floor is the read-ahead a jump actually uses; a
+/// sequential walk still climbs to one open per window (`window::window_for`
+/// doubles a window its readers read out).
+#[tokio::test]
+async fn a_jump_stages_the_floor_and_a_second_read_inside_it_stages_nothing() {
+    let dir = tempdir().unwrap();
+    let clock = Arc::new(MockClock::new(0));
+    let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
+    cfg.session_window_bytes = 1 << 20;
+    cfg.window_floor_bytes = 1 << 18;
+    let cfg = Arc::new(cfg);
+    let opens = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(SizedBackend::new(&[("big.bin", 64 << 20)], Arc::clone(&opens)));
+    let mut slots = HashMap::new();
+    slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
+    let cache = Arc::new(Cache::new(cfg, clock, BackendRegistry::new(slots)));
+    let rk = cache.resolve("big.bin").unwrap();
+
+    // A cold jump: 1 MiB in, and read the floor out (256 KiB) so the next
+    // request at its frontier is a continuation, not a jump.
+    let out = cache
+        .serve(&rk, Some(ByteRange::bounded(1 << 20, 1 << 18)), None)
+        .await
+        .unwrap();
+    let mut served = match out {
+        origin_cache::cache::cache::ServeOutcome::Stream(p) => p,
+        _ => panic!("a ranged miss must stream"),
+    };
+    // The body is borrowed, not moved out: `Served`'s guards (lease, watch)
+    // drop with it, and a partially moved value cannot be dropped whole.
+    let _ = collect(&mut served.plan.body).await;
+    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
+        if cache.snapshot().await.segment_bytes >= 1 << 18 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        cache.snapshot().await.segment_bytes,
+        1 << 18,
+        "a jump stages the floor (256 KiB), not the 1 MiB window"
+    );
+
+    // The next read at that frontier continues the run it replaces, which was
+    // read out: the window doubles. This is the request-driven half of the
+    // ramp (the tick-driven half is pinned in `cache::session`).
+    let out = cache
+        .serve(&rk, Some(ByteRange::bounded((1 << 20) + (1 << 18), 65536)), None)
+        .await
+        .unwrap();
+    let mut served = match out {
+        origin_cache::cache::cache::ServeOutcome::Stream(p) => p,
+        _ => panic!("a staged read must stream"),
+    };
+    let _ = collect(&mut served.plan.body).await;
+    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
+        if cache.snapshot().await.segment_bytes >= (1 << 18) * 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        cache.snapshot().await.segment_bytes,
+        (1 << 18) * 3,
+        "a read-out window ramps the next one to twice the floor (256 KiB + 512 KiB)"
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 2, "two runs, two upstream opens");
+}
+
 /// An object the magazine can NEVER hold whole still gets a run (ADR-0019).
 ///
 /// Before this, `magazine.fits` refused every request on such a key, so each

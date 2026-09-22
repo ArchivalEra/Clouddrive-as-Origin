@@ -32,6 +32,7 @@ time, and `docs/spec.md` is the acceptance contract they add up to.
 | [0020](0020-the-ranged-path-is-one-path.md) | `range.is_some() && !has_durable_entry` is the whole ranged decision; protection travels with the response | amends 0013; narrowed by 0022 |
 | [0021](0021-one-ranged-body-and-the-length-a-stream-is-promised.md) | One ranged body builder, one Content-Range constructor, and a promise read on both sides | |
 | [0022](0022-the-standard-profile-is-retired-and-one-key-one-view.md) | The `standard` profile is retired; one read-only view of one key | amended by the `promised_len` rename (ADR-0021's contract, one name) |
+| [0024](0024-the-window-decision.md) | The window decision: a floor for a jump, a ramp for a walk, and a boundary that hands over | amends 0016; leaves 0019's cap arithmetic untouched |
 | [0023](0023-a-covered-read-answers-from-the-ledger.md) | **Proposal, not a decision:** a covered read answers its metadata from the ledger instead of paying a provider stat | readings included: ~108 ms per stat vs ~936 ms per open, so the trigger is real traffic, not this document |
 
 Cross-cutting: **ADR-0012's rule** (a guard is a deadline, not an exemption) is

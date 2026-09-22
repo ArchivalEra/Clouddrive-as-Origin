@@ -739,6 +739,7 @@ pub struct FixtureBuilder {
     profile: Option<String>,
     coverage: Option<u64>,
     session_window: Option<u64>,
+    window_floor: Option<u64>,
     eviction: Option<crate::config::EvictionPolicy>,
     read_grace: Option<u64>,
     watch_idle: Option<u64>,
@@ -753,6 +754,7 @@ impl FixtureBuilder {
         Self {
             bytes: bytes.to_vec(),
             session_window: None,
+            window_floor: None,
             eviction: None,
             read_grace: None,
             watch_idle: None,
@@ -819,6 +821,14 @@ impl FixtureBuilder {
         self
     }
 
+    /// How far ahead a run reads when nothing precedes it (the window decision
+    /// floor). Tests that assert on jump amplification set this below the
+    /// session window so the ramp is visible without staging megabytes.
+    pub fn window_floor(mut self, bytes: u64) -> Self {
+        self.window_floor = Some(bytes);
+        self
+    }
+
     /// Grace after the last body before a key is evictable again (ADR-0017).
     /// 0 isolates the live-body rule in tests that assert on the lease itself.
     pub fn read_grace(mut self, secs: u64) -> Self {
@@ -871,6 +881,9 @@ impl FixtureBuilder {
         }
         if let Some(bytes) = self.session_window {
             cfg.session_window_bytes = bytes;
+        }
+        if let Some(bytes) = self.window_floor {
+            cfg.window_floor_bytes = bytes;
         }
         if let Some(secs) = self.read_grace {
             cfg.read_grace_secs = secs;

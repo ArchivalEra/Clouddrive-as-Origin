@@ -51,6 +51,14 @@ eviction_policy = "lru"
 # and more disk churn per window.
 session_window_bytes = 67108864    # 64 MiB
 
+# How far ahead a run reads when nothing precedes it (the window decision,
+# src/cache/window.rs). A request that jumps to a cold offset opens this much
+# instead of a whole window; a window that gets read out doubles the next one
+# towards session_window_bytes, so a sequential walk still converges on one
+# open per window. Measured on a real 200 GiB object: a 5 MiB jump used to
+# stage 64 MiB (12.8x), and the next 5 MiB inside the window cost 0.04 s.
+window_floor_bytes = 8388608       # 8 MiB, clamped to session_window_bytes
+
 # Seconds a key stays protected from eviction after the last body reading it
 # ended (ADR-0017). While a body is streaming the key is protected regardless
 # of its age; this grace covers the pause between two requests of one viewing

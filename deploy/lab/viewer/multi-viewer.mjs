@@ -16,7 +16,8 @@
 //   `--object` and `--page` are paths under the target (the LAB serves
 //   `media/…`, the CDN serves `googledrive1/…`), not bare keys.
 //                         [--viewers 4] [--chunks 64] [--chunk-bytes 262144]
-//                         [--seeks 4] [--gap-ms 1500]
+//                         [--seeks 4] [--gap-ms 1500] [--viewer-timeout-secs 120]
+//   A viewer that times out is reported as one failed row, not as a lost run.
 //   Env: CHROME=/usr/bin/chromium  PW=<playwright-core dir>
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -36,6 +37,11 @@ const chunks = Number(arg('chunks', '64'));
 const chunkBytes = Number(arg('chunk-bytes', String(256 * 1024)));
 const seeks = Number(arg('seeks', '4'));
 const gapMs = Number(arg('gap-ms', '1500'));
+// A viewer that hangs takes the whole run with it: on 2026-09-22 a six-viewer
+// run against the CDN sat for five minutes with an empty log and had to be
+// killed, which produced no numbers at all. A timeout turns that into one
+// failed viewer plus everybody else's rows.
+const viewerTimeoutSecs = Number(arg('viewer-timeout-secs', '120'));
 const size = Number(arg('size', '0'));
 // `--objects a,b,c` gives each viewer its OWN object (the permit-queue case).
 // `--unique-seeds` gives each viewer its own jump positions (the one-pin-per-key
@@ -71,6 +77,24 @@ for (let i = 0; i < viewers; i++) {
   pages.push({ ctx, page });
 }
 const started = Date.now();
+// One line per viewer, so a run reports as it goes instead of only at the end.
+const viewerLine = (r) =>
+  `  viewer ${r.viewer}: bytes=${r.bytes} requests=${r.requests} gaps>${gapMs}ms=${r.gaps} ` +
+  `worst=${r.worstGapMs}ms sum=${r.gapTotalMs}ms ` +
+  `seekTTFB p50=${r.seekTtfbMs?.length ? r.seekTtfbMs.slice().sort((a, b) => a - b)[Math.floor(r.seekTtfbMs.length / 2)] : '-'}ms ` +
+  `ck=${r.checksum}${r.error ? ' ERROR=' + r.error : ''}${r.aborted ? ' (capped)' : ''}`;
+const timedOut = (i) => ({
+  viewer: i,
+  bytes: 0,
+  requests: 0,
+  gaps: 0,
+  worstGapMs: 0,
+  gapTotalMs: 0,
+  seekTtfbMs: [],
+  checksum: 0,
+  error: `TIMEOUT after ${viewerTimeoutSecs}s`,
+});
+const failed = (i, e) => ({ ...timedOut(i), error: String((e && e.message) || e) });
 const results = await Promise.all(
   Array.from({ length: viewers }, async (_, i) => {
     const { ctx, page } = pages[i];
@@ -86,11 +110,22 @@ const results = await Promise.all(
       url: objects.length ? `${base}/${pathFor(i)}?size=${size}` : url,
       seed: uniqueSeeds ? 12345 + i * 7919 : 12345,
     };
-    const stats = await page.evaluate(
-      `(async () => { ${readerSrc}\n return await window.__readRange(${JSON.stringify(opts)}); })()`,
-    );
-    await ctx.close();
-    return { viewer: i, ...stats };
+    let row;
+    try {
+      row = await Promise.race([
+        page
+          .evaluate(
+            `(async () => { ${readerSrc}\n return await window.__readRange(${JSON.stringify(opts)}); })()`,
+          )
+          .then((stats) => ({ viewer: i, ...stats })),
+        new Promise((resolve) => setTimeout(() => resolve(timedOut(i)), viewerTimeoutSecs * 1000)),
+      ]);
+    } catch (e) {
+      row = failed(i, e);
+    }
+    await ctx.close().catch(() => {});
+    console.log(viewerLine(row));
+    return row;
   }),
 );
 await browser.close();
@@ -102,16 +137,10 @@ ttfb.sort((a, b) => a - b);
 const p = (q) => (ttfb.length ? ttfb[Math.min(ttfb.length - 1, Math.floor(ttfb.length * q))] : 0);
 
 console.log(`viewers=${viewers} target=${base} object=${objectPath} size=${size}`);
-for (const r of results) {
-  console.log(
-    `  viewer ${r.viewer}: bytes=${r.bytes} requests=${r.requests} gaps>${gapMs}ms=${r.gaps} ` +
-      `worst=${r.worstGapMs}ms sum=${r.gapTotalMs}ms seekTTFB p50=${r.seekTtfbMs?.length ? r.seekTtfbMs.slice().sort((a, b) => a - b)[Math.floor(r.seekTtfbMs.length / 2)] : '-'}ms ` +
-      `ck=${r.checksum}${r.error ? ' ERROR=' + r.error : ''}${r.aborted ? ' (capped)' : ''}`,
-  );
-}
+for (const r of results) console.log(viewerLine(r));
 console.log(
   `total: bytes=${sum((r) => r.bytes)} requests=${sum((r) => r.requests)} gaps=${sum((r) => r.gaps)} ` +
     `gapTotalMs=${sum((r) => r.gapTotalMs)} worstGapMs=${Math.max(...results.map((r) => r.worstGapMs))} ` +
     `seekTTFB p50=${p(0.5)}ms p90=${p(0.9)}ms wall=${wall}ms errors=${results.filter((r) => r.error).length} ` +
-    `checksums=${new Set(results.map((r) => r.checksum)).size}`,
+    `checksums=${new Set(results.filter((r) => !r.error).map((r) => r.checksum)).size}`,
 );

@@ -5,6 +5,7 @@ pub(crate) mod magazine;
 pub(crate) mod ranged;
 pub(crate) mod session;
 pub(crate) mod staging;
+pub(crate) mod window;
 pub mod watch;
 pub mod meta;
 pub mod persist;

@@ -32,10 +32,26 @@ already on disk, serve it, and fetch only the gap. Profile name does not select 
 its ledger record. **Staged spans ARE the cache** for objects too large to hold
 whole (ADR-0015): they are served directly, there is no promotion step.
 
-**window / run** — a run fetches one window (default 64 MiB) with **one** upstream
-open and shares its stream with every reader inside it (ADR-0016). A run chains a
-successor window while its key is watched and the reader's **playhead** is close
-enough behind; a successor inherits its predecessor's playhead.
+**window / run** — a run fetches one window with **one** upstream open and shares
+its stream with every reader inside it (ADR-0016). A run chains a successor
+window while its key is watched and the reader's **playhead** is close enough
+behind; a successor inherits its predecessor's playhead. How big the window is,
+and what happens at its boundary, is **the window decision** (ADR-0024).
+
+**the window decision** — `cache::window`, the one module that answers how far
+ahead a run reads and how much one key may keep staged. A run with nothing behind
+it opens the **floor** (`window_floor_bytes`, default 8 MiB, clamped to
+`session_window_bytes`); a window its readers **read out** doubles the next one up
+to `session_window_bytes`; a request wider than either gets what it asked for. The
+floor is a floor, never a cap. The reserve an un-keepable key may hold stays
+`watch_pin_bytes + session_window_bytes` (ADR-0019), because the ramp only ever
+shrinks a live window.
+
+**a jump / a continuation** — a *jump* is a ranged request that begins outside
+the run it replaces (a cold offset, a scrub); it opens the floor. A *continuation*
+begins at or inside that run — the sequential walk arrives exactly at its
+frontier — and ramps on what that run achieved. A request at a LIVE window's end
+hands the key over rather than escaping (ADR-0024).
 
 **playhead** — how far a reader has consumed. The chain's bound and the pin's
 anchor are both functions of it.
