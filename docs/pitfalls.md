@@ -266,3 +266,16 @@ entry for being obvious in hindsight — hindsight is the point.
     seal. It only pays once `Sessions::start` takes the key over at the boundary
     (ADR-0024). *Fix:* when a change makes a boundary more frequent, measure the
     boundary, not the steady state — a walk is a sequence of boundaries.
+
+39. **A binary's architecture and libc are part of the deploy.** A local x86_64
+    build copied to the aarch64 node fails at `EXEC` (`Exec format error`) and
+    leaves both units in `activating` — three or four minutes of downtime,
+    measured 2026-09-22, made worse by running `install.sh`, which the deploy
+    recipe says is for config/unit changes only. The subtler half is the libc:
+    the compile machine's `aarch64-linux-gnu-gcc` builds fine and produces a
+    binary the node refuses with `version 'GLIBC_2.38' not found`, because the
+    toolchain is Debian trixie (glibc 2.43) and the node is Oracle Linux 9.8
+    (2.34). *Fix:* `file` the artifact, run it once with a bogus config path
+    (`Error: load config` proves it executes), keep a copy of the running binary
+    for rollback, and prefer a STATIC toolchain — musl removes the version
+    question entirely instead of pinning an answer to it.

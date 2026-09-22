@@ -290,6 +290,50 @@ origin-cache serves stale-if-error from disk while OpenList is down (any cached
 profile — for an object it can hold, a durable entry is served regardless of
 upstream health); nocache has no disk fallback (by design).
 
+## Building for the node (aarch64)
+
+The node is aarch64 on Oracle Linux 9.8 (glibc 2.34). Two ways to produce its
+binary, and one that does not work:
+
+- **On the node** — always works, and the fallback: ship the source tree and
+  build there. Measured 1m47s; it spends the node's own CPU, which is production.
+- **On the compile machine, cross, STATIC MUSL** — fast and free of the node's
+  CPU: `deploy/oracle/build-aarch64.sh` drives a static cross toolchain unpacked
+  at `/mnt/hdd/crossbuild-tools/aarch64-linux-musl-cross` (the HDD: read-mostly,
+  no IO pressure), with the build's target dir on the NVMe home
+  (`~/cds-musl-target`), which is where the IO is. Measured 1m11s, and the result
+  is `statically linked, ARM aarch64`.
+- **NOT the compile machine's plain cross-gcc.** Its `aarch64-linux-gnu-gcc`
+  links against Debian trixie's glibc **2.43**, so the binary asks for
+  `GLIBC_2.38` and dies on the node with `version 'GLIBC_2.38' not found`
+  (measured 2026-09-22). A static toolchain removes the question instead of
+  answering it.
+
+Check every build before installing it — a wrong-architecture binary takes the
+service down (`Exec format error` at `EXEC`, both units stuck in `activating`;
+measured 2026-09-22, when a local x86_64 binary was copied to the aarch64 node
+and `install.sh` was run against it):
+
+```sh
+scp <binary> <node>:/home/opc/origin-cache.new
+ssh <node> 'file /home/opc/origin-cache.new | head -1'      # aarch64; static when musl
+ssh <node> '/home/opc/origin-cache.new /nonexistent.toml'   # "Error: load config" = it runs
+ssh <node> 'sudo -n cp -a /opt/origin-cache/origin-cache /home/opc/origin-cache.prev \
+            && sudo -n install -o opc -g opc -m 0755 /home/opc/origin-cache.new /opt/origin-cache/origin-cache \
+            && sudo -n systemctl restart origin-cache-efficient origin-cache-nocache'
+ssh <node> 'bash /home/opc/repo/deploy/oracle/accept.sh'     # expect VERDICT=PASS
+```
+
+`install.sh` is for changing configs or units; a binary-only update uses
+`install -o opc -g opc -m 0755` as above.
+
+A musl binary is a different libc, so it is accepted by the gate rather than
+trusted for being newer. The 2026-09-22 musl deploy passed `accept.sh` (PASS, all
+four units active) *and* served a 4 MiB ranged read of the 200 GiB film from a
+fresh offset through the CDN (206, TTFB 1.36 s) — which exercises the upstream
+path, stat plus open plus stream through Google Drive via OpenList, under musl's
+DNS and TLS resolution.
+
 ## Node acceptance after a deploy
 
 `deploy/oracle/accept.sh` is the post-deploy gate: it polls readiness, then
