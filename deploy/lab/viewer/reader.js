@@ -36,11 +36,18 @@ window.__readRange = async function readRange(opts) {
     seekTtfbMs: [],
     checksum: 0,
     aborted: false,
+    // The edge's own verdict per response (`eo-cache-status`), which is what
+    // tells a "cold" run apart from a run that measured its own cache: a
+    // re-run of the same offsets is a HIT and is not a cold reading.
+    edgeHIT: 0,
+    edgeMISS: 0,
+    edgeOther: 0,
   };
 
   const size = Number(new URL(url).searchParams.get('size') || opts.size || 0);
 
-  let lastByteAt = performance.now();
+  const beganAt = performance.now();
+  let lastByteAt = beganAt;
   let read = 0;
   let pos = 0; // absolute object offset of the next byte, for the checksum
 
@@ -58,6 +65,12 @@ window.__readRange = async function readRange(opts) {
     if (!(res.status === 206 || res.status === 200)) {
       throw new Error(`range ${start}-${start + len - 1} -> ${res.status}`);
     }
+    // Same-origin, so the response headers are readable: record what the edge
+    // says it did rather than what we hope it did.
+    const edge = res.headers.get('eo-cache-status');
+    if (edge === 'HIT') stats.edgeHIT++;
+    else if (edge === 'MISS') stats.edgeMISS++;
+    else stats.edgeOther++;
     const reader = res.body.getReader();
     let got = 0;
     for (;;) {
@@ -120,7 +133,9 @@ window.__readRange = async function readRange(opts) {
   } catch (e) {
     stats.error = String(e && e.message ? e.message : e);
   }
-  stats.elapsedMs = Math.round(performance.now() - (lastByteAt - stats.gapTotalMs));
+  // Wall clock of this viewer's own reads. (The previous expression subtracted
+  // a gap total from an absolute timestamp, which is not a duration.)
+  stats.elapsedMs = Math.round(performance.now() - beganAt);
   stats.jumps = jumps.length;
   return stats;
 };

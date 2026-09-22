@@ -17,6 +17,9 @@
 //   `media/…`, the CDN serves `googledrive1/…`), not bare keys.
 //                         [--viewers 4] [--chunks 64] [--chunk-bytes 262144]
 //                         [--seeks 4] [--gap-ms 1500] [--viewer-timeout-secs 120]
+//                         [--cold-band] [--unique-seeds]
+//   `--cold-band` gives each viewer a fresh band and a fresh jump seed so the
+//   run is cold; check `edgeMISS` in the report before believing it.
 //   A viewer that times out is reported as one failed row, not as a lost run.
 //   Env: CHROME=/usr/bin/chromium  PW=<playwright-core dir>
 import { readFileSync } from 'node:fs';
@@ -42,6 +45,12 @@ const gapMs = Number(arg('gap-ms', '1500'));
 // killed, which produced no numbers at all. A timeout turns that into one
 // failed viewer plus everybody else's rows.
 const viewerTimeoutSecs = Number(arg('viewer-timeout-secs', '120'));
+// `--cold-band`: give every viewer a fresh band of the object, different on
+// every run, and a fresh jump seed. Without it the reader's seeds are fixed
+// constants, so a second run of the same command re-reads offsets the edge has
+// already cached — a warm reading wearing a cold label. With it, the report's
+// edgeHIT/edgeMISS columns say whether the run was actually cold.
+const coldBand = args.includes('--cold-band');
 const size = Number(arg('size', '0'));
 // `--objects a,b,c` gives each viewer its OWN object (the permit-queue case).
 // `--unique-seeds` gives each viewer its own jump positions (the one-pin-per-key
@@ -82,7 +91,17 @@ const viewerLine = (r) =>
   `  viewer ${r.viewer}: bytes=${r.bytes} requests=${r.requests} gaps>${gapMs}ms=${r.gaps} ` +
   `worst=${r.worstGapMs}ms sum=${r.gapTotalMs}ms ` +
   `seekTTFB p50=${r.seekTtfbMs?.length ? r.seekTtfbMs.slice().sort((a, b) => a - b)[Math.floor(r.seekTtfbMs.length / 2)] : '-'}ms ` +
+  `edgeHIT=${r.edgeHIT ?? '-'} edgeMISS=${r.edgeMISS ?? '-'} jumps=${r.jumps ?? '-'} elapsed=${r.elapsedMs ?? '-'}ms ` +
   `ck=${r.checksum}${r.error ? ' ERROR=' + r.error : ''}${r.aborted ? ' (capped)' : ''}`;
+
+/// A viewer's band: `size/viewers` apart, so no two viewers share bytes, plus a
+/// random jitter inside the band so a second run lands somewhere else.
+const bandFor = (i) => {
+  if (!coldBand || !size) return 0;
+  const stride = Math.floor(size / (viewers + 1));
+  const jitter = Math.floor(Math.random() * Math.max(stride - chunkBytes * (chunks + 2), 1));
+  return (i + 1) * stride + jitter;
+};
 const timedOut = (i) => ({
   viewer: i,
   bytes: 0,
@@ -107,8 +126,19 @@ const results = await Promise.all(
       chunks,
       seeks,
       gapMs,
-      url: objects.length ? `${base}/${pathFor(i)}?size=${size}` : url,
-      seed: uniqueSeeds ? 12345 + i * 7919 : 12345,
+      // `url` and the per-object form already carry `?size=`: append the band,
+      // never rebuild the query (a doubled `size` parsed as NaN and every jump
+      // offset became NaN — measured, one 416).
+      url: coldBand && bandFor(i)
+        ? `${objects.length ? `${base}/${pathFor(i)}?size=${size}` : url}&start=${bandFor(i)}`
+        : objects.length ? `${base}/${pathFor(i)}?size=${size}` : url,
+      // A cold band has to come with fresh jumps too: fixed seeds would jump to
+      // the same offsets on every run.
+      seed: coldBand
+        ? (Math.random() * 0x7fffffff) | 0
+        : uniqueSeeds
+          ? 12345 + i * 7919
+          : 12345,
     };
     let row;
     try {
@@ -142,5 +172,6 @@ console.log(
   `total: bytes=${sum((r) => r.bytes)} requests=${sum((r) => r.requests)} gaps=${sum((r) => r.gaps)} ` +
     `gapTotalMs=${sum((r) => r.gapTotalMs)} worstGapMs=${Math.max(...results.map((r) => r.worstGapMs))} ` +
     `seekTTFB p50=${p(0.5)}ms p90=${p(0.9)}ms wall=${wall}ms errors=${results.filter((r) => r.error).length} ` +
-    `checksums=${new Set(results.filter((r) => !r.error).map((r) => r.checksum)).size}`,
+    `checksums=${new Set(results.filter((r) => !r.error).map((r) => r.checksum)).size} ` +
+    `edgeHIT=${sum((r) => r.edgeHIT ?? 0)} edgeMISS=${sum((r) => r.edgeMISS ?? 0)}`,
 );
