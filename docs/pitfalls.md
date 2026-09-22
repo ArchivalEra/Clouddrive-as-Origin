@@ -343,3 +343,22 @@ entry for being obvious in hindsight — hindsight is the point.
     mode that costs an afternoon and a serving domain. *Fix:* send only the block
     you intend to change, then re-read and diff the whole setting object; any
     field that moved unasked-for means stop and read the diff, not carry on.
+
+47. **An hourly CDN metric can put a whole burst in the wrong bucket.** The
+    origin-pull timing metric reads about 15% above the origin's own body bytes
+    and smears a burst across a bucket boundary: one hour reported **49.61 MB** of
+    origin-to-edge traffic while the origin's own access log shows **zero pulls**
+    in that hour. A "viewerless pull" found from a one-hour bucket is an artifact,
+    and it is convincing enough to invent a `CachePrefresh` problem out of
+    nothing. *Fix:* answer origin-pull questions from the origin's per-request
+    access log, and use the CDN metric for totals only.
+
+48. **`xff=-` in the front log does not mean "the edge".** The front logs every
+    request it serves, and `X-Forwarded-For` is simply absent for the ones that
+    arrive directly at the node: our own `accept.sh` contract checks (400 on
+    reserved names, 404 on nested look-alikes, HEAD, `/favicon.ico`) and the LAB
+    probes never leave the box. Counting those as edge pulls turns a few KB of
+    self-checks into a phantom background pull, and reading `xff` correctly is what
+    separates "the edge asked for this" from "we asked ourselves". *Fix:* split on
+    `xff=` before attributing anything to the edge -- a value there is the client as
+    EdgeOne saw it, `-` is a direct hit.
