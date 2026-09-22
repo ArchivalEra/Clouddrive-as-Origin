@@ -704,8 +704,11 @@ still useful as a description of each leg's ceiling: Google Drive -> origin
 20.3 MB/s cold (64 MiB in 3.31 s); origin -> edge 12 MB/s for bytes already
 staged; a cold 1 MiB is ~1.1 s because that is the upstream OPEN's latency, not a
 rate; and a pony season (`mlp-s02-concat.mkv`, 13,009,202,351 B / 21,184 s =
-4.9 Mbit/s) needs only 0.61 MB/s, which is why it played smoothly — though that
-session was not served by this edge at all, so it is not evidence about it.
+4.9 Mbit/s) needs only 0.61 MB/s, which is why it played smoothly through this
+edge: that session really did use the domain and therefore genuine EdgeOne, and
+the origin's log agrees — it holds almost no pulls for that key, because the edge
+kept it and served the viewer itself. It is positive evidence for the shard rule,
+not a curiosity: 0.61 MB/s is far inside what a sharded concurrent reader gets.
 
 ### Multi-viewer accounts through the CDN: from the NODE
 
