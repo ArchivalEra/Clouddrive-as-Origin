@@ -725,6 +725,15 @@ the configured window turns seven of the new tests red (`cache::window` three,
 `cache::session` four, one integration) and leaves every pre-existing test
 green, so the new tests measure the ramp and nothing else does.
 
+After the change, the CDN shape through the deployed binary (4 viewers x 5 MB
+shards, distinct offsets, `--unique-seeds`): three viewers moved 45 MiB each —
+**141 MiB, zero gaps, three distinct checksums** — with seek TTFB p50 91-101 ms,
+while the fourth hit the workstation path's long-standing one-in-N stall (0 bytes
+in 90 s) and was reported as one failed row instead of hanging the run. The
+origin's side of that same window (`fill-account.sh`): **zero `front access`
+lines** — every byte came out of the edge's own cache, which is the shape a CDN
+is for.
+
 Two instruments were added with it, both because a CDN round needs both sides:
 `deploy/oracle/fill-account.sh` reads the origin's `front access` log into a
 per-key account (requests, MiB, p50/p90 ms, distinct `xff`) plus the live
