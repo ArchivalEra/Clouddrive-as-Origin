@@ -498,11 +498,10 @@ impl<C: Clock + 'static> Sessions<C> {
 mod tests {
     use super::*;
     use crate::{
-        cache::store::{self, Coverage},
+        cache::store,
         clock::MockClock,
         testsupport::SizedBackend,
     };
-    use std::collections::HashMap;
 
     fn sessions(dir: &std::path::Path, window: u64, object_bytes: u64, opens: Arc<AtomicUsize>) -> (Arc<Sessions<MockClock>>, Arc<BackendSlot>) {
         // No idle budget: a watch exists only while a body streams it, which
@@ -548,17 +547,11 @@ mod tests {
         cfg.session_window_bytes = window;
         cfg.window_floor_bytes = floor;
         let cfg = Arc::new(cfg);
-        let coverage = Arc::new(Mutex::new(HashMap::<String, Coverage>::new()));
-        let state = Arc::new(tokio::sync::RwLock::new(crate::cache::cache::CacheState::default()));
+        let ledger = Arc::new(crate::cache::ledger::Ledger::new(dir.to_path_buf()));
         let leases = Arc::new(crate::cache::leases::Leases::new(0));
         let watches = Arc::new(crate::cache::watch::Watches::new(watch_idle_ms, 4096));
-        let staging = Staging::new(
-            Arc::clone(&coverage),
-            Arc::clone(&state),
-            Arc::clone(&cfg),
-            leases,
-            Arc::clone(&watches),
-        );
+        let staging =
+            Staging::new(Arc::clone(&ledger), Arc::clone(&cfg), leases, Arc::clone(&watches));
         let flights = Flights::new(flight::DEFAULT_STALL_BUDGET);
         let sessions =
             Arc::new(Sessions::new(cfg, Arc::clone(&clock), staging, flights, Arc::clone(&watches)));

@@ -12,19 +12,19 @@
 //! oldest-touched-first by the tick (ADR-0015). Promotion no longer exists;
 //! there is nothing to assemble and nothing to wait for.
 //!
-//! Lock discipline (C3, ADR-0008): the coverage lock is taken before any
-//! state guard, never after; redb and filesystem work happens outside both.
+//! Lock discipline (C3, ADR-0008): the staged state lives behind the ledger's
+//! own lock, which is taken before any state guard and never after; redb and
+//! filesystem work happens outside both. This module no longer holds a handle to
+//! that lock at all — see `cache::ledger`, where the rule is structural.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     cache::{flight::BodyStream, store},
     config::{Config, EvictionPolicy},
 };
 
-use super::cache::CacheState;
+use super::ledger::Ledger;
 
 /// Never evict a staging ledger row younger than this (P56): an active
 /// transfer's row is touched continuously and must not be yanked mid-flight.
@@ -58,8 +58,7 @@ pub(crate) struct FinalizedSpan {
 /// the sealing watcher and the body, which outlive the request.
 #[derive(Clone)]
 pub(crate) struct Staging {
-    coverage: Arc<Mutex<HashMap<String, store::Coverage>>>,
-    state: Arc<RwLock<CacheState>>,
+    ledger: Arc<Ledger>,
     config: Arc<Config>,
     leases: Arc<super::leases::Leases>,
     /// Watches: a key being VIEWED, which outlives its response bodies
@@ -72,24 +71,22 @@ pub(crate) struct Staging {
 
 impl Staging {
     pub(crate) fn new(
-        coverage: Arc<Mutex<HashMap<String, store::Coverage>>>,
-        state: Arc<RwLock<CacheState>>,
+        ledger: Arc<Ledger>,
         config: Arc<Config>,
         leases: Arc<super::leases::Leases>,
         watches: Arc<super::watch::Watches>,
     ) -> Self {
-        Self { coverage, state, config, leases, watches }
+        Self { ledger, config, leases, watches }
     }
 
     /// The etag the ledger last saw for a key: the version gate's peek.
     pub(crate) async fn known_etag(&self, key: &str) -> Option<String> {
-        self.coverage.lock().await.get(key).and_then(|e| e.etag.clone())
+        self.ledger.view(key).await.and_then(|v| v.etag)
     }
 
     /// Ledger + interval counts for healthz.
     pub(crate) async fn summary(&self) -> (usize, usize) {
-        let cov = self.coverage.lock().await;
-        (cov.len(), cov.values().map(|c| c.intervals.len()).sum())
+        self.ledger.summary().await
     }
 
     /// Ledger rows idle past the inactivity TTL (swept with their sidecars).
@@ -101,12 +98,7 @@ impl Staging {
         // the whole point of a watch outliving its bodies (ADR-0018): a viewer
         // who pauses for longer than the read grace is still watching.
         spared.extend(self.watches.live_keys(now));
-        let cov = self.coverage.lock().await;
-        cov.iter()
-            .filter(|(_, c)| now.saturating_sub(c.last_touch_millis) >= ttl_ms)
-            .filter(|(k, _)| !spared.contains(k.as_str()))
-            .map(|(k, _)| k.clone())
-            .collect()
+        self.ledger.expired_candidates(ttl_ms, now, &spared).await
     }
 
     /// Evict staged spans until `need_bytes` is freed. ONE mechanism, two
@@ -126,16 +118,16 @@ impl Staging {
     /// single-big-object workload that is the whole magazine — on any
     /// overshoot.
     ///
-    /// File deletion, the ledger rebuild and the `segment_bytes` subtraction
-    /// live in this module and nowhere else: the earlier shape returned span
-    /// lists to `tick`, which fed them into the row-level delete path —
+    /// File deletion lives in this module and nowhere else, and the account
+    /// follows the measured `freed` into the ledger: the earlier shape returned
+    /// span lists to `tick`, which fed them into the row-level delete path —
     /// undoing the span eviction and subtracting the same bytes twice.
     ///
     /// Returns `(keys touched, bytes freed)`.
     pub(crate) async fn evict_staged(&self, need_bytes: u64, now: u64) -> (usize, u64) {
         let protected = self.leases.protected(now);
         let pins = self.watches.pins(now);
-        let order = self.rows_by_age().await;
+        let order = self.ledger.rows_by_age(self.config.max_size_bytes).await;
         let mut freed_total = 0u64;
         let mut touched = 0usize;
 
@@ -181,7 +173,7 @@ impl Staging {
         // construction (pin + one window), so a row within its cap can never
         // force the pin to be spent: the bytes outside the pin are enough.
         let cap = self.working_window_bytes();
-        for key in self.unkeepable_rows().await {
+        for key in self.ledger.unkeepable_rows(self.config.max_size_bytes).await {
             if protected.contains(&key) && !pins.contains_key(&key) {
                 continue; // a live body with no watch: ADR-0017's rule
             }
@@ -209,24 +201,12 @@ impl Staging {
 
     /// How many keys are in the un-keepable class right now (the gauge).
     pub(crate) async fn unkeepable_keys(&self) -> usize {
-        self.unkeepable_rows().await.len()
-    }
-
-    /// The keys whose object cannot fit the magazine — the working-window
-    /// class. Read from the ledger (no disk scan), so a cache of keepable
-    /// objects pays nothing for the rule.
-    async fn unkeepable_rows(&self) -> Vec<String> {
-        let cov = self.coverage.lock().await;
-        cov.iter()
-            .filter(|(_, c)| c.total > self.config.max_size_bytes)
-            .map(|(k, _)| k.clone())
-            .collect()
+        self.ledger.unkeepable_rows(self.config.max_size_bytes).await.len()
     }
 
     /// Trim one row towards `want` bytes (and, when `cap` is given, towards its
     /// working window). Shared by the global budget pass and the per-key pass so
-    /// the selection, the deletion and the single `segment_bytes` subtraction
-    /// exist once.
+    /// the selection, the deletion and the account adjustment exist once.
     async fn trim_row(
         &self,
         key: &str,
@@ -236,14 +216,10 @@ impl Staging {
         cap: Option<u64>,
         now: u64,
     ) -> u64 {
-        let prior = {
-            let cov = self.coverage.lock().await;
-            match cov.get(key) {
-                Some(c) => c.intervals.clone(),
-                None => return 0,
-            }
+        let Some(view) = self.ledger.view(key).await else {
+            return 0;
         };
-        let picks = self.pick_spans(key, &prior, want, pin, inside_pins, cap, now).await;
+        let picks = self.pick_spans(key, &view.spans, want, pin, inside_pins, cap, now).await;
         if picks.is_empty() {
             return 0;
         }
@@ -251,34 +227,11 @@ impl Staging {
         if freed == 0 {
             return 0;
         }
-        {
-            let mut s = self.state.write().await;
-            s.segment_bytes = s.segment_bytes.saturating_sub(freed);
-        }
         // A row that lost every span has nothing left to protect: drop it with
         // its version marker so the next request re-stats upstream instead of
         // gating on an etag for bytes that no longer exist.
         self.drop_empty_row(key).await;
         freed
-    }
-
-    /// Rows oldest-touched-first — the cross-key LRU both policies share.
-    async fn rows_by_age(&self) -> Vec<(u64, String)> {
-        let max = self.config.max_size_bytes;
-        let cov = self.coverage.lock().await;
-        // The un-keepable class first: a key whose object cannot fit the
-        // magazine has no long-term claim on its bytes, so its excess is spent
-        // before any keepable key's span (ADR-0019). Within a class this is the
-        // cross-key LRU both policies share.
-        let mut rows: Vec<(u8, u64, String)> = cov
-            .iter()
-            .map(|(k, c)| {
-                let class = u8::from(c.total <= max);
-                (class, c.last_touch_millis, k.clone())
-            })
-            .collect();
-        rows.sort();
-        rows.into_iter().map(|(_, t, k)| (t, k)).collect()
     }
 
     /// The spans to delete, in deletion order, until at least `need_bytes` is
@@ -302,7 +255,7 @@ impl Staging {
     async fn pick_spans(
         &self,
         key: &str,
-        prior: &[(u64, u64, u64, u64)],
+        prior: &[crate::cache::ledger::SpanReads],
         need_bytes: u64,
         pin: Option<super::watch::Pin>,
         // Whether this pass may spend the pin itself. Pass one may not.
@@ -325,9 +278,11 @@ impl Staging {
         // measured on real spans, not on ledger entries).
         let policy: Vec<(u64, u64)> = files
             .iter()
-            .map(|(start, end)| match prior.iter().find(|(ps, pe, ..)| ps <= start && end <= pe) {
-                Some((_, _, t, r)) => (*t, *r),
-                None => (0, 0),
+            .map(|(start, end)| {
+                match prior.iter().find(|p| p.start <= *start && *end <= p.end) {
+                    Some(p) => (p.last_read_millis, p.reads),
+                    None => (0, 0),
+                }
             })
             .collect();
         // A span younger than the guard is not a candidate, however the ROW's
@@ -339,7 +294,7 @@ impl Staging {
         //
         // The age of a span is when it was SEALED (`add_read` counts reads
         // without moving `t`), and the in-flight part is safe by construction:
-        // an unsealed `.segpart` is neither in `segment_bytes` nor a candidate,
+        // an unsealed `.segpart` is neither in the account nor a candidate,
         // so no transfer is endangered by trimming a row mid-walk.
         let min_sealed = now.saturating_sub(STAGE_MIN_AGE_MS);
         let young = |i: usize| policy[i].0 > 0 && policy[i].0 > min_sealed;
@@ -415,12 +370,12 @@ impl Staging {
         picked
     }
 
-    /// Delete the chosen spans' sidecar files, then RE-DERIVE this row's
-    /// intervals from the files that remain ([`store::Coverage::adopt_files`],
-    /// which reads the row's live intervals as the carry-over source): a merged
-    /// interval loses its span-level bounds the moment one of its files goes,
-    /// so the row is rebuilt rather than patched. Returns the bytes removed
-    /// from disk; the caller subtracts them from `segment_bytes` once.
+    /// Delete the chosen spans' sidecar files, then hand the key to the ledger:
+    /// it gives up exactly the bytes measured here and re-derives the row from
+    /// the files that remain, carrying the read policy across — a merged
+    /// interval loses its span-level bounds the moment one of its files goes, so
+    /// the row is rebuilt rather than patched. Returns the bytes removed from
+    /// disk.
     async fn drop_spans(&self, key: &str, picks: &[(u64, u64)], now: u64) -> u64 {
         let mut freed = 0u64;
         for (start, end) in picks {
@@ -428,37 +383,19 @@ impl Staging {
             freed += tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
             let _ = tokio::fs::remove_file(&path).await;
         }
-        let survivors: Vec<(u64, u64)> = store::segments_for_key(&self.config.cache_dir, key)
-            .into_iter()
-            .map(|(start, end, _)| (start, end))
-            .collect();
-        {
-            let mut cov = self.coverage.lock().await;
-            if let Some(entry) = cov.get_mut(key) {
-                entry.adopt_files(&survivors, now);
-            }
-        }
+        self.ledger.re_adopt(key, freed, now).await;
         freed
     }
 
-    /// Drop ledger rows (no files, no accounting — the caller owns both).
-    pub(crate) async fn drop_rows(&self, keys: &[String]) {
-        let mut cov = self.coverage.lock().await;
-        for key in keys {
-            cov.remove(key);
-        }
-    }
-
     /// Seal a staged span: RENAME the part into place and claim it only when
-    /// the rename actually landed. The ledger and `segment_bytes` describe what
-    /// is on disk, so a claim written over a failed rename is a phantom span —
-    /// invisible until the next restart's scan, and until then bytes an
-    /// eviction pass would "free" without a file behind them. A failure is a
-    /// real possibility rather than a theoretical one: the part can be gone
-    /// (a strays sweep, or a pressure reclaim racing the writer), and the
-    /// rename is the point where that becomes visible. Both writers (the
-    /// body's exhaustion tail and the disconnect watcher) come through here,
-    /// so the order is stated once.
+    /// the rename actually landed. The ledger describes what is on disk, so a
+    /// claim written over a failed rename is a phantom span — invisible until
+    /// the next restart's scan, and until then bytes an eviction pass would
+    /// "free" without a file behind them. A failure is a real possibility
+    /// rather than a theoretical one: the part can be gone (a strays sweep, or a
+    /// pressure reclaim racing the writer), and the rename is the point where
+    /// that becomes visible. Both writers (the body's exhaustion tail and the
+    /// disconnect watcher) come through here, so the order is stated once.
     pub(crate) async fn seal_renamed(
         &self,
         segpart: &std::path::Path,
@@ -484,9 +421,10 @@ impl Staging {
         }
     }
 
-    /// Full history reset for one key: drop staged files + version marker +
-    /// ledger row + accounting. Used on version drift (serve pre-check,
-    /// finalize backstop) — never serves mixed versions.
+    /// Full history reset for one key: drop staged files + version marker + the
+    /// ledger row, giving up exactly the bytes the disk scan measured. Used on
+    /// version drift (serve pre-check, finalize backstop) — never serves mixed
+    /// versions.
     pub(crate) async fn reset(&self, key: &str) {
         let cache_dir = &self.config.cache_dir;
         let mut freed = 0u64;
@@ -495,50 +433,26 @@ impl Staging {
             let _ = std::fs::remove_file(&path);
         }
         let _ = std::fs::remove_file(store::segmeta_path(cache_dir, key));
-        self.coverage.lock().await.remove(key);
-        {
-            let mut s = self.state.write().await;
-            s.segment_bytes = s.segment_bytes.saturating_sub(freed);
-        }
+        self.ledger.forget(key, freed).await;
     }
 
-    /// One read of `[start, end)` landed. Every span the read actually
-    /// TOUCHED gains a count (heat is the eviction policy's input, and this
-    /// is the only place it is recorded): a read crossing two staged spans
-    /// credits both, and a read that only partly overlaps a span still
-    /// credits it. The earlier rule — credit a single span only when it
-    /// strictly contained the whole read — meant that cold sequential
-    /// playback, where every read is a partial hit against the frontier,
-    /// recorded no heat at all.
+    /// One read of `[start, end)` landed. The ledger credits every span the read
+    /// actually TOUCHED with a count (heat is the eviction policy's input, and
+    /// this is the only place it is recorded): a read crossing two staged spans
+    /// credits both, and a read that only partly overlaps a span still credits
+    /// it. The earlier rule — credit a single span only when it strictly
+    /// contained the whole read — meant that cold sequential playback, where
+    /// every read is a partial hit against the frontier, recorded no heat at
+    /// all.
     pub(crate) async fn add_read(&self, key: &str, start: u64, end: u64) {
-        if start >= end {
-            return;
-        }
-        let mut cov = self.coverage.lock().await;
-        if let Some(entry) = cov.get_mut(key) {
-            for (s, e, _, reads) in entry.intervals.iter_mut() {
-                if *s < end && start < *e {
-                    *reads = reads.saturating_add(1);
-                }
-            }
-        }
+        self.ledger.served(key, start, end).await;
     }
 
     /// Remove a ledger row that holds no spans any more (the eviction took
     /// them all) together with its version marker. Leaving it would only keep
     /// a stale etag alive to gate a request for bytes that no longer exist.
     async fn drop_empty_row(&self, key: &str) {
-        let empty = {
-            let mut cov = self.coverage.lock().await;
-            match cov.get(key) {
-                Some(c) if c.intervals.is_empty() => {
-                    cov.remove(key);
-                    true
-                }
-                _ => false,
-            }
-        };
-        if empty {
+        if self.ledger.drop_row_if_empty(key).await {
             let _ = tokio::fs::remove_file(store::segmeta_path(&self.config.cache_dir, key)).await;
         }
     }
@@ -547,9 +461,7 @@ impl Staging {
     /// window is not swept for inactivity (the per-interval read times are
     /// untouched — window decay stays a function of when bytes were SERVED).
     pub(crate) async fn touch(&self, key: &str, now_millis: u64) {
-        if let Some(entry) = self.coverage.lock().await.get_mut(key) {
-            entry.last_touch_millis = now_millis;
-        }
+        self.ledger.touch(key, now_millis).await;
     }
 
     /// Merge one completed staged interval — the ONE entry both sealing
@@ -567,41 +479,42 @@ impl Staging {
             total,
             start,
             end,
-            bytes,
+            // The caller's byte count is not what the account takes: the ledger
+            // measures the file that landed. Kept in the struct because the
+            // failed-rename warning reports it.
+            bytes: _,
             now_millis,
         } = span;
         let window_millis = self.config.cache_profile(&upstream_id).coverage_window_secs * 1000;
-        {
-            let mut cov = self.coverage.lock().await;
-            let entry = cov.entry(key.clone()).or_default();
-            let version_changed = match (&entry.etag, &etag) {
-                (Some(a), Some(b)) => a != b,
-                _ => false,
-            };
-            if version_changed {
-                // New bytes already sealed above: keep this file, drop the rest.
-                let fresh = store::seg_path(&cache_dir, &key, start, end);
-                store::remove_key_segments(&cache_dir, &key, Some(&fresh));
-                *entry = store::Coverage::default();
+        let version_changed = match (self.ledger.view(&key).await.and_then(|v| v.etag), &etag) {
+            (Some(a), Some(b)) => a.as_str() != b.as_str(),
+            _ => false,
+        };
+        if version_changed {
+            // New bytes already sealed above: keep this file, drop the rest,
+            // and give up their bytes in the same breath — the ledger describes
+            // what is on disk, so bytes that left it cannot stay accounted.
+            let fresh = store::seg_path(&cache_dir, &key, start, end);
+            let mut freed = 0u64;
+            for path in store::key_segment_files(&cache_dir, &key) {
+                if path == fresh {
+                    continue;
+                }
+                freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let _ = std::fs::remove_file(&path);
             }
-            if etag.is_some() {
-                entry.etag = etag.clone();
-            }
-            if total != 0 {
-                entry.total = total;
-            }
-            entry.add_interval(start, end, now_millis);
-            entry.last_touch_millis = now_millis;
-            // Window decay: drop intervals whose last read is older than the
-            // coverage window, so stale staged bytes stop being served. Disk
-            // sidecars stay for the sweep.
-            entry.decay_and_covered(now_millis, window_millis);
+            self.ledger.forget(&key, freed).await;
         }
+        // One call, one guard: the version, the claim (measured off the file that
+        // landed), the row's age and the coverage window. Stale staged bytes stop
+        // being served; their sidecars stay for the sweep.
+        self.ledger
+            .seal(&key, (start, end), etag.as_deref(), total, window_millis, now_millis)
+            .await;
         let meta = store::SegMeta { etag, total };
         if let Ok(b) = serde_json::to_vec(&meta) {
             let _ = tokio::fs::write(store::segmeta_path(&cache_dir, &key), b).await;
         }
-        self.state.write().await.segment_bytes += bytes;
     }
 }
 
@@ -726,8 +639,7 @@ mod tests {
     /// which span goes" assertable at all.
     struct Harness {
         staging: Staging,
-        coverage: Arc<Mutex<HashMap<String, store::Coverage>>>,
-        state: Arc<RwLock<CacheState>>,
+        ledger: Arc<Ledger>,
         leases: Arc<Leases>,
         watches: Arc<Watches>,
         dir: tempfile::TempDir,
@@ -738,18 +650,16 @@ mod tests {
         let mut cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
         cfg.eviction_policy = policy;
         let cfg = Arc::new(cfg);
-        let coverage = Arc::new(Mutex::new(HashMap::new()));
-        let state = Arc::new(RwLock::new(CacheState::default()));
+        let ledger = Arc::new(Ledger::new(dir.path().to_path_buf()));
         let leases = Arc::new(Leases::new(0));
         let watches = Arc::new(Watches::new(watch_idle_ms, pin_bytes));
         let staging = Staging::new(
-            Arc::clone(&coverage),
-            Arc::clone(&state),
+            Arc::clone(&ledger),
             Arc::clone(&cfg),
             Arc::clone(&leases),
             Arc::clone(&watches),
         );
-        Harness { staging, coverage, state, leases, watches, dir }
+        Harness { staging, ledger, leases, watches, dir }
     }
 
     impl Harness {
@@ -757,34 +667,27 @@ mod tests {
             self.dir.path().to_path_buf()
         }
 
-        /// Write one real `.seg` file and give the ledger the policy input the
-        /// eviction paths read about it: the disk is the authority for
-        /// existence, the row only supplies the ordering.
+        /// Write one real `.seg` file and record it the way sealing does: the
+        /// disk decides the bytes, `t` is the moment it was staged (which is
+        /// also the read time the eviction policy orders by), and `reads` is the
+        /// heat a served read adds. The ROW's age lands on the same `t`, so a
+        /// test that wants an old row passes an old moment — the min-age guard
+        /// and the cross-key LRU read that, the span ordering reads `t`.
         async fn stage_span(&self, key: &str, start: u64, end: u64, t: u64, reads: u64) {
             let path = store::seg_path(&self.cache_dir(), key, start, end);
             std::fs::write(&path, vec![b'x'; (end - start) as usize]).unwrap();
-            let mut cov = self.coverage.lock().await;
-            let row = cov.entry(key.to_string()).or_default();
-            row.intervals.push((start, end, t, reads));
-            row.intervals.sort();
-            row.total = 1_000_000;
-            row.etag = Some("v1".into());
-            // The ROW's age (the min-age guard and the cross-key LRU) is left
-            // old, so the trim is not refused as "actively staging"; the
-            // per-interval `t` is the policy input the span ordering uses.
-            drop(cov);
-            let mut s = self.state.write().await;
-            s.segment_bytes += end - start;
+            assert!(self.ledger.adopt(key, (start, end), t).await, "the disk backs it");
+            for _ in 0..reads {
+                self.ledger.served(key, start, end).await;
+            }
+            self.ledger.set_version(key, Some("v1"), 1_000_000).await;
         }
 
         /// Age the ROW without touching its spans: what a walking key looks
         /// like from the trim's point of view (every read and every seal stamps
         /// the row).
         async fn touch_row(&self, key: &str, t: u64) {
-            let mut cov = self.coverage.lock().await;
-            if let Some(row) = cov.get_mut(key) {
-                row.last_touch_millis = t;
-            }
+            self.ledger.touch(key, t).await;
         }
 
         fn spans(&self, key: &str) -> Vec<(u64, u64)> {
@@ -820,7 +723,7 @@ mod tests {
             vec![(0, 100), (100, 200), (300, 400)],
             "the LRU-oldest span was NOT the one to go: the pin sent the trim to the tail"
         );
-        assert_eq!(h.state.read().await.segment_bytes, 300, "accounting follows the file");
+        assert_eq!(h.ledger.total_staged().await, 300, "accounting follows the file");
     }
 
     /// The reverse verification: with the pin switched off, the same setup
@@ -859,7 +762,7 @@ mod tests {
         let (_, freed) = h.staging.evict_staged(400, 400_000).await;
         assert_eq!(freed, 400, "the whole row goes when the need is bigger than the tail");
         assert!(h.spans("a.bin").is_empty());
-        assert_eq!(h.state.read().await.segment_bytes, 0);
+        assert_eq!(h.ledger.total_staged().await, 0);
     }
 
     /// A key being walked is trimmable OUTSIDE its pin. The row-level guard this
@@ -867,7 +770,7 @@ mod tests {
     /// by every read and every seal — which is every key a viewer is walking — so
     /// the budget could never be enforced against the key that was filling the
     /// disk, and only the other keys paid. The in-flight part is already safe
-    /// (an unsealed `.segpart` is neither in `segment_bytes` nor a candidate) and
+    /// (an unsealed `.segpart` is neither in the account nor a candidate) and
     /// the age of a span is its seal time (`add_read` counts reads without
     /// moving it), so the guard belongs on the span.
     #[tokio::test]
@@ -992,7 +895,7 @@ mod tests {
             .await;
         assert!(!claimed, "the rename did not land, so nothing was claimed");
         assert!(!seg.exists());
-        assert_eq!(h.state.read().await.segment_bytes, 0);
+        assert_eq!(h.ledger.total_staged().await, 0);
         assert!(h.spans("a.bin").is_empty());
 
         // The positive control: with the part present, the same call seals and
@@ -1018,7 +921,7 @@ mod tests {
             .await;
         assert!(claimed);
         assert!(seg.exists());
-        assert_eq!(h.state.read().await.segment_bytes, 100);
+        assert_eq!(h.ledger.total_staged().await, 100);
         assert_eq!(h.spans("a.bin"), vec![(0, 100)]);
     }
 }

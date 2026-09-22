@@ -5,8 +5,8 @@ use tempfile::tempdir;
 
 // The mock lives in the lib now: one implementation for the whole tree.
 use origin_cache::testsupport::{
-    collect, collect_allow_error, install_staged, install_staged_aged, rebuild_staged_bytes,
-    wait_entry, WAIT_TRIES,
+    collect, collect_allow_error, install_staged, install_staged_aged, install_staged_decayed,
+    install_staged_merged, wait_entry, LEDGER_INTERVAL_CEILING, WAIT_TRIES,
     BlockingOpenBackend, CacheTestExt, MockBackend as CountingBackend, SizedBackend, StormBackend,
     StormMode, VersionedBackend,
 };
@@ -1791,28 +1791,21 @@ async fn a_merged_interval_still_evicts_one_file_at_a_time() {
 
     let touched = 10_000u64;
     clock.advance(120_000);
-    let mut paths = Vec::new();
-    for i in 0..4u64 {
-        let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, "m.bin", i * 1024, (i + 1) * 1024);
-        std::fs::write(&path, vec![0u8; 1024]).unwrap();
-        paths.push(path);
-    }
-    {
-        // One interval for the whole walk: a scan cannot produce this (touching
-        // intervals stay separate in the ledger by design, so each keeps its
-        // own window), and this bridged history is what the walk's compaction
-        // leaves behind. The BYTES still come off the disk.
-        let mut cov = cache.coverage.lock().await;
-        let mut c = origin_cache::cache::store::Coverage {
-            total: 4096,
-            last_touch_millis: touched,
-            ..Default::default()
-        };
-        c.add_interval(0, 4096, touched);
-        assert_eq!(c.intervals.len(), 1, "the premise is a merged ledger");
-        cov.insert("m.bin".to_string(), c);
-    }
-    rebuild_staged_bytes(&cache).await;
+    let files: Vec<(u64, u64)> = (0..4u64).map(|i| (i * 1024, (i + 1) * 1024)).collect();
+    let paths: Vec<std::path::PathBuf> = files
+        .iter()
+        .map(|(s, e)| origin_cache::cache::store::seg_path(&cfg.cache_dir, "m.bin", *s, *e))
+        .collect();
+    // One interval for the whole walk: touching intervals stay separate in the
+    // ledger by design (each keeps its own window), so this bridged history is
+    // what the walk's compaction leaves behind — and adoption records it because
+    // the union of the files covers it. The BYTES still come off the disk.
+    install_staged_merged(&cache, "m.bin", &files, (0, 4096), 4096, touched).await;
+    assert_eq!(
+        cache.inspect("m.bin").await.ledger_spans.len(),
+        1,
+        "the premise is a merged ledger"
+    );
 
     cache.tick().await;
 
@@ -1845,27 +1838,15 @@ async fn a_decayed_interval_leaves_its_files_evictable() {
 
     let touched = 10_000u64;
     clock.advance(120_000);
-    let mut paths = Vec::new();
-    for i in 0..2u64 {
-        let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, "d.bin", i * 1024, (i + 1) * 1024);
-        std::fs::write(&path, vec![0u8; 1024]).unwrap();
-        paths.push(path);
-    }
-    {
-        // No intervals at all: every record of these bytes decayed away, while
-        // the files themselves are still here. That is a state only the decay
-        // path produces, so it is built rather than scanned.
-        let mut cov = cache.coverage.lock().await;
-        cov.insert(
-            "d.bin".to_string(),
-            origin_cache::cache::store::Coverage {
-                total: 2048,
-                last_touch_millis: touched,
-                ..Default::default()
-            },
-        );
-    }
-    rebuild_staged_bytes(&cache).await;
+    let files: Vec<(u64, u64)> = (0..2u64).map(|i| (i * 1024, (i + 1) * 1024)).collect();
+    let paths: Vec<std::path::PathBuf> = files
+        .iter()
+        .map(|(s, e)| origin_cache::cache::store::seg_path(&cfg.cache_dir, "d.bin", *s, *e))
+        .collect();
+    // No intervals at all: every record of these bytes decayed away while the
+    // files themselves are still here. A state only the decay path produces, so
+    // it is built by decaying — which removes ledger records, never bytes.
+    install_staged_decayed(&cache, "d.bin", &files, 2048, touched).await;
 
     cache.tick().await;
 
@@ -1896,31 +1877,22 @@ async fn a_sequential_walk_past_the_ledger_ceiling_stays_evictable() {
 
     let touched = 10_000u64;
     clock.advance(120_000);
-    let spans = origin_cache::cache::store::MAX_INTERVALS_PER_KEY + 1;
-    for i in 0..spans as u64 {
-        let path = origin_cache::cache::store::seg_path(&cfg.cache_dir, "walk.bin", i, i + 1);
-        std::fs::write(&path, vec![7u8; 1]).unwrap();
-    }
-    {
-        // The ceiling's own compaction, which no scan produces: the ledger
-        // collapses a walk this long. The BYTES come off the disk.
-        let mut cov = cache.coverage.lock().await;
-        let mut c = origin_cache::cache::store::Coverage {
-            total: spans as u64,
-            last_touch_millis: touched,
-            ..Default::default()
-        };
-        for i in 0..spans as u64 {
-            c.add_interval(i, i + 1, touched);
-        }
-        assert!(
-            c.intervals.len() < spans,
-            "the ceiling must have merged the walk (got {} intervals)",
-            c.intervals.len()
-        );
-        cov.insert("walk.bin".to_string(), c);
-    }
-    rebuild_staged_bytes(&cache).await;
+    let spans = LEDGER_INTERVAL_CEILING + 1;
+    // Staged at `touched`, which is older than the min-age guard (`now` is
+    // 120_000, the guard is 60_000): the trim refuses to evict a span that was
+    // JUST sealed, and the row's object size puts the key in the un-keepable
+    // class (ADR-0019), which is the premise this test has always had.
+    let plan: Vec<(&str, u64, u64, u64)> =
+        (0..spans as u64).map(|i| ("walk.bin", i, i + 1, touched)).collect();
+    install_staged_aged(&cache, &plan).await;
+    // The ceiling's own compaction, fired by adoption: touching spans merge
+    // losslessly, so the ledger collapses a walk this long and no interval's
+    // bounds are a file's bounds any more.
+    let intervals = cache.inspect("walk.bin").await.ledger_spans.len();
+    assert!(
+        intervals < spans,
+        "the ceiling must have merged the walk (got {intervals} intervals)"
+    );
 
     cache.tick().await;
 
@@ -1929,6 +1901,63 @@ async fn a_sequential_walk_past_the_ledger_ceiling_stays_evictable() {
     assert_eq!(key.staged_spans.len(), 1000, "exactly one file per byte of the budget remains");
     let covered: u64 = key.ledger_spans.iter().map(|s| s.end - s.start).sum();
     assert_eq!(covered, 1000, "the rebuilt ledger covers exactly the surviving files");
+}
+
+/// Sealing IS adoption. The two ways a span enters the record — the live path
+/// (a rename landed, so the ledger measures the file it named) and the installer
+/// (a test states "this node holds these bytes at this moment") — leave the same
+/// record: same bytes, same read time, same count. They differ only in how they
+/// learn that the disk holds the bytes, which is why one rule can serve both.
+#[tokio::test]
+async fn a_sealed_span_and_an_adopted_span_agree() {
+    let stamp = 50_000u64;
+    let build = |dir: &std::path::Path| {
+        let mut cfg = Config { cache_dir: dir.to_path_buf(), ..Config::default() };
+        cfg.session_window_bytes = 1 << 20;
+        cfg.window_floor_bytes = 1 << 18;
+        let cfg = Arc::new(cfg);
+        let backend =
+            Arc::new(SizedBackend::new(&[("big.bin", 64 << 20)], Arc::new(AtomicUsize::new(0))));
+        let mut slots = HashMap::new();
+        slots.insert("primary".to_string(), Arc::new(BackendSlot::new(backend, 3)));
+        Arc::new(Cache::new(cfg, Arc::new(MockClock::new(stamp)), BackendRegistry::new(slots)))
+    };
+
+    // The live path: one cold ranged read, exactly the floor, sealed as it lands.
+    let dir = tempdir().unwrap();
+    let cache = build(dir.path());
+    let rk = cache.resolve("big.bin").unwrap();
+    let out = cache.serve(&rk, Some(ByteRange::bounded(0, 1 << 18)), None).await.unwrap();
+    let mut served = match out {
+        origin_cache::cache::cache::ServeOutcome::Stream(p) => p,
+        _ => panic!("a ranged miss must stream"),
+    };
+    let _ = collect(&mut served.plan.body).await;
+    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
+        if !cache.inspect("big.bin").await.staged_spans.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let sealed = cache.inspect("big.bin").await.ledger_spans;
+    assert!(!sealed.is_empty(), "the read staged something to compare");
+
+    // The installer path, over the same bytes at the same moment.
+    let dir2 = tempdir().unwrap();
+    let cache2 = build(dir2.path());
+    let plan: Vec<(&str, u64, u64, u64)> =
+        sealed.iter().map(|s| ("big.bin", s.start, s.end, stamp)).collect();
+    install_staged_aged(&cache2, &plan).await;
+    let adopted = cache2.inspect("big.bin").await.ledger_spans;
+
+    let shape = |v: &[origin_cache::cache::cache::SpanReads]| {
+        v.iter().map(|s| (s.start, s.end, s.last_read_millis, s.reads)).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        shape(&sealed),
+        shape(&adopted),
+        "a sealed span and an adopted span are the same record"
+    );
 }
 
 /// A mid-write failure must not leave the temp file behind: the leak used
