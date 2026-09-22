@@ -97,22 +97,22 @@ async fn prime_cache(fx: &Fixture, key: &str) {
 
 #[test]
 fn range_parser_shapes() {
-    assert!(matches!(parse_client_range(&headers(&[])).unwrap(), ClientRange::Absent));
+    assert!(matches!(client_range::parse(&headers(&[])).unwrap(), ClientRange::Absent));
     assert!(matches!(
-        parse_client_range(&headers(&[("range", "bytes=10-20")])).unwrap(),
+        client_range::parse(&headers(&[("range", "bytes=10-20")])).unwrap(),
         ClientRange::Single(_)
     ));
     assert!(matches!(
-        parse_client_range(&headers(&[("range", "bytes=-30")])).unwrap(),
+        client_range::parse(&headers(&[("range", "bytes=-30")])).unwrap(),
         ClientRange::Suffix(30)
     ));
     assert!(matches!(
-        parse_client_range(&headers(&[("range", "bytes=0-1,3-4")])).unwrap(),
+        client_range::parse(&headers(&[("range", "bytes=0-1,3-4")])).unwrap(),
         ClientRange::Multi
     ));
-    assert!(parse_client_range(&headers(&[("range", "bytes=100-50")])).is_err());
-    assert!(parse_client_range(&headers(&[("range", "bytes=-0")])).is_err());
-    assert!(parse_client_range(&headers(&[("range", "items=0-1")])).is_err());
+    assert!(client_range::parse(&headers(&[("range", "bytes=100-50")])).is_err());
+    assert!(client_range::parse(&headers(&[("range", "bytes=-0")])).is_err());
+    assert!(client_range::parse(&headers(&[("range", "items=0-1")])).is_err());
 }
 
 #[tokio::test]

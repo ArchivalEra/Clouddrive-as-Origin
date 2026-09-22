@@ -17,6 +17,7 @@ use tracing::info;
 use crate::{
     backend::{BackendError, ByteRange, ContentRange},
     cache::cache::{Cache, ServeOutcome},
+    client_range::{self, ClientRange},
     clock::Clock,
     config::Config,
     response::{error_response, invalid_key_response, request_ids, s3_meta_headers},
@@ -115,47 +116,6 @@ pub struct AppState<C: Clock + Clone> {
     pub sigv4_config: Option<sigv4::SigV4Config>,
 }
 
-// ---------------------------------------------------------------------------
-// Range parsing (R1: single 206, suffix support, multi/malformed → 416).
-// ---------------------------------------------------------------------------
-
-enum ClientRange {
-    Absent,
-    Single(ByteRange),
-    /// Suffix request `bytes=-N` (N >= 1; `bytes=-0` is malformed → 416).
-    Suffix(u64),
-    Multi,
-}
-
-/// Parse the Range header. `Err` = syntactically malformed → 416
-/// InvalidRange (AWS behavior; a server MAY ignore Range, S3 does not).
-fn parse_client_range(headers: &HeaderMap) -> Result<ClientRange, ()> {
-    let raw = match headers.get("range").and_then(|v| v.to_str().ok()) {
-        None => return Ok(ClientRange::Absent),
-        Some(r) => r,
-    };
-    let parsed = http_range_header::parse_range_header(raw).map_err(|_| ())?;
-    if parsed.ranges.len() > 1 {
-        // S3 has no multipart/byteranges: reject, do not coalesce.
-        return Ok(ClientRange::Multi);
-    }
-    let r = &parsed.ranges[0];
-    match (r.start, r.end) {
-        (http_range_header::StartPosition::FromLast(n), _) => Ok(ClientRange::Suffix(n)),
-        (http_range_header::StartPosition::Index(s), http_range_header::EndPosition::LastByte) => {
-            Ok(ClientRange::Single(ByteRange::from_offset(s)))
-        }
-        (http_range_header::StartPosition::Index(s), http_range_header::EndPosition::Index(e)) => {
-            if s > e {
-                // Reversed (`bytes=100-50`): unsatisfiable. ByteRange cannot
-                // express it (length would underflow), so reject here.
-                return Err(());
-            }
-            Ok(ClientRange::Single(ByteRange::bounded(s, e - s + 1)))
-        }
-    }
-}
-
 /// A relief valve (P1): cold + redirect-capable upstream → 307 to the
 /// upstream-issued direct link, bytes filled in background. Returns
 /// `Some(response)` only on the 307 path; `None` means "serve from cache
@@ -241,33 +201,49 @@ where
     };
     let key = &rk.cache_key;
 
-    // AWS error precedence: malformed/multi Ranges 416 before anything else.
-    let parsed = match parse_client_range(&headers) {
+    // A malformed or multi Range is refused here; everything else is decided by
+    // `client_range`. Note what this does NOT say: the 416 arms below are reached
+    // only when `Cache::resolve` has already accepted the key, so a bad range on
+    // an invalid key answers about the key. (The comment here used to claim the
+    // opposite.)
+    let parsed = match client_range::parse(&headers) {
         Err(()) | Ok(ClientRange::Multi) => {
             let hint = state.cache.memory_size(key).await;
             return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, false, hint);
         }
         Ok(r) => r,
     };
-    // Suffix ranges need the object size up front: one lightweight stat
-    // (memory or single PROPFIND — never a flight).
     let range = match parsed {
         ClientRange::Absent => None,
-        ClientRange::Multi => unreachable!("rejected above"),
+        // A single range goes down unresolved: the serve path clamps it against
+        // the size its own version gate just confirmed.
         ClientRange::Single(r) => Some(r),
-        ClientRange::Suffix(n) => {
+        ClientRange::Multi => unreachable!("rejected above"),
+        // A suffix has to become a range before it can be served, so the size
+        // comes first: one lightweight stat (memory or a single PROPFIND — never
+        // a flight).
+        ClientRange::Suffix(_) => {
             let size = match state.cache.head_resolved(&rk).await {
                 Ok(m) => m.size,
                 Err(e) => {
                     return error_response(e, key, &req_id, &host_id, false, None);
                 }
             };
-            if size == 0 || n == 0 {
-                return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, false, Some(size));
+            match client_range::resolve(&parsed, size) {
+                client_range::RequestedSpan::Span { offset, len } => {
+                    Some(ByteRange::bounded(offset, len))
+                }
+                _ => {
+                    return error_response(
+                        BackendError::RangeNotSatisfiable,
+                        key,
+                        &req_id,
+                        &host_id,
+                        false,
+                        Some(size),
+                    );
+                }
             }
-            // RFC 9110: suffix longer than the representation → whole object,
-            // still 206 (not 200).
-            Some(if n >= size { ByteRange::bounded(0, size) } else { ByteRange::bounded(size - n, n) })
         }
     };
 
@@ -465,37 +441,29 @@ where
 
     // One lightweight stat up front (memory or a single PROPFIND — never a
     // flight, never file bytes), then resolve any range against its size.
-    let parsed = match parse_client_range(&headers) {
+    let parsed = match client_range::parse(&headers) {
         Err(()) | Ok(ClientRange::Multi) => {
             let hint = state.cache.memory_size(key).await;
             return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, true, hint);
         }
         Ok(r) => r,
     };
-    // Suffix form needs no size yet; single/absent neither. The stat below
-    // serves both freshness and size — exactly one upstream call at most.
+    // The stat serves both freshness and size — exactly one upstream call at
+    // most — and HEAD resolves every form against it, because the response needs
+    // the length and the content-range rather than a body.
     let meta = match state.cache.head_resolved(&rk).await {
         Ok(m) => m,
         Err(e) => {
             return error_response(e, key, &req_id, &host_id, true, None);
         }
     };
-    let (len, content_range) = match parsed {
-        ClientRange::Absent => (meta.size, None),
-        ClientRange::Multi => unreachable!("rejected above"),
-        ClientRange::Single(r) => {
-            if r.offset >= meta.size {
-                return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, true, Some(meta.size));
-            }
-            let end = r.length.map_or(meta.size, |l| (r.offset + l).min(meta.size));
-            (end - r.offset, ContentRange::for_span(meta.size, r.offset, end, true))
-        }
-        ClientRange::Suffix(n) => {
-            if meta.size == 0 || n == 0 {
-                return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, true, Some(meta.size));
-            }
-            let (offset, len) = if n >= meta.size { (0, meta.size) } else { (meta.size - n, n) };
+    let (len, content_range) = match client_range::resolve(&parsed, meta.size) {
+        client_range::RequestedSpan::Whole => (meta.size, None),
+        client_range::RequestedSpan::Span { offset, len } => {
             (len, ContentRange::for_span(meta.size, offset, offset + len, true))
+        }
+        client_range::RequestedSpan::Unsatisfiable => {
+            return error_response(BackendError::RangeNotSatisfiable, key, &req_id, &host_id, true, Some(meta.size));
         }
     };
 
