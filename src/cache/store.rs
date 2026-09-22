@@ -15,7 +15,7 @@ pub const META_STORE_FILE: &str = "redb.db";
 /// (the quarantine archive `redb.db.corrupt-<epoch>`). No legitimate cache
 /// object can collide: objects are the NESTED files, and the top level
 /// holds only infrastructure and ephemeral artifacts.
-pub fn is_meta_store_name(name: &str) -> bool {
+fn is_meta_store_name(name: &str) -> bool {
     name.starts_with(META_STORE_FILE)
 }
 
@@ -89,7 +89,7 @@ pub fn install_tmp(tmp: &Path, dest: &Path, cache_dir: &Path) -> anyhow::Result<
 /// path (`file_path`). The sweep helpers therefore never need to recurse:
 /// walking the whole tree made every sweep cost grow with the number of
 /// cached objects while finding nothing new.
-pub fn top_level_files(cache_dir: &Path) -> Vec<PathBuf> {
+fn top_level_files(cache_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(cache_dir) else {
         return out;
@@ -228,13 +228,46 @@ pub fn prune_empty_parents(cache_dir: &Path, file: &Path) {
 }
 
 
+/// The longest name this cache directory can hold: `NAME_MAX` on the
+/// filesystems it runs on. A layout fact, so it lives with the layout.
+pub const NAME_MAX_BYTES: usize = 255;
+
+/// Why a key cannot be stored, as the layout sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unstorable {
+    /// Its cache filename would not fit in one directory entry.
+    TooLong,
+    /// Its cache filename is one the directory owns (an artifact prefix, or the
+    /// metadata store).
+    Reserved,
+}
+
+/// Can a request name this key? ONE question about the cache directory's naming,
+/// asked by the request path and answered here, where the names are made.
+///
+/// The raw text is what gets escaped into the filename, so the LENGTH is checked
+/// on that; the reservation is about the cache key, which is what
+/// [`file_path`] joins onto `cache_dir`. Both rules belong to the layout: a new
+/// artifact family has to reserve its prefix, and the validator that forgot to
+/// ask would let a request collide with infrastructure or fail deep inside a
+/// transfer as an opaque `ENAMETOOLONG` instead of a 400 here.
+pub fn storable(raw: &str, cache_key: &str) -> Result<(), Unstorable> {
+    if escape_key(raw).len() > NAME_MAX_BYTES {
+        return Err(Unstorable::TooLong);
+    }
+    if is_reserved_key(cache_key) {
+        return Err(Unstorable::Reserved);
+    }
+    Ok(())
+}
+
 /// Reversible flattening for segment filenames (`%` first, then `/`).
 /// tmp files flatten lossily; segments must map back to the key.
 pub fn escape_key(key: &str) -> String {
     key.replace('%', "%25").replace('/', "%2F")
 }
 
-pub fn unescape_key(esc: &str) -> Option<String> {
+fn unescape_key(esc: &str) -> Option<String> {
     let mut out = String::with_capacity(esc.len());
     let bytes = esc.as_bytes();
     let mut i = 0;
@@ -287,7 +320,7 @@ pub struct SegMeta {
 
 /// Parse a `.seg.*` filename back to `(key, start, end)`. The range part
 /// carries no dots, so the last dot separates it from the escaped key.
-pub fn parse_seg_name(name: &str) -> Option<(String, u64, u64)> {
+fn parse_seg_name(name: &str) -> Option<(String, u64, u64)> {
     let rest = name.strip_prefix(".seg.")?;
     let (esc, range) = rest.rsplit_once('.')?;
     let (s, e) = range.split_once('-')?;
@@ -306,15 +339,15 @@ fn mtime_millis(path: &Path) -> Option<u64> {
 /// One completed `.seg` sidecar found on disk, with the version its key's
 /// `.segmeta` claims.
 #[derive(Debug, Clone)]
-pub struct SegmentFile {
-    pub key: String,
-    pub start: u64,
-    pub end: u64,
+pub(crate) struct SegmentFile {
+    pub(crate) key: String,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
     /// The file's REAL length. The name says what was promised; this says what
     /// is there, and it is the number the ledger records.
-    pub len: u64,
-    pub etag: Option<String>,
-    pub total: u64,
+    pub(crate) len: u64,
+    pub(crate) etag: Option<String>,
+    pub(crate) total: u64,
 }
 
 /// Startup inventory: the completed segments on disk, with the version each
@@ -326,7 +359,7 @@ pub struct SegmentFile {
 /// because they are our own crashes' leftovers and nothing can claim them.
 /// What those bytes COST is the ledger's question (`Ledger::adopt_all`); this
 /// function answers only what is there.
-pub fn scan_segment_files(cache_dir: &Path) -> Vec<SegmentFile> {
+pub(crate) fn scan_segment_files(cache_dir: &Path) -> Vec<SegmentFile> {
     let mut out = Vec::new();
     if !cache_dir.exists() {
         return out;
@@ -394,24 +427,32 @@ pub fn segments_for_key(cache_dir: &Path, key: &str) -> Vec<(u64, u64, PathBuf)>
     out
 }
 
-/// Drop a key's completed segments and its version marker (the etag-reset
-/// path). In-flight `.segpart.*` files are left alone: a concurrent transfer
-/// still owns them.
+
+/// Delete every completed segment of `key` except `keep`, plus its version
+/// marker, and return the bytes that left the disk.
 ///
-/// `keep` names the one segment to preserve — the one just sealed.
+/// `keep` names the one segment to preserve — the one just sealed by a transfer
+/// that found the object's version had changed.
 ///
-/// This lives here rather than at the caller because the filename shape is
-/// this module's rule. Re-deriving it by hand is the class of bug that once
-/// let a sweep reach the metadata store, and it is why the prefix is spelled
-/// exactly once (`seg_path`) instead of in a `format!` at each use site.
-pub fn remove_key_segments(cache_dir: &Path, key: &str, keep: Option<&Path>) {
+/// This lives here rather than at the caller because the filename shape is this
+/// module's rule. Re-deriving it by hand is the class of bug that once let a
+/// sweep reach the metadata store, and it is why the prefix is spelled exactly
+/// once (`seg_path`) instead of in a `format!` at each use site.
+///
+/// The returned byte count is what the caller hands to the ledger: the account
+/// follows the disk, so the module that removes the bytes is the module that
+/// measures them.
+pub(crate) fn remove_key_segments(cache_dir: &Path, key: &str, keep: Option<&Path>) -> u64 {
+    let mut freed = 0u64;
     for path in key_segment_files(cache_dir, key) {
         if keep.is_some_and(|k| k == path.as_path()) {
             continue;
         }
+        freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let _ = std::fs::remove_file(&path);
     }
     let _ = std::fs::remove_file(segmeta_path(cache_dir, key));
+    freed
 }
 
 /// Completed segments grouped by key, built in ONE top-level pass (P4).
@@ -565,7 +606,11 @@ mod tests {
         let store = dir.path().join(META_STORE_FILE);
         std::fs::write(&store, b"database").unwrap();
 
-        remove_key_segments(dir.path(), "v/f.bin", Some(&kept));
+        let freed = remove_key_segments(dir.path(), "v/f.bin", Some(&kept));
+        assert_eq!(
+            freed, 1,
+            "only the dropped segment's bytes are measured: the kept one stays, another              key's is not ours, and the version marker is not a staged span"
+        );
 
         assert!(kept.exists(), "the just-sealed segment must be kept");
         assert!(!dropped.exists(), "the other segments of this key must go");

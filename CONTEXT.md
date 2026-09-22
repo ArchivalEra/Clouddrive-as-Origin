@@ -60,11 +60,26 @@ anchor are both functions of it.
 with one stays on the ordinary path, which is the only path that revalidates.
 
 **lease** — a response body is alive (ADR-0017). Coarse: it protects the whole
-key while the body streams, plus a grace.
+key while the body streams, plus a grace. A key under a lease is SPARED, and a
+budget pass that may not spend a pin leaves it alone entirely.
 
 **watch / pin** — a key is being VIEWED (ADR-0018). Precise: it remembers where the
 viewer is and protects a bounded neighbourhood around that position. A pin is a
 preference, not an exemption, and a pin that must be spent is spent from the back.
+A watch and a lease are NOT the same question, and the difference is what a budget
+pass turns on: a lease holds the whole key, a watch holds only its neighbourhood —
+so a key watched with **no pin configured** holds nothing back and the budget still
+governs it. Only the age sweep and the relief valve ask the coarser question
+("is anything holding this key?").
+
+**protection / the verdict** — `cache::protection`: the two protections behind one
+interface, and the questions kept distinct on purpose — `spared(now)` (the union,
+a set, for the sweeps), `in_use(key, now)` (the union, one key, for the relief
+valve), and `verdict(key, now)` (`{ leased, pin }`, which is what a budget pass
+needs). Every eviction site used to derive these from two receivers it had to know
+about, which is the shape where a rule goes missing: a new pass that consulted
+only leases would silently lose the pin rule, and one that read a watch as a
+second reason to spare a key would silently stop enforcing the budget.
 
 **un-keepable / the working window** — a key whose object is larger than the
 retention budget (ADR-0019). It gets a run like any other, and may keep

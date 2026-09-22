@@ -1200,6 +1200,64 @@ the origin's log agrees — it holds almost no pulls for that key, because the e
 kept it and served the viewer itself. It is positive evidence for the shard rule,
 not a curiosity: 0.61 MB/s is far inside what a sharded concurrent reader gets.
 
+### The architecture review's seven cards (2026-09-22)
+
+A review of the hot spots (`src/cache/`, `src/business.rs`, the harness) named
+seven deepenings; all seven landed, and the two that changed behaviour are the
+ones worth reading about.
+
+| card | what landed |
+| --- | --- |
+| 1 account and record | `cache::ledger` owns both; `adopt`/`seal` are one disk-backed rule, the account moves only by measurement, and the guard never leaves |
+| 2 what is protected | `cache::protection`: `spared`/`in_use`/`verdict` keep the union and the budget's question apart; `Staging` and `Magazine` hold one collaborator |
+| 3 the requested range | `client_range`: `parse` + `resolve` state the RFC 9110 rules once, so HEAD's four untested 416 arms are pinned and the suffix arithmetic has one home |
+| 4 the front's internal guard | the rule is the `/\_internal/` PREFIX (prewarm excepted), not a route name the front has to be told about |
+| 5 key naming | `store::storable` answers "may a request name this key?" — capacity and reservation in one question the layout owns |
+| 6 the magazine's passes | `reap`/`evict_budget`/`reclaim_under_pressure` select AND delete; the victim list never leaves the module and `delete` is private |
+| 7 store.rs's width | the ledger move took the coverage type out; six internals that only store.rs used became private, and `remove_key_segments` went back to being the one implementation the seal's version change calls |
+
+Readings: tests **310 -> 318**, zero warnings, LAB `--quick` **PASS=72 FAIL=0**
+(71 before; the new assertion is card 4's structural half). `store.rs` went 1100
+-> 808 lines with the coverage type and six internals gone from its interface;
+`CacheState.segment_bytes` and the `Arc<Mutex<HashMap<..>>>` handle are gone
+entirely. Reverse verifications, each breaking one rule and naming the tests that
+go red: the disk check in `adopt` (2: the refusal test and
+`a_partially_covered_range_needs_one_open_and_stages_the_rest`), the pin in the
+verdict (4: ADR-0018's trim tests).
+
+Card 2 is the one to read in full below: writing the module uncovered a rule that
+had been implicit all along.
+
+### One question for "what is protected right now" (2026-09-22)
+
+Two protections guard a key and they answer differently: a **lease** (a body is
+alive, ADR-0017) holds the whole key, while a **watch** (a key is being viewed,
+ADR-0018) holds only a bounded neighbourhood — and a key watched with no pin
+configured (`watch_pin_bytes = 0`) holds nothing back at all, so the budget still
+governs it. Five sites derived the union themselves, from two receivers each had
+to know about, which is the shape where a rule goes missing.
+
+`cache::protection` holds both and keeps three questions distinct on purpose:
+
+| question | who asks | answer |
+| --- | --- | --- |
+| `spared(now)` | the age sweep, the magazine's reap | the union, as a set |
+| `in_use(key, now)` | the relief valve | the union, for one key |
+| `verdict(key, now)` | every budget pass | `{ leased, pin }` — and the budget skips only on `pin.is_none() && leased` |
+
+Writing it turned up a rule that was implicit until the code had a name for it:
+the budget pass has always spared on the LEASE alone, and a watch without a pin has
+never held bytes back — while `pin_of`'s own comment claimed "the callers fall back
+to sparing the whole key when there is no pin". The first cut of the module read
+`spared` as the budget's answer and stopped enforcing the budget on watched keys;
+`without_a_pin_the_policy_takes_the_oldest_span` caught it. That is the whole point
+of the split: three named questions instead of one word doing three jobs.
+
+`Staging` and `Magazine` now hold one collaborator instead of two. Reverse
+verification: ignoring the pin in the verdict turns four tests red — the viewer's
+window survives the trim, a spent pin gives up the back, a watched key gives up
+its outside, and `the_trim_takes_the_tail_and_leaves_the_window_the_viewer_is_on`.
+
 ### The staged state has one home (2026-09-22)
 
 The account (how many bytes are staged) and the record (which bytes, last read

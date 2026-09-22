@@ -2148,8 +2148,8 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             .unwrap_or_default()
         };
         // 3. State mutation — memory only, no awaits under the write
-        // guard (C3); deletes for reaped/evicted rows run guard-free.
-        let reaped = self.magazine.reap(ttl_ms, now).await;
+        // guard (C3); the magazine deletes what it picked before returning.
+        self.magazine.reap(ttl_ms, now).await;
         if do_sweep {
             self.state.write().await.segment_sweep_at_millis = now;
         }
@@ -2160,9 +2160,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         for (key, bytes) in &swept {
             self.ledger.forget(key, *bytes).await;
         }
-        self.magazine.delete(&reaped).await;
-        let evicted = self.magazine.evict_budget(now).await;
-        self.magazine.delete(&evicted).await;
+        self.magazine.evict_budget(now).await;
         // 3b. Disk pressure (ADR-0014). Resident strays sit outside the byte
         //     budget, so nothing else bounds how much of the disk they take;
         //     without this the only signal would be a cold pull that cannot
@@ -2170,8 +2168,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         //     touched first. Strays only: the byte budget already governs
         //     the magazine's own members, and freeing resident bytes would
         //     make the disk a second, silent eviction budget for them.
-        let pressure_victims = self.magazine.reclaim_under_pressure().await;
-        self.magazine.delete(&pressure_victims).await;
+        self.magazine.reclaim_under_pressure().await;
         // 5. Publish what the cache is holding for viewers (ADR-0018). These
         //    are gauges, not counters: the question they answer is "how much
         //    of the budget is currently spoken for by viewing sessions", and a
