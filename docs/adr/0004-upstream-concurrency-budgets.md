@@ -15,6 +15,18 @@ calls").
 - With the single shared gate: an **idle HEAD took 22 ms**, and the same HEAD
   took **14.2 s** while three cold pulls held the permits.
 
+## Measured later: the gate is not the cold-fill limit (2026-09-22)
+
+Raising `concurrency_per_upstream` 3 -> 12 on the production node and repeating a
+4-viewer cold-region run through the CDN changed nothing measurable: the origin's
+per-ask service time stayed at p50 223 ms (225 ms at 3), its ask count did not
+rise, and the delivered aggregate did not improve. The link between this origin
+and the edge measures 0.6-1.3 MB/s per connection (16 MiB in one Range: 26.6 s
+and 12.9 s, TTFB 0.21 s) and 2-3.4 MB/s with a few — a cold run's fill crosses
+that same link. So the budgets below bound *provider* load, which is what they
+were added for (ADR-0004's own reason), and they do not bound the CDN path; the
+runbook records the experiment. The value was restored to 3.
+
 ## Decision
 
 Split the per-upstream gate into two independent semaphores on `BackendSlot`,

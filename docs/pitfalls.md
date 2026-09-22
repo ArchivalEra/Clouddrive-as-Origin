@@ -305,3 +305,14 @@ entry for being obvious in hindsight — hindsight is the point.
     proposal had nothing to win, and implementing it would have bought a
     version-gate design for six milliseconds. *Fix:* before building on a
     reading, re-take it on the object the decision is about, and record both.
+
+43. **More upstream concurrency cannot exceed the pipe.** `concurrency_per_upstream`
+    is the obvious suspect when a CDN path is slow, so it was raised 3 -> 12 and
+    the same cold multi-viewer run repeated: the origin's per-ask service time was
+    unchanged (p50 225 vs 223 ms), its ask count did not rise, and nothing
+    improved — because the constraint was never the gate but the link: 16 MiB in
+    one Range from the node took 26.6 s and 12.9 s (0.63-1.31 MB/s) with TTFB at
+    0.21 s, i.e. the origin answers immediately and the bytes then crawl, and a
+    cold run's *fill* crosses that same link. *Fix:* when a path is slow, measure
+    the pipe end to end before turning a concurrency knob — and remember that a
+    shard shape can move 5-10x what one large Range does over the same link.
