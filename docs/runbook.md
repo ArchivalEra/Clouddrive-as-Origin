@@ -932,9 +932,30 @@ node — a vantage whose path to the edge is clean — with 16 MiB in ONE reques
 | 5 MB shards, four viewers, warm at the edge | 5.3 MB/s aggregate, zero gaps |
 
 So the origin answers in ~0.2 s and the bytes then crawl: **the constraint is the
-path between this origin and the edge** (the tunnel over Phoenix <-> Singapore),
+path between this origin and the edge** (Phoenix <-> the edge's own network),
 0.6-1.3 MB/s per connection and 2-3.4 MB/s with a few — and in a cold run the
-edge's *fill* and its delivery both cross that same path. Raising the gate cannot
+edge's *fill* and its delivery both cross that same path.
+
+Where the edge's pull actually comes from (measured 2026-09-22, after a wrong
+guess that the cloudflared tunnel was in this path — it is not: that tunnel
+carries the watchdog's status reports). The peers connected to the origin's front
+port are Tencent's AS139341 nodes: three in **Hong Kong** (43.168.149.241,
+43.152.24.44, 43.175.119.174) and two in **New Mexico, US** (43.174.106.43,
+43.146.63.79). The client-facing POP the domestic resolvers hand out is
+**Singapore** (43.174.246/247.108). So content can cross the Pacific twice:
+origin (Phoenix) to a Hong Kong puller, then to the Singapore POP a domestic
+viewer lands on.
+
+The per-ask arithmetic says the same from the other side: 223 ms per 1 MiB ask, of
+which our staging is 86 ms, leaves ~137 ms of network — a Hong Kong-class round
+trip. One serial ask chain at that RTT could move ~7 MB/s, and the cold
+multi-viewer runs achieved 2.8 MB/s aggregate, so the pacer is the edge's ask
+cadence, not our answers.
+
+Two levers follow, and both are outside this repository: the origin's placement
+(closer to the pullers) and the origin-pull concurrency/batch settings in the
+EdgeOne console. Our end is already at its floor: no extra hop in the path, 86 ms
+of staging per 1 MiB ask, and 20 MB/s from the provider on a contiguous read. Raising the gate cannot
 exceed the pipe; Google Drive's parallelism is irrelevant for the same reason (a
 contiguous read from it measures 20 MB/s). It also shows why the shard shape is
 worth what it is: 5 MB shards move 5-10x what one large Range does on this link.
