@@ -247,3 +247,12 @@ entry for being obvious in hindsight — hindsight is the point.
     name the shape in every CDN/route/origin verdict, and take the verdict with
     `multi-viewer.mjs --chunk-bytes 5242880 --viewers N` (plus `--unique-seeds`
     when the viewers should not share a fill).
+
+37. **Cold bytes through an edge are a shared budget, not a per-client rate.**
+    The same edge that served one client 7 MB/s also pulls cold data at a median
+    of 265 ms per 1 MiB fill request (about 4 MB/s while filling, 0.33 MB/s
+    averaged over a mixed 7-minute window) — and that supply is divided among
+    every viewer who wants bytes the edge does not have yet, while cache hits go
+    out at line rate. *Fix:* state which one a number is. "Zero gaps for one
+    viewer on 5 MB shards" and "six viewers, 390 MB of distinct cold ranges" are
+    different experiments with different answers.

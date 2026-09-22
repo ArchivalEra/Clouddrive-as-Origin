@@ -688,6 +688,17 @@ carried for a day:
    86 ms, one upstream open per window instead of one per request, and 20.3 MB/s
    cold from Google Drive when a span is big enough to amortise the open.
 
+**The supply side of that shape (same night, at the origin).** While the edge is
+actively filling it pulls 1 MiB per request, and the origin answers with a median
+of 265 ms (p90 2236 ms) — roughly 4 MB/s of cold supply, shared by every viewer
+who wants bytes the edge does not already have. Over a 7-minute window that mixed
+filling with idle time the edge pulled 133.1 MiB, i.e. 0.33 MB/s averaged. Cache
+hits are served at line rate; cold bytes are a shared budget. One viewer of this
+1.94 MB/s film fits comfortably; six viewers at distinct cold offsets (a 390 MB
+read) do not — a run that asked for exactly that was stopped after five minutes
+rather than allowed to finish, and its `page.evaluate` exception is the kill, not
+a harness failure.
+
 For the record, the leg table measured while chasing the wrong shape, which is
 still useful as a description of each leg's ceiling: Google Drive -> origin
 20.3 MB/s cold (64 MiB in 3.31 s); origin -> edge 12 MB/s for bytes already
