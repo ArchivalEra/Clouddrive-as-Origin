@@ -656,33 +656,45 @@ origin closer to the audience. Until one of those lands, a 30-hour film cannot
 play smoothly for a Chinese viewer however correct the origin is: 200 GiB over
 30 h needs about 1.9 MB/s sustained, and the leg measured here peaks at 1.4.
 
-**Why a pony season played fine on the same path (measured the same night).**
-A challenge worth taking seriously: this workstation watched a season of My
-Little Pony smoothly through the same hostname. Measured leg by leg, that is
-consistent — the two objects differ by 3.2x in what they demand.
+**The shape is the measurement: the same object, the same route, the same night,
+four orders of magnitude apart.**
 
-| leg | measured |
+Everything above was taken with the shape a browser player uses — one
+open-ended `Range: bytes=N-`. That shape is not what this CDN is good at, and
+the difference is not marginal:
+
+| shape (same object, same client, same route, minutes apart) | result |
 | --- | --- |
-| Google Drive -> origin, cold 64 MiB | 20.3 MB/s for the film (3.31 s), 25.5 MB/s for MLP |
-| origin -> edge, bytes already staged | 12 MB/s (1 MiB in 86 ms) |
-| origin -> edge, cold 1 MiB | ~1.1 s, which is the upstream OPEN's latency, not a rate |
-| edge -> Phoenix client, same minute, same object | 793 KB/s |
-| edge -> Zhejiang client, same minute, same object | 792 B/s (best seen all night: 1.5 MB/s) |
+| one open-ended pull, `bytes=N-` | 300 B to 1.4 KB/s, player never starts |
+| 4 concurrent readers x 5 MB shards, shared offsets | 180 MiB in 24.6 s = **7.3 MB/s**, 0 gaps, 0 errors |
+| 4 concurrent readers x 5 MB shards, DISTINCT offsets (cold fill) | 180 MiB in 26.7 s = **7.1 MB/s**, 0 gaps, checksums 4/4, seek TTFB p50 1422 ms |
 
-What each object needs, computed from its own bytes:
+The film needs 214,748,364,800 B / 110,716 s = 15.5 Mbit/s = **1.94 MB/s
+sustained**, so the shape the product promises clears it by 3.6x from this very
+workstation, through the Singapore POP the domestic resolvers hand out, with the
+edge filling its cold bytes from Phoenix at ~2.6 MB/s and serving the rest from
+its own cache. `deploy/lab/viewer/multi-viewer.mjs --chunk-bytes 5242880
+--viewers N` is the instrument, and `--unique-seeds` is the honest variant: it
+stops four viewers from sharing one fill.
 
-- the 30-hour film: 214,748,364,800 B / 110,716 s = 15.5 Mbit/s = **1.94 MB/s sustained**
-- `mlp-s02-concat.mkv`: 13,009,202,351 B / 21,184 s = 4.9 Mbit/s = **0.61 MB/s sustained**
+Two conclusions follow, and they replace the topology reading this section
+carried for a day:
 
-So the pony season fits inside the good phase of the route AND rides the edge's
-cache (0.61 MB/s is well under every leg above); a film needing 3.2x more, from
-an object no edge can ever fully cache, does not. The origin is not the cap, the
-edge is not the cap, the object is playable, and the code answers every shape
-correctly — the variable leg is the client's route to the POP it was given, and
-it swings across three orders of magnitude within one minute. That is the
-topology finding: mainland acceleration (filing required) or a POP that is not
-across the border, plus — for a film this long — an origin that is not two
-crossings away from it.
+1. **There is no route problem and no topology verdict to take.** The same
+   domestic client, on the same hostname, moves 7.1 MB/s when it asks in shards.
+   Whatever the open-ended shape runs into is a property of that shape.
+2. **The origin's contract is to answer shards correctly and cheaply, and it
+   does**: byte-identical ranges (4/4 checksums), 1 MiB from staged bytes in
+   86 ms, one upstream open per window instead of one per request, and 20.3 MB/s
+   cold from Google Drive when a span is big enough to amortise the open.
+
+For the record, the leg table measured while chasing the wrong shape, which is
+still useful as a description of each leg's ceiling: Google Drive -> origin
+20.3 MB/s cold (64 MiB in 3.31 s); origin -> edge 12 MB/s for bytes already
+staged; a cold 1 MiB is ~1.1 s because that is the upstream OPEN's latency, not a
+rate; and a pony season (`mlp-s02-concat.mkv`, 13,009,202,351 B / 21,184 s =
+4.9 Mbit/s) needs only 0.61 MB/s, which is why it played smoothly — though that
+session was not served by this edge at all, so it is not evidence about it.
 
 ### Multi-viewer accounts through the CDN: from the NODE
 

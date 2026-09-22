@@ -214,9 +214,11 @@ entry for being obvious in hindsight — hindsight is the point.
     cross the border twice and the measured 0.4-1.4 MB/s says nothing about the
     origin's code. Three checks, each one command: the leg's POP
     (`curl -w '%{remote_ip}'`), the client's own egress (`myip.ipip.net`), and
-    what the audience's resolvers return (`dig @223.5.5.5 <host>`). *Fix:* when
-    all three are overseas for a domestic audience, the finding is a deployment
-    topology finding, and no amount of origin work will move it.
+    what the audience's resolvers return (`dig @223.5.5.5 <host>`). *Fix:* record
+    the geography, and then measure the shape you promise before reading a
+    verdict out of it: the same domestic client through the same overseas POP
+    moved 7.1 MB/s in 5 MB shards, so "the POP is overseas" is a fact, not a
+    verdict.
 
 34. **A proxy can hide which vantage you are measuring — and this one exits from
     the origin host.** `http_proxy`/`ALL_PROXY` here point at 127.0.0.1:2080,
@@ -234,3 +236,14 @@ entry for being obvious in hindsight — hindsight is the point.
     MiB), and measure latency separately, before naming either one the bottleneck.
     The same trap sat in the other direction all night: the CDN's 0.4-1.4 MB/s
     "ceiling" was one bad moment on one leg, not a property of the path.
+
+36. **The request shape is part of the measurement, not a detail of it.** One
+    open-ended `Range: bytes=N-` on the 200 GiB film gave 300 B to 1.4 KB/s and
+    a player that never starts; four concurrent readers asking in 5 MB shards on
+    the SAME object, client, route and night gave 7.1 MB/s with zero gaps and
+    correct checksums — four orders of magnitude. Two weeks of this project's
+    own tests had already settled it (shards in, single huge pull out), and a
+    day of this session was spent re-learning it with a player probe. *Fix:*
+    name the shape in every CDN/route/origin verdict, and take the verdict with
+    `multi-viewer.mjs --chunk-bytes 5242880 --viewers N` (plus `--unique-seeds`
+    when the viewers should not share a fill).
