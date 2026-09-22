@@ -279,3 +279,29 @@ entry for being obvious in hindsight — hindsight is the point.
     (`Error: load config` proves it executes), keep a copy of the running binary
     for rollback, and prefer a STATIC toolchain — musl removes the version
     question entirely instead of pinning an answer to it.
+
+40. **Appending a query with `?` to a URL that already has one silently corrupts
+    every parameter after it.** The cold-band flag was wired by rebuilding the
+    viewer URL as `...?size=${size}&start=${band}`, but the module-level URL
+    already ended in `?size=...`, so the request became
+    `?size=214748364800?size=214748364800&start=...`: `Number("214748364800?size=214748364800")`
+    is NaN, the reader's object size became NaN, and every jump offset became
+    NaN (`range NaN-NaN -> 416`, measured). *Fix:* append with `&` when the URL
+    carries a query, or build the query with `URL`/`URLSearchParams` and set
+    fields on it.
+
+41. **A "cold" reading has to carry its own proof.** `--unique-seeds` picks
+    *different* offsets from fixed constants, so the second run of the same
+    command re-reads what the first one warmed: a warm reading wearing a cold
+    label. *Fix:* `multi-viewer.mjs --cold-band` gives every viewer a fresh band
+    and a fresh jump seed per run, and the reader records the CDN's own
+    `eo-cache-status` per response — the report's `edgeHIT`/`edgeMISS` columns are
+    what make "cold" a fact rather than a claim.
+
+42. **A reading can outlive the object it was taken on.** ADR-0023 was written
+    around "the provider `stat` costs 108 ms", measured on the synthetic
+    `round3.mp4`; on the real 200 GiB film the same metric is **5.8 ms** (273
+    calls; 1 ms inside a three-jump window) against an 824 ms `open` — so the
+    proposal had nothing to win, and implementing it would have bought a
+    version-gate design for six milliseconds. *Fix:* before building on a
+    reading, re-take it on the object the decision is about, and record both.

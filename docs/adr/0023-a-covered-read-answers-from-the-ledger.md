@@ -1,8 +1,19 @@
 # A covered read answers its metadata from the ledger (proposal)
 
-**Status: proposal, not a decision.** Nothing here is implemented. It is written
-down because ADR-0016 recorded the candidate and the readings now exist, so the
-question can be answered rather than re-derived.
+**Status: proposal, not a decision — and its premise does not reproduce.** Nothing
+here is implemented. It is written down because ADR-0016 recorded the candidate
+and the readings now exist, so the question can be answered rather than
+re-derived.
+
+**Measured 2026-09-22 on the real 200 GiB film (the object the criterion is
+about): the provider `stat` is not 108 ms, it is ~6 ms** — 1 ms in a window of
+three cold jumps, and 5.8 ms as the mean of 273 calls over the origin process's
+lifetime (`backend_call_duration_seconds{op="stat"}`), against **824 ms** for the
+same process's 165 `open`s. The 108 ms below came from `round3.mp4`, the
+synthetic object. Answering a covered read from the ledger would save about six
+milliseconds of origin-side time per request, which is not worth a version-gate
+design. Kept as the record of the reading and of the constraint it found
+(`Last-Modified` is not in the ledger); not scheduled.
 
 ## The question
 

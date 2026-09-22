@@ -334,6 +334,21 @@ fresh offset through the CDN (206, TTFB 1.36 s) — which exercises the upstream
 path, stat plus open plus stream through Google Drive via OpenList, under musl's
 DNS and TLS resolution.
 
+## One command from source to a serving node
+
+`deploy/oracle/deploy-node.sh` (run on the workstation) does the whole path and
+refuses to install anything that has not proved itself on the node: package the
+source, cross-build on the compile machine, `file` the artifact, run it once with
+a bogus config path (a `load config` error means it executes; a `GLIBC` or exec
+error means the toolchain is wrong), back up the running binary, install with
+`install -o opc -g opc -m 0755`, restart, and run `accept.sh`. A failed
+acceptance rolls back to `/home/opc/origin-cache.prev` by itself.
+
+```sh
+bash deploy/oracle/deploy-node.sh          # asks before installing
+bash deploy/oracle/deploy-node.sh --yes    # unattended
+```
+
 ## Node acceptance after a deploy
 
 `deploy/oracle/accept.sh` is the post-deploy gate: it polls readiness, then
@@ -777,6 +792,44 @@ in 90 s) and was reported as one failed row instead of hanging the run. The
 origin's side of that same window (`fill-account.sh`): **zero `front access`
 lines** — every byte came out of the edge's own cache, which is the shape a CDN
 is for.
+
+**Cold regions are a different regime, measured 2026-09-22** with
+`deploy/lab/probe-cold-viewers.sh` and `multi-viewer.mjs --cold-band` (a fresh
+band and a fresh jump seed per viewer per run, and the report's `edgeHIT`/
+`edgeMISS` columns so a run proves it was cold instead of claiming it):
+
+| shape | delivered | gaps > 1.5 s | seek TTFB p50 |
+| --- | --- | --- | --- |
+| 4 viewers, 5 MB shards, offsets the edge already held | 141 MiB in 26.7 s (5.3 MB/s) | **0** | 101 ms |
+| 4 viewers, 5 MB shards, fresh bands (`edgeMISS=4`) | 120 MiB in 43.3 s (2.8 MB/s) | **6**, worst 2118 ms | 1179 ms |
+| 6 viewers, fresh bands | 120 MiB, one viewer 0 bytes in 240 s | 8, worst 2460 ms | 1479 ms |
+| 1 viewer, a fresh band | 30 MiB in 16.5 s (1.8 MB/s) | 0 | 1463 ms |
+
+Three things follow. **The origin is not the limit**: its side of the 4-viewer
+cold run is 141 asks for 115.5 MiB at p50 225 ms (each ask is a 1 MiB fill, most
+served from staged bytes). **The edge's cold fill is the limit and it is shared**:
+one cold viewer gets ~1.8 MB/s — right at the 1.94 MB/s the film needs — and four
+cold viewers split ~2.8 MB/s, so the same shape that shows zero gaps on warm
+bytes shows gaps of two seconds on cold ones. **The 6-viewer run's total is
+unchanged** (120 MiB, the same budget) and its one dead viewer had `requests=0`:
+that is the workstation path's known stall, not the fill.
+
+**A cold jump's ~800 ms is the provider's `open`** (attributed at the origin with
+`deploy/oracle/seek-attribution-probe.sh`: three cold jumps from loopback, with
+the deltas of `backend_call_duration_seconds{op}` and
+`cache_body_ttfb_seconds{source="upstream"}` around them):
+
+| inside one cold jump | measured |
+| --- | --- |
+| the jump's own first byte (loopback) | 727-839 ms (1-2 ms when the offset was already staged) |
+| provider `stat` | **1 ms** in the window; **5.8 ms mean over the process's 273 calls** |
+| provider `open` | **806 ms** in the window; **824 ms mean over 165 calls** |
+| our overhead (headers ready, first body byte) | the difference, i.e. nothing measurable |
+
+So the seek's cost is the provider's connection, not our bookkeeping — which is
+what ADR-0016 already judged ("the open side is at its floor", and chasing it
+"would change what a run IS"). A seek *inside* the watched neighbourhood
+(ADR-0018's pin) is already warm: 1-2 ms.
 
 Two instruments were added with it, both because a CDN round needs both sides:
 `deploy/oracle/fill-account.sh` reads the origin's `front access` log into a

@@ -93,9 +93,13 @@ by construction" still holds.
 - **A preempted run loses its chain.** A far seek that takes the slot over a live
   run means that run can no longer chain its successor (the entry is no longer
   its own); its readers are unaffected.
-- **The seek's first-byte latency is untouched**: `open` (~0.94 s) and `stat`
-  (~0.11 s) are still paid per window and per covered read. ADR-0023 remains a
-  proposal, and ADR-0016's "a single continuous stream spanning a whole viewing
-  session" remains un-decided.
+- **The seek's first-byte latency is untouched, and measured (2026-09-22)**: a
+  cold jump's first byte is 727-839 ms at the origin, of which the provider's
+  `open` is 806 ms in-window (824 ms mean over 165 calls) and the provider's
+  `stat` is 1 ms in-window (5.8 ms mean over 273 calls). Our own overhead is not
+  measurable in it. So the only lever left would be the open, which ADR-0016
+  rejected on the grounds that chasing it changes what a run IS — and that
+  judgement now has the account it asked for. ADR-0023's stat is not a lever
+  either: see the note on that proposal.
 - **The ramp is per run, not per key**: it has no memory of a viewer who returns
   to a key an hour later — that read is a jump again, and takes the floor.
