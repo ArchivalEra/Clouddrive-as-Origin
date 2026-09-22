@@ -534,6 +534,54 @@ Dumps of the raw responses carry the origin address, so keep them out of the
 repository (`/tmp/eo/` is fine; the `.gitignore` is a whitelist, but a file named
 by hand into `deploy/` would still be tracked).
 
+### What the origin-pull settings actually are (read 2026-09-22)
+
+Read with the read-only key, one call per layer. The zone is `isui.ren`
+(`zone-3taqnjqfr1zo`), area `overseas`, type `partial`, `ActiveStatus: active`
+(the `Status: pending` field is the zone *type*'s provisioning state and does not
+affect serving), and the plan is **`plan-free`** -- which decides what is
+available at all.
+
+| layer | what is set |
+| --- | --- |
+| site-wide | `UpstreamHTTP2` **on**, `HTTP2` (client) on, `SmartRouting` **off**, `AccelerateMainland` off, `OfflineCache` on, `CachePrefresh` on at 90% of TTL, `Cache` follow-origin, `MaxAge` 600 s, `PostMaxSize` 800 MiB |
+| rules (exactly one) | `rule-3usngannhvqa`, enabled, priority 1, condition `${http.request.uri.path} in ['/*'] and ${http.request.host} in ['cdn-oracle.isui.ren']`, action `RangeOriginPull` **on** -- and nothing else set on it |
+| domain `cdn-oracle.isui.ren` | `online`, `OriginProtocol: FOLLOW`, HTTP port 80 / HTTPS port **7777**, `HostHeader: cdn-oracle.isui.ren`, free certificate |
+
+So **both knobs the origin-leg discussion named are already on**: sharded origin
+pull (as a rule action, scoped to that host) and HTTP/2 to the origin. Lever B is
+therefore not "switch sharding on"; what is left in it is:
+
+- **the origin-read timeout**, which is the one action in the list that is *not*
+  set, so the platform default applies. The API exposes only the settable range
+  (5-600 s) and does not report the default; the doc page that would name it could
+  not be fetched from here. This is the only remaining knob that matches the
+  measured failure shape, since a product that answers an open-ended range with a
+  200 GiB promise holds a body open for a long time -- worth one experiment.
+- **the plan tier.** `SmartRouting` (smart acceleration) is off and
+  `AdvancedOriginRouting` is unset on both layers; the latter is documented as
+  requiring the former, and neither is a free-plan feature. The geographic
+  adaptation knob that would suit a domestic client talking to a Singapore POP
+  with a Hong Kong origin-pull is therefore **not reachable from this account**
+  without a plan change -- which is a decision, not a setting.
+
+The origin itself resolves straight to the node's own address (an Oracle Cloud
+IPv4 and IPv6), with no tunnel between: EdgeOne talks directly to the front on port
+7777. That closes the question the earlier correction raised, from the account's
+own side rather than from the peer addresses.
+
+CDN-side account, `DescribeTimingL7OriginPullData`, 09-14 16:00 to 09-22 08:00
+UTC, hourly:
+
+- edge <- origin response flux total **2.09 GB**; busiest hour **431 MB**
+  (09-22 00:00 UTC, the heavy test window)
+- peak hourly-average bandwidth **5.9 Mbps**
+- `l7Flow_request_hy` came back all zeros, which is a metric a free plan does not
+  appear to retain -- read it as unavailable, not as "no origin pulls"
+
+The other domain in the zone (`pure-dns.isui.ren`, origin `baidu.com`) is unrelated
+to this project and was not touched.
+
 ## One command from source to a serving node
 
 `deploy/oracle/deploy-node.sh` (run on the workstation) does the whole path and
