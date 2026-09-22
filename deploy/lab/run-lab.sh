@@ -798,12 +798,15 @@ for i in $(seq 1 24); do
 done
 walk_ms=$(( ($(date +%s%N) - walk_start) / 1000000 ))
 opened=$(( $(opens 9096) - before_g ))
-# 24 MiB of ascending shards against a 64 MiB default window: one window covers
-# the whole walk, so the origin is opened ONCE — the property the node's own
-# 24-shard measurement showed, asserted here so a default change cannot break it
-# silently.
-[ "$opened" -le 2 ] && ok "24 ascending 1 MiB shards cost $opened upstream open(s) (want 1, at most 2)" \
-  || bad "24 shards on the default window cost $opened opens (want 1)"
+# 24 MiB of ascending shards against the default window (64 MiB) and the
+# window decision's floor (8 MiB, ADR-0024): the walk climbs 8 -> 16 MiB, so it
+# costs TWO windows plus the boundary handover — three opens — where a
+# per-request open would be 24. Before the handover existed this measured 8
+# (one per three shards), which is what this assertion is here to catch: the
+# failure mode is a walk that stops riding windows, not a walk that takes one
+# more window than the old policy.
+[ "$opened" -le 3 ] && ok "24 ascending 1 MiB shards cost $opened upstream open(s) (the ramp climbs 8+16 MiB, want 3, at most 3)" \
+  || bad "24 shards on the default window cost $opened opens (want 3)"
 # The window SEALS asynchronously — the run's driver keeps pumping the 64 MiB
 # window after the last shard was served — so this polls rather than samples.
 gbytes=0

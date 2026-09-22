@@ -327,16 +327,27 @@ repo** — it is injected at runtime via an environment variable (e.g.
     budget, not by the object; promotion and the promotion hold are deleted,
     so there is no threshold, no merge task and no hold deadline.
 
-    **A run is one upstream stream covering a window (ADR-0016).** The first
-    ranged miss on a key opens `[frontier, frontier + session_window_bytes)`
-    (default 64 MiB), pumps it through the flight machinery (watermark,
-    inactivity-bounded waits, fsync + rename) and seals it as one `.seg` span.
+    **A run is one upstream stream covering a window (ADR-0016), and how big
+    that window is belongs to the window decision (ADR-0024).** The first ranged
+    miss on a key opens `[frontier, frontier + window)`, where the window is
+    `cache::window`'s answer: the **floor** (`window_floor_bytes`, default
+    8 MiB) when nothing precedes the run — a jump pays for the read-ahead it
+    uses, not for a window nobody reads — doubled on what the run it replaces
+    actually consumed, up to `session_window_bytes` (default 64 MiB), so a
+    sequential walk still converges on one open per window. A request wider than
+    either gets what it asked for. The run pumps it through the flight machinery
+    (watermark, inactivity-bounded waits, fsync + rename) and seals it as one
+    `.seg` span.
     Every request whose range falls inside a live run's window is answered from
     its watermark with **no upstream open and no stream permit** — the ~640 ms
     open is paid once per window instead of once per request. A request no run
     covers takes its own exact Range (the escape, unchanged); a gap larger than
-    the window widens it, so one response still costs one open; admission asks
-    the disk about the window, since that is what gets written. When a run
+    the window widens it, so one response still costs one open; a request that
+    begins exactly where a LIVE run's window ends hands the key over instead of
+    escaping (ADR-0024 — without it a small floor measured worse than the waste
+    it saved); admission asks the disk about the **worst case** the policy can
+    choose (`max(need, session_window_bytes)`), since the ramp's input is read
+    after admission has answered. When a run
     seals, the next window may start at once while a reader is still consuming
     and within one window of the boundary, so the open lands ahead of the
     playhead; a paused or departed reader stops the chain. `cache_session_total`
@@ -879,8 +890,20 @@ disabling the mechanism and watching the named test fail)
       — `a_seek_far_beyond_the_window_opens_its_own_range`.
 - [x] A sealed run's spans serve later reads with no further upstream open.
       — `a_sealed_run_leaves_spans_that_serve_later_reads`.
-- [x] A walk costs **one open per window**, not one per request.
-      — `a_sequential_walk_opens_once_per_window`.
+- [x] A walk costs **one open per window** once the ramp is warm, not one per
+      request — the first windows of a walk climb from the floor.
+      — `a_sequential_walk_opens_once_per_window` (small windows, where the floor
+      clamps to the window and the ramp is invisible), and the LAB's 24-shard
+      section for the default-window shape.
+- [x] A jump opens the **floor**, not the window, and a window read out doubles
+      the next one.
+      — `cache::window::tests::*`, `cache::session::tests::
+      a_jump_opens_the_floor_and_a_read_out_window_ramps_the_next_one`,
+      `a_partly_read_window_ramps_nothing`,
+      `a_far_seek_after_a_read_out_window_still_opens_the_floor`,
+      `a_request_at_a_windows_end_takes_the_key_over_instead_of_escaping`, and
+      `a_jump_stages_the_floor_and_a_second_read_inside_it_stages_nothing`
+      (integration; pinning the floor to the window turns all of them red).
 - [x] A failed open **errors its reader** rather than parking it.
       — `a_run_that_cannot_open_errors_its_reader_instead_of_hanging`.
 - [x] A consuming reader **chains the next window**; a paused one buys at most

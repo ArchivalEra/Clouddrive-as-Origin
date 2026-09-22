@@ -204,9 +204,7 @@ impl Staging {
     /// the magazine can never hold may keep staged (ADR-0019). >= the pin by
     /// construction, so the cap never forces the pin to be spent.
     fn working_window_bytes(&self) -> u64 {
-        self.config
-            .watch_pin_bytes
-            .saturating_add(self.config.session_window_bytes)
+        super::window::reserve_bytes(self.config.watch_pin_bytes, self.config.session_window_bytes)
     }
 
     /// How many keys are in the un-keepable class right now (the gauge).
@@ -704,6 +702,11 @@ mod tests {
         use crate::config::Config;
         let c = Config::default();
         assert_eq!(c.session_window_bytes, 64 * 1024 * 1024, "one second of transfer (ADR-0016)");
+        assert_eq!(
+            c.window_floor_bytes,
+            crate::config::DEFAULT_WINDOW_FLOOR_BYTES,
+            "the window decision's floor (one eighth of the window)"
+        );
         assert_eq!(c.watch_pin_bytes, 128 * 1024 * 1024, "the viewer's neighbourhood (ADR-0018)");
         assert_eq!(c.watch_idle_secs, 900, "longer than a phone call (ADR-0018)");
         assert_eq!(c.read_grace_secs, 300, "covers a viewer who is thinking (ADR-0017)");

@@ -30,6 +30,16 @@ run's window is served from that run's watermark at no upstream open and no
 stream permit. The window is `session_window_bytes` (default 64 MiB: about a
 second of transfer at the measured rate).
 
+> **Amended by ADR-0024 (2026-09-22):** how large a run's window is, and what
+> happens at its boundary, is now `cache::window`'s decision. A run with nothing
+> behind it opens a floor (`window_floor_bytes`, default 8 MiB) rather than the
+> configured window — measured before that change, on a real 200 GiB object: one
+> 5 MiB cold jump staged 67,108,864 bytes, a 12.8x amplification — and a window
+> that gets read out doubles the next one up to `session_window_bytes`, so a
+> sequential walk still converges on one `open` per window. A request that begins
+> exactly where a LIVE window ends now hands over instead of escaping; without
+> that handover a small floor measured *worse* (a 24 MiB walk at 8 opens).
+
 **Attaching is an optimization, never a dependency.** A request that no run
 covers takes its own exact Range, exactly as before — that is the correctness
 escape, not a failure path. A request whose gap is larger than the window

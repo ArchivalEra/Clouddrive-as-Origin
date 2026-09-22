@@ -60,7 +60,6 @@ pub(crate) struct Successor {
     upstream_id: String,
     etag: Option<String>,
     total: u64,
-    window: u64,
 }
 
 /// Live run for one cache key.
@@ -121,14 +120,30 @@ impl Run {
     /// paid for, while the `next <= playhead + keep_ahead` bound — which does
     /// not move while the playhead is stalled — still stops the chain, so
     /// watching a file never becomes pulling it.
-    fn wants_successor(&self, watched: bool) -> Option<u64> {
+    fn wants_successor(&self, watched: bool, configured: u64, floor: u64) -> Option<(u64, u64)> {
         let next = self.end;
-        let keep_ahead = self.successor.window.saturating_mul(CHAIN_KEEP_AHEAD_WINDOWS);
+        // The ramp's input is this run's own account: how much it held and how
+        // far its readers actually got. A window read out doubles the next one
+        // (a sequential walk climbs back to one open per configured window); a
+        // window left half-read, or a viewer that never arrived, falls back to
+        // the floor — which is also what keeps a paused viewer from turning
+        // "watch the file" into "pull the file", now in bytes rather than in
+        // whole windows.
+        let covered = self.end.saturating_sub(self.start);
+        let consumed = self.playhead().saturating_sub(self.start);
+        let window = super::window::window_for(
+            0,
+            self.successor.total.saturating_sub(next),
+            configured,
+            floor,
+            Some((covered, consumed)),
+        );
+        let keep_ahead = window.saturating_mul(CHAIN_KEEP_AHEAD_WINDOWS);
         if next < self.successor.total
             && watched
             && next <= self.playhead().saturating_add(keep_ahead)
         {
-            Some(next)
+            Some((next, window))
         } else {
             None
         }
@@ -226,15 +241,36 @@ impl<C: Clock + 'static> Sessions<C> {
         // (measured on the node: 25 opens during one 90 s pause).
         playhead_seed: Option<u64>,
     ) -> Option<Arc<Run>> {
+        // What the run we are replacing achieved, when this request continues
+        // it. Read here because here is the only place it is visible: the same
+        // lock that reaps the spent run is the last moment anybody can ask it
+        // what it covered and how far its readers got.
+        let mut behind = None;
         {
             let mut slots = self.slots.lock().await;
             match slots.get(key) {
-                // A finished run still owns the key until somebody reaps it,
-                // and that would make every request of a sequential walk take
-                // the standalone escape (its own exact Range, no window) —
-                // the next window has to start immediately, not at the next
-                // tick. Reap it here instead of refusing.
-                Some(Slot::Live(run)) if run.is_terminal() => {
+                // Two handovers, one rule: a run this request cannot ride is
+                // reaped and replaced here rather than at the next tick.
+                //
+                // - The run is SPENT (terminal): a finished run still owns the
+                //   key until somebody reaps it, and that would make every
+                //   request of a sequential walk take the standalone escape
+                //   (its own exact Range, no window).
+                // - The request begins exactly where a LIVE run's window ends:
+                //   the sequential walk crossing a window boundary. Waiting for
+                //   that run to seal is what made a small floor cost more opens
+                //   than the waste it saved — the LAB measured a 24 MiB walk at
+                //   8 opens (one per three shards), because each crossing
+                //   escaped to its own Range instead of handing over.
+                //
+                // Taking the slot does not disturb the predecessor: its driver
+                // keeps pumping into its own `.segpart`, seals on its own, and
+                // its `finish` is pointer-checked, so it cannot clear the
+                // successor's entry. A seek that does NOT continue it (a gap, a
+                // far offset) still takes the escape below, which is what keeps
+                // several viewers on one key from thrashing the slot.
+                Some(Slot::Live(run)) if run.is_terminal() || start == run.end => {
+                    behind = super::window::behind_of(start, run.start, run.end, run.playhead());
                     slots.remove(key);
                 }
                 Some(_) => return None,
@@ -242,8 +278,18 @@ impl<C: Clock + 'static> Sessions<C> {
             }
             slots.insert(key.to_string(), Slot::Starting);
         }
-        let window = self.config.session_window_bytes.max(1);
-        let end = start.saturating_add(need.max(window)).min(total);
+        // One question, one answer: how far ahead may this run read (see
+        // `cache::window`). A jump opens the floor, a continuation ramps on what
+        // the run it replaces consumed, and a request wider than either gets
+        // its own length — the floor is a floor, not a cap (ADR-0016).
+        let window = super::window::window_for(
+            need,
+            total.saturating_sub(start),
+            self.config.session_window_bytes,
+            self.config.window_floor_bytes,
+            behind,
+        );
+        let end = start.saturating_add(window).min(total);
         let permit = if end > start {
             Arc::clone(&slot.stream_gate).acquire_owned().await.ok()
         } else {
@@ -280,7 +326,6 @@ impl<C: Clock + 'static> Sessions<C> {
                 upstream_id: backend_id.clone(),
                 etag: etag.clone(),
                 total,
-                window,
             },
             readers: AtomicUsize::new(0),
             playhead: AtomicU64::new(playhead_seed.unwrap_or(start)),
@@ -395,14 +440,18 @@ impl<C: Clock + 'static> Sessions<C> {
             // pre-ADR-0018 rule and the reverse verification is a config flip.
             let watched =
                 run.readers() > 0 || self.watches.live(&key, self.clock.now_millis());
-            let next_start = run.wants_successor(watched);
+            let next = run.wants_successor(
+                watched,
+                self.config.session_window_bytes,
+                self.config.window_floor_bytes,
+            );
             // The spent entry goes first: `start` refuses a key that still has
             // one, so chaining before releasing would never fire. `finish` is
             // pointer-checked, and two ticks racing here both release (the
             // second is a no-op) and then race on `start`, where the loser sees
             // the winner's entry and stops.
             self.finish(&key, &run).await;
-            if let Some(next_start) = next_start {
+            if let Some((next_start, window)) = next {
                 let successor = &run.successor;
                 let started = self
                     .start(
@@ -413,7 +462,7 @@ impl<C: Clock + 'static> Sessions<C> {
                         successor.etag.clone(),
                         successor.total,
                         next_start,
-                        successor.window,
+                        window,
                         Some(run.playhead()),
                     )
                     .await
@@ -469,12 +518,35 @@ mod tests {
         opens: Arc<AtomicUsize>,
         watch_idle_ms: u64,
     ) -> (Arc<Sessions<MockClock>>, Arc<BackendSlot>, Arc<crate::cache::watch::Watches>) {
+        sessions_tuned(
+            dir,
+            window,
+            crate::config::DEFAULT_WINDOW_FLOOR_BYTES,
+            object_bytes,
+            opens,
+            watch_idle_ms,
+        )
+    }
+
+    /// The same harness with the window decision's floor set explicitly. Tests
+    /// above leave it at the default, which is clamped up to their small
+    /// windows and so invisible to them; a test that asserts on the ramp needs
+    /// a window bigger than the floor.
+    fn sessions_tuned(
+        dir: &std::path::Path,
+        window: u64,
+        floor: u64,
+        object_bytes: u64,
+        opens: Arc<AtomicUsize>,
+        watch_idle_ms: u64,
+    ) -> (Arc<Sessions<MockClock>>, Arc<BackendSlot>, Arc<crate::cache::watch::Watches>) {
         let clock = Arc::new(MockClock::new(0));
         let mut cfg = Config {
             cache_dir: dir.to_path_buf(),
             ..Config::default()
         };
         cfg.session_window_bytes = window;
+        cfg.window_floor_bytes = floor;
         let cfg = Arc::new(cfg);
         let coverage = Arc::new(Mutex::new(HashMap::<String, Coverage>::new()));
         let state = Arc::new(tokio::sync::RwLock::new(crate::cache::cache::CacheState::default()));
@@ -548,6 +620,160 @@ mod tests {
         // handover: wait for that window to seal before counting opens.
         wait_terminal(&next).await;
         assert_eq!(opens.load(Ordering::SeqCst), 2, "one open per window");
+        drop(body);
+    }
+
+    /// The window decision at both ends: a jump opens the floor, and a window
+    /// a reader reads out doubles the next one. Measured on the node before
+    /// this rule existed: a 5 MiB cold jump staged a whole 64 MiB window
+    /// (12.8x) while the next 5 MiB inside that window cost 0.04 s.
+    ///
+    /// The floor here is below one publisher chunk (`ranged::CHUNK`, 256 KiB),
+    /// because "read out" has to be reachable by pulling a single chunk: a
+    /// window at or below the chunk size arrives in one piece, a bigger one
+    /// only ever arrives partly.
+    #[tokio::test]
+    async fn a_jump_opens_the_floor_and_a_read_out_window_doubles_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let floor = 64 * 1024;
+        let (sessions, slot, _watches) =
+            sessions_tuned(dir.path(), 4 * 1024 * 1024, floor, 16 * 1024 * 1024, Arc::clone(&opens), 0);
+
+        // Nothing behind it: the floor, not the configured window.
+        let run = start(&sessions, &slot, 16 * 1024 * 1024).await;
+        assert_eq!(run.end - run.start, floor, "a jump opens the floor");
+
+        // Read that window out (one chunk, because the floor IS one chunk) and
+        // let the tick chain the next one.
+        let mut body = Sessions::<MockClock>::reader(Arc::clone(&run), 0, floor);
+        let first = futures::StreamExt::next(&mut body).await.expect("a chunk").unwrap();
+        assert_eq!(first.len() as u64, floor, "one chunk reads the floor out");
+        wait_terminal(&run).await;
+        sessions.tick().await;
+
+        let successor = sessions
+            .covering("a.bin", floor, floor * 2)
+            .await
+            .expect("a read-out window chains the next one");
+        assert_eq!(
+            successor.end - successor.start,
+            floor * 2,
+            "a read-out window doubles the next one"
+        );
+        // The successor's window is capped by the configured one (4 MiB), and
+        // the open still happens once per window.
+        wait_terminal(&successor).await;
+        assert_eq!(opens.load(Ordering::SeqCst), 2, "one open per window");
+        drop(body);
+    }
+
+    /// A window left partly read ramps nothing: the ramp is a reward for being
+    /// read out, so the successor falls back to the floor. This is the byte
+    /// version of "a stalled viewer buys the read-ahead it is owed" — the
+    /// read-ahead it is owed is now the floor, not a whole window.
+    #[tokio::test]
+    async fn a_partly_read_window_ramps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let floor = 1024 * 1024;
+        let (sessions, slot, _watches) =
+            sessions_tuned(dir.path(), 4 * 1024 * 1024, floor, 16 * 1024 * 1024, Arc::clone(&opens), 0);
+
+        let run = start(&sessions, &slot, 16 * 1024 * 1024).await;
+        assert_eq!(run.end - run.start, floor);
+        // One chunk of a floor-sized window: the reader is inside it, not
+        // through it.
+        let mut body = Sessions::<MockClock>::reader(Arc::clone(&run), 0, floor);
+        let first = futures::StreamExt::next(&mut body).await.expect("a chunk").unwrap();
+        assert!((first.len() as u64) < floor, "the reader stopped inside the window");
+        wait_terminal(&run).await;
+        sessions.tick().await;
+
+        let successor = sessions
+            .covering("a.bin", floor, floor * 2)
+            .await
+            .expect("the read-ahead a stopped reader is owed is still granted");
+        assert_eq!(
+            successor.end - successor.start,
+            floor,
+            "a partly-read window ramps nothing: the next one is the floor again"
+        );
+        drop(body);
+    }
+
+    /// The boundary handover: a request that begins exactly where a run's
+    /// window ends takes the key over rather than escaping to its own Range.
+    ///
+    /// This test pins the outcome (a run comes back, with the ramp's window);
+    /// which arm of the handover fires depends on whether the predecessor had
+    /// sealed yet, and the LIVE arm is what the LAB's 24-shard walk measures —
+    /// before the handover it cost 8 opens, one per three shards, because every
+    /// crossing escaped.
+    #[tokio::test]
+    async fn a_request_at_a_windows_end_takes_the_key_over_instead_of_escaping() {
+        let dir = tempfile::tempdir().unwrap();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let (sessions, slot, _watches) =
+            sessions_tuned(dir.path(), 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024, Arc::clone(&opens), 0);
+
+        let run = start(&sessions, &slot, 16 * 1024 * 1024).await;
+        assert_eq!(run.end - run.start, 64 * 1024, "the first window is the floor");
+
+        let next = sessions
+            .start(
+                &slot,
+                "a.bin",
+                key(),
+                "primary",
+                Some("v1".into()),
+                16 * 1024 * 1024,
+                run.end,
+                0,
+                None,
+            )
+            .await
+            .expect("a request at the window's end hands over instead of escaping");
+        assert_eq!(next.start, run.end, "the successor begins where the window ended");
+        // Nothing had been read out of the first window, so the ramp stays at
+        // the floor: a handover is about the slot, not about read-ahead.
+        assert_eq!(next.end - next.start, 64 * 1024);
+        wait_terminal(&run).await;
+    }
+
+    /// A request that begins OUTSIDE the run it replaces is a jump: it opens
+    /// the floor even when that run was read out, so a scrub cannot inherit the
+    /// ramp of a region it is not continuing.
+    #[tokio::test]
+    async fn a_far_seek_after_a_read_out_window_still_opens_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let floor = 256 * 1024;
+        let (sessions, slot, _watches) =
+            sessions_tuned(dir.path(), 4 * 1024 * 1024, floor, 16 * 1024 * 1024, Arc::clone(&opens), 0);
+
+        let run = start(&sessions, &slot, 16 * 1024 * 1024).await;
+        let mut body = Sessions::<MockClock>::reader(Arc::clone(&run), 0, floor);
+        let first = futures::StreamExt::next(&mut body).await.expect("a chunk").unwrap();
+        assert!(!first.is_empty(), "the replacement run was being read");
+        wait_terminal(&run).await;
+
+        // 4 MiB away: not a continuation of [0, floor).
+        let far = sessions
+            .start(
+                &slot,
+                "a.bin",
+                key(),
+                "primary",
+                Some("v1".into()),
+                16 * 1024 * 1024,
+                4 * 1024 * 1024,
+                0,
+                None,
+            )
+            .await
+            .expect("a far seek starts its own run");
+        assert_eq!(far.end - far.start, floor, "a far seek opens the floor, not the ramp");
         drop(body);
     }
 

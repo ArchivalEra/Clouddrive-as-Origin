@@ -699,6 +699,40 @@ read) do not — a run that asked for exactly that was stopped after five minute
 rather than allowed to finish, and its `page.evaluate` exception is the kill, not
 a harness failure.
 
+### The window decision: a jump pays the floor (ADR-0024, 2026-09-22)
+
+The reading that motivated it, and the reading after it, both on the node
+against the real 200 GiB object. `deploy/oracle/window-decision-probe.sh` takes
+the second one (fresh random bands per run, and it settles between rows because
+a seal lands after the body it seals):
+
+| read | before (whole-window policy) | after (deploy `db6c07ce…`) |
+| --- | --- | --- |
+| a 5 MiB cold jump | `segment_bytes` +67,108,864 — exactly one 64 MiB window, **12.8x the bytes read** | **+8 MiB** (the floor), one upstream open — measured on three separate jumps |
+| another 5 MiB inside that window | 0.04 s, no open | 0 new bytes, no open |
+| a single 20 MiB request | one 20 MiB window, one open | unchanged: the floor is a floor, never a cap |
+| 41 MiB of reads across 5 requests (3 jumps) | ~256 MiB staged | **+52 MiB staged, 5 opens** |
+
+The LAB pins the shape a CDN actually asks in — 24 ascending 1 MiB shards
+against the default 64 MiB window and the 8 MiB floor: **3 upstream opens** (the
+ramp climbs 8 → 16 MiB, and the boundary hands over), where a per-request open
+would be 24. Before the handover existed that measured **8**. The old
+whole-window policy measured 1; the walk pays one or two extra opens for the
+ramp and stops paying a whole window for every seek.
+
+Tests: 310 green, zero warnings. Reverse verification: pinning `floor_bytes` to
+the configured window turns seven of the new tests red (`cache::window` three,
+`cache::session` four, one integration) and leaves every pre-existing test
+green, so the new tests measure the ramp and nothing else does.
+
+Two instruments were added with it, both because a CDN round needs both sides:
+`deploy/oracle/fill-account.sh` reads the origin's `front access` log into a
+per-key account (requests, MiB, p50/p90 ms, distinct `xff`) plus the live
+counters, and `deploy/lab/viewer/multi-viewer.mjs` grew
+`--viewer-timeout-secs` (default 120) with a progress line per viewer — a hung
+viewer is now one failed row instead of a run with no numbers, which is how a
+six-viewer CDN round ended on 2026-09-22 before it had any.
+
 For the record, the leg table measured while chasing the wrong shape, which is
 still useful as a description of each leg's ceiling: Google Drive -> origin
 20.3 MB/s cold (64 MiB in 3.31 s); origin -> edge 12 MB/s for bytes already

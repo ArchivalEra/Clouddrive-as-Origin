@@ -11,6 +11,7 @@ use crate::{
         session::{self, Sessions},
         staging::{self, FinalizedSpan, Staging},
         store,
+        window,
     },
     clock::Clock,
     config::Config,
@@ -1284,12 +1285,15 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         // the question: staged spans are served directly (ADR-0015), so a
         // bounded window of an object too large to keep whole is the sliding
         // window its reader is walking through, not bytes nobody can read back.
-        let run_len = self
-            .config
-            .session_window_bytes
-            .max(1)
-            .max(end - plan.frontier)
-            .min(meta.size_bytes.saturating_sub(plan.frontier));
+        // The window decision owns this number (see `cache::window`); what
+        // admission needs from it is the largest write the policy can choose
+        // for this request, which is the configured window however the ramp
+        // lands.
+        let run_len = window::worst_case_bytes(
+            end - plan.frontier,
+            meta.size_bytes.saturating_sub(plan.frontier),
+            self.config.session_window_bytes,
+        );
         if !magazine::run_admits(
             run_len,
             self.config.max_size_bytes,
