@@ -1200,6 +1200,55 @@ the origin's log agrees — it holds almost no pulls for that key, because the e
 kept it and served the viewer itself. It is positive evidence for the shard rule,
 not a curiosity: 0.61 MB/s is far inside what a sharded concurrent reader gets.
 
+### The staged state has one home (2026-09-22)
+
+The account (how many bytes are staged) and the record (which bytes, last read
+when, read how often) used to live in four places: a `segment_bytes` counter on
+`CacheState`, a raw `Arc<Mutex<HashMap<..>>>` cloned into `Staging` and reached
+from `Cache`, the intervals inside `store::Coverage`, and a startup scan that
+wrote to both. Three of them maintained "the account is the sum of disk-backed
+staged bytes" by hand, and the rule for combining them lived in a comment in
+`Cache::tick` ("keep them added, not max-ed: they are disjoint").
+
+They are now one module, `cache::ledger`, and the rule is the interface:
+
+- **a claim must be disk-backed.** `Ledger::adopt` records bytes only after
+  asking the disk, takes the count from the file (a short write claims short),
+  and refuses a span the disk does not cover. `Ledger::seal` is the same rule on
+  the live path — a rename that landed is a disk fact like any other.
+- **the account changes only by measurement**: a file's real length when bytes
+  arrive, the sweep's measured `freed` when they leave, a fresh inventory at
+  startup.
+- **the guard never leaves**: every query, every selection (the sweep's
+  candidates, the eviction's order, the un-keepable class) and every mutation
+  finishes inside the module, so no call site has to know ADR-0008's ordering
+  rule — it is structural now rather than remembered.
+
+The reading, before and after:
+
+| | before | after |
+| --- | --- | --- |
+| writers of the account | 8 (3 in `Staging`, 2 in `Cache`, 3 test-side) | 1 (`Ledger::adopt`/`seal`/`forget`/`re_adopt`) |
+| `self.coverage.lock()` sites outside the ledger | 15 in `staging.rs`, 3 in `cache.rs` | **0** |
+| state-guard writes for the account | 3 (`seal_span`, `trim_row`, `reset`) | **0** — `Staging` no longer holds the state guard at all |
+| `store::Coverage` | 4 `pub` fields, touched in ~10 call sites | private to the module |
+| `staged_segments` (test helper) | its own directory walk | the operator view (`Cache::inspect`) |
+
+Tests: **313 green, zero warnings** (310 before: +2 in `cache::ledger` for the
+refusal rule and the account's disk-following rule, +1 integration for
+`a_sealed_span_and_an_adopted_span_agree`, which pins sealing-as-adoption by
+driving a real read and comparing its record with an installed one). Reverse
+verification: removing the disk check from `adopt` turns exactly two tests red —
+the new refusal test and `a_partially_covered_range_needs_one_open_and_stages_the_rest`,
+so the rule is load-bearing in the serving path and not only in its own test.
+
+Two lessons came out of getting it green, both now pitfalls: sealing runs
+**inside the response body's stream**, so a `spawn_blocking` round trip there
+stalls the drain (35% of runs, 0% with a synchronous `stat`); and a test that
+samples the ledger right after a response races the seal, which is what
+`wait_ledger` is for — `a_read_credits_every_staged_span_it_touches` failed 4 of
+6 runs on the tree as it stood before this change.
+
 ### Multi-viewer accounts through the CDN: from the NODE
 
 A "N viewers through the CDN" number taken from a workstation measures the
