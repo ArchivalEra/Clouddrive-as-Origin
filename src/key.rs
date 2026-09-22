@@ -26,7 +26,6 @@ pub enum KeyError {
 /// and `/` threefold, so a key of at most this many BYTES (as a raw string)
 /// still fits; anything longer is refused as a bad request rather than failing
 /// later as an opaque filesystem error.
-pub const NAME_MAX_BYTES: usize = 255;
 
 /// Validate a cache key per spec §2 / ADR 0001.
 /// - Non-empty, not absolute, no `..` segments, no backslash, no NUL.
@@ -68,31 +67,31 @@ pub fn validate_key(raw: &str) -> Result<String, KeyError> {
             return Err(KeyError::Traversal);
         }
     }
-    // And a key whose CACHE FILENAME could not exist. Every sidecar and object
-    // file is `escape_key(key)` in one flat directory, and `%` and `/` expand
-    // threefold there, so a key that passes every other check can still be
-    // un-storable: the failure would surface as an opaque ENAMETOOLONG deep in
-    // a transfer instead of a 400 here. 255 is NAME_MAX on the filesystems this
-    // runs on; the escaped length is what has to fit.
-    if crate::cache::store::escape_key(raw).len() > NAME_MAX_BYTES {
-        return Err(KeyError::TooLong);
-    }
+    // The capacity and reservation rules are NOT here: they are properties of
+    // how the cache directory makes its filenames, and `store::storable` answers
+    // both in one question that `resolve_key` asks. (They used to sit half here
+    // and half in the caller, which is how a new artifact family could reserve a
+    // prefix the validator never asked about.)
     Ok(raw.to_string())
 }
 
-/// Reject a CACHE key that would name infrastructure.
+/// Reject a key the cache directory cannot name: too long once escaped, or
+/// reserved for infrastructure. Asked as ONE question of the layout
+/// (`store::storable`), because both rules are properties of how the directory
+/// makes its filenames.
 ///
-/// Only the cache identity is checked, never the provider-side key: the
-/// cache key is what `store::file_path` joins onto `cache_dir`, while the
-/// backend key is only ever sent upstream. Under a bucket alias the two
+/// Only the cache identity is checked for reservation, never the provider-side
+/// key: the cache key is what `store::file_path` joins onto `cache_dir`, while
+/// the backend key is only ever sent upstream. Under a bucket alias the two
 /// differ -- `/googledrive1/redb.db` has the safe cache key
 /// `googledrive1/redb.db` and the backend key `redb.db` -- so checking the
 /// backend key would make a legitimately-named upstream object unfetchable.
-fn reject_reserved_cache_key(cache_key: &str) -> Result<(), KeyError> {
-    if crate::cache::store::is_reserved_key(cache_key) {
-        return Err(KeyError::ReservedName);
+fn reject_unstorable(raw: &str, cache_key: &str) -> Result<(), KeyError> {
+    match crate::cache::store::storable(raw, cache_key) {
+        Ok(()) => Ok(()),
+        Err(crate::cache::store::Unstorable::TooLong) => Err(KeyError::TooLong),
+        Err(crate::cache::store::Unstorable::Reserved) => Err(KeyError::ReservedName),
     }
-    Ok(())
 }
 
 fn percent_decode(s: &str) -> Result<String, KeyError> {
@@ -146,7 +145,7 @@ pub struct ResolvedKey {
 pub fn resolve_key(raw_path: &str, routes: &RouteTable, buckets: &[String]) -> Result<ResolvedKey, KeyError> {
     if let Some((bucket, rest)) = split_bucket(raw_path, buckets) {
         let cache_key = validate_key(raw_path)?;
-        reject_reserved_cache_key(&cache_key)?;
+        reject_unstorable(raw_path, &cache_key)?;
         return Ok(ResolvedKey {
             cache_key,
             // Provider-side name only: it never becomes a local path, so a
@@ -156,7 +155,7 @@ pub fn resolve_key(raw_path: &str, routes: &RouteTable, buckets: &[String]) -> R
         });
     }
     let cache_key = validate_key(raw_path)?;
-    reject_reserved_cache_key(&cache_key)?;
+    reject_unstorable(raw_path, &cache_key)?;
     let upstream_id = routes.resolve(&cache_key).to_string();
     Ok(ResolvedKey { backend_key: cache_key.clone(), cache_key, upstream_id })
 }
@@ -204,20 +203,26 @@ mod tests {
 
     /// A key is only useful if its cache FILENAME can exist, and escaping
     /// expands `%` and `/` threefold in one flat directory. A key that passes
-    /// every other check but cannot be stored must be a 400 here, not an opaque
-    /// ENAMETOOLONG deep inside a transfer.
+    /// every other check but cannot be stored must be refused on the REQUEST
+    /// path, not surface as an opaque ENAMETOOLONG deep inside a transfer.
+    ///
+    /// Asked of `resolve_key`, because that is the seam a request crosses; the
+    /// capacity and reservation rules belong to the layout and are answered in
+    /// one place (`store::storable`).
     #[test]
     fn rejects_a_key_whose_cache_filename_cannot_exist() {
-        let at_limit = "a".repeat(NAME_MAX_BYTES);
-        assert!(validate_key(&at_limit).is_ok(), "a key at the limit still fits");
+        let routes = test_routes();
+        let limit = crate::cache::store::NAME_MAX_BYTES;
+        let at_limit = "a".repeat(limit);
+        assert!(resolve_key(&at_limit, &routes, &[]).is_ok(), "a key at the limit still fits");
 
-        let over = "a".repeat(NAME_MAX_BYTES + 1);
-        assert!(matches!(validate_key(&over), Err(KeyError::TooLong)));
+        let over = "a".repeat(limit + 1);
+        assert!(matches!(resolve_key(&over, &routes, &[]), Err(KeyError::TooLong)));
 
         // Short in raw bytes, but every separator triples on the way to disk.
         let slashes = vec!["ab"; 60].join("/");
-        assert!(slashes.len() < NAME_MAX_BYTES);
-        assert!(matches!(validate_key(&slashes), Err(KeyError::TooLong)));
+        assert!(slashes.len() < limit);
+        assert!(matches!(resolve_key(&slashes, &routes, &[]), Err(KeyError::TooLong)));
     }
 
     #[test]

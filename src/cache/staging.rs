@@ -483,14 +483,7 @@ impl Staging {
             // and give up their bytes in the same breath — the ledger describes
             // what is on disk, so bytes that left it cannot stay accounted.
             let fresh = store::seg_path(&cache_dir, &key, start, end);
-            let mut freed = 0u64;
-            for path in store::key_segment_files(&cache_dir, &key) {
-                if path == fresh {
-                    continue;
-                }
-                freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                let _ = std::fs::remove_file(&path);
-            }
+            let freed = store::remove_key_segments(&cache_dir, &key, Some(&fresh));
             self.ledger.forget(&key, freed).await;
         }
         // One call, one guard: the version, the claim (measured off the file that

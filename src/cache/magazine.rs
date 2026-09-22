@@ -402,8 +402,9 @@ impl Magazine {
     }
 
     /// redb row removal + cache-file deletion for victims collected under a
-    /// state guard. Never call this while holding the guard (C3).
-    pub(crate) async fn delete(&self, victims: &[(String, u64)]) {
+    /// state guard. PRIVATE: the three passes below call it after dropping the
+    /// guard, so no caller ever holds a victim list across one (C3).
+    async fn delete(&self, victims: &[(String, u64)]) {
         if victims.is_empty() {
             return;
         }
@@ -451,18 +452,31 @@ impl Magazine {
 
     /// Inactive-expiry pass: returns the victims whose redb rows and files
     /// the caller must remove via [`Magazine::delete`].
-    pub(crate) async fn reap(&self, ttl_ms: u64, now: u64) -> Vec<(String, u64)> {
+    /// Reap expired entries: select and delete in one call, because the two
+    /// halves have different lock rules — the selection holds the state guard
+    /// (C3), the deletion must not — and a caller that had to sequence them is a
+    /// caller that can get the order wrong. The victim list stays inside: the
+    /// only caller wanted the rows gone, not the roster.
+    pub(crate) async fn reap(&self, ttl_ms: u64, now: u64) {
         let protected = self.spared(now);
-        let mut s = self.state.write().await;
-        reap_collect(&mut s, ttl_ms, now, &protected)
+        let victims = {
+            let mut s = self.state.write().await;
+            reap_collect(&mut s, ttl_ms, now, &protected)
+        };
+        self.delete(&victims).await;
     }
 
     /// Byte/count budget pass: returns the victims that bring the magazine
     /// back under its caps.
-    pub(crate) async fn evict_budget(&self, now: u64) -> Vec<(String, u64)> {
+    /// Bring the magazine inside its byte budget: select under the guard,
+    /// delete outside it. One call, same reason as [`Magazine::reap`].
+    pub(crate) async fn evict_budget(&self, now: u64) {
         let protected = self.spared(now);
-        let mut s = self.state.write().await;
-        evict_pick(&mut s, &self.config, &protected)
+        let victims = {
+            let mut s = self.state.write().await;
+            evict_pick(&mut s, &self.config, &protected)
+        };
+        self.delete(&victims).await;
     }
 
     /// Disk-pressure pass: returns the resident strays to delete for
@@ -476,11 +490,11 @@ impl Magazine {
     /// below the working floor (reserve + pressure margin), evict resident
     /// strays oldest-touched-first until the floor is restored. Strays only:
     /// the byte budget already governs the magazine's own members.
-    pub(crate) async fn reclaim_under_pressure(&self) -> Vec<(String, u64)> {
+    pub(crate) async fn reclaim_under_pressure(&self) {
         let free = store::free_bytes(&self.config.cache_dir).unwrap_or(u64::MAX);
         let floor = DISK_RESERVE_BYTES.saturating_add(DISK_PRESSURE_BYTES);
         if free >= floor {
-            return Vec::new();
+            return;
         }
         let victims = self.reclaim_strays(floor - free).await;
         if !victims.is_empty() {
@@ -489,7 +503,7 @@ impl Magazine {
                 "evicting resident strays: free space is below the working floor"
             );
         }
-        victims
+        self.delete(&victims).await;
     }
 
     /// The staged-bytes check the tick makes: is

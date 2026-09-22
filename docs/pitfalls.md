@@ -382,3 +382,22 @@ entry for being obvious in hindsight — hindsight is the point.
     exactly this, used by ten other tests. *Fix:* wait for the record, not for
     the response — and when a test is flaky, check the baseline first (this one
     was not the change's fault).
+51. **A union is not a substitute for the question.** Two protections answer
+    differently — a lease shelters a whole key, a watch shelters a neighbourhood —
+    and one word covering both ("spared") made the budget stop enforcing itself on
+    watched keys the moment a new module read the union as the budget's answer:
+    `without_a_pin_the_policy_takes_the_oldest_span` caught it. The old comment
+    (`pin_of`: "the callers fall back to sparing the whole key when there is no
+    pin") described one caller and not the other, and nothing in the code said
+    which was which. *Fix:* give each question its own name — `spared` for the
+    union, `verdict` (`{ leased, pin }`) for the budget — and let the compiler
+    keep callers from picking the wrong one.
+
+52. **A refusal that has to be kept in sync is not a refusal.** The front refused
+    the business plane's private surface by naming `/_internal/healthz` exactly,
+    in a crate that does not depend on the plane: a rename on either side
+    silently republished the route, and every internal route added later would
+    have to be remembered. *Fix:* guard the PREFIX (`/_internal/` except the one
+    documented public entry), so growing or renaming a route cannot open it. The
+    same shape as a whitelist that must be updated in two places: prefer the rule
+    that needs no news.
