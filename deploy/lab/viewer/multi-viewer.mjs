@@ -52,6 +52,7 @@ const viewerTimeoutSecs = Number(arg('viewer-timeout-secs', '120'));
 // edgeHIT/edgeMISS columns say whether the run was actually cold.
 const coldBand = args.includes('--cold-band');
 const size = Number(arg('size', '0'));
+const progressSecs = Number(arg('progress-secs', '0'));
 // `--objects a,b,c` gives each viewer its OWN object (the permit-queue case).
 // `--unique-seeds` gives each viewer its own jump positions (the one-pin-per-key
 // case: several viewers on ONE key at DIFFERENT places).
@@ -86,6 +87,30 @@ for (let i = 0; i < viewers; i++) {
   pages.push({ ctx, page });
 }
 const started = Date.now();
+// A long session has to be observable WHILE it runs: this harness reports per
+// viewer at the END, which for a run measured in hours is the same as being
+// blind — a session that dies at minute ten would look exactly like one that is
+// working. One line per interval, read from the page's own live counters (the
+// reader publishes the same object it returns).
+const progress = progressSecs > 0
+  ? setInterval(async () => {
+      const parts = [];
+      for (let i = 0; i < pages.length; i++) {
+        try {
+          const st = await pages[i].page.evaluate(() => {
+            const s = window.__readerStats;
+            return s ? { bytes: s.bytes, requests: s.requests, gaps: s.gaps, hit: s.edgeHIT, miss: s.edgeMISS } : null;
+          });
+          parts.push(st
+            ? `v${i} bytes=${st.bytes} reqs=${st.requests} gaps=${st.gaps} edgeHIT=${st.hit} edgeMISS=${st.miss}`
+            : `v${i} (reader not started)`);
+        } catch (e) {
+          parts.push(`v${i} (unreadable: ${e.message})`);
+        }
+      }
+      console.log(`  [progress +${Math.round((Date.now() - started) / 1000)}s] ${parts.join(' | ')}`);
+    }, progressSecs * 1000)
+  : null;
 // One line per viewer, so a run reports as it goes instead of only at the end.
 const viewerLine = (r) =>
   `  viewer ${r.viewer}: bytes=${r.bytes} requests=${r.requests} gaps>${gapMs}ms=${r.gaps} ` +
@@ -158,6 +183,7 @@ const results = await Promise.all(
     return row;
   }),
 );
+if (progress) clearInterval(progress);
 await browser.close();
 
 const wall = Date.now() - started;

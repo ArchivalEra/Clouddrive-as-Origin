@@ -27,7 +27,8 @@ window.__readRange = async function readRange(opts) {
     return state / 0x100000000;
   };
 
-  const stats = {
+  let stats;
+  window.__readerStats = stats = {
     requests: 0,
     bytes: 0,
     gaps: 0,          // gaps longer than gapMs
