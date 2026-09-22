@@ -334,6 +334,53 @@ fresh offset through the CDN (206, TTFB 1.36 s) — which exercises the upstream
 path, stat plus open plus stream through Google Drive via OpenList, under musl's
 DNS and TLS resolution.
 
+## The neighbouring H1.1 mux, carried against this origin (spike, 2026-09-22)
+
+A sibling repo (`cloudflare-related`, branch `mux-final-20260922`) ships an H1.1
+stream multiplexer: N logical streams inside one H1.1 exchange — uplink framed in
+the request body (`POST /up?sid=N`), downlink in the response body
+(`GET /down?sid=N`), LEB128 frames with policy-chosen random padding, per-stream
+credit flow control and deficit-round-robin scheduling. It does not know what it
+carries (S3, HTTP, arbitrary bytes), and it needs no handshake, no ALPN and no new
+endpoint: it is private to an already-established connection.
+
+**Can it carry THIS origin's traffic?** Its `mux-twohost` boots a front whose job
+is to bridge every mux stream to `ORIGIN_ADDR` as opaque bytes, and its gates ask
+for `/corpus/<n>` — paths this origin does not have.
+`deploy/lab/mux-origin-shim.py` answers them from this origin instead: it rewrites
+the request line to the real key, adds a `Range` for the byte count the path names,
+and splices the exchange, over an `ssh -L` tunnel to the node (the only route to
+the origin that does not pass through the CDN). The gates assert byte counts and
+timing, not content, so the bytes really are this origin's.
+
+Result: **ALL GATES GREEN** — the 5-step WAN sequence, 10 MiB bulk, the
+small-response timing gate, and carrier rotation (the old carrier retires loudly,
+a fresh one serves) — with `bulk 10m: OK 10486282 bytes in 3.52s (2.84 MB/s)`.
+
+Read that number with its handicap: the harness runs the LIBRARY default policy
+(`stream_window = 256 KiB`), which the mux's own README says caps a single stream
+at window/RTT. The same leg, same payload, plain HTTP through the same tunnel
+measured **3.5 MB/s on one connection and 8.8 MB/s with four in parallel** (40 MiB
+in 4.57 s). So on this leg what wins is several connections — the shape this
+project's clients already use (5 MB shards) — and the leg is the cap: 0.6-1.3 MB/s
+per connection through the CDN, 2-3.4 MB/s with a few.
+
+**Through EdgeOne the carrier's fate follows from its wire shape.** The `POST /up`
+half is uncacheable and its body is relayed, so it survives as an opaque body
+(subject to the edge's request-body and time limits). The `GET /down` half is an
+endless streaming response: an edge whose business is buffering dynamic content is
+the wrong place for it, and this origin must never answer such a path with the
+`cache-control: public, immutable` its cache-hit path sets, or the edge would try
+to cache a body that never ends. Neither half can be *terminated* at the edge —
+EdgeOne does not speak a private framing — so the mux can only help on a hop we
+control, and the hop it is designed for (client to origin) is exactly the one a
+CDN breaks into two.
+
+Verdict: a clean, well-instrumented multiplexer (its own doctor passes at
+212 MiB/s aggregate on loopback, with backpressure and rotation exercised), and
+the wrong instrument for this deployment's bottleneck — every limit measured on
+2026-09-22 sits in the link, not in the framing or the number of logical streams.
+
 ## One command from source to a serving node
 
 `deploy/oracle/deploy-node.sh` (run on the workstation) does the whole path and
