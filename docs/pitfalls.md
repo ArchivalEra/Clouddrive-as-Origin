@@ -401,3 +401,20 @@ entry for being obvious in hindsight — hindsight is the point.
     documented public entry), so growing or renaming a route cannot open it. The
     same shape as a whitelist that must be updated in two places: prefer the rule
     that needs no news.
+53. **A scripted edit that PRINTS success may have changed nothing.** Adding
+    `--progress-secs` to `multi-viewer.mjs` with a python `str.replace` whose
+    anchor silently did not match left the file untouched, while the script
+    printed "added" — so the two-hour session ran **completely silent**, with no
+    way to see that anything was wrong until its summary two hours later. The
+    same pattern (edit by `replace`, no assertion, trust the print) is used all
+    over this project's tooling. *Fix:* `assert anchor in text` before every
+    replacement, and `grep` the changed file afterwards. A harness that reports
+    nothing looks exactly like a harness that is working.
+
+54. **A long run has to report while it runs.** Both viewer harnesses printed only
+    at the end (per-viewer rows and a total), which is fine for the LAB's
+    thirty-second runs and useless for a session measured in hours: a run that
+    died at minute ten would look identical to one that is working. *Fix:*
+    `--progress-secs N` on both (`multi-viewer.mjs`, `player-probe.mjs`), reading
+    the page's own live counters (`reader.js` publishes `window.__readerStats`),
+    with `<- NOT PLAYING` on the probe so a player that never starts says so.

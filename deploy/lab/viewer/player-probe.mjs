@@ -17,6 +17,7 @@
 // Usage:
 //   node player-probe.mjs --target <base-url> --object <path> [--page <path>]
 //                         [--play-secs <n>] [--timeout-secs <n>]
+//                         [--progress-secs <n>]
 //   `--object`/`--page` are paths under the target (the LAB serves `media/…`),
 //   not bare keys. `--play-secs` bounds the listening window (default 30, the
 //   length of the LAB's own clip); the probe stops early on `ended` or `error`.
@@ -41,6 +42,7 @@ const objectPath = arg('object', 'media/viewer-object.mp4');
 const pagePath = arg('page', 'media/hello.txt');
 const playSecs = Number(arg('play-secs', '30'));
 const timeoutSecs = Number(arg('timeout-secs', String(playSecs + 20)));
+const progressSecs = Number(arg('progress-secs', '0'));
 const chrome = process.env.CHROME || '/usr/bin/chromium';
 const pwDir = process.env.PW || '/home/archivalera/.npm/_npx/9833c18b2d85bc59/node_modules/playwright-core';
 
@@ -79,6 +81,35 @@ cdp.on('Network.loadingFinished', (e) => {
   const r = wire.find((w) => w.id === e.requestId);
   if (r) r.ms = Date.now() - r.at;
 });
+
+// A long session needs to be observable WHILE it runs: one line per interval
+// with the player's own state and what the wire has carried so far. Read from
+// Node (not from inside the page) so the reporting cannot perturb the run.
+const progress = progressSecs > 0
+  ? setInterval(async () => {
+      try {
+        const state = await page.evaluate(() => {
+          const v = document.querySelector('video');
+          if (!v) return null;
+          return { ready: v.readyState, t: v.currentTime, dur: Number.isFinite(v.duration) ? v.duration : null };
+        });
+        const answered = wire.filter((w) => w.status).length;
+        const declared = wire.reduce((a, w) => a + (w.contentLength || 0), 0);
+        const hits = wire.filter((w) => (w.edge || '').toUpperCase().includes('HIT')).length;
+        const misses = wire.filter((w) => (w.edge || '').toUpperCase().includes('MISS')).length;
+        const started = state && state.ready >= 2;
+        console.log(
+          `  [progress +${Math.round(process.uptime())}s] ` +
+            `t=${state ? state.t.toFixed(0) : '?'}s ready=${state ? state.ready : '?'} ` +
+            `reqs=${wire.length} answered=${answered} declared_bytes=${declared} ` +
+            `edgeHIT=${hits} edgeMISS=${misses}` +
+            (started ? '' : '  <- NOT PLAYING'),
+        );
+      } catch (e) {
+        console.log(`  [progress] unreadable: ${e.message}`);
+      }
+    }, progressSecs * 1000)
+  : null;
 
 const report = await page.evaluate(
   async ({ url, playSecs, timeoutSecs }) => {
@@ -150,6 +181,9 @@ const report = await page.evaluate(
   },
   { url: objectUrl, playSecs, timeoutSecs },
 );
+
+// The session is over: the reporter is the only thing still pending.
+if (progress) clearInterval(progress);
 await ctx.close();
 await browser.close();
 
