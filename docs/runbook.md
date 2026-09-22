@@ -407,6 +407,44 @@ host) and not to one that can (our shard clients do). And through EdgeOne it
 cannot be terminated at the edge at all, so the hop it would help is the one a CDN
 splits in two.
 
+## Standard H2 already does what the private mux was for (measured 2026-09-22)
+
+The mux spike's lesson was "connection count, not speed", so the same question was
+put to plain HTTP/2 through EdgeOne: one connection carrying N concurrent Range
+requests (standard, cacheable 206s) versus N separate connections. Instrument:
+`deploy/lab/probe-h2-vs-conns.sh` (N x 5 MiB, fresh offsets, three repetitions,
+`ss` counts curl's own sockets).
+
+| shape | result |
+| --- | --- |
+| 4 separate connections | 4/4, 4/4, 3/4 completed — 7.9 s, 8.6 s and 16.2 s (one connection lost to the path's stall; an earlier run of this shape hit 90 s) |
+| ONE connection, 4 streams | 3/3 completed, 4.5-6.2 s, `curl sockets=1` — 3.1, 3.4, 4.2 MB/s |
+| ONE connection, N streams | N=4: 3.6 MB/s, N=8: 6.2, N=16: 5.7 (N=1 and N=2 timed out at 60 s: with one connection there is nothing to fall back on when the path stalls) |
+| one connection, 4 streams, edge-warm offsets | 4.95 and **17.36 MB/s** in two consecutive runs — the edge's cache state moves this more than any knob |
+
+So: multiplexing over one connection is *stable* (no per-connection stall to lose)
+and its aggregate rises with the stream count, plateauing around 6 MB/s here
+against ~9.7 MB/s for four connections — a connection-level ceiling, which is what
+a flow-control window governs. This curl (8.21.0, nghttp2) has no window knobs, so
+the ceiling could not be moved from here; hyper's client exposes
+`initial_stream_window_size` / `initial_connection_window_size`, which is the
+knob to test next.
+
+Who can turn that knob is the part that decides whether it is usable:
+
+- **client <-> edge**: the client owns its receive window, so this is tunable — in
+  clients WE ship (a Rust/hyper reader, the LAB harness). Browsers do not expose
+  it.
+- **edge <-> origin**: the EDGE owns that window (our front log shows it speaking
+  h2 to us); nothing on our side changes it, which is the same wall the upstream
+  concurrency experiment hit from the other side.
+
+So the usable form of "an H2 flow-control design" is not a new private protocol
+(the private one cannot be terminated at the edge, and H2 is already the transport
+on both hops) but: **one H2 connection, N concurrent Range streams, with the
+connection and stream windows sized to the BDP of the client's leg** — standard,
+cacheable, and deliverable in our own client code.
+
 ## One command from source to a serving node
 
 `deploy/oracle/deploy-node.sh` (run on the workstation) does the whole path and
