@@ -445,6 +445,95 @@ on both hops) but: **one H2 connection, N concurrent Range streams, with the
 connection and stream windows sized to the BDP of the client's leg** — standard,
 cacheable, and deliverable in our own client code.
 
+## The edge's control plane, from here (tccli, 2026-09-22)
+
+The remaining origin-leg levers are EdgeOne settings rather than code, so the
+console was the only door to them. `deploy/edge/` opens a second one.
+
+```sh
+uv tool install tccli        # tccli 3.1.172.1, the version tested here
+```
+
+Credentials come from the environment and nowhere else -- `TENCENTCLOUD_SECRET_ID`
+and `TENCENTCLOUD_SECRET_KEY`, plus `TENCENTCLOUD_TOKEN` for a temporary key.
+Nothing in `deploy/edge/` writes, echoes or stores them.
+
+```sh
+export TENCENTCLOUD_SECRET_ID=...    # environment, not a file in the repo
+export TENCENTCLOUD_SECRET_KEY=...
+```
+
+### Two traps, both already paid for
+
+**The endpoint.** EdgeOne International is served by
+`teo.intl.tencentcloudapi.com`. tccli 3.x has no international routing at all and
+defaults to the domestic endpoint, where an international key answers
+`AuthFailure.SecretIdNotFound` -- which reads as "wrong key" and is actually
+"wrong endpoint". `eo.sh` sets the international endpoint; override with
+`EO_ENDPOINT` for a domestic account. Confirmed with a black-hole proxy: the same
+call through raw tccli dies trying to reach the proxy, through `eo.sh` it reaches
+the API and comes back with a real `requestId`.
+
+**The proxy.** This workstation exports `HTTP(S)_PROXY=http://127.0.0.1:2080`
+globally, and nothing here may travel through it. `eo.sh` unsets the proxy
+variables before every call, in one place, rather than at each call site where
+one of them would eventually be forgotten.
+
+### Where each knob lives
+
+| knob | layer | API | request field |
+| --- | --- | --- | --- |
+| HTTP/2 to the origin | site-wide | `ModifyL7AccSetting` | `ZoneConfig.UpstreamHTTP2.Switch` |
+| sharded origin pull | rule only | `ModifyL7AccRule` | `Rule.Branches[0].Actions[].RangeOriginPullParameters.Switch` |
+| origin-read timeout, 5-600 s | rule only | `ModifyL7AccRule` | `...HTTPUpstreamTimeoutParameters.ResponseTimeout` |
+| origin address / protocol / ports | per domain | `ModifyAccelerationDomain` | `OriginInfo`, `OriginProtocol`, `Http(s)OriginPort` |
+
+Note the asymmetry that makes a round trip dangerous: the read returns
+`ZoneSetting.UpstreamHttp2` while the write takes `ZoneConfig.UpstreamHTTP2`.
+Copying a read response straight back into a write request drops settings
+silently, so `eo-origin-pull.sh` sends only the block named on the command line
+and diffs the whole setting object afterwards.
+
+### The three scripts
+
+```sh
+deploy/edge/eo.sh <Action> [...]      # one door: proxy stripped, intl endpoint, creds from env
+deploy/edge/eo-audit.sh [ZoneId ...]  # read-only; dumps land in /tmp/eo-audit, outside the repo
+
+deploy/edge/eo-origin-pull.sh --zone <id> --upstream-http2 on              # dry run
+deploy/edge/eo-origin-pull.sh --zone <id> --upstream-http2 on --yes        # apply, re-read, diff
+deploy/edge/eo-origin-pull.sh --zone <id> --range-origin-pull on --rule-id <id> --yes
+deploy/edge/eo-origin-pull.sh --zone <id> --upstream-timeout 60 --rule-id <id> --yes
+```
+
+The write path is dry-run by default and refuses to write without `--yes`. After
+a write it re-reads and prints every field that moved. If the zone is not in the
+state the command asked for -- `upstream-http2` not moving, `upstream-http2`
+moving something else as well, or a *rule* write moving the site-wide setting at
+all -- it exits 3 and names the field. Before and after dumps stay in
+`$EO_DUMP_DIR` (default `/tmp/eo-audit`, deliberately outside the repository, so
+the origin address can never be committed), which is also where the revert value
+sits.
+
+`RangeOriginPull` is rule-scoped on purpose: without `--rule-id` the script
+refuses instead of inventing a rule, because a rule carries a match condition and
+a match condition is an operator's decision. If the zone turns out to have no
+rule to hang it on, that is a finding to report rather than something to paper
+over.
+
+### Proving it without an account
+
+```sh
+bash deploy/edge/selftest.sh
+```
+
+stands a stub `eo.sh` in place of the wrapper, replays recorded responses from
+fixtures, and asserts 25 behaviours -- that the audit names both knobs, that a
+dry run makes no write call, that the after-read shows the intended field moving,
+that an unasked-for change exits 3 and is named, and that the guards refuse a
+rule knob without a rule, an out-of-range timeout, and a missing zone. No
+network, no credentials, no account touched: `VERDICT PASS 25/25` on 2026-09-22.
+
 ## One command from source to a serving node
 
 `deploy/oracle/deploy-node.sh` (run on the workstation) does the whole path and
