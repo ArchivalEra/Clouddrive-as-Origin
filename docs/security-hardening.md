@@ -247,9 +247,17 @@ half is a decision, because it needs an observation only the EdgeOne side can
 make: **does EdgeOne retry a 429, and would that make things worse?** Acceptance:
 A7 on the plane that carries the CDN.
 
-**R9 `ours` — configure and actually test `front_ip_allow`.**
-Once R3's list is authoritative, the allow path (never exercised end to end) gets
-a real assertion, not a config line.
+**R9 `ours` — configure and actually test `front_ip_allow`. CLOSED (2026-09-23).**
+`deploy/oracle/ip-filter-probe.sh` runs ten assertions against a throwaway
+`[::]`-bound instance: the rate ceiling counts the mapped peer (a burst of six
+gets four 429s), `127.0.0.1/32` exempts it through the mapped form (six 200s, zero
+429s), a non-matching allow list exempts nothing, `front_ip_block` drops a mapped
+v4 peer and a pure v6 peer at connection time, an unrelated blocklist answers as
+usual, and a dead business is a `502` with `Cache-Control: private, no-store`.
+R3's authoritative list turned out not to be a prerequisite: `front_ip_allow` is
+only the rate-limit exemption (the connection gate is `front_ip_block` alone),
+and admission is R4's token. Readings and the 502 mapping:
+`docs/runbook.md` ("The front's two IP lists, end to end").
 
 **R10 `infra`/`ours` — make the origin's upstream credential read-only. CLOSED BY DECISION, superseded by isolation (2026-09-23).**
 The owner chose writable ("more convenient") with a stronger mitigation: **network isolation**
