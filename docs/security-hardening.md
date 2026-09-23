@@ -67,10 +67,17 @@ Two more facts, both relevant:
   plan change; R3 stays available to anyone who upgrades.
 - **R5 waits on R4 or on an upgrade**: a host default-deny needs the pull ranges, and without
   R3 there is no authoritative list. Do not build one by guessing or by resolving hostnames.
+- **R4's edge half is done** (2026-09-23): `rule-3usngannhvqa` now carries a third action,
+  `ModifyRequestHeader` setting `X-Origin-Token`, so every origin pull is stamped by the edge
+  — and the free plan accepted it, which was the open question. The secret is a 64-hex value
+  generated in-shell (never printed, never in the repo) and stored on the node as
+  `ORIGIN_TOKEN` in `/opt/origin-cache/origin-cache.env`; the CDN path was re-verified after
+  the write (ranged read 206, exact bytes, TTFB 0.35 s). Revert: remove that action from the
+  rule (`ModifyL7AccRule` with the two remaining actions). The origin-side check is the
+  remaining piece, and it is what turns the stamp into admission control.
 - **R4 is buildable**: the L7 rule model has `ModifyRequestHeaderParameters` →
-  `HeaderActions[{Action: set|del|add, Name, Value}]`, which the edge can use to **set** a
-  header on the request it forwards to the origin (a client cannot spoof a `set`). Whether the
-  free plan accepts that action is untested — one reversible rule write answers it.
+  `HeaderActions[{Action: set|del|add, Name, Value}]`. A client cannot spoof it because the
+  edge **sets** the value rather than appending one.
 
 ## Requirements
 
