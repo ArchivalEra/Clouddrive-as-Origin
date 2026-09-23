@@ -1908,28 +1908,23 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                             // path — `growing_reader_from(0, want)` — so a
                             // `bytes=0-N` shard never gets promised the
                             // whole file.)
-                            if r.offset >= meta.size_bytes {
-                                return Err(BackendError::RangeNotSatisfiable);
-                            }
-                            // The last byte asked for, inclusive, clamped to the
-                            // object: this is the one site whose range is
-                            // resolved here rather than by `resolve_range`, and
-                            // the shared constructor takes an exclusive end.
-                            let last = r.length.map_or(meta.size_bytes.saturating_sub(1), |l| {
-                                (r.offset + l).saturating_sub(1).min(meta.size_bytes - 1)
-                            });
-                            let want = last.saturating_sub(r.offset).saturating_add(1);
+                            // One clamp for the whole crate: `resolve_range`
+                            // answers exactly this question (offset checked,
+                            // exclusive end), so this site no longer derives it
+                            // by hand.
+                            let (start, end) = resolve_range(Some(r), meta.size_bytes)?;
+                            let want = end - start;
                             return Ok(CacheHit {
                                 outcome: CacheOutcome::Miss,
                                 meta: meta_out,
                                 content_range: ContentRange::for_span(
                                     meta.size_bytes,
-                                    r.offset,
-                                    r.offset + want,
+                                    start,
+                                    start + want,
                                     true,
                                 ),
                                 content_length: Some(want),
-                                body: flight::growing_reader_from(flight, r.offset, Some(want)),
+                                body: flight::growing_reader_from(flight, start, Some(want)),
                                 source: BodySource::Upstream,
                             });
                         }
@@ -2236,8 +2231,32 @@ mod tests {
     use crate::testsupport::CacheTestExt;
     use tempfile::tempdir;
 
-
-
+    /// The clamp the whole crate shares (ADR-0021's "one construction site"):
+    /// a bounded range that runs past the end is TRUNCATED to it, an unbounded
+    /// one ends at it, and a range starting at or past the end is refusable.
+    /// Written because removing `.min(total)` turned no test red — this rule
+    /// was load-bearing and unasserted.
+    #[test]
+    fn resolve_range_clamps_to_the_object() {
+        let total = 1000;
+        // A bounded range inside the object is itself.
+        assert_eq!(resolve_range(Some(ByteRange { offset: 10, length: Some(90) }), total).unwrap(), (10, 100));
+        // Past the end: truncated, not refused.
+        assert_eq!(resolve_range(Some(ByteRange { offset: 900, length: Some(500) }), total).unwrap(), (900, total));
+        // Unbounded: to the end.
+        assert_eq!(resolve_range(Some(ByteRange { offset: 900, length: None }), total).unwrap(), (900, total));
+        // No range: the whole object, as (0, total).
+        assert_eq!(resolve_range(None, total).unwrap(), (0, total));
+        // At or past the end: 416, never a zero-length span.
+        assert!(matches!(
+            resolve_range(Some(ByteRange { offset: total, length: Some(1) }), total),
+            Err(BackendError::RangeNotSatisfiable)
+        ));
+        assert!(matches!(
+            resolve_range(Some(ByteRange { offset: total + 5, length: None }), total),
+            Err(BackendError::RangeNotSatisfiable)
+        ));
+    }
 
     fn test_cache(
         dir: std::path::PathBuf,
