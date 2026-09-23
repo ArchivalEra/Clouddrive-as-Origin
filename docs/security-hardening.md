@@ -240,12 +240,20 @@ plus A1/A4.
 8080/8081, 4330, 44321, 8471, 20241) stay loopback; nothing new gets published
 without a line in this document.
 
-**R8 `ours` — decide and set a per-IP rate ceiling.**
-Today `front_rate_rps = 0` (off) on both planes. `deploy/oracle/rate-limit-probe.sh`
-already proves the mechanism on a throwaway loopback instance; the production
-half is a decision, because it needs an observation only the EdgeOne side can
-make: **does EdgeOne retry a 429, and would that make things worse?** Acceptance:
-A7 on the plane that carries the CDN.
+**R8 `ours` — a per-IP rate ceiling. DECIDED, and the answer is "off on the CDN-facing plane" (2026-09-23).**
+Measured on the production plane in three short windows (ceiling 1 rps plus the
+loopback exemption so the node's own probes keep working; reverted after each,
+`accept.sh` PASS): the edge fans one burst across **ten** distinct pull IPs, so a
+per-IP ceiling produced only one or two 429s per eight client requests — and **the
+viewer never saw a 429**: every response was `206`, with the failure surfacing as
+a 206 whose body was short or empty (from the node's clean vantage, one 429 went
+with exactly one empty-bodied 206, while the asks outnumbered the requests ~2:1).
+A gate whose peers are the edge's own pull nodes and whose failure is invisible is
+worse than no gate. `front_rate_rps` stays 0 on the CDN plane; the mechanism
+remains available for a plane with many untrusted clients. Readings:
+`docs/runbook.md` ("Would rate limiting be safe to enable?"). Acceptance: A7 is
+met by the LAB arm (`config-f.toml`, 2 rps) — the production plane is documented
+as intentionally unthrottled.
 
 **R9 `ours` — configure and actually test `front_ip_allow`. CLOSED (2026-09-23).**
 `deploy/oracle/ip-filter-probe.sh` runs ten assertions against a throwaway

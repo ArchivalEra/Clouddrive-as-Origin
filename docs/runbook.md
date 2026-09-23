@@ -100,12 +100,38 @@ removes it. Measured 2026-09-21: the third request in a second is refused
 counted rather than raced past (three refused), and the business plane is not
 rate limited — the gate is the front's own, on the front's port.
 
-The other half is a decision, because a 429 arrives at the EDGE: whether EdgeOne
-retries it (and how hard) is its contract, not ours to discover unattended.
-Enabling it is one line in the production config plus a restart; watch
-`front_requests_total{status="429"}` on 9090 and the origin's access log for a
-retry pattern (a rising request rate on unchanged keys), and roll back by
-removing the same line. The probe prints this procedure too.
+The other half was measured on 2026-09-23, on the production plane, in three
+short windows: the ceiling set to 1 rps with the loopback exemption added (so the
+node's own probes keep working — the path R9 proved), reverted after each, with
+`accept.sh` PASS afterwards.
+
+```
+a burst of 8 concurrent cold 1 MiB reads, fresh band at 70 GiB
+  from the NODE  : origin saw 15 asks -> 14 x 206, 1 x 429, across TEN distinct pull IPs
+                   viewer saw all 206; ONE of them with an empty body (0.45 s)
+  from this box  : origin saw 14 asks -> 13 x 206, 2 x 429, ten distinct pull IPs
+                   viewer saw all 206; two empty, one truncated at 36 KB after 45 s
+                   (and this box reproduces short bodies with the ceiling OFF, so
+                    its damage is its own vantage - see "Requests are slow")
+```
+
+Two findings, and the second is why the ceiling stays off:
+
+- **A per-IP ceiling barely bites here.** The edge fans one burst across ~10 pull
+  nodes — ten distinct `peer=` addresses, measured twice — so 1 rps per IP
+  produced one or two 429s per eight client requests.
+- **The viewer never sees the 429.** Every client response was `206`; the failure
+  surfaces as a 206 whose body is short or empty. From the node's clean vantage,
+  the one 429 in the window went with exactly one empty-bodied 206, while the asks
+  outnumbered the requests ~2:1 — so the edge re-asks rather than propagating the
+  status. A client cannot tell that apart from a stall, and its own cache label
+  still reads `206`.
+
+So `front_rate_rps` stays **0 on the CDN-facing plane**: its peers are the edge's
+own pull nodes, and its failure mode is invisible. The mechanism stays available
+for a plane with many untrusted clients (the LAB's `config-f.toml` runs at 2 rps).
+If it is ever turned on here, watch `front_requests_total{status="429"}` on 9090
+plus the front-access log; rollback is the same line removed.
 
 ## Looking at ONE key (2026-09-21)
 
