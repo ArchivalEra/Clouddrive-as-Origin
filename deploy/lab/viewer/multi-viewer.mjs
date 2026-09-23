@@ -17,7 +17,15 @@
 //   `media/…`, the CDN serves `googledrive1/…`), not bare keys.
 //                         [--viewers 4] [--chunks 64] [--chunk-bytes 262144]
 //                         [--seeks 4] [--gap-ms 1500] [--viewer-timeout-secs 120]
-//                         [--cold-band] [--unique-seeds]
+//                         [--cold-band] [--unique-seeds] [--retries 0]
+//                         [--attempt-timeout-secs 0]
+//   `--retries N` lets a viewer survive a leg that drops a fetch: a failed
+//   attempt is retried (resuming at the first missing byte) and counted in the
+//   report. Default 0 keeps the strict reading — every other probe still fails
+//   on the first bad fetch. A long session is the reason the knob exists.
+//   `--attempt-timeout-secs N` turns a stalled attempt into a failed one, which
+//   is the only way `--retries` can act on a hang.
+//   `--max-bytes N` raises the reader's 64 MiB hard stop; a long session has to.
 //   `--cold-band` gives each viewer a fresh band and a fresh jump seed so the
 //   run is cold; check `edgeMISS` in the report before believing it.
 //   A viewer that times out is reported as one failed row, not as a lost run.
@@ -45,6 +53,18 @@ const gapMs = Number(arg('gap-ms', '1500'));
 // killed, which produced no numbers at all. A timeout turns that into one
 // failed viewer plus everybody else's rows.
 const viewerTimeoutSecs = Number(arg('viewer-timeout-secs', '120'));
+// Failed fetches a viewer is allowed to retry before the run fails. See the
+// usage note: 0 everywhere except a long session.
+const retries = Number(arg('retries', '0'));
+// A hang is not a rejection, so retries alone cannot see it. With this set, an
+// attempt that stops making progress for N seconds is aborted and retried (or
+// fails the run, at retries 0). 0 = the old behaviour: wait forever, bounded
+// only by --viewer-timeout-secs.
+const attemptTimeoutSecs = Number(arg('attempt-timeout-secs', '0'));
+// The reader's own hard stop (`maxBytes`), in bytes. Its default suits a probe;
+// a session that intends to move gigabytes has to say so, or it stops (capped)
+// at 64 MiB. 0 = leave the reader's default alone.
+const maxBytes = Number(arg('max-bytes', '0'));
 // `--cold-band`: give every viewer a fresh band of the object, different on
 // every run, and a fresh jump seed. Without it the reader's seeds are fixed
 // constants, so a second run of the same command re-reads offsets the edge has
@@ -99,10 +119,10 @@ const progress = progressSecs > 0
         try {
           const st = await pages[i].page.evaluate(() => {
             const s = window.__readerStats;
-            return s ? { bytes: s.bytes, requests: s.requests, gaps: s.gaps, hit: s.edgeHIT, miss: s.edgeMISS } : null;
+            return s ? { bytes: s.bytes, requests: s.requests, gaps: s.gaps, hit: s.edgeHIT, miss: s.edgeMISS, retries: s.retries } : null;
           });
           parts.push(st
-            ? `v${i} bytes=${st.bytes} reqs=${st.requests} gaps=${st.gaps} edgeHIT=${st.hit} edgeMISS=${st.miss}`
+            ? `v${i} bytes=${st.bytes} reqs=${st.requests} gaps=${st.gaps} retries=${st.retries ?? 0} edgeHIT=${st.hit} edgeMISS=${st.miss}`
             : `v${i} (reader not started)`);
         } catch (e) {
           parts.push(`v${i} (unreadable: ${e.message})`);
@@ -117,6 +137,7 @@ const viewerLine = (r) =>
   `worst=${r.worstGapMs}ms sum=${r.gapTotalMs}ms ` +
   `seekTTFB p50=${r.seekTtfbMs?.length ? r.seekTtfbMs.slice().sort((a, b) => a - b)[Math.floor(r.seekTtfbMs.length / 2)] : '-'}ms ` +
   `edgeHIT=${r.edgeHIT ?? '-'} edgeMISS=${r.edgeMISS ?? '-'} jumps=${r.jumps ?? '-'} elapsed=${r.elapsedMs ?? '-'}ms ` +
+  `retries=${r.retries ?? 0}${r.retryWaitMs ? ` (+${r.retryWaitMs}ms waiting${r.lastRetryError ? `, last: ${r.lastRetryError}` : ''})` : ''} ` +
   `ck=${r.checksum}${r.error ? ' ERROR=' + r.error : ''}${r.aborted ? ' (capped)' : ''}`;
 
 /// A viewer's band: `size/viewers` apart, so no two viewers share bytes, plus a
@@ -151,6 +172,9 @@ const results = await Promise.all(
       chunks,
       seeks,
       gapMs,
+      retries,
+      attemptTimeoutMs: attemptTimeoutSecs * 1000,
+      ...(maxBytes > 0 ? { maxBytes } : {}),
       // `url` and the per-object form already carry `?size=`: append the band,
       // never rebuild the query (a doubled `size` parsed as NaN and every jump
       // offset became NaN — measured, one 416).
@@ -198,6 +222,7 @@ console.log(
   `total: bytes=${sum((r) => r.bytes)} requests=${sum((r) => r.requests)} gaps=${sum((r) => r.gaps)} ` +
     `gapTotalMs=${sum((r) => r.gapTotalMs)} worstGapMs=${Math.max(...results.map((r) => r.worstGapMs))} ` +
     `seekTTFB p50=${p(0.5)}ms p90=${p(0.9)}ms wall=${wall}ms errors=${results.filter((r) => r.error).length} ` +
+    `retries=${sum((r) => r.retries ?? 0)} ` +
     `checksums=${new Set(results.filter((r) => !r.error).map((r) => r.checksum)).size} ` +
     `edgeHIT=${sum((r) => r.edgeHIT ?? 0)} edgeMISS=${sum((r) => r.edgeMISS ?? 0)}`,
 );
