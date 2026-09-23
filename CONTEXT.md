@@ -11,7 +11,8 @@ storage provider, answers ranged reads from what it holds, and pulls the rest. I
 is not a media server and knows nothing about content types — a 200 GiB video, a
 100 GiB tarball, a VM image and a database dump are the same object to it. The
 video case is the *motivating* one (a viewer scrubbing a 30-hour file), never a
-special case in the code.
+special case in the code. What a viewer needs beyond bytes — a manifest, MSE, a
+player page — is the client's packaging, not this service's (ADR-0026).
 
 ## Domain terms
 
