@@ -32,6 +32,13 @@ class Logging(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    # A media element aborts and re-requests constantly — that IS its shape — so
+    # a broken pipe is an expected event here, not a server error. It gets
+    # reported as part of the request line instead of as a traceback, and the
+    # default handler stops printing tracebacks over the log.
+    def handle_error(self, *args):
+        pass
+
     def do_GET(self):
         path = self.path.split("?")[0].lstrip("/")
         full = os.path.join(ROOT, path)
@@ -66,25 +73,30 @@ class Logging(BaseHTTPRequestHandler):
         self.end_headers()
         began = time.monotonic()
         sent = 0
-        with open(full, "rb") as f:
-            f.seek(start)
-            remaining = length
-            while remaining > 0:
-                chunk = f.read(min(262144, remaining))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                sent += len(chunk)
-                remaining -= len(chunk)
-                if RATE > 0:
-                    # Pace the writer: after sending `sent` bytes the response
-                    # should have taken sent/RATE seconds in total.
-                    owed = sent / RATE - (time.monotonic() - began)
-                    if owed > 0:
-                        time.sleep(owed)
+        aborted = False
+        try:
+            with open(full, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(262144, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+                    remaining -= len(chunk)
+                    if RATE > 0:
+                        # Pace the writer: after sending `sent` bytes the response
+                        # should have taken sent/RATE seconds in total.
+                        owed = sent / RATE - (time.monotonic() - began)
+                        if owed > 0:
+                            time.sleep(owed)
+        except (BrokenPipeError, ConnectionResetError):
+            aborted = True  # the client hung up: a cancel, not a failure
         print(
             f"{time.monotonic() - T0:8.3f}  {path}  {self.headers.get('Range') or '-'}  "
-            f"sent={sent}  dur={time.monotonic() - began:.3f}s  status={status}",
+            f"sent={sent}  dur={time.monotonic() - began:.3f}s  status={status}"
+            + ("  ABORTED" if aborted else ""),
             flush=True,
         )
 

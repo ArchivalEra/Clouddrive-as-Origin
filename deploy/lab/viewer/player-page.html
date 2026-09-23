@@ -74,6 +74,15 @@ async function boot() {
       p.events.push({ t: t(), ev: 'fanout-registration-failed', msg: String(e) });
     }
   }
+  // `?plain=1` skips hls.js entirely and hands the media element the URL: an
+  // ordinary progressive MP4, read with open-ended ranges. That shape needs no
+  // packaging at all — it is what the product's object already is.
+  if (q.get('plain')) {
+    p.events.push({ t: t(), ev: 'plain' });
+    v.src = src;
+    v.play().catch((e) => p.events.push({ t: t(), ev: 'play-rejected', msg: String(e) }));
+    return;
+  }
   start();
 }
 boot();
