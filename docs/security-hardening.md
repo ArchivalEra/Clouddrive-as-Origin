@@ -92,6 +92,18 @@ Two more facts, both relevant:
   It prints the `ConfirmOriginACLUpdate` step when Tencent announces a new version; doing that
   needs write access, so it is left to whoever holds it. Self-tested (`--self-test`, twelve
   checks over both authorities, the refusal, idempotence and the pending-update path).
+- **R3 is closed with a decision, not left open** (infra side, 2026-09-23 — recorded in
+  `~/.oci/perimeter-hardening-20260923/R3-outcome.md` on this workstation): 7777 stays
+  world-reachable at the perimeter **by design**, because R4 identifies the caller at the
+  application layer and the plan cannot publish a binding range list. The whitelist applied
+  2026-09-23 (22, 7777, proxy-stack ports, ICMP) stands; the infra side independently
+  verified all four arms of the token test (external 403, CDN 206, loopback 200/206 by probe
+  shape, `peer=` in journald) and keeps the revert at
+  `~/.oci/perimeter-hardening-20260923/revert.sh`. The upgrade-day runbook (enable →
+  `--fetch` → `emit-oci` → merge only the 7777 rule → verify A1+A4 in the same session) is in
+  that same file; two additions when that day comes: require `AUTH=yes` from the tool before
+  merging (report mode does not fail on `AUTH=no`, so grep the `meta` line), and after
+  applying a new family, confirm it (`ConfirmOriginACLUpdate`) so Tencent stops announcing.
 - **R5** stays the infrastructure agent's: with the token live (R4) a default-deny can be
   written against the token, and with this tool the pull-range arm can be kept in step once
   origin protection is available.
