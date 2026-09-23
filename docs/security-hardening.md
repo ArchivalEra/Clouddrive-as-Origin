@@ -58,8 +58,19 @@ Two more facts, both relevant:
   untouched, as required.
 - **R3 is unblocked** — the authoritative list exists and is API-driven; see R3 below. It was
   previously "stop and report" only because the source was unknown.
-- **R5 waits on R3 step 2**: a host default-deny is only safe once the origin-pull ranges are
-  known and applied.
+- **R3 is plan-gated, not missing.** The ranges are published through the origin-protection
+  API, but enabling it is refused on the free plan — verbatim error code:
+  `OperationDenied.PlanNotSupportOriginProtection` ("the plan does not support origin
+  protection"; announcement: https://www.tencentcloud.com/announce/detail/100833). Attempted
+  2026-09-23 with `EnableOriginACL --L7EnableMode specific --L7Hosts '["cdn-oracle.isui.ren"]'`;
+  the zone still reads `Status: "offline"`. **R4 is now the primary path** because it needs no
+  plan change; R3 stays available to anyone who upgrades.
+- **R5 waits on R4 or on an upgrade**: a host default-deny needs the pull ranges, and without
+  R3 there is no authoritative list. Do not build one by guessing or by resolving hostnames.
+- **R4 is buildable**: the L7 rule model has `ModifyRequestHeaderParameters` →
+  `HeaderActions[{Action: set|del|add, Name, Value}]`, which the edge can use to **set** a
+  header on the request it forwards to the origin (a client cannot spoof a `set`). Whether the
+  free plan accepts that action is untested — one reversible rule write answers it.
 
 ## Requirements
 
@@ -73,43 +84,36 @@ Port 5244 is the gateway to the content store and holds its credentials. Bind it
 to loopback (OpenList's own config) and block 5244 at the perimeter. The origin
 must keep reaching it at `127.0.0.1:5244`. Acceptance: A2.
 
-**R3 `infra` + `edgeone` — restrict the origin port (7777) to EdgeOne's origin-pull ranges.**
+**R3 `edgeone` + `infra` — restrict the origin port to EdgeOne's origin-pull ranges. Plan-gated (see Status).**
+Kept here because it is the cleanest end state if the plan ever changes: `EnableOriginACL`
+first (only then does EdgeOne pull exclusively from the family's ranges), then apply the
+312 IPv4 + 184 IPv6 CIDRs of `gaz-0.0.4-20260907` as a **set** (OCI NSG / nftables), then poll
+`DescribeOriginACL` about every three days and on a non-empty `NextOriginACL` apply the new
+ranges and `ConfirmOriginACLUpdate`. Revert: `DisableOriginACL`. `DescribeOriginProtection`
+is the old API (superseded 2025-06-27) — do not use it.
 
-The authoritative list exists and is API-driven. **Do not guess CIDRs, and do not derive
-them by resolving hostnames** — Tencent publishes them through the origin-protection API,
-as versioned families, with a documented refresh pattern.
+**R4 `ours` + `edgeone` — an origin-access token, which needs no plan change. Primary path.**
+The edge sets a header on the request it forwards to the origin; the origin requires that
+header. Consequences: a direct hit on the origin port fails (403) even though the port is
+open, the CDN path is untouched, and nothing depends on IP churn.
 
-Read-only findings, 2026-09-23, with the sub-account
-(`--endpoint teo.intl.tencentcloudapi.com`, proxies unset):
+- Edge side (`edgeone`, one rule write, reversible by removing the action): add
+  `ModifyRequestHeaderParameters` with `HeaderActions: [{Action: "set", Name: "<name>",
+  Value: "<secret>"}]` to `rule-3usngannhvqa`. Read the rule back afterwards and diff it —
+  reading and writing use different field spellings (pitfall 48), so write only that action.
+  The capability on the free plan is unknown; that is what this write finds out.
+- Origin side (`ours`): a config knob naming the header and the env var holding the secret
+  (same shape as `prewarm_shared_secret_env`, compared with `sigv4::constant_time_eq`), a
+  boot warning when the env var is named but unset, and an exemption for loopback peers so the
+  node's own probes (`accept.sh`, LAB) keep working. Default off, so the knob cannot change
+  behaviour until it is deliberately turned on.
+- Acceptance: A8 plus A4. A8: from an external host, a plain GET on `https://<node-ip>:7777/…`
+  returns 403 (today it returns 200); from the node, the same request on `127.0.0.1:7777`
+  returns 206; and through the CDN a ranged read still returns 206 with the exact byte count.
+  Any failure → remove the rule action and unset the knob.
 
-- `DescribeAvailableOriginACLFamily` → one family for this zone:
-  **`gaz-0.0.4-20260907`**, `ActiveTime 2026-10-12T00:00:00+08:00`,
-  **312 IPv4 + 184 IPv6 CIDRs**. (`gaz` = global standard control domain; `mlc` = China,
-  `emc` = overseas-excluding-China; the `plat-*` families are lite variants with fewer
-  ranges, for approved accounts.)
-- `DescribeOriginACL` for `zone-3taqnjqfr1zo` → `Status: "offline"`: origin protection is
-  not enabled, so today EdgeOne pulls from whatever it likes and no allowlist can be correct
-  yet.
-- `DescribeOriginProtection` is the **old API, superseded 2025-06-27** — use
-  `DescribeOriginACL`.
-
-Order matters: an allowlist applied before the feature is on would block the pull nodes
-EdgeOne actually uses today.
-
-1. `EnableOriginACL` on the zone. From then on EdgeOne pulls **only** from the `gaz`
-   ranges. Revert: `DisableOriginACL` (which also stops update notifications).
-2. Apply that family's CIDRs to the perimeter — the OCI security list / NSG covering 7777,
-   or an nftables set on the host. 496 CIDRs is a **set to be reloaded by a timer**, not
-   496 hand-written rules.
-3. Refresh: poll `DescribeOriginACL` about every three days (Tencent's own suggested
-   cadence). If `NextOriginACL` comes back non-empty, apply the new ranges, then call
-   `ConfirmOriginACLUpdate` so the notifications stop.
-4. `ModifyOriginACL` binds or unbinds specific domains/instances to the protection; any
-   domain added later goes through it.
-
-Acceptance: A1 and A4 verified **in the same session** as step 2, plus the applied set's
-count equal to the family's count (312 + 184), and the ordering visible in the change log
-(enabled before applied).
+**R5 `infra` — a host firewall with default-deny inbound.** Blocked until R3 or R4 lands: a
+default-deny needs to know which peers legitimately pull.
 
 **R4 `ours`, blocked on a capability check — an origin-access secret instead of an IP list.**
 If EdgeOne can inject a request header on origin pull, the front can require it
@@ -174,6 +178,9 @@ cap and at least one alert condition (unit down, disk watermark, healthz).
 - **A6** a `PUT` with the origin's credential fails (403) and reads still return
   206.
 - **A7** (after R8) a burst from one IP gets 429s while a normal read is served.
+- **A8** (after R4) an external plain GET on `https://<node-ip>:7777/googledrive1/test-page.html`
+  returns 403 (today: 200), the same request from the node on `127.0.0.1:7777` returns 206,
+  and A4 still passes.
 
 ## Rollback
 
