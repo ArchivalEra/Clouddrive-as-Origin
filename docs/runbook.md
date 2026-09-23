@@ -1148,6 +1148,16 @@ question is precisely **the media element's request stream against the CDN**, an
 the instrument it needs is a CDP dump of the browser's full request *and*
 response headers on one offset — not another vantage.
 
+**Do not read "300 bytes" as the failure by itself.** The LAB's own player run —
+working, against the origin with no CDN — also records its first `bytes=0-` as 300
+bytes: that is what an open-ended request looks like when the media element
+abandons it and moves on. The discriminator is not the first row but whether ANY
+request afterwards transfers a body. In the LAB the next two deliver 9,316 and
+3,146,028 bytes and playback proceeds (`played=30s/30s`, `ready=4`); through the
+CDN every one of 249 requests reports 300 bytes and none delivers. Section 15 of
+`--quick` after the probe change: `VERDICT: the player played it through`
+(75 PASS / 0 FAIL overall).
+
 ### The window decision: a jump pays the floor (ADR-0024, 2026-09-22)
 
 The reading that motivated it, and the reading after it, both on the node
