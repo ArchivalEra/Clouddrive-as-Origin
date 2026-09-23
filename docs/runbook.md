@@ -1650,6 +1650,9 @@ Two files carry the rest:
   Read it before an experiment, and add to it after one that surprises you.
 - **`docs/adr/README.md`** — one line per decision, which ones amend which, and
   the cross-cutting rule (ADR-0012: a guard is a deadline, not an exemption).
+- **`docs/security-hardening.md`** — the origin's public surface as measured, and
+  the requirements that close it (perimeter is OCI-side; the node has no host
+  firewall). Read it before touching the node's ports or the CDN's origin pull.
 
 Three modes, in rising cost:
 
