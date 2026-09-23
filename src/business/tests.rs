@@ -36,29 +36,16 @@ fn base(bytes: &[u8]) -> FixtureBuilder {
 
 /// Single-upstream ("primary") fixture. `extra` adds more upstreams
 /// (used for the bucket-alias test). `missing` makes every key absent.
-fn fixture(bytes: &[u8], etag: Option<&str>, extra: Vec<(&str, Vec<u8>)>, missing: bool) -> Fixture {
-    base(bytes).etag(etag).extra(extra).missing(missing).build()
-}
-
-/// Full fixture: `direct` is the Tier 1 link the backend offers
-/// (None = Tier 3 fallback); `redirect` flips primary to
-/// `cold_miss = "redirect"`.
-fn fixture_full(
-    bytes: &[u8],
-    etag: Option<&str>,
-    extra: Vec<(&str, Vec<u8>)>,
-    missing: bool,
-    direct: Option<&str>,
-    redirect: bool,
-) -> Fixture {
-    let builder = base(bytes).etag(etag).extra(extra).missing(missing).direct(direct);
-    if redirect {
-        builder.redirect().build()
-    } else {
-        builder.build()
-    }
-}
-
+///
+/// The two positional constructors that used to sit here (`fixture`, with four
+/// arguments, and `fixture_full`, with six) are gone: a call site that read
+/// `fixture_full(b, None, vec![], false, Some(url), true)` said nothing about
+/// which of those was which, so those sites now chain the builder instead
+/// (`base(b).direct(Some(url)).redirect().build()`). What remains below are the
+/// two NAMED SHAPES, where the argument IS the shape and a chain would only be
+/// longer: the session window an efficient fixture stages, and the no-disk
+/// profile.
+///
 /// Efficient-profile fixture with the session window pinned to the span
 /// the test means to stage. A run fetches its whole WINDOW (ADR-0016), so
 /// the production 64 MiB default would stage this whole ten-byte fixture
@@ -117,7 +104,7 @@ fn range_parser_shapes() {
 
 #[tokio::test]
 async fn get_hit_s3_shape() {
-    let fx = fixture(b"0123456789", Some("abc123"), vec![], false);
+    let fx = base(b"0123456789").etag(Some("abc123")).build();
     prime(&fx, "a.bin").await;
     let resp = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
     let (status, h, body) = body_text(resp).await;
@@ -134,7 +121,7 @@ async fn get_hit_s3_shape() {
 
 #[tokio::test]
 async fn request_ids_unique_per_response() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     prime(&fx, "a.bin").await;
     let r1 = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
     let r2 = get_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
@@ -146,7 +133,7 @@ async fn request_ids_unique_per_response() {
 
 #[tokio::test]
 async fn get_missing_is_nosuchkey_xml() {
-    let fx = fixture(b"0123456789", None, vec![], true);
+    let fx = base(b"0123456789").missing(true).build();
     // Missing on a fresh cache: stat the backend once to confirm absence.
     let resp = get_key(State(fx.state.clone()), Path("nope.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
     let (status, h, body) = body_text(resp).await;
@@ -160,7 +147,7 @@ async fn get_missing_is_nosuchkey_xml() {
 
 #[tokio::test]
 async fn get_unsatisfiable_is_invalidrange_xml() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     prime(&fx, "a.bin").await;
     let resp = get_key(
         State(fx.state.clone()),
@@ -178,7 +165,7 @@ async fn get_unsatisfiable_is_invalidrange_xml() {
 
 #[tokio::test]
 async fn get_multi_range_rejected() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     prime(&fx, "a.bin").await;
     let resp = get_key(
         State(fx.state.clone()),
@@ -195,7 +182,7 @@ async fn get_multi_range_rejected() {
 
 #[tokio::test]
 async fn get_suffix_ranges() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     prime(&fx, "a.bin").await;
     // Last 3 bytes.
     let resp = get_key(
@@ -227,7 +214,7 @@ async fn get_suffix_ranges() {
 
 #[tokio::test]
 async fn head_hit_no_backend_no_body() {
-    let fx = fixture(b"0123456789", Some("v1"), vec![], false);
+    let fx = base(b"0123456789").etag(Some("v1")).build();
     prime(&fx, "a.bin").await;
     reset(&fx);
     let resp = head_key(State(fx.state.clone()), Path("a.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone()))
@@ -245,7 +232,7 @@ async fn head_hit_no_backend_no_body() {
 
 #[tokio::test]
 async fn head_ranged_returns_200_with_range_length() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     prime(&fx, "a.bin").await;
     reset(&fx);
     let resp = head_key(
@@ -273,14 +260,10 @@ async fn head_ranged_returns_200_with_range_length() {
 /// has to be made on purpose rather than by accident.
 #[tokio::test]
 async fn head_never_redirects_even_when_get_does() {
-    let fx = fixture_full(
-        b"0123456789",
-        None,
-        vec![],
-        false,
-        Some("https://cdn.example.com/f?sign=x"),
-        true,
-    );
+    let fx = base(b"0123456789")
+        .direct(Some("https://cdn.example.com/f?sign=x"))
+        .redirect()
+        .build();
     let get = get_key(
         State(fx.state.clone()),
         Path("a.bin".into()),
@@ -342,7 +325,7 @@ async fn head_on_nocache_reports_shape_without_touching_disk() {
 
 #[tokio::test]
 async fn head_missing_404_empty_shares_negative_cache() {
-    let fx = fixture(b"0123456789", None, vec![], true);
+    let fx = base(b"0123456789").missing(true).build();
     let resp = head_key(State(fx.state.clone()), Path("gone.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone()))
         .await;
     let (status, _, body) = body_text(resp).await;
@@ -359,7 +342,7 @@ async fn head_missing_404_empty_shares_negative_cache() {
 
 #[tokio::test]
 async fn head_stale_costs_one_stat_no_open() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     prime(&fx, "a.bin").await;
     // Age past revalidate_ttl (60 s default): HEAD must re-stat (fresh),
     // but still never opens a flight or reads bytes.
@@ -377,7 +360,7 @@ async fn head_stale_costs_one_stat_no_open() {
 
 #[tokio::test]
 async fn bucket_alias_pins_upstream() {
-    let fx = fixture(b"AAA", None, vec![("archive", b"BBB".to_vec())], false);
+    let fx = base(b"AAA").extra(vec![("archive", b"BBB".to_vec())]).build();
     // Legacy path routes "" → primary.
     let resp = get_key(State(fx.state.clone()), Path("f.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
     let (_, _, body) = body_text(resp).await;
@@ -390,7 +373,7 @@ async fn bucket_alias_pins_upstream() {
 
 #[tokio::test]
 async fn redirect_cold_307_and_background_fill() {
-    let fx = fixture_full(b"0123456789", None, vec![], false, Some("https://cdn.example.com/f?sign=x"), true);
+    let fx = base(b"0123456789").direct(Some("https://cdn.example.com/f?sign=x")).redirect().build();
     let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
     let (status, h, body) = body_text(resp).await;
     assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
@@ -408,7 +391,7 @@ async fn redirect_cold_307_and_background_fill() {
 
 #[tokio::test]
 async fn redirect_hit_serves_cache_never_redirects() {
-    let fx = fixture_full(b"0123456789", None, vec![], false, Some("https://cdn.example.com/f"), true);
+    let fx = base(b"0123456789").direct(Some("https://cdn.example.com/f")).redirect().build();
     prime_cache(&fx, "a.bin").await;
     reset(&fx);
     // fresh hit → 200 from cache even though redirect is enabled.
@@ -422,7 +405,7 @@ async fn redirect_hit_serves_cache_never_redirects() {
 #[tokio::test]
 async fn redirect_unavailable_silently_proxies() {
     // Tier 3 (no link): normal water-pipe, viewer unaffected.
-    let fx = fixture_full(b"0123456789", None, vec![], false, None, true);
+    let fx = base(b"0123456789").redirect().build();
     let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
     let (status, _, body) = body_text(resp).await;
     assert_eq!(status, StatusCode::OK);
@@ -433,7 +416,7 @@ async fn redirect_unavailable_silently_proxies() {
 #[tokio::test]
 async fn redirect_rejected_target_silently_proxies() {
     // Foreign http is not an allowed redirect target → proxy.
-    let fx = fixture_full(b"0123456789", None, vec![], false, Some("http://cdn.example.com/f"), true);
+    let fx = base(b"0123456789").direct(Some("http://cdn.example.com/f")).redirect().build();
     let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
     let (status, _, body) = body_text(resp).await;
     assert_eq!(status, StatusCode::OK);
@@ -443,7 +426,7 @@ async fn redirect_rejected_target_silently_proxies() {
 #[tokio::test]
 async fn redirect_disabled_never_consults_backend() {
     // Default proxy mode: direct_url untouched even when offered.
-    let fx = fixture_full(b"0123456789", None, vec![], false, Some("https://cdn.example.com/f"), false);
+    let fx = base(b"0123456789").direct(Some("https://cdn.example.com/f")).build();
     let resp = get_key(State(fx.state.clone()), Path("new.bin".into()), headers(&[]), RawQuery(None), OriginalUri(DEFAULT_TEST_URI.clone())).await;
     let (status, _, _) = body_text(resp).await;
     assert_eq!(status, StatusCode::OK);
@@ -454,7 +437,7 @@ async fn redirect_disabled_never_consults_backend() {
 /// the row appears after the response, not before it.
 #[tokio::test]
 async fn prewarm_accepts_immediately_and_fetches_in_the_background() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     let resp = prewarm(State(fx.state.clone()), Path("w.bin".into()), headers(&[])).await.into_response();
     let (status, _, body) = body_text(resp).await;
     assert_eq!(status, StatusCode::ACCEPTED);
@@ -475,7 +458,7 @@ async fn prewarm_accepts_immediately_and_fetches_in_the_background() {
 /// nothing new is fetched and nothing is counted as in flight.
 #[tokio::test]
 async fn prewarm_reports_a_hit_without_queueing_anything() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     prime(&fx, "w.bin").await;
     let resp = prewarm(State(fx.state.clone()), Path("w.bin".into()), headers(&[])).await.into_response();
     let (status, _, body) = body_text(resp).await;
@@ -790,7 +773,7 @@ async fn healthz_reports_segment_bytes() {
 /// can tell "answering" from "healthy") and expose the disk numbers.
 #[tokio::test]
 async fn healthz_reports_a_verdict_and_disk_state() {
-    let fx = fixture(b"x", None, Vec::new(), false);
+    let fx = base(b"x").build();
     let resp = healthz(State(fx.state.clone()), RawQuery(None)).await.into_response();
     assert_eq!(resp.status(), StatusCode::OK, "liveness stays 200");
     let (_, _, body) = body_text(resp).await;
@@ -963,7 +946,7 @@ async fn a_version_drift_waits_for_a_watcher_to_leave() {
 async fn prewarm_secret_gate_blocks_anonymous() {
     // Endpoint is open when prewarm_shared_secret_env is unset, but
     // when set and wrong token sent, it must 401.
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     std::env::set_var("TEST_PW_SECRET", "right-token");
     let mut cfg = fx.state.config.as_ref().clone();
     cfg.prewarm_shared_secret_env = Some("TEST_PW_SECRET".into());
@@ -996,7 +979,7 @@ async fn prewarm_secret_gate_blocks_anonymous() {
 /// it had no test.
 #[tokio::test]
 async fn prewarm_401s_when_the_named_secret_is_missing() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     std::env::remove_var("TEST_PW_MISSING");
     let mut cfg = fx.state.config.as_ref().clone();
     cfg.prewarm_shared_secret_env = Some("TEST_PW_MISSING".into());
@@ -1022,7 +1005,7 @@ async fn prewarm_401s_when_the_named_secret_is_missing() {
 /// no-store XML error.
 #[tokio::test]
 async fn sigv4_gate_anonymous_passes_and_bad_signature_403s() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     let cfg = crate::sigv4::SigV4Config {
         access_key_id: "AKIDEXAMPLE".into(),
         secret_access_key: "s3cr3t".into(),
@@ -1147,7 +1130,7 @@ async fn assert_invalid_request_400(resp: Response, what: &str) {
 
 #[tokio::test]
 async fn root_handlers_reject_empty_object_keys_without_backend_calls() {
-    let fx = fixture(b"unused", None, vec![], false);
+    let fx = base(b"unused").build();
     for query in [None, Some(""), Some("download=1")] {
         let resp = get_key_root(
             State(fx.state.clone()),
@@ -1176,7 +1159,7 @@ async fn root_handlers_reject_empty_object_keys_without_backend_calls() {
 async fn invalid_object_keys_are_bad_requests_for_get_and_head() {
     use tower::ServiceExt;
 
-    let fx = fixture(b"unused", None, vec![], false);
+    let fx = base(b"unused").build();
     let keys = [
         "/../outside",              // traversal
         "/googledrive1/../outside", // traversal under a bucket alias
@@ -1206,7 +1189,7 @@ async fn invalid_object_keys_are_bad_requests_for_get_and_head() {
 /// for real yields the perfectly valid key `absolute` and a 200).
 #[tokio::test]
 async fn invalid_object_keys_unreachable_by_uri_are_rejected_at_the_seam() {
-    let fx = fixture(b"unused", None, vec![], false);
+    let fx = base(b"unused").build();
     for key in ["", "/absolute"] {
         let get = get_key(
             State(fx.state.clone()), Path(key.into()), headers(&[]), RawQuery(None),
@@ -1236,7 +1219,7 @@ async fn root_router_preserves_v2_and_v1_listing() {
     use crate::backend::ListEntry;
     use tower::ServiceExt;
 
-    let fx = fixture(b"unused", None, vec![], false);
+    let fx = base(b"unused").build();
     let backend = crate::testsupport::MockBackend::new(b"unused", None, None).with_listing(vec![ListEntry {
         key: "listed.bin".into(),
         size: 6,
@@ -1276,7 +1259,7 @@ async fn root_router_preserves_v2_and_v1_listing() {
 async fn root_router_answers_400_for_root_get_and_head() {
     use tower::ServiceExt;
 
-    let fx = fixture(b"unused", None, vec![], false);
+    let fx = base(b"unused").build();
     for method in ["GET", "HEAD"] {
         let request = axum::http::Request::builder()
             .method(method).uri("/").body(Body::empty()).unwrap();
@@ -1736,7 +1719,7 @@ async fn a_nocache_404_writes_no_tombstone() {
 /// spot that let route-syntax panics surface only at deploy boot.
 #[tokio::test]
 async fn router_constructs_without_panic() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     let _app = router(fx.state.clone());
 }
 
@@ -1866,7 +1849,7 @@ async fn instrument_body_counts_bytes_even_when_the_stream_is_dropped() {
 /// which reads the plan instead of the counters.
 #[tokio::test]
 async fn http_get_records_its_byte_source() {
-    let fx = fixture(b"0123456789", None, vec![], false);
+    let fx = base(b"0123456789").build();
     let before_disk = body_bytes("disk");
     prime(&fx, "a.bin").await;
     reset(&fx);
