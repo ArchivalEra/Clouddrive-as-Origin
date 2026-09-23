@@ -326,16 +326,29 @@ pub async fn collect_allow_error(body: BodyStream) -> (Vec<u8>, bool) {
     (out, errored)
 }
 
+/// Poll `cond` until it holds, or panic with `what` after the budget every other
+/// wait in this tree uses. One place decides the step and the bound, so a slow
+/// machine slows every wait alike instead of only the ones that remembered the
+/// constants — eighteen hand-written loops used to spell this out, in three
+/// different steps and three different bounds.
+pub async fn wait_until<F, Fut>(what: &str, mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..WAIT_TRIES {
+        if cond().await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(WAIT_STEP_MS)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
 /// Wait until the driver task has installed the metadata row for `key`. The
 /// clock bound is the one `Cache`'s own impl carries.
 pub async fn wait_entry(cache: &Cache<impl crate::clock::Clock + Clone + 'static>, key: &str) {
-    for _ in 0..WAIT_TRIES {
-        if cache.entry_exists(key).await {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    panic!("entry {key} never installed");
+    wait_until(&format!("entry {key} to be installed"), || cache.entry_exists(key)).await;
 }
 
 /// Fill the ledger and the staged-byte account from the sidecars on disk,
