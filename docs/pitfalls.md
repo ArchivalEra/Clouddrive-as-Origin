@@ -471,3 +471,16 @@ entry for being obvious in hindsight — hindsight is the point.
     meaningless: the same shape, minutes apart, moved 300 B/s and 7 MB/s (measured
     2026-09-22). *Fix:* repeat, and change one variable at a time — the shard
     harness's `--unique-seeds` versus a fixed seed is the pattern.
+
+61. **The LAB's player row (§15) can fail on a busy machine with unchanged code.**
+    Measured 2026-09-23, twice, same binary: the first `--quick` run (started while
+    `load` was 3.1, minutes after a release build and the full test suite) reported
+    `FAIL: a real player stalled` — the media element waited at t=13.2 s and the
+    fourth request's *body* took 30,118 ms to deliver 1.3 MB over loopback
+    (`maxGapBetweenRequests=30419ms`). The second run on a quiet machine (load 1.3)
+    was 75/0 with `stalls=0` and `maxGapBetweenRequests=90ms`. The row is a
+    wall-clock judgement about a real browser decoding video, so the machine's
+    state is part of the measurement. *Fix:* read `uptime` before the run and
+    re-run before believing a single §15 failure — but if it recurs on a quiet
+    machine, treat it as a lead, not as noise: compare the body duration against
+    the object size (1.3 MB in 30 s is four orders off, not a slow disk).
