@@ -9,8 +9,10 @@
 #
 # What it does NOT claim: this measures LATENCY, not concurrency. A client on
 # a 30 Mbps link can answer "is the first byte fast enough" but cannot
-# reproduce a multi-client throughput scenario -- use the node-side
-# seek-storm for that (deploy/seek-storm.sh).
+# reproduce a multi-client throughput scenario. For that, use the shard harness
+# (`deploy/lab/viewer/multi-viewer.mjs`); `deploy/seek-storm.sh` reproduces the
+# scattered-seek shape C5 investigated and dropped (2026-09-12), so it is a
+# counter-example, not a tool to reach for.
 #
 # Usage:
 #   deploy/measure-client-ttfb.sh <url> [trials] [cold]

@@ -6,10 +6,11 @@ static-asset origin that fronts one or more drives through OpenList
 gone; the upstream is OpenList today, and the client-facing namespace is flat
 so adding an upstream never changes a URL.
 
-  <!-- keep the two knowledge files discoverable from the front door -->
+  <!-- keep the knowledge files discoverable from the front door -->
 Docs worth knowing about before changing anything: `docs/pitfalls.md` (traps this
-repo has actually hit, with evidence) and `docs/adr/README.md` (one line per
-decision, and which ones amend which).
+repo has actually hit, with evidence), `docs/adr/README.md` (one line per
+decision, and which ones amend which), and `deploy/README.md` (what every
+instrument under `deploy/` answers, where it runs, and where its reading lives).
 
 EdgeOne (or any CDN) origin-pulls `GET /<key>` over HTTPS. On hit the
 service streams from local disk; on miss it fetches from the owning

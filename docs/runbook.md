@@ -404,11 +404,14 @@ endpoint: it is private to an already-established connection.
 **Can it carry THIS origin's traffic?** Its `mux-twohost` boots a front whose job
 is to bridge every mux stream to `ORIGIN_ADDR` as opaque bytes, and its gates ask
 for `/corpus/<n>` — paths this origin does not have.
-`deploy/lab/mux-origin-shim.py` answers them from this origin instead: it rewrites
-the request line to the real key, adds a `Range` for the byte count the path names,
-and splices the exchange, over an `ssh -L` tunnel to the node (the only route to
-the origin that does not pass through the CDN). The gates assert byte counts and
-timing, not content, so the bytes really are this origin's.
+`deploy/lab/mux-origin-shim.py` answered them from this origin instead: it rewrote
+the request line to the real key, added a `Range` for the byte count the path named,
+and spliced the exchange, over an `ssh -L` tunnel to the node (the only route to
+the origin that does not pass through the CDN). The gates asserted byte counts and
+timing, not content, so the bytes really were this origin's. The shim is gone
+(2026-09-23) with the rest of the spike's apparatus: the verdict below is what it
+bought, and the mux lives in another repository so nothing here could exercise it
+again.
 
 Result: **ALL GATES GREEN** — the 5-step WAN sequence, 10 MiB bulk, the
 small-response timing gate, and carrier rotation (the old carrier retires loudly,
@@ -470,7 +473,8 @@ The mux spike's lesson was "connection count, not speed", so the same question w
 put to plain HTTP/2 through EdgeOne: one connection carrying N concurrent Range
 requests (standard, cacheable 206s) versus N separate connections. Instrument:
 `deploy/lab/probe-h2-vs-conns.sh` (N x 5 MiB, fresh offsets, three repetitions,
-`ss` counts curl's own sockets).
+`ss` counts curl's own sockets) — retired 2026-09-23 once its readings were here;
+re-measure with the shard harness if the leg ever needs it again.
 
 | shape | result |
 | --- | --- |
@@ -1908,6 +1912,10 @@ staged-byte eviction knob in the cache section: `eviction_policy = "lru"`
 (default) or `"heat"` (ADR-0015).
 
 ## Reading the suite, and where the knowledge lives
+
+Every instrument under `deploy/` — what it answers, where it runs, what it
+needs, and where its reading lives — is indexed in `deploy/README.md`. This
+section is the narrative for the two newest sections of the suite.
 
 `deploy/lab/run-lab.sh` is seventeen sections, each with a `note` line naming what
 it pins. Two of them were added last and are the ones to look at when a change

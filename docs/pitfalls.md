@@ -445,3 +445,29 @@ entry for being obvious in hindsight — hindsight is the point.
     done unverified. *Fix before touching it:* find a case where the writer
     really stops mid-window (the driver cancelled, not the reader), or leave the
     watcher alone.
+
+57. **Measure from the client, not from the origin node.** Every "the CDN is
+    fast/slow" conclusion drawn from a shell on the origin is a conclusion about
+    the origin's own loopback: the edge is not in that path at all. The retired
+    `deploy/verify-cold-pull.sh` existed because four earlier conclusions were
+    wrong for exactly this reason. *Fix:* run CDN measurements from a real client
+    vantage (or the LAB's browsers), and keep the node for what it can answer —
+    the origin's side of the account.
+
+58. **Assert the bytes, not the speed.** A truncated transfer is fast, and a
+    curl that gives up at `--max-time` looks like a completed one in a byte
+    count nobody printed. Every cold-pull conclusion has to come with
+    `size_download == expected` (or a checksum), and a distinct failure for
+    timeout (exit 28) versus truncation (exit 18).
+
+59. **Know which cache you measured.** A hit at the edge says nothing about the
+    origin, and an origin hit says nothing about the edge: the two have separate
+    caches, separate keys and their own clocks. The account has to name the layer
+    (`eo-cache-status` for the edge, the origin's own counters or front-access
+    log for the pull) — pitfall 5 in measurement clothing.
+
+60. **A conclusion needs two runs that differ only in the thing you claim.**
+    Letting the network vary under a measurement makes every later comparison
+    meaningless: the same shape, minutes apart, moved 300 B/s and 7 MB/s (measured
+    2026-09-22). *Fix:* repeat, and change one variable at a time — the shard
+    harness's `--unique-seeds` versus a fixed seed is the pattern.
