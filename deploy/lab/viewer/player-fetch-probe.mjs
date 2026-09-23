@@ -2,11 +2,16 @@
 // how far it played, which fragments it loaded, how many loaded in parallel
 // (overlapping load windows), and any error it hit.
 //
-//   node probe-player.mjs <page-url-with-?src=> [seconds-to-watch]
+//   node player-fetch-probe.mjs <page-url-with-?src=> [seconds-to-watch] [progress-secs]
+//
+// A session measured in hours has to be observable while it runs: with
+// progress-secs > 0 this prints the video element's own state every interval, so
+// a run that stops advancing is visible instead of only visible at the end.
 import { join } from 'node:path';
 
 const pageUrl = process.argv[2];
 const watchSecs = Number(process.argv[3] || 20);
+const progressSecs = Number(process.argv[4] || 0);
 const pwDir = process.env.PW || '/home/archivalera/.npm/_npx/9833c18b2d85bc59/node_modules/playwright-core';
 const chrome = process.env.CHROME || '/usr/bin/chromium';
 const { chromium } = await import(join(pwDir, 'index.mjs')).catch(async () => await import(pwDir));
@@ -17,8 +22,32 @@ const page = await ctx.newPage();
 const requests = [];
 page.on('request', (r) => requests.push({ url: r.url(), range: r.headers()['range'] || '', at: Date.now() }));
 
+const started = Date.now();
+const timer = progressSecs > 0
+  ? setInterval(async () => {
+      const since = Math.round((Date.now() - started) / 1000);
+      try {
+        const s = await page.evaluate(() => {
+          const v = document.querySelector('video');
+          const p = window.__probe || {};
+          return {
+            readyState: v.readyState,
+            currentTime: Number(v.currentTime.toFixed(1)),
+            bufferedEnd: v.buffered.length ? Number(v.buffered.end(v.buffered.length - 1).toFixed(1)) : 0,
+            stalls: (p.events || []).filter((e) => e.ev === 'waiting' || e.ev === 'stalled').length,
+            errors: (p.errors || []).length,
+          };
+        });
+        console.log(`  [progress +${since}s] currentTime=${s.currentTime}s bufferedEnd=${s.bufferedEnd}s readyState=${s.readyState} stalls=${s.stalls} errors=${s.errors}`);
+      } catch (e) {
+        console.log(`  [progress +${since}s] unreadable: ${e.message}`);
+      }
+    }, progressSecs * 1000)
+  : null;
+
 await page.goto(pageUrl, { waitUntil: 'domcontentloaded' });
 await page.waitForTimeout(watchSecs * 1000);
+if (timer) clearInterval(timer);
 
 const state = await page.evaluate(() => {
   const v = document.querySelector('video');
