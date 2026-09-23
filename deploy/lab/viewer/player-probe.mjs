@@ -51,7 +51,17 @@ const { chromium } = await import(join(pwDir, 'index.mjs')).catch(async () => aw
 const base = target.replace(/\/$/, '');
 const objectUrl = `${base}/${objectPath}`;
 
-const browser = await chromium.launch({ executablePath: chrome, args: ['--no-proxy-server'] });
+// Vantage knobs. `PROXY=socks5://127.0.0.1:1080` gives the browser another
+// egress (an `ssh -D` tunnel to the node) without a browser anywhere but here;
+// `HOST_MAP="MAP cdn-oracle.isui.ren <addr>"` pins the address the far side's
+// resolver returned, so the run measures THAT vantage's route and POP rather
+// than this machine's DNS answer wearing a tunnel.
+const proxy = process.env.PROXY || '';
+const hostMap = process.env.HOST_MAP || '';
+const launchArgs = proxy ? [`--proxy-server=${proxy}`] : ['--no-proxy-server'];
+if (hostMap) launchArgs.push(`--host-resolver-rules=${hostMap}`);
+
+const browser = await chromium.launch({ executablePath: chrome, args: launchArgs });
 const ctx = await browser.newContext();
 const page = await ctx.newPage();
 // The page must be same-origin with the object, so the video's own requests need

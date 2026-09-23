@@ -1098,41 +1098,55 @@ The probe did sharpen *where* the leg is: that first response came back
 The stall is therefore on client <-> POP, not POP <-> origin. Same object, same
 route, same night: 300 bytes open-ended against 7.1 MB/s in shards.
 
-### The real player on the real film, from this vantage (2026-09-23)
+### The real player on the real film, from two vantages (2026-09-23)
 
-`deploy/lab/viewer/player-probe.mjs --target https://cdn-oracle.isui.ren/googledrive1
---object <the 200 GiB film> --page test-page.html`, real Chromium, no proxy. Two
-runs the same evening:
-
-```
-long session (stopped at ~5 min)
-  187 requests in 273 s, every one `edgeHIT`, `readyState 0` the whole time
-  no `waiting`/`stalled` events — the media element kept re-asking, and the page
-  never reported playback
-short run (100 s, the one that prints the per-request table)
-  requests=249  bytes=74400  played=0s  ready=0  stalls=0  error=0
-  maxGapBetweenRequests=15805ms — 249 responses of exactly 300 bytes each
-  VERDICT: the player never loaded metadata (playback never began)
-```
-
-**The asymmetry is the finding.** In the same minutes, on the same object and the
-same route:
+`deploy/lab/viewer/player-probe.mjs` gained two knobs for this: `PROXY=socks5://…`
+gives the browser another egress (an `ssh -D` tunnel to the node — no browser gets
+installed on the node, which is a standing constraint), and
+`HOST_MAP="MAP cdn-oracle.isui.ren <addr>"` pins the address the far side's
+resolver returned, so the run measures that vantage's route and POP rather than
+this machine's DNS answer wearing a tunnel.
 
 ```
-curl -r 0-   ->   206, 25,853,934 bytes in 30 s (0.86 MB/s), TTFB 0.14 s
+same object, same probe, minutes apart
+vantage                        player                                    origin saw
+this workstation (direct)      249 requests, 249 x 300 bytes, ready 0      xff=39.172.36.93
+node (tunnel + node's AAAA)    153 requests, 153 x 300 bytes, ready 0      xff=2603:c020:22:9467:0:eb9b:c0ab:d6d0
+both                           VERDICT: the player never loaded metadata
 ```
 
-The edge streams the open-ended shape to curl while answering the media element's
-open-ended requests with 300 bytes each, 249 times. Those requests are ordinary
-206s at the origin (265 asks in five minutes across fifteen pull peers), so the
-bytes are being paid for upstream while the viewer gets headers only.
+**So it is not the vantage.** The node's IPv6 POP — the leg where curl has always
+been clean — fails the media element exactly the same way, and the origin's own
+`xff=` proves which egress each arm used.
 
-What this does NOT change: the shard shape still measures 7.06-7.1 MB/s with zero
-gaps through the same edge, which is what the product criterion needs. It does
-mean the open question is now specifically **the media element's own requests
-against this edge**, and it needs a vantage-independent instrument — the same
-probe run from the node (which the edge sees as a domestic IPv6 POP) or from a
-second domestic host — before anything is concluded about the player.
+**The player's shape, from the CDP table** (the probe records every request the
+media stack makes): `bytes=0-`, then `bytes=1572864-`, then `bytes=3342336-`,
+`5668864-`, `7700480-` … open-ended ranges **marching forward ~2 MiB at a time**,
+every response `206 edge=HIT`, and none of them ever finishing (`? ms` — no
+`loadingFinished`). The media element never receives a body, gives up on each
+request, and asks for the next offset.
+
+**Meanwhile curl, same object and route:**
+
+```
+curl -r 0-     ->  22.3 / 25.9 / 22.8 / 18.7 / 19.7 MB in 18-30 s (several runs)
+curl -r 1572864- -> 22.8 MB in 25 s
+```
+
+**One honest caveat.** A single run with Chrome's header set replayed by curl
+looked damning (81 KB, TTFB 12 s), but the bisect did not reproduce a
+header-determined effect: on this same vantage a bare `-r 0-` stalled at 0 bytes
+and an `Accept-Encoding: identity` run crawled at 57 KB, while `UA +
+Accept-Encoding` streamed 18.7 MB. Individual curl runs on this vantage vary.
+What is *systematic* is the asymmetry: the media element has never received a
+body (2 x 249 + 153 requests, two vantages), while curl usually streams.
+
+What this does NOT change: the shard shape measures 7.06-7.1 MB/s with zero gaps
+through the same edge, and the LAB's own browser playing against the origin's
+front (no CDN in the path) starts in 37 ms and plays through. So the remaining
+question is precisely **the media element's request stream against the CDN**, and
+the instrument it needs is a CDP dump of the browser's full request *and*
+response headers on one offset — not another vantage.
 
 ### The window decision: a jump pays the floor (ADR-0024, 2026-09-22)
 
