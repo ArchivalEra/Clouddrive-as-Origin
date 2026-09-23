@@ -1259,6 +1259,15 @@ The lever is the deployment's topology — an origin near the edge — which is 
 same conclusion the domestic-vantage section reached from the other end. The gate
 was restored to 3.
 
+**Owner's decision (2026-09-23): the origin does not move.** It is a free instance
+sitting close to Google's backbone, with a 2 Gbps egress and Oracle's network
+protection in front of it - the one thing it is not is near the audience, and
+that is accepted. The placement lever is closed; the origin-pull settings remain
+the only console-side knob, and what a viewer experiences is decided by the
+edge's behaviour plus the client's own packaging (the shard path measures
+7.06-7.1 MB/s with zero gaps, which is what the product criterion needs, and the
+film itself is an fMP4 that needs MSE rather than a bare <video>).
+
 Three things follow. **The origin is not the limit**: its side of the 4-viewer
 cold run is 141 asks for 115.5 MiB at p50 225 ms (each ask is a 1 MiB fill, most
 served from staged bytes). **The edge's cold fill is the limit and it is shared**:
