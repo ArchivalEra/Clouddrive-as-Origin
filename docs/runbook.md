@@ -1098,65 +1098,72 @@ The probe did sharpen *where* the leg is: that first response came back
 The stall is therefore on client <-> POP, not POP <-> origin. Same object, same
 route, same night: 300 bytes open-ended against 7.1 MB/s in shards.
 
-### The real player on the real film, from two vantages (2026-09-23)
+### The real player on the real film: the object is a fragmented MP4 (2026-09-23)
 
-`deploy/lab/viewer/player-probe.mjs` gained two knobs for this: `PROXY=socks5://…`
-gives the browser another egress (an `ssh -D` tunnel to the node — no browser gets
-installed on the node, which is a standing constraint), and
-`HOST_MAP="MAP cdn-oracle.isui.ren <addr>"` pins the address the far side's
-resolver returned, so the run measures that vantage's route and POP rather than
-this machine's DNS answer wearing a tunnel.
+Everything before this section measured the wrong suspect. The chain - bytes,
+edge, origin, vantage, protocol - is exonerated by measurement, and the asset
+itself is the answer: **the film is a fragmented MP4 (fMP4)**, which a bare
+`<video src=...>` cannot play in Chromium at all.
 
-```
-same object, same probe, minutes apart
-vantage                        player                                    origin saw
-this workstation (direct)      249 requests, 249 x 300 bytes, ready 0      xff=39.172.36.93
-node (tunnel + node's AAAA)    153 requests, 153 x 300 bytes, ready 0      xff=2603:c020:22:9467:0:eb9b:c0ab:d6d0
-both                           VERDICT: the player never loaded metadata
-```
-
-**So it is not the vantage.** The node's IPv6 POP — the leg where curl has always
-been clean — fails the media element exactly the same way, and the origin's own
-`xff=` proves which egress each arm used.
-
-**The player's shape, from the CDP table** (the probe records every request the
-media stack makes): `bytes=0-`, then `bytes=1572864-`, then `bytes=3342336-`,
-`5668864-`, `7700480-` … open-ended ranges **marching forward ~2 MiB at a time**,
-every response `206 edge=HIT`, and none of them ever finishing (`? ms` — no
-`loadingFinished`). The media element never receives a body, gives up on each
-request, and asks for the next offset.
-
-**Meanwhile curl, same object and route:**
+The object's own layout, from the first 20 MiB (fetched through the CDN, then
+walked offline):
 
 ```
-curl -r 0-     ->  22.3 / 25.9 / 22.8 / 18.7 / 19.7 MB in 18-30 s (several runs)
-curl -r 1572864- -> 22.8 MB in 25 s
++0          ftyp  (28)
++28         moov  (2436)      <- carries mvex + trex: the fragmented-MP4 marker
++2464       mdat  (1,593,550)
++1596014    moof  (592)
++1596606    mdat  (1,762,891)
++3359497    moof  (592)
++3360089    mdat  (2,324,208)
+...                             one moof+mdat pair per ~2 MiB, to the end
 ```
 
-**One honest caveat.** A single run with Chrome's header set replayed by curl
-looked damning (81 KB, TTFB 12 s), but the bisect did not reproduce a
-header-determined effect: on this same vantage a bare `-r 0-` stalled at 0 bytes
-and an `Accept-Encoding: identity` run crawled at 57 KB, while `UA +
-Accept-Encoding` streamed 18.7 MB. Individual curl runs on this vantage vary.
-What is *systematic* is the asymmetry: the media element has never received a
-body (2 x 249 + 153 requests, two vantages), while curl usually streams.
+`mvhd` says 30.75 h and the `moov` sits at the head, which is why earlier
+readings called it "faststart" - but that `moov` is an *init segment*: a 2.4 KB
+sample-less header carrying `mvex`, and every sample lives in a `moof`/`mdat`
+fragment, with no `sidx` and no manifest. A progressive player reads the init,
+finds nothing playable, and then does exactly what was measured: open-ended
+requests marching forward one fragment at a time, each abandoned at a fragment
+boundary, `readyState` 0 forever.
 
-What this does NOT change: the shard shape measures 7.06-7.1 MB/s with zero gaps
-through the same edge, and the LAB's own browser playing against the origin's
-front (no CDN in the path) starts in 37 ms and plays through. So the remaining
-question is precisely **the media element's request stream against the CDN**, and
-the instrument it needs is a CDP dump of the browser's full request *and*
-response headers on one offset — not another vantage.
+`deploy/lab/viewer/media-wire-dump.mjs` (new) dumps the wire with the parts the
+player probe does not keep - complete request and response headers, connection
+id and remote IP per response, `loadingFailed` reasons, and per-request body
+bytes. Three arms in one browser session:
 
-**Do not read "300 bytes" as the failure by itself.** The LAB's own player run —
-working, against the origin with no CDN — also records its first `bytes=0-` as 300
-bytes: that is what an open-ended request looks like when the media element
-abandons it and moves on. The discriminator is not the first row but whether ANY
-request afterwards transfers a body. In the LAB the next two deliver 9,316 and
-3,146,028 bytes and playback proceeds (`played=30s/30s`, `ready=4`); through the
-CDN every one of 249 requests reports 300 bytes and none delivers. Section 15 of
-`--quick` after the probe change: `VERDICT: the player played it through`
-(75 PASS / 0 FAIL overall).
+```
+media element, Range: bytes=0-
+  receives 15,631,475 bytes of correct data in 10.4 s (322 data frames), then is
+  ABORTED by the media stack; the requests that follow march forward ~1.8 MiB at
+  a time and each is aborted within ~100 ms - the fragment walk
+page fetch, same range, same minutes
+  15.7 MB in 10 s, no error; a bounded bytes=0-5242879 completes in 26 ms
+open-ended vs bounded at the same offset
+  byte-identical (SHA-256 over the first 64 KiB) - the edge serves correct bytes
+  for both shapes; it answers open-ended with content-range N-(N+2147483646)
+  over the whole file and content-length 2147483647 (2^31-1), worth knowing but
+  not the cause
+curl, both vantages and both protocols (h2 / h1.1)
+  40-41 MB per 60 s, every combination - which is what made "it is the
+  client-to-POP leg" look plausible
+```
+
+The two-vantage comparison that preceded this (this workstation direct, and
+through an `ssh -D` tunnel to the node with the node's own AAAA pinned: 249 and
+153 requests, all 300-byte responses, `xff` at the origin proving each egress)
+is what killed the vantage hypothesis; the atom walk is what named the real one.
+`PROXY` and `HOST_MAP` remain on the player probe for future vantage work, and
+"300 bytes" alone is not a failure signal (the LAB's own working player records
+its first open-ended request the same way; the discriminator is whether any
+request afterwards carries a body).
+
+**Consequences for the product.** The origin's job is ranged delivery and it does
+it: 7.06-7.1 MB/s in 5 MiB shards, zero gaps, checksums verified. Playing an fMP4
+means MSE with a manifest - the hls.js-on-a-single-file-playlist path the LAB
+already carries, or a DASH manifest over the fragments - which is a **client-side
+packaging** decision, not an origin change. A viewer page that hands this object
+to a bare `<video>` fails identically from every vantage, CDN or not.
 
 ### The window decision: a jump pays the floor (ADR-0024, 2026-09-22)
 
