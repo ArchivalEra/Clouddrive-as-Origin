@@ -431,3 +431,17 @@ entry for being obvious in hindsight — hindsight is the point.
     fake-config run and anything that starts the binary share this rule. If it
     does happen: `mv -f <quarantined> redb.db` restores the name, and the running
     unit's fd already points at the real inode.
+
+56. **Dropping a response body does NOT stop the transfer behind it — so
+    "seal on viewer disconnect" cannot be exercised through the public
+    interface.** Measured 2026-09-23 with a paced upstream (1 KiB per 100 ms) and
+    a 64 KiB ranged passthrough: after the viewer's body was dropped, the
+    `.segpart` kept growing (1024 → 19456 bytes over the next two seconds), i.e.
+    the writer outlives its reader and seals at the window's own tail. The
+    watcher's comment ("viewer disconnect drops the whole body stream, so the
+    seal code below never runs on abort") describes a case this path does not
+    produce; its numbers (600 polls of 100 ms, three stable polls) remain
+    unpinned, and the planned move into `cache::staging` was DROPPED rather than
+    done unverified. *Fix before touching it:* find a case where the writer
+    really stops mid-window (the driver cancelled, not the reader), or leave the
+    watcher alone.
