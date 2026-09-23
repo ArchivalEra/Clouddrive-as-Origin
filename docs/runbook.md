@@ -1495,10 +1495,39 @@ is byte-exact (a 4,000,001-byte range through the worker has the same SHA-256 as
 the same range read from disk), and the player never learns it happened: hls.js
 still reports one fragment load per segment.
 
-For the film the arithmetic is the same shape: 15.5 Mbps is 11.6 MB per
+For the film the arithmetic has the same shape: 15.5 Mbps is 11.6 MB per
 6-second segment, so fan-out 8 gives ~1.45 MB parts, ~1.6 s each at 900 KB/s.
 Fan-out and a lower rendition are alternatives, not rivals: ABR fits the content
 to the leg, fan-out multiplies the leg.
+
+### What the edge's cache label is worth (measured 2026-09-23)
+
+`eo-cache-status` reads like an account of where the bytes came from. It is not
+one. Measured with the origin's own counters snapshotted immediately before and
+after each pass — same fresh offsets past everything the two-hour session had
+read, 100 x 5 MiB per pass, `deploy/lab/viewer/multi-viewer.mjs --start`:
+
+```
+pass   client wall   client rate   labels        origin delta (open/stat/stage)
+cold   213 s         2.46 MB/s     99 HIT 1 MISS  +64 / +502 / +502
+warm   412 s         1.27 MB/s     99 HIT 1 MISS  +67 / +502 / +501
+```
+
+Both passes pulled the full volume from the origin, and the second one — over
+byte-identical offsets, minutes later — was *slower* than the first. The label
+said HIT 99 times out of 100 in both. The two-hour session showed the same thing
+at scale: 1402/1402 responses labelled HIT, while the origin supplied 6596.6 MiB
+in that window.
+
+So: **use the origin's counters or its front-access log for anything about
+bytes, rate or cost**; a client-side cache label is at best a hint. (One reading
+does not fit: ranges read minutes earlier in the same session came back at
+20.8 MB/s. Either some POPs do hold ranges or the passes landed on different
+POPs — which is itself the point: the label does not tell you which.)
+
+The origin side of the same passes is healthy and matches the design: ~1 stat
+and ~1 staged answer per 1 MiB shard (502 for 500 MiB), and one `open` per
+~8 MiB — the window floor of ADR-0024, exactly 64 opens for 500 MiB.
 
 ### The target-scale account: an object the node can never hold
 

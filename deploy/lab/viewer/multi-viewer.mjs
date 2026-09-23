@@ -65,6 +65,10 @@ const attemptTimeoutSecs = Number(arg('attempt-timeout-secs', '0'));
 // a session that intends to move gigabytes has to say so, or it stops (capped)
 // at 64 MiB. 0 = leave the reader's default alone.
 const maxBytes = Number(arg('max-bytes', '0'));
+// `--start N`: every viewer begins at this fixed offset. It is how the SAME
+// offsets get read twice — a cold pass and then a warm one — which is what
+// separates "the edge had these bytes" from "the edge re-pulled them anyway".
+const startAt = Number(arg('start', '0'));
 // `--cold-band`: give every viewer a fresh band of the object, different on
 // every run, and a fresh jump seed. Without it the reader's seeds are fixed
 // constants, so a second run of the same command re-reads offsets the edge has
@@ -180,7 +184,9 @@ const results = await Promise.all(
       // offset became NaN — measured, one 416).
       url: coldBand && bandFor(i)
         ? `${objects.length ? `${base}/${pathFor(i)}?size=${size}` : url}&start=${bandFor(i)}`
-        : objects.length ? `${base}/${pathFor(i)}?size=${size}` : url,
+        : startAt > 0
+          ? `${objects.length ? `${base}/${pathFor(i)}?size=${size}` : url}&start=${startAt}`
+          : objects.length ? `${base}/${pathFor(i)}?size=${size}` : url,
       // A cold band has to come with fresh jumps too: fixed seeds would jump to
       // the same offsets on every run.
       seed: coldBand
@@ -226,3 +232,8 @@ console.log(
     `checksums=${new Set(results.filter((r) => !r.error).map((r) => r.checksum)).size} ` +
     `edgeHIT=${sum((r) => r.edgeHIT ?? 0)} edgeMISS=${sum((r) => r.edgeMISS ?? 0)}`,
 );
+// The run is over and its numbers are printed, so do not let a stray handle keep
+// the process alive: measured twice, the harness sat in epoll_wait long after
+// reporting, with the browser already gone, and anything waiting on it (a probe
+// script's next step, a shell pipeline) waited with it.
+process.exit(0);
