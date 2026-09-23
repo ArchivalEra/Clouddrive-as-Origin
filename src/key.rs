@@ -22,11 +22,6 @@ pub enum KeyError {
     TooLong,
 }
 
-/// The longest cache filename this node will create. `escape_key` expands `%`
-/// and `/` threefold, so a key of at most this many BYTES (as a raw string)
-/// still fits; anything longer is refused as a bad request rather than failing
-/// later as an opaque filesystem error.
-
 /// Validate a cache key per spec §2 / ADR 0001.
 /// - Non-empty, not absolute, no `..` segments, no backslash, no NUL.
 /// - Percent-encoded traversal (`%2e%2e`, `%2F`, `%5C`, etc.) is rejected.

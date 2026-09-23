@@ -31,9 +31,6 @@ impl RouteTable {
         &self.rules[0].upstream
     }
 
-    pub fn rules(&self) -> &[RouteRule] {
-        &self.rules
-    }
 }
 
 #[cfg(test)]

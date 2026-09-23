@@ -58,29 +58,6 @@ pub struct HitMeta {
     pub last_modified: Option<String>,
 }
 
-impl From<&ObjectMeta> for HitMeta {
-    fn from(m: &ObjectMeta) -> Self {
-        Self {
-            size: m.size_bytes,
-            etag: m.etag.clone(),
-            content_type: m.mime_hint.clone(),
-            last_modified: m.last_modified.clone(),
-        }
-    }
-}
-
-impl From<&EntryMeta> for HitMeta {
-    fn from(m: &EntryMeta) -> Self {
-        Self {
-            size: m.size_bytes,
-            etag: m.etag.clone(),
-            content_type: m.content_type.clone(),
-            last_modified: m.last_modified.clone(),
-        }
-    }
-}
-
-/// Build response headers' metadata with MIME fallback applied (§3.9).
 /// Resolve a client Range against an object of `total` bytes into
 /// `[start, end)`, `end` exclusive. One construction site (C3): the same
 /// arithmetic used to live in four places, and two of them had drifted.
@@ -99,6 +76,7 @@ pub(crate) fn resolve_range(
     }
 }
 
+/// Build response headers' metadata with MIME fallback applied (§3.9).
 fn hit_meta_remote(key: &str, m: &ObjectMeta) -> HitMeta {
     HitMeta {
         size: m.size_bytes,
@@ -790,6 +768,11 @@ impl<C: Clock + Clone + 'static> Cache<C> {
 
 
     /// Whether any entry row (positive or negative tombstone) exists.
+    ///
+    /// This is also the ranged path's gate: a key with a durable entry (a whole
+    /// object on disk) stays on the ordinary path, because only that path
+    /// revalidates and serving the range from the file it already holds costs no
+    /// upstream open. Deliberately NOT a freshness check.
     pub async fn entry_exists(&self, key: &str) -> bool {
         self.state.read().await.entries.contains_key(key)
     }
@@ -942,14 +925,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
 
     /// Pure memory peek at a cached entry's size: no upstream call, no
     /// state mutation. Used only for best-effort `Content-Range: bytes
-    /// */size` hints on 416 responses (SHOULD-level per R1).
-    /// Whether this key has a whole object on disk — the one thing that keeps a
-    /// ranged request on the ordinary path. Deliberately NOT a freshness check:
-    /// whether those bytes need revalidating is the ordinary path's business.
-    pub(crate) async fn has_durable_entry(&self, raw_key: &str) -> bool {
-        self.state.read().await.entries.contains_key(raw_key)
-    }
-
     pub(crate) async fn memory_size(&self, raw_key: &str) -> Option<u64> {
         let key = validate_key(raw_key).ok()?;
         let s = self.state.read().await;
@@ -1634,7 +1609,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         // already holds costs no upstream open at all). Objects below
         // `min_file_size` fall through for the same reason — a small object is
         // worth a durable entry, a large one is worth windows.
-        if range.is_some() && !self.has_durable_entry(&rk.cache_key).await {
+        if range.is_some() && !self.entry_exists(&rk.cache_key).await {
             if let Ok(hit) = self.serve_passthrough(rk, range, prof.min_file_size).await {
                 tracing::info!(key = %rk.cache_key, size = hit.meta.size, "passthrough response");
                 // Always 206: this path only runs with a range, and its hit
@@ -2061,13 +2036,12 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     }
 
     /// Drive both reapers: inactive expiry + max_size LRU. Called by `tick()`.
-    /// Lock discipline is ORDERING, not exclusion: the coverage mutex is
-    /// always taken BEFORE any state guard, and never the reverse. Every
-    /// site follows it (finalize 1959→2001, reset 2020→2022, and the
-    /// staged-victim block below, which holds coverage across a state READ).
-    /// Inverting the order deadlocks. Nothing enforces this but the layout —
-    /// see ADR-0008 and the magazine/staging module split that is meant to
-    /// make it structural.
+    ///
+    /// The lock-ordering rule this used to spell out (coverage before state) is
+    /// gone with the lock that needed it: the ledger takes its mutex inside its
+    /// own module and never hands it out (`cache::ledger`), so no caller can
+    /// hold it across a state guard. What is left here is the state lock alone:
+    /// taken briefly, never across an await that can block on the upstream.
     pub async fn tick(&self) {
         let now = self.clock.now_millis();
         let ttl_ms = self.config.inactive_ttl_secs * 1000;
