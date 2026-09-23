@@ -6,7 +6,7 @@ use tempfile::tempdir;
 // The mock lives in the lib now: one implementation for the whole tree.
 use origin_cache::testsupport::{
     collect, collect_allow_error, install_staged, install_staged_aged, install_staged_decayed,
-    install_staged_merged, wait_entry, LEDGER_INTERVAL_CEILING, WAIT_TRIES,
+    install_staged_merged, wait_entry, wait_until, LEDGER_INTERVAL_CEILING, WAIT_TRIES,
     BlockingOpenBackend, CacheTestExt, MockBackend as CountingBackend, SizedBackend, StormBackend,
     StormMode, VersionedBackend,
 };
@@ -41,13 +41,7 @@ fn registry_with(backend: Arc<dyn StorageBackend>) -> BackendRegistry {
 /// Wait until every flight has left the map (an admission round keeps the
 /// map as its coalescing key-set, and these tests assert on its drain).
 async fn wait_map_empty(cache: &Cache<MockClock>) {
-    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if cache.flights.active().await == 0 {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    panic!("flight map never emptied");
+    wait_until("the flight map to empty", || async { cache.flights.active().await == 0 }).await;
 }
 
 #[tokio::test]
@@ -406,13 +400,10 @@ async fn spawned_reaper_expires_entries_without_manual_tick() {
     // real-time moment to fire (the loop interval is wall time, the TTL is
     // mock-clock time).
     clock.advance(1_201_000);
-    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if cache.snapshot().await.entries == 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(cache.snapshot().await.entries == 0, "spawned reaper did not expire the entry");
+    wait_until("the spawned reaper to expire the entry", || async {
+        cache.snapshot().await.entries == 0
+    })
+    .await;
     assert!(!cache.config.cache_dir.join("old.png").exists(), "expired file must be deleted");
 }
 
@@ -667,13 +658,10 @@ async fn head_not_starved_by_saturated_stream_gate() {
         });
     }
     // Wait until both transfers have reached open() (both stream permits held).
-    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if opened.load(Ordering::SeqCst) >= 2 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert!(opened.load(Ordering::SeqCst) >= 2, "both transfers must hold stream permits");
+    wait_until("both transfers to hold stream permits", || async {
+        opened.load(Ordering::SeqCst) >= 2
+    })
+    .await;
     assert_eq!(slot.stream_gate.available_permits(), 0, "stream gate must be saturated");
 
     // A metadata call on a third key must still be fast: the metadata
@@ -886,12 +874,10 @@ async fn efficient_passthrough_waits_for_a_stream_permit() {
     // Free the gate: the transfer proceeds, and the permit it takes must
     // stay held for the body rather than being dropped when `serve` returns.
     drop(held);
-    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if opened.load(Ordering::SeqCst) >= 1 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_until("the passthrough to open upstream", || async {
+        opened.load(Ordering::SeqCst) >= 1
+    })
+    .await;
     assert_eq!(opened.load(Ordering::SeqCst), 1, "the passthrough must now open upstream");
     assert_eq!(
         slot.stream_gate.available_permits(),
@@ -921,12 +907,10 @@ async fn efficient_passthrough_waits_for_a_stream_permit() {
     // held while the run's window transfers — which is what lets one open serve
     // every request inside that window — and released when the window ends,
     // possibly after this body is already consumed. So poll rather than sample.
-    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if slot.stream_gate.available_permits() == 2 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_until("the stream gate to be released", || async {
+        slot.stream_gate.available_permits() == 2
+    })
+    .await;
     assert_eq!(
         slot.stream_gate.available_permits(),
         2,
@@ -1306,16 +1290,10 @@ async fn get_range(
 /// Wait until the key has exactly `bytes` staged (the seal lands after the
 /// body's last byte, so staged state is polled, never sampled).
 async fn wait_staged(cache: &Arc<Cache<MockClock>>, bytes: u64) {
-    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if cache.snapshot().await.segment_bytes == bytes {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    panic!(
-        "segment_bytes never became {bytes}; got {}",
-        cache.snapshot().await.segment_bytes
-    );
+    wait_until(&format!("segment_bytes to reach {bytes}"), || async {
+        cache.snapshot().await.segment_bytes == bytes
+    })
+    .await;
 }
 
 /// The PROFILE NAME no longer decides whether a ranged request gets a run
@@ -1354,12 +1332,10 @@ async fn the_default_profile_gets_runs_for_ranged_reads() {
     let mut body = served.plan.body;
     let _ = collect(&mut body).await;
     assert_eq!(opens.load(Ordering::SeqCst), 1, "one run, one upstream open");
-    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if cache.snapshot().await.segment_bytes == 1 << 20 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_until("one window to be staged", || async {
+        cache.snapshot().await.segment_bytes == 1 << 20
+    })
+    .await;
     assert_eq!(cache.snapshot().await.segment_bytes, 1 << 20, "one window staged");
 }
 
@@ -1400,12 +1376,10 @@ async fn a_jump_stages_the_floor_and_a_second_read_inside_it_stages_nothing() {
     // The body is borrowed, not moved out: `Served`'s guards (lease, watch)
     // drop with it, and a partially moved value cannot be dropped whole.
     let _ = collect(&mut served.plan.body).await;
-    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if cache.snapshot().await.segment_bytes >= 1 << 18 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_until("the floor to be staged", || async {
+        cache.snapshot().await.segment_bytes >= 1 << 18
+    })
+    .await;
     assert_eq!(
         cache.snapshot().await.segment_bytes,
         1 << 18,
@@ -1424,12 +1398,10 @@ async fn a_jump_stages_the_floor_and_a_second_read_inside_it_stages_nothing() {
         _ => panic!("a staged read must stream"),
     };
     let _ = collect(&mut served.plan.body).await;
-    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if cache.snapshot().await.segment_bytes >= (1 << 18) * 3 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_until("three windows to be staged", || async {
+        cache.snapshot().await.segment_bytes >= (1 << 18) * 3
+    })
+    .await;
     assert_eq!(
         cache.snapshot().await.segment_bytes,
         (1 << 18) * 3,
@@ -1939,12 +1911,10 @@ async fn a_sealed_span_and_an_adopted_span_agree() {
     // `staged_spans` then reading `ledger_spans` failed two full-suite runs out
     // of two under load, while the same test passed 3/3 in isolation. Wait for
     // the thing this test actually asserts.
-    for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if !cache.inspect("big.bin").await.ledger_spans.is_empty() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_until("the ledger row to appear", || async {
+        !cache.inspect("big.bin").await.ledger_spans.is_empty()
+    })
+    .await;
     let view = cache.inspect("big.bin").await;
     let sealed = view.ledger_spans;
     // Say what was there when it was not: a bare "staged nothing" on a box under
@@ -2080,13 +2050,11 @@ async fn metadata_loss_rebuilds_rows_from_the_object_tree() {
     cache2.load_and_start().await;
 
     {
-        let s = cache2.state.read().await;
-        assert!(
-            s.entries.contains_key("kept.bin"),
-            "the row must be rebuilt from the object tree (got {:?})",
-            s.entries.keys().collect::<Vec<_>>()
-        );
-        assert_eq!(s.entries.get("kept.bin").unwrap().size_bytes, 7);
+        // Through the read-only view (ADR-0022), not the machinery's own state:
+        // callers and tests cross the same seam.
+        let state = cache2.inspect("kept.bin").await;
+        assert!(state.installed, "the row must be rebuilt from the object tree");
+        assert_eq!(state.entry_bytes, Some(7));
     }
 }
 

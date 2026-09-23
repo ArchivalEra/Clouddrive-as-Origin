@@ -20,7 +20,7 @@ use crate::{
 use crate::testsupport::CacheTestExt;
 use crate::testsupport::{
     assert_no_backend_calls, body_text, headers, reset, staged_segments, stray_cache_files,
-    wait_installed, Fixture, FixtureBuilder, DEFAULT_TEST_URI,
+    wait_installed, wait_until, Fixture, FixtureBuilder, DEFAULT_TEST_URI,
 };
 
 /// The mock's fixed last-modified, as the backend it replaced returned.
@@ -400,13 +400,10 @@ async fn redirect_cold_307_and_background_fill() {
     assert!(h.get("x-amz-request-id").is_some());
     assert_eq!(fx.direct_calls.load(Ordering::SeqCst), 1);
     // Background fill installs the entry without any viewer attached.
-    for _ in 0..crate::testsupport::WAIT_TRIES {
-        if fx.state.cache.entry_exists("new.bin").await {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert!(fx.state.cache.entry_exists("new.bin").await);
+    wait_until("the background fill to install the entry", || async {
+        fx.state.cache.entry_exists("new.bin").await
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -462,29 +459,16 @@ async fn prewarm_accepts_immediately_and_fetches_in_the_background() {
     let (status, _, body) = body_text(resp).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert!(body.contains("accepted"), "{body}");
-    for _ in 0..crate::testsupport::WAIT_TRIES {
-        if fx.state.cache.entry_exists("w.bin").await {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert!(
-        fx.state.cache.entry_exists("w.bin").await,
-        "the background fetch must still install the row"
-    );
+    wait_until("the prewarm to install the entry", || async {
+        fx.state.cache.entry_exists("w.bin").await
+    })
+    .await;
     // The in-flight count must come back down on its own, or healthz
     // would report a queue that never drains.
-    for _ in 0..100 {
-        if fx.state.cache.snapshot().await.prewarm_inflight == 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert_eq!(
-        fx.state.cache.snapshot().await.prewarm_inflight,
-        0,
-        "the prewarm in-flight count must return to zero"
-    );
+    wait_until("the prewarm queue to drain", || async {
+        fx.state.cache.snapshot().await.prewarm_inflight == 0
+    })
+    .await;
 }
 
 /// A second prewarm for an object already cached is a synchronous hit;
@@ -1136,12 +1120,10 @@ async fn nocache_prewarm_is_noop() {
     assert_eq!(status, StatusCode::ACCEPTED);
     assert!(body.contains("accepted"), "{body}");
     // Let the background task run before judging what it did.
-    for _ in 0..20 {
-        if fx.state.cache.snapshot().await.prewarm_inflight == 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_until("the rejected prewarm to settle", || async {
+        fx.state.cache.snapshot().await.prewarm_inflight == 0
+    })
+    .await;
     assert_eq!(fx.open_calls.load(Ordering::SeqCst), 0);
     assert!(!fx.state.cache.entry_exists("w.bin").await);
 }
@@ -1409,17 +1391,10 @@ async fn lru_eviction_ejects_the_stale_span_even_when_it_is_hot() {
 /// (the same discipline the lab's `wait_segment_bytes` uses). Poll for the
 /// ledger to describe `expect` instead.
 async fn wait_ledger(fx: &Fixture, key: &str, expect: &[(u64, u64)]) {
-    for _ in 0..crate::testsupport::WAIT_TRIES {
-        {
-            let got = ledger_spans(fx, key).await;
-            if got == expect {
-                return;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    let got = ledger_spans(fx, key).await;
-    panic!("ledger for {key} never became {expect:?}; got {got:?}");
+    wait_until(&format!("the ledger for {key} to become {expect:?}"), || async {
+        ledger_spans(fx, key).await == expect
+    })
+    .await;
 }
 
 /// The ledger's spans as `(start, end)`, off the same view an operator reads.
@@ -1436,16 +1411,10 @@ async fn ledger_spans(fx: &Fixture, key: &str) -> Vec<(u64, u64)> {
 
 /// The same wait for the staged-byte counter (healthz-level assertions).
 async fn wait_segment_bytes(fx: &Fixture, expect: u64) {
-    for _ in 0..crate::testsupport::WAIT_TRIES {
-        if fx.state.cache.snapshot().await.segment_bytes == expect {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    panic!(
-        "segment_bytes never became {expect}; got {}",
-        fx.state.cache.snapshot().await.segment_bytes
-    );
+    wait_until(&format!("segment_bytes to reach {expect}"), || async {
+        fx.state.cache.snapshot().await.segment_bytes == expect
+    })
+    .await;
 }
 
 /// One ranged GET, asserting it was served as a partial response. The
@@ -1564,8 +1533,8 @@ async fn an_upstream_sourced_body_holds_its_key() {
     let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
     // Grace 0, so the lease's own life is what is being asserted.
     let fx = base(&bytes).etag(Some("v1")).read_grace(0).build();
-    let now = fx.state.cache.clock.now_millis();
-    assert!(!fx.state.cache.leases.is_protected("a.bin", now), "nothing read yet");
+    // Through the read-only view (ADR-0022) rather than the lease table itself.
+    assert!(!fx.state.cache.inspect("a.bin").await.leased, "nothing read yet");
 
     // A cold miss: the body IS the provider's stream, which is exactly the
     // case the source test used to exclude from protection.
@@ -1579,7 +1548,7 @@ async fn an_upstream_sourced_body_holds_its_key() {
     .await;
     let body = resp.into_body();
     assert!(
-        fx.state.cache.leases.is_protected("a.bin", now),
+        fx.state.cache.inspect("a.bin").await.leased,
         "an upstream-served body must hold its key's lease"
     );
 
@@ -1587,7 +1556,7 @@ async fn an_upstream_sourced_body_holds_its_key() {
     // whole difference.
     drop(body);
     assert!(
-        !fx.state.cache.leases.is_protected("a.bin", now),
+        !fx.state.cache.inspect("a.bin").await.leased,
         "the lease ends when the body does"
     );
 }
