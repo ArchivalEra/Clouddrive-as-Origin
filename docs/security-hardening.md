@@ -47,31 +47,77 @@ Two more facts, both relevant:
   own WebDAV (loopback 5244) succeeded. The origin only ever reads, so this is
   over-privileged.
 
+## Status (2026-09-23, updated)
+
+- **Done and verified**: R1, R2, R6 — the perimeter is now a whitelist (22, 7777, the proxy
+  stack, ICMP); 7778, 5244 and 111 are closed to the internet; rpcbind is disabled. Verified
+  from an external host: 5244 and 7778 now time out (they answered 200 before), the CDN path
+  is intact (ranged read through the CDN → 206 with the exact byte count, TTFB 0.26 s), and
+  `bash /home/opc/cds/deploy/oracle/accept.sh` on the node prints **VERDICT=PASS** (four units
+  active, 0 failed, report endpoint 200). The proxy stack and s3shroud ports were left
+  untouched, as required.
+- **R3 is unblocked** — the authoritative list exists and is API-driven; see R3 below. It was
+  previously "stop and report" only because the source was unknown.
+- **R5 waits on R3 step 2**: a host default-deny is only safe once the origin-pull ranges are
+  known and applied.
+
 ## Requirements
 
-**R1 `infra` + `ours` — the nocache plane must stop being public.**
+**R1 `infra` + `ours` — the nocache plane must stop being public.** ✅ done (2026-09-23)
 It is an internal plane by design (ADR-0022; `config-nocache.toml`,
 `front_listen = "[::]:7778"`). Ours: bind it to loopback and redeploy.
 Infra: block 7778 at the perimeter as well. Acceptance: A3.
 
-**R2 `infra` — OpenList must not be reachable from the internet.**
+**R2 `infra` — OpenList must not be reachable from the internet.** ✅ done (2026-09-23)
 Port 5244 is the gateway to the content store and holds its credentials. Bind it
 to loopback (OpenList's own config) and block 5244 at the perimeter. The origin
 must keep reaching it at `127.0.0.1:5244`. Acceptance: A2.
 
-**R3 `infra` — restrict the origin port (7777) to EdgeOne's origin-pull origins.**
-**Do not guess the CIDRs.** Obtain the authoritative list for this zone (area
-overseas) from Tencent — EdgeOne console, API, or support ticket — and record
-where it came from. If there is no authoritative list for this zone, **stop and
-report that**; the fallback is R4, not invented ranges. A wrong allowlist here
-takes the whole CDN path down and looks like a CDN fault. Acceptance: A1 and A4
-in the same session.
+**R3 `infra` + `edgeone` — restrict the origin port (7777) to EdgeOne's origin-pull ranges.**
+
+The authoritative list exists and is API-driven. **Do not guess CIDRs, and do not derive
+them by resolving hostnames** — Tencent publishes them through the origin-protection API,
+as versioned families, with a documented refresh pattern.
+
+Read-only findings, 2026-09-23, with the sub-account
+(`--endpoint teo.intl.tencentcloudapi.com`, proxies unset):
+
+- `DescribeAvailableOriginACLFamily` → one family for this zone:
+  **`gaz-0.0.4-20260907`**, `ActiveTime 2026-10-12T00:00:00+08:00`,
+  **312 IPv4 + 184 IPv6 CIDRs**. (`gaz` = global standard control domain; `mlc` = China,
+  `emc` = overseas-excluding-China; the `plat-*` families are lite variants with fewer
+  ranges, for approved accounts.)
+- `DescribeOriginACL` for `zone-3taqnjqfr1zo` → `Status: "offline"`: origin protection is
+  not enabled, so today EdgeOne pulls from whatever it likes and no allowlist can be correct
+  yet.
+- `DescribeOriginProtection` is the **old API, superseded 2025-06-27** — use
+  `DescribeOriginACL`.
+
+Order matters: an allowlist applied before the feature is on would block the pull nodes
+EdgeOne actually uses today.
+
+1. `EnableOriginACL` on the zone. From then on EdgeOne pulls **only** from the `gaz`
+   ranges. Revert: `DisableOriginACL` (which also stops update notifications).
+2. Apply that family's CIDRs to the perimeter — the OCI security list / NSG covering 7777,
+   or an nftables set on the host. 496 CIDRs is a **set to be reloaded by a timer**, not
+   496 hand-written rules.
+3. Refresh: poll `DescribeOriginACL` about every three days (Tencent's own suggested
+   cadence). If `NextOriginACL` comes back non-empty, apply the new ranges, then call
+   `ConfirmOriginACLUpdate` so the notifications stop.
+4. `ModifyOriginACL` binds or unbinds specific domains/instances to the protection; any
+   domain added later goes through it.
+
+Acceptance: A1 and A4 verified **in the same session** as step 2, plus the applied set's
+count equal to the family's count (312 + 184), and the ordering visible in the change log
+(enabled before applied).
 
 **R4 `ours`, blocked on a capability check — an origin-access secret instead of an IP list.**
 If EdgeOne can inject a request header on origin pull, the front can require it
 (a new config knob; today only the prewarm token exists), and then the allowlist
-stops being hostage to IP churn. Needs the EdgeOne-holding side to answer
-"can a rule add a header on origin pull?" before any code is written.
+stops being hostage to IP churn. The API model does contain request-header actions
+(`ModifyRequestHeader`, `HeaderParameters`), so this looks possible; it needs the
+EdgeOne-holding side to confirm it applies to **origin-pull** requests before any code is
+written. R3 is now the primary path — R4 stays as the belt to its braces.
 
 **R5 `infra` — a host firewall with default-deny inbound.**
 firewalld or nftables, allowing only 22 (from the management CIDRs) and 7777
