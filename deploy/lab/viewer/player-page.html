@@ -50,7 +50,33 @@ function start() {
   }
   v.play().catch((e) => p.events.push({ t: t(), ev: 'play-rejected', msg: String(e) }));
 }
-start();
+
+// `?fanout=N` puts the range fan-out service worker in front of the player. The
+// player is never told: the worker splits each media range request into N
+// parallel sub-ranges and hands the bytes back in order. That is the shape that
+// measured 7.1 MB/s where one serial connection measures 0.9. Playback starts
+// only after this page is controlled, so a run cannot silently measure the
+// workerless path and call it a fan-out result.
+async function boot() {
+  const fanout = Number(q.get('fanout') || 0);
+  if (fanout > 0 && 'serviceWorker' in navigator) {
+    try {
+      await navigator.serviceWorker.register(`range-fanout-sw.js?fanout=${fanout}`, { scope: './' });
+      await navigator.serviceWorker.ready;
+      if (!navigator.serviceWorker.controller) {
+        await Promise.race([
+          new Promise((res) => navigator.serviceWorker.addEventListener('controllerchange', res, { once: true })),
+          new Promise((res) => setTimeout(res, 3000)),
+        ]);
+      }
+      p.events.push({ t: t(), ev: 'fanout', fanout, controlled: !!navigator.serviceWorker.controller });
+    } catch (e) {
+      p.events.push({ t: t(), ev: 'fanout-registration-failed', msg: String(e) });
+    }
+  }
+  start();
+}
+boot();
 </script>
 </body>
 </html>

@@ -1471,6 +1471,35 @@ Repro (local, no network): `node deploy/lab/viewer/log-server.py 7900 <dir>
 and an `hls.min.js` (jsdelivr) into `<dir>`, then
 `node deploy/lab/viewer/player-fetch-probe.mjs "http://127.0.0.1:7900/player-page.html?src=hls.m3u8" 45`.
 
+### The glue that gives a ready-made player more speed: range fan-out (2026-09-23)
+
+Since an off-the-shelf player fetches one segment at a time, the only lever left
+on a per-connection-limited leg is parallelism — and the player cannot supply
+it. `deploy/lab/viewer/range-fanout-sw.js` supplies it without the player
+knowing: a service worker intercepts each media Range request, splits it into N
+sub-ranges, starts them all at once, and hands the bytes back in order as one
+206. It is a byte-range multiplier for one URL pattern, not media-aware, so it
+works for hls.js, dash.js, a plain `<video>`, or this repo's own reader.
+
+Same fixture, same 900 KB/s leg, 8 Mbps content (6.07 MB per 6-second segment):
+
+```
+no worker    segment fetch 6.7-7.4 s   stalls every ~6 s; 45 s watched, 11 s lost
+?fanout=4    segment fetch 1.68 s      0 stalls after startup, buffer reaches the end
+```
+
+The server log shows the mechanism: four 1.51 MB ranges with identical start
+timestamps (68.154/68.155, 71.872/71.875/71.878/71.880), each taking 1.68 s —
+the per-connection rate is unchanged, there are simply four of them. Reassembly
+is byte-exact (a 4,000,001-byte range through the worker has the same SHA-256 as
+the same range read from disk), and the player never learns it happened: hls.js
+still reports one fragment load per segment.
+
+For the film the arithmetic is the same shape: 15.5 Mbps is 11.6 MB per
+6-second segment, so fan-out 8 gives ~1.45 MB parts, ~1.6 s each at 900 KB/s.
+Fan-out and a lower rendition are alternatives, not rivals: ABR fits the content
+to the leg, fan-out multiplies the leg.
+
 ### The target-scale account: an object the node can never hold
 
 The product's object is a 3-hour video of 30-200 GB. Measured on the node against
