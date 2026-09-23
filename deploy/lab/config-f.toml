@@ -14,6 +14,11 @@
 front_listen = "127.0.0.1:7782"
 front_metrics_listen = "127.0.0.1:9095"
 front_rate_rps = 2
+# R4's gate, with the DEFAULT exemption list: loopback (this section's own
+# requests) carries no stamp and is still served. That is the exemption arm --
+# the four assertions above passing unstamped is the evidence for it.
+front_origin_token_header = "X-Origin-Token"
+front_origin_token_env = "CDN_LAB_ORIGIN_TOKEN"
 listen_addr = "127.0.0.1:8086"
 cache_dir = "/mnt/hdd/CDN-LAB/cache-f"
 max_size_bytes = 268435456

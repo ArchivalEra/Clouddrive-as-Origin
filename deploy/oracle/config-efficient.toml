@@ -17,6 +17,19 @@ front_ip_block = []
 front_ip_allow = []
 # Per-client-IP requests/sec ceiling; Omit = disabled (threshold lands later).
 front_rate_rps = 0
+# Admission control (R4, 2026-09-23). EdgeOne sets this header on every request
+# it forwards to us -- `ModifyRequestHeader` on rule-3usngannhvqa, its value
+# living in the rule and never here -- so a request without it did not come from
+# the CDN. The port has to stay reachable, because the free plan does not
+# publish the origin-pull ranges (docs/security-hardening.md R3), so this check
+# is what keeps strangers out. The env var is set in
+# /opt/origin-cache/origin-cache.env; naming it here without setting it is a
+# boot failure on purpose.
+front_origin_token_header = "X-Origin-Token"
+front_origin_token_env = "ORIGIN_TOKEN"
+# Loopback, spelled out rather than left implicit: accept.sh, the LAB and the
+# watchdog reach the front over loopback and carry no edge stamp.
+front_origin_token_exempt = ["127.0.0.1/32", "::1/128"]
 tls_cert_env = "ORIGIN_TLS_CERT_PATH"
 tls_key_env = "ORIGIN_TLS_KEY_PATH"
 listen_addr = "127.0.0.1:8080"

@@ -23,7 +23,7 @@ DAV_PASS=labpass
 PREWARM_SECRET=labsecret
 SIGV4_AK=AKLLABTESTKEY
 SIGV4_SK=labsk_demo
-PID_DAV= PID_A= PID_B= PID_C= PID_D= PID_E= PID_F= PID_G=
+PID_DAV= PID_A= PID_B= PID_C= PID_D= PID_E= PID_F= PID_G= PID_H=
 PASS=0; FAIL=0
 # `--smoke` is the core regression set in a minute: the binary boots, the front
 # serves, ranges are 206 and byte-exact, and the run/window machinery shares one
@@ -72,7 +72,7 @@ echo $$ > "$LOCK"
 
 cleanup() {
   rm -f "$LOCK"
-  for pid in "$PID_A" "$PID_B" "$PID_C" "$PID_D" "$PID_E" "$PID_F" "$PID_G" "$PID_DAV"; do
+  for pid in "$PID_A" "$PID_B" "$PID_C" "$PID_D" "$PID_E" "$PID_F" "$PID_G" "$PID_H" "$PID_DAV"; do
     [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null
   done
   # Belt and braces: an instance this run failed to track would keep `wait`
@@ -96,7 +96,7 @@ pkill -f "target/release/origin-cache" 2>/dev/null
 # Every port a stale instance could hold, front AND business: waiting only on
 # the front ports let a dying process keep its business port and the fresh
 # instance died at bind with "Address already in use".
-for port in 7777 7778 7779 7780 7781 7782 7783 8081 8082 8083 8084 8085 8086 8087; do
+for port in 7777 7778 7779 7780 7781 7782 7783 7784 8081 8082 8083 8084 8085 8086 8087 8088; do
   for _ in $(seq 1 20); do
     ss -tln 2>/dev/null | grep -q ":$port " || break
     sleep 0.5
@@ -107,8 +107,8 @@ done
 # The cache dirs must start EMPTY: they persist across runs, the ledger is
 # rebuilt from whatever sidecars are on disk at boot, and every staged-bytes
 # assertion below would otherwise be measuring the previous run.
-rm -rf "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e" "$LAB/cache-f" "$LAB/cache-g"
-mkdir -p "$LAB/dav-data/media/2026/08" "$LAB/dav-data/archive" "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e" "$LAB/cache-f" "$LAB/cache-g"
+rm -rf "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e" "$LAB/cache-f" "$LAB/cache-g" "$LAB/cache-h"
+mkdir -p "$LAB/dav-data/media/2026/08" "$LAB/dav-data/archive" "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e" "$LAB/cache-f" "$LAB/cache-g" "$LAB/cache-h"
 echo "hello-origin" > "$LAB/dav-data/media/hello.txt"
 head -c 1048576 /dev/urandom > "$LAB/dav-data/media/big1mb.bin"
 # A second 1 MiB object: the eviction test needs two keys staging at once.
@@ -154,6 +154,8 @@ done
 
 # --- setup: start every profile ---
 export CDN_LAB_DAV_USER=$DAV_USER CDN_LAB_DAV_PASS=labpass CDN_LAB_PREWARM_SECRET=$PREWARM_SECRET
+# The origin token the edges stamp in production; here it is a lab constant.
+export CDN_LAB_ORIGIN_TOKEN=lab-origin-token
 cd "$REPO"
 "$BIN" "$REPO/deploy/lab/config-a.toml" > "$LAB/cache-a/serve.log" 2>&1 & PID_A=$!
 "$BIN" "$REPO/deploy/lab/config-b.toml" > "$LAB/cache-b/serve.log" 2>&1 & PID_B=$!
@@ -162,6 +164,7 @@ cd "$REPO"
 "$BIN" "$REPO/deploy/lab/config-e.toml" > "$LAB/cache-e/serve.log" 2>&1 & PID_E=$!
 "$BIN" "$REPO/deploy/lab/config-f.toml" > "$LAB/cache-f/serve.log" 2>&1 & PID_F=$!
 "$BIN" "$REPO/deploy/lab/config-g.toml" > "$LAB/cache-g/serve.log" 2>&1 & PID_G=$!
+"$BIN" "$REPO/deploy/lab/config-h.toml" > "$LAB/cache-h/serve.log" 2>&1 & PID_H=$!
 # Readiness is POLLED, never a fixed sleep: boot measures 1-11 s on the node
 # (aarch64 with a cold page cache), and a single-shot probe fails a healthy
 # instance. `-f` matters too: without it a 404 (or any error page) still exits
@@ -191,6 +194,7 @@ kill -0 "$PID_D" 2>/dev/null || { echo "FAIL: eviction process died at boot"; ta
 kill -0 "$PID_E" 2>/dev/null || { echo "FAIL: watch process died at boot";    tail -5 "$LAB/cache-e/serve.log"; exit 1; }
 kill -0 "$PID_F" 2>/dev/null || { echo "FAIL: front guards died at boot"; tail -5 "$LAB/cache-f/serve.log"; exit 1; }
 kill -0 "$PID_G" 2>/dev/null || { echo "FAIL: default-window instance died at boot"; tail -5 "$LAB/cache-g/serve.log"; exit 1; }
+kill -0 "$PID_H" 2>/dev/null || { echo "FAIL: origin-token instance died at boot"; tail -5 "$LAB/cache-h/serve.log"; exit 1; }
 
 # Every request is BOUNDED. Without a timeout a single stalled request hangs the
 # whole suite with no output at all — which is exactly what happened once, in
@@ -791,6 +795,21 @@ code=$(H -o /dev/null -w "%{http_code}" -X POST --data-binary @"$LAB/oversize-pr
   "http://127.0.0.1:7782/_internal/prewarm/media/$WALK_OBJ")
 [ "$code" = 413 ] && ok "an oversized prewarm body is 413 at the front" \
   || bad "oversized prewarm returned $code (want 413)"
+
+# R4: the origin-token gate. config-f runs it with the DEFAULT exemption list
+# (loopback), so every request above was served with no stamp on it -- that is
+# the exemption arm, established by the four assertions that just passed.
+# config-h runs the same gate with an EMPTY list, where nothing is exempt and
+# the refusal is therefore reachable.
+code=$(H -m 20 -o /dev/null -w "%{http_code}" -r 0-1023 "http://127.0.0.1:7784/media/$WALK_OBJ")
+[ "$code" = 403 ] && ok "without the edge's stamp a request is refused (403)" \
+  || bad "an unstamped request returned $code (want 403)"
+code=$(H -m 20 -o /dev/null -w "%{http_code}" -H "X-Origin-Token: not-the-token" -r 0-1023 "http://127.0.0.1:7784/media/$WALK_OBJ")
+[ "$code" = 403 ] && ok "and a wrong stamp with it" \
+  || bad "a wrongly stamped request returned $code (want 403)"
+code=$(H -m 20 -o /dev/null -w "%{http_code}" -H "X-Origin-Token: $CDN_LAB_ORIGIN_TOKEN" -r 0-1023 "http://127.0.0.1:7784/media/$WALK_OBJ")
+[ "$code" = 206 ] || [ "$code" = 200 ] && ok "the stamped request is served ($code)" \
+  || bad "a correctly stamped request returned $code (want 206)"
 
 # --- the production DEFAULT window against the CDN's shard shape (note 17) ---
 # Every other efficient config here sets a 256 KiB window so its numbers are

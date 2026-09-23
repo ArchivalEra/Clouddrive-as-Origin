@@ -75,9 +75,18 @@ Two more facts, both relevant:
   the write (ranged read 206, exact bytes, TTFB 0.35 s). Revert: remove that action from the
   rule (`ModifyL7AccRule` with the two remaining actions). The origin-side check is the
   remaining piece, and it is what turns the stamp into admission control.
-- **R4 is buildable**: the L7 rule model has `ModifyRequestHeaderParameters` →
-  `HeaderActions[{Action: set|del|add, Name, Value}]`. A client cannot spoof it because the
-  edge **sets** the value rather than appending one.
+- **R4 is DONE and live** (2026-09-23): the edge sets `X-Origin-Token` on every origin pull
+  (`ModifyRequestHeader` on `rule-3usngannhvqa`), the front requires it from any non-exempt
+  peer, and the four-way test passes — external direct 403, loopback 206, CDN 206, the real
+  film through the CDN 206/1 MiB. `accept.sh` on the node: **VERDICT=PASS**. Details, config
+  and the two traps paid for on the way are in the runbook's "The origin token" section.
+- **R5 is now unblocked in principle** but still belongs to the infrastructure agent: with
+  the token live, a host default-deny can be written against the *token* rather than an
+  address list (allow 22 + 7777, let the front do the identifying). R3's address list stays
+  the cleaner end state if the plan ever changes.
+- **What remains**: R8 (rate ceiling — still a decision, and it interacts with the edge's
+  pull IPs), R9 (`front_ip_allow` end-to-end), R11 (public or not), R12 (retention/alerts),
+  R10 (rotate the upstream credential to read-only).
 
 ## Requirements
 

@@ -1933,14 +1933,29 @@ async fn a_sealed_span_and_an_adopted_span_agree() {
         _ => panic!("a ranged miss must stream"),
     };
     let _ = collect(&mut served.plan.body).await;
+    // Wait for the LEDGER row, not the disk view. The seal renames the file
+    // first and records the row after, so sampling the ledger the moment the
+    // staged view appears races the seal (pitfall 50). Measured: waiting on
+    // `staged_spans` then reading `ledger_spans` failed two full-suite runs out
+    // of two under load, while the same test passed 3/3 in isolation. Wait for
+    // the thing this test actually asserts.
     for _ in 0..origin_cache::testsupport::WAIT_TRIES {
-        if !cache.inspect("big.bin").await.staged_spans.is_empty() {
+        if !cache.inspect("big.bin").await.ledger_spans.is_empty() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    let sealed = cache.inspect("big.bin").await.ledger_spans;
-    assert!(!sealed.is_empty(), "the read staged something to compare");
+    let view = cache.inspect("big.bin").await;
+    let sealed = view.ledger_spans;
+    // Say what was there when it was not: a bare "staged nothing" on a box under
+    // load is not actionable (this test failed twice in two full-suite runs
+    // before it waited on the ledger, and it is still rare after that).
+    assert!(
+        !sealed.is_empty(),
+        "the read staged something to compare: ledger={} staged={}",
+        sealed.len(),
+        view.staged_spans.len()
+    );
 
     // The installer path, over the same bytes at the same moment.
     let dir2 = tempdir().unwrap();

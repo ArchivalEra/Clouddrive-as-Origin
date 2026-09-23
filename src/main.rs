@@ -104,6 +104,42 @@ async fn main() -> anyhow::Result<()> {
 
     let tls = front::acceptor_from_env(cfg.tls_cert_env.as_deref(), cfg.tls_key_env.as_deref())
         .context("load front TLS material")?;
+    // R4 admission control. The config names the header the edge stamps and the
+    // env var holding the expected value; the value itself never reaches a file
+    // in this repo or a command line. A named env var that is not set is a boot
+    // failure, for the same reason prewarm's missing secret is one: an admission
+    // control that quietly stops applying when a variable goes missing is worse
+    // than none, because it looks installed.
+    let origin_token = match (
+        cfg.front_origin_token_header.as_deref(),
+        cfg.front_origin_token_env.as_deref(),
+    ) {
+        (Some(header), Some(env_name)) => {
+            let value = std::env::var(env_name).with_context(|| {
+                format!(
+                    "front_origin_token_env names {env_name:?} but it is not set: the front \
+                     would have no value to compare a request against. Set {env_name}, or \
+                     remove front_origin_token_header to serve any peer deliberately."
+                )
+            })?;
+            if value.is_empty() {
+                anyhow::bail!(
+                    "front_origin_token_env {env_name:?} is empty: an empty token is one any \
+                     caller can guess"
+                );
+            }
+            Some((header.to_string(), value))
+        }
+        (None, None) => None,
+        (Some(h), None) => anyhow::bail!(
+            "front_origin_token_header = {h:?} without front_origin_token_env: the header names \
+             what the edge stamps, the env var names where the expected value lives"
+        ),
+        (None, Some(e)) => anyhow::bail!(
+            "front_origin_token_env = {e:?} without front_origin_token_header: nothing would be \
+             checked"
+        ),
+    };
     // Pingora manages its own runtime + signal handling; run it on a
     // dedicated thread (run_forever panics inside a tokio runtime).
     let front_opts = front::FrontOptions {
@@ -114,6 +150,8 @@ async fn main() -> anyhow::Result<()> {
         ip_block: cfg.front_ip_block.clone(),
         ip_allow: cfg.front_ip_allow.clone(),
         rate_rps: cfg.front_rate_rps,
+        origin_token,
+        origin_token_exempt: cfg.front_origin_token_exempt.clone(),
         // The box has 2 cores; the business plane already runs its own
         // workers on them. Pingora's default of 1 thread serializes every
         // TLS/H2/byte-move on one core (P6). Two proxy threads let TLS and

@@ -1500,6 +1500,59 @@ For the film the arithmetic has the same shape: 15.5 Mbps is 11.6 MB per
 Fan-out and a lower rendition are alternatives, not rivals: ABR fits the content
 to the leg, fan-out multiplies the leg.
 
+### The origin token: closing the bypass the CDN cannot (R4, 2026-09-23)
+
+The origin port has to stay reachable — EdgeOne pulls from addresses Tencent does not
+publish on this plan (`OperationDenied.PlanNotSupportOriginProtection`, see
+`docs/security-hardening.md` R3) — so the port is open to whoever finds it, and each of
+those requests bills the upstream. The gate that closes that is an edge-set header: the
+CDN rule (`rule-3usngannhvqa`) carries a third action, `ModifyRequestHeader`, which
+**sets** `X-Origin-Token` on every request the edge forwards (a `set`, so a client cannot
+spoof it), and the front refuses any request from a non-exempt peer that does not carry
+the expected value.
+
+Config, both planes:
+
+```toml
+front_origin_token_header = "X-Origin-Token"
+front_origin_token_env = "ORIGIN_TOKEN"      # value lives in the env file, never here
+front_origin_token_exempt = ["127.0.0.1/32", "::1/128"]   # the node's own probes
+```
+
+Set together or not at all (half a gate is a config error), and a named env var that is
+unset is a **boot failure**, not a silent fail-open — the same call the prewarm secret
+made. The value is 64 hex characters, generated once and stored in
+`/opt/origin-cache/origin-cache.env`.
+
+Measured, with the gate live on the node:
+
+```
+external, straight at the origin port    403   (was 200: the bypass is closed)
+loopback, on the node (`accept.sh`)      206   (the exemption)
+through the CDN                          206   (the stamp arrives: the edge action works)
+the real 200 GiB film through the CDN    206, exactly 1 MiB
+```
+
+Two traps, both paid for on the way:
+
+- **`[::]` reports an IPv4 peer as `::ffff:a.b.c.d`.** The loopback exemption did not match
+  `127.0.0.1/32` and refused `accept.sh` at its own front. The same hole was latent in
+  `front_ip_block` and `front_ip_allow`, where an operator's v4 CIDR would simply never
+  match; all three now go through one canonicalizing matcher (`ip_in_any`), pinned by
+  `cidr_lists_match_mapped_ipv4_peers`. Corollary: write CIDRs in their own family's form —
+  the mapped spelling is the one that stops matching.
+- **Order: the binary that canonicalizes must land with a config that is already plain.**
+  Deploying it while the node still carried the mapped entry the experiment had written made
+  `accept.sh` fail (a mapped CIDR no longer matches once the peer is canonicalized), and the
+  deploy rolled itself back — correctly. The working sequence is: plain config → deploy →
+  flip.
+
+The LAB carries both arms: `config-f` runs the gate with the default exemption (its
+un-stamped requests being served IS the exemption arm), and `config-h` runs it with an empty
+exemption list, where nothing is exempt and the refusal is reachable — three assertions
+(no stamp → 403, wrong stamp → 403, right stamp → 206). Section 16 therefore covers nine
+guards instead of six, and `--quick` measures 75 PASS / 0 FAIL.
+
 ### What the edge's cache label is worth (measured 2026-09-23)
 
 `eo-cache-status` reads like an account of where the bytes came from. It is not

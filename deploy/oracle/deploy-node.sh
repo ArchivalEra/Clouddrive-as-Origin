@@ -36,6 +36,12 @@ ls -l /tmp/cds-src.tgz
 
 say "2/6 cross-build on the compile machine ($COMPILE_HOST)"
 scp -q -i "$COMPILE_KEY" -o IdentitiesOnly=yes /tmp/cds-src.tgz "$COMPILE_HOST:/tmp/cds-src.tgz"
+# The build script travels with this one. It used to be assumed already present
+# at /tmp/build-aarch64.sh on the compile machine, which held only as long as
+# nobody cleaned that machine's /tmp — the deploy then died at step 2 with "no
+# such file", the same way a secret passed through the other side's /tmp
+# silently arrives empty.
+scp -q -i "$COMPILE_KEY" -o IdentitiesOnly=yes "$REPO/deploy/oracle/build-aarch64.sh" "$COMPILE_HOST:/tmp/build-aarch64.sh"
 ssh -i "$COMPILE_KEY" -o IdentitiesOnly=yes "$COMPILE_HOST" \
   'bash /tmp/build-aarch64.sh /tmp/cds-src.tgz /tmp/origin-cache-aarch64-musl' | tail -4
 BUILT=$(ssh -i "$COMPILE_KEY" -o IdentitiesOnly=yes "$COMPILE_HOST" 'sha256sum /tmp/origin-cache-aarch64-musl | cut -c1-16')
@@ -76,11 +82,16 @@ echo
 echo "  running now: $(ssh "$NODE" 'sha256sum /opt/origin-cache/origin-cache | cut -c1-16') (rollback copy: /home/opc/origin-cache.prev)"
 
 say "6/6 acceptance gate"
-ssh "$NODE" 'bash /home/opc/repo/deploy/oracle/accept.sh 2>&1 | tail -4' || true
-if ssh "$NODE" 'bash /home/opc/repo/deploy/oracle/accept.sh 2>&1 | grep -q "VERDICT=PASS"'; then
-  echo "  VERDICT=PASS"
+# One run, and its whole output kept on the node: a verdict that says FAIL while
+# the evidence that would explain it was piped through `tail` cannot be acted on,
+# and running it twice also runs it under two different moments of the restart.
+ssh "$NODE" 'bash /home/opc/repo/deploy/oracle/accept.sh > /home/opc/accept-last.log 2>&1; tail -6 /home/opc/accept-last.log'
+if ssh "$NODE" 'grep -q "VERDICT=PASS" /home/opc/accept-last.log'; then
+  echo "  VERDICT=PASS (full output: /home/opc/accept-last.log on the node)"
 else
-  echo "  accept FAILED — rolling back to the previous binary"
+  echo "  accept FAILED — full output kept at /home/opc/accept-last.log on the node:"
+  ssh "$NODE" 'grep -E "FAIL" /home/opc/accept-last.log | head -6'
+  echo "  rolling back to the previous binary"
   ssh "$NODE" 'sudo -n install -o opc -g opc -m 0755 /home/opc/origin-cache.prev /opt/origin-cache/origin-cache \
     && sudo -n systemctl restart origin-cache-efficient origin-cache-nocache && sleep 8 \
     && systemctl is-active origin-cache-efficient origin-cache-nocache'
