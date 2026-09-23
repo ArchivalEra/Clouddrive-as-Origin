@@ -602,8 +602,7 @@ mod tests {
 
     #[test]
     fn coverage_merges_and_reports_covered() {
-        let mut c = Coverage::default();
-        c.total = 100;
+        let mut c = Coverage { total: 100, ..Coverage::default() };
         c.add_interval(0, 30, 1000);
         c.add_interval(50, 80, 2000);
         assert_eq!(c.covered(), 60);
@@ -649,8 +648,7 @@ mod tests {
 
     #[test]
     fn coverage_window_decay_drops_stale_intervals() {
-        let mut c = Coverage::default();
-        c.total = 100;
+        let mut c = Coverage { total: 100, ..Coverage::default() };
         c.add_interval(0, 30, 1000);
         c.add_interval(50, 80, 2000);
         // Window 1000ms, now=2500: interval [0,30) read at 1000 is stale.
@@ -707,8 +705,7 @@ mod tests {
     /// the ledger under-reports rather than claiming a gap it cannot fill.
     #[test]
     fn a_gapped_ledger_is_bounded_by_dropping_the_coldest_spans() {
-        let mut c = Coverage::default();
-        c.total = 1_000_000;
+        let mut c = Coverage { total: 1_000_000, ..Coverage::default() };
         let n = MAX_INTERVALS_PER_KEY + 100;
         for i in 0..n as u64 {
             c.add_interval(i * 100, i * 100 + 10, i); // 10 read, 90 gap
