@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>player probe</title>
+<style>body{font:14px system-ui;margin:16px}video{width:640px;background:#000}</style>
+</head>
+<body>
+<video id="v" controls muted playsinline></video>
+<script src="hls.min.js"></script>
+<script>
+// A ready-made player (hls.js) on a single-file byte-range playlist. The page
+// records what the player did rather than what it looked like: every fragment
+// load with its byte count and timing (so parallelism can be read off the
+// overlap), every error, and every waiting/stalled event.
+const q = new URLSearchParams(location.search);
+const src = q.get('src');
+const v = document.getElementById('v');
+const p = window.__probe = { events: [], frags: [], errors: [], t0: performance.now() };
+const t = () => Math.round(performance.now() - p.t0);
+v.addEventListener('playing', () => p.events.push({ t: t(), ev: 'playing' }));
+v.addEventListener('waiting', () => p.events.push({ t: t(), ev: 'waiting' }));
+v.addEventListener('stalled', () => p.events.push({ t: t(), ev: 'stalled' }));
+v.addEventListener('error', () => p.events.push({ t: t(), ev: 'video-error' }));
+
+function start() {
+  if (window.Hls && Hls.isSupported()) {
+    const hls = window.__hls = new Hls();
+    hls.on(Hls.Events.MANIFEST_PARSED, () => p.events.push({ t: t(), ev: 'manifest-parsed' }));
+    hls.on(Hls.Events.FRAG_LOADED, (_e, d) => {
+      const s = d.frag.stats || {};
+      p.frags.push({
+        t: t(),
+        sn: d.frag.sn,
+        bytes: s.total,
+        start: Math.round(s.loading.start - p.t0),
+        first: Math.round(s.loading.first - p.t0),
+        end: Math.round(s.loading.end - p.t0),
+      });
+    });
+    hls.on(Hls.Events.ERROR, (_e, d) =>
+      p.errors.push({ t: t(), type: d.type, details: d.details, fatal: !!d.fatal }));
+    hls.loadSource(src);
+    hls.attachMedia(v);
+  } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+    p.events.push({ t: t(), ev: 'native-hls' });
+    v.src = src;
+  } else {
+    p.events.push({ t: t(), ev: 'no-hls-support' });
+  }
+  v.play().catch((e) => p.events.push({ t: t(), ev: 'play-rejected', msg: String(e) }));
+}
+start();
+</script>
+</body>
+</html>
