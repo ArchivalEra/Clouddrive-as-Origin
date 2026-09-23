@@ -152,9 +152,13 @@ pub const LISTING_SNAPSHOT_TTL_MS: u64 = 5_000;
 /// of methods with exactly one caller, while the key is entirely a listing
 /// concept. `now_millis` comes from the caller — the house idiom in
 /// `Inflight` and `Flights` — so this holds no clock of its own.
+/// Rows keyed by `(upstream, prefix, is_v2)`: the walk time and the page
+/// snapshot it produced, shared rather than copied (O5).
+type ListingRows = Arc<tokio::sync::Mutex<HashMap<(String, String, bool), (u64, Arc<Vec<ListEntry>>)>>>;
+
 #[derive(Clone, Default)]
 pub struct ListingCache {
-    rows: Arc<tokio::sync::Mutex<HashMap<(String, String, bool), (u64, Arc<Vec<ListEntry>>)>>>,
+    rows: ListingRows,
 }
 
 impl ListingCache {
@@ -428,14 +432,12 @@ pub(crate) async fn try_list<C: Clock + Clone>(
 
     let page = select_items(&entries, &params);
     match resume_from(&params) {
-        Some(Err(())) => {
-            return Some(invalid_argument(
-                &ListParamError::ContinuationToken,
-                path_key,
-                req_id,
-                host_id,
-            ))
-        }
+        Some(Err(())) => Some(invalid_argument(
+            &ListParamError::ContinuationToken,
+            path_key,
+            req_id,
+            host_id,
+        )),
         Some(Ok(resume)) => Some(render_page(state, upstream_id, &params, page, resume, req_id, host_id)),
         None => Some(render_page(state, upstream_id, &params, page, Resume::Start, req_id, host_id)),
     }
@@ -522,6 +524,9 @@ fn render_page<C: Clock + Clone>(
     )
 }
 
+// The arguments ARE the page and the request's ids; a bundle struct would
+// rename them without grouping anything that travels together elsewhere.
+#[allow(clippy::too_many_arguments)]
 fn render_page_response(
     bucket: &str,
     params: &ListParams,
@@ -580,8 +585,7 @@ fn aws_url_encode(s: &str) -> String {
 }
 
 fn enc_maybe(params: &ListParams, s: &str) -> String {
-    let raw = if params.encoding_url { aws_url_encode(s) } else { xml_escape(s) };
-    raw
+    if params.encoding_url { aws_url_encode(s) } else { xml_escape(s) }
 }
 
 fn iso8601(rfc2822: &str) -> Option<String> {

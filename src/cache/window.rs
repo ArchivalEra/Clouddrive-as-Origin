@@ -208,7 +208,8 @@ mod tests {
         assert_eq!(crate::config::DEFAULT_WINDOW_FLOOR_BYTES, 8 * 1024 * 1024);
         // The floor is meaningful only below the default window; if a change
         // ever made it larger, every default-window jump would silently take
-        // the full window again.
-        assert!(crate::config::DEFAULT_WINDOW_FLOOR_BYTES < 64 * 1024 * 1024);
+        // the full window again. A compile-time assertion, so raising the floor
+        // past the default window is a build error rather than a test failure.
+        const _: () = assert!(crate::config::DEFAULT_WINDOW_FLOOR_BYTES < 64 * 1024 * 1024);
     }
 }

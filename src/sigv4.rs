@@ -218,10 +218,8 @@ impl CredentialV4 {
 // ---------------------------------------------------------------------------
 
 /// Look up request headers: lowercase name -> all values in request order.
-fn header_lookup<'a>(headers: &'a [(String, String)], _unused: &str) -> Box<dyn Fn(&str) -> Vec<String> + 'a> {
-    Box::new(move |n: &str| {
-        headers.iter().filter(|(k, _)| k == n).map(|(_, v)| v.clone()).collect()
-    })
+fn header_lookup(headers: &[(String, String)]) -> impl Fn(&str) -> Vec<String> + '_ {
+    move |n: &str| headers.iter().filter(|(k, _)| k == n).map(|(_, v)| v.clone()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -404,12 +402,14 @@ fn verify_signature(
     canonical_decoded: &str,
     canonical_raw: Option<&str>,
     amz_date_iso: &str,
-    scope_date: &str,
-    region: &str,
-    service: &str,
+    // Date, region and service are the credential's scope, so they travel as
+    // the credential rather than as three more strings.
+    credential: &CredentialV4,
     secret: &str,
     expected: &str,
 ) -> bool {
+    let (scope_date, region, service) =
+        (credential.date.as_str(), credential.aws_region.as_str(), credential.aws_service.as_str());
     // Try the decoded form, then the raw form ONLY when the two canonical
     // requests actually differ — otherwise the second attempt re-signs an
     // identical string (P7).
@@ -569,7 +569,7 @@ fn verify_header(
     if names.is_empty() {
         return Err("empty SignedHeaders");
     }
-    let lookup = header_lookup(&input.headers, "");
+    let lookup = header_lookup(&input.headers);
     let canonical_headers = canonical_headers(&names, &lookup).ok_or("signed header missing from request")?;
     let signed_list = signed_headers_list(&names);
     // Payload hash comes from the signed x-amz-content-sha256 header
@@ -610,15 +610,13 @@ fn verify_header(
         let sts_iso = amz_date.fmt_iso8601();
         let expected = signature;
         if !verify_signature(
-        &canonical_decoded,
-        canonical_raw.as_deref(),
-        &sts_iso,
-        &credential.date,
-        &credential.aws_region,
-        &credential.aws_service,
-        &cfg.secret_access_key,
-        &expected,
-    ) {
+            &canonical_decoded,
+            canonical_raw.as_deref(),
+            &sts_iso,
+            &credential,
+            &cfg.secret_access_key,
+            &expected,
+        ) {
         return Err("signature does not match");
     }
 
@@ -685,7 +683,7 @@ fn verify_presigned(
     // signed; X-Amz-Signature is excluded from the canonical query.
     let names: Vec<String> = signed_headers_raw.split(';').map(|s| s.to_ascii_lowercase()).collect();
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let lookup = header_lookup(&input.headers, "");
+    let lookup = header_lookup(&input.headers);
     let canonical_headers = canonical_headers(&name_refs, &lookup).ok_or("signed header missing from request")?;
     let signed_list = signed_headers_list(&name_refs);
     let qs = canonical_query(&input.query_pairs, true);
@@ -715,9 +713,7 @@ fn verify_presigned(
         &canonical_decoded,
         canonical_raw.as_deref(),
         &sts_iso,
-        &credential.date,
-        &credential.aws_region,
-        &credential.aws_service,
+        &credential,
         &cfg.secret_access_key,
         signature,
     ) {
@@ -726,9 +722,6 @@ fn verify_presigned(
 
     Ok(VerifiedRequest { access_key_id: credential.access_key_id })
 }
-
-#[cfg(test)]
-
 
 #[cfg(test)]
 mod tests {
@@ -768,7 +761,7 @@ mod tests {
             ("x-amz-content-sha256".into(), "UNSIGNED-PAYLOAD".into()),
             ("x-amz-date".into(), "20130524T000000Z".into()),
         ];
-        let lookup = header_lookup(&headers, "");
+        let lookup = header_lookup(&headers);
         let names = vec!["host", "x-amz-content-sha256", "x-amz-date"];
         let ch = canonical_headers(&names, &lookup).unwrap();
         let list = signed_headers_list(&names);
@@ -783,9 +776,12 @@ mod tests {
             &canonical,
             None, // identical forms: the raw retry is skipped
             &date.fmt_iso8601(),
-            &date.fmt_date(),
-            "us-east-1",
-            "s3",
+            &CredentialV4 {
+                access_key_id: "AKIDEXAMPLE".into(),
+                date: date.fmt_date(),
+                aws_region: "us-east-1".into(),
+                aws_service: "s3".into(),
+            },
             secret,
             &sig,
         ));
@@ -825,9 +821,12 @@ mod tests {
             canonical,
             None,
             "20260912T000000Z",
-            "20260912",
-            "us-east-1",
-            "s3",
+            &CredentialV4 {
+                access_key_id: "AKID".into(),
+                date: "20260912".into(),
+                aws_region: "us-east-1".into(),
+                aws_service: "s3".into(),
+            },
             "secret",
             &sig
         ));
@@ -867,7 +866,7 @@ mod tests {
         let secret = cfg.secret_access_key.clone();
         // Build the signature the way a client would.
         let names = vec!["host", "x-amz-content-sha256", "x-amz-date"];
-        let lookup = header_lookup(&input.headers, "");
+        let lookup = header_lookup(&input.headers);
         let ch = canonical_headers(&names, &lookup).unwrap();
         let list = signed_headers_list(&names);
         // AWS canonical request: headers section ends with '\n', then the
@@ -941,7 +940,7 @@ mod tests {
         // Compute the signature the client would: X-Amz-Signature excluded
         // from canonical query.
         let names = vec!["host"];
-        let lookup = header_lookup(&input.headers, "");
+        let lookup = header_lookup(&input.headers);
         let ch = canonical_headers(&names, &lookup).unwrap();
         let qs = canonical_query(&input.query_pairs, true);
         // Presigned canonical request (s3s shape): method, uri path,

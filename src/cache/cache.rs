@@ -181,6 +181,11 @@ impl Served {
 }
 
 
+// A `Served` is much larger than a redirect's `String`, and boxing it would
+// put a heap allocation on the hot path of every streamed response while
+// every one of the 14 call sites pays a deref. The value is built once per
+// request and destructured immediately, so the difference never accumulates.
+#[allow(clippy::large_enum_variant)]
 pub enum ServeOutcome {
     /// Hand the viewer the upstream's own signed link (307).
     Redirect { location: String },
@@ -277,16 +282,11 @@ impl StreamPlan {
     }
 }
 
+#[derive(Default)]
 pub struct CacheState {
     pub entries: HashMap<String, EntryMeta>,
     pub total_bytes: u64,
     pub segment_sweep_at_millis: u64,
-}
-
-impl Default for CacheState {
-    fn default() -> Self {
-        Self { entries: HashMap::new(), total_bytes: 0, segment_sweep_at_millis: 0 }
-    }
 }
 
 /// Lock-free access clock: the per-hit alternative to taking the state
@@ -1372,7 +1372,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         // (segmented downloads are separate connections).
         let watcher = {
             let segpart = segpart.clone();
-            let fetch_start = fetch_start;
             let seg = store::seg_path(&cache_dir, &cache_key, fetch_start, end);
             let clock = Arc::clone(&clock);
             let staging = self.staging.clone();
@@ -1380,7 +1379,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             let cache_key = cache_key.clone();
             let upstream_id = upstream_id.clone();
             let etag = etag.clone();
-            let total = total;
             tokio::spawn(async move {
                 // Wait for the segpart to appear and stop growing (viewer
                 // gone or transfer done), then seal it.
@@ -1427,7 +1425,8 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                 }
             })
         };
-        let _ = watcher;
+        // The handle is dropped here on purpose: the task keeps running.
+        drop(watcher);
         Ok(PassthroughHit {
             meta: meta_out,
             etag: meta.etag,
@@ -1469,7 +1468,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     /// reader converges on the flight's growing temp file and waits for the
     /// writer to reach its offset (single stream — every upstream open pays
     /// a ~800 ms fixed cost).
-
+    ///
     /// [`Cache::get`] for a pre-resolved key (no re-validation).
     ///
     /// Two key namespaces: [`ResolvedKey::cache_key`] is the cache identity
@@ -1684,12 +1683,9 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         };
 
         if !needs_revalidate {
-            match self.serve_from_disk(&key, CacheOutcome::Hit, range).await? {
-                Some(hit) => {
-                    self.bump_last_access(&key).await;
-                    return Ok(hit);
-                }
-                None => {}
+            if let Some(hit) = self.serve_from_disk(&key, CacheOutcome::Hit, range).await? {
+                self.bump_last_access(&key).await;
+                return Ok(hit);
             }
         } else {
             // Revalidation = stat + etag compare (G2 #11: Drive has no 304;
@@ -1708,9 +1704,10 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             match stat {
                 Ok(stat) if cached_etag.is_some() && cached_etag == stat.meta.etag => {
                     self.bump_last_access(&key).await;
-                    match self.serve_from_disk(&key, CacheOutcome::Revalidated, range).await? {
-                        Some(hit) => return Ok(hit),
-                        None => {}
+                    if let Some(hit) =
+                        self.serve_from_disk(&key, CacheOutcome::Revalidated, range).await?
+                    {
+                        return Ok(hit);
                     }
                 }
                 Ok(stat) => {
@@ -1933,9 +1930,8 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                     return Err(BackendError::Other("flight done but entry missing".into()));
                 }
                 FlightProgress::Failed(e) => {
-                    match self.serve_from_disk(key, CacheOutcome::Stale, range).await? {
-                        Some(hit) => return Ok(hit),
-                        None => {}
+                    if let Some(hit) = self.serve_from_disk(key, CacheOutcome::Stale, range).await? {
+                        return Ok(hit);
                     }
                     if matches!(e, BackendError::NotFound) {
                         self.magazine

@@ -1045,8 +1045,7 @@ mod tests {
         // The built-in nocache profile needs no [cache_profiles] table
         // (real bug caught by the CDN-LAB dry-run: boot rejected
         // cache_profile = "nocache" with a dangling-table error).
-        let toml = format!(
-            r#"
+        let toml = r#"
             [[upstreams]]
             id = "a"
             type = "openlist"
@@ -1058,7 +1057,7 @@ mod tests {
             prefix = ""
             upstream = "a"
         "#
-        );
+        .to_string();
         let cfg = Config::from_toml_str(&toml).unwrap();
         let p = cfg.cache_profile("a");
         assert!(p.nocache);

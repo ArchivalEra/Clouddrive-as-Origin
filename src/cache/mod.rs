@@ -1,3 +1,7 @@
+// `cache::cache` is the module named after the type it owns (`Cache`) and the
+// file every ADR and the module map point at; renaming it would churn every
+// import path in the tree and in the docs for the sake of a lint.
+#[allow(clippy::module_inception)]
 pub mod cache;
 pub mod flight;
 pub(crate) mod ledger;

@@ -33,6 +33,10 @@ use crate::backend::{
 use crate::cache::cache::Cache;
 use crate::cache::flight::BodyStream;
 
+/// Every open a backend recorded, as `(offset, length)` — `None` length means
+/// "to the end of the object". Shared by the mock, its builder and the fixture.
+pub type OpenLog = Arc<Mutex<Vec<(u64, Option<u64>)>>>;
+
 /// The one mock backend: fixed bytes, optional failure, optional Tier-1 link,
 /// optional listing, and call counters.
 ///
@@ -62,7 +66,7 @@ pub struct MockBackend {
     direct_calls: Arc<AtomicUsize>,
     list_calls: Arc<AtomicUsize>,
     /// Every open's `(offset, length)`, for gap-fetch assertions.
-    opens: Arc<Mutex<Vec<(u64, Option<u64>)>>>,
+    opens: OpenLog,
 }
 
 impl MockBackend {
@@ -146,7 +150,7 @@ impl MockBackend {
         stat_calls: Arc<AtomicUsize>,
         open_calls: Arc<AtomicUsize>,
         direct_calls: Arc<AtomicUsize>,
-        opens: Arc<Mutex<Vec<(u64, Option<u64>)>>>,
+        opens: OpenLog,
     ) -> Self {
         self.stat_calls = stat_calls;
         self.open_calls = open_calls;
@@ -735,7 +739,7 @@ mod fixture_support {
 
     use axum::http::{HeaderMap, StatusCode};
 
-    use super::MockBackend;
+    use super::{MockBackend, OpenLog};
     use crate::backend::{BackendRegistry, BackendSlot, StorageBackend};
     use crate::business::AppState;
     use crate::cache::cache::Cache;
@@ -750,7 +754,7 @@ pub struct Fixture {
     pub open_calls: Arc<AtomicUsize>,
     pub direct_calls: Arc<AtomicUsize>,
     pub etag: Arc<Mutex<Option<String>>>,
-    pub opens: Arc<Mutex<Vec<(u64, Option<u64>)>>>,
+    pub opens: OpenLog,
     /// The backend behind "primary", for tests that assert on the mock itself.
     pub primary: Arc<MockBackend>,
 }

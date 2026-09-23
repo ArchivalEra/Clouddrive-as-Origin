@@ -24,6 +24,16 @@ use crate::{
     sigv4,
 };
 
+/// The request-line material the SigV4 verifier reads, borrowed from the
+/// incoming request (grouped so `sigv4_gate` stays under the argument
+/// budget clippy enforces).
+struct SigV4Request<'a> {
+    method: &'a str,
+    raw_uri_path: &'a str,
+    query: Option<&'a str>,
+    headers: &'a HeaderMap,
+}
+
 /// Inbound SigV4 gate (#28): optional verify-if-present. Reads the
 /// verifier's input from the raw request line + headers; a request with
 /// SigV4 material is verified (403 XML on failure), anything else
@@ -31,14 +41,12 @@ use crate::{
 /// vars once at boot; `None` disables the layer entirely.
 fn sigv4_gate(
     cfg: Option<&sigv4::SigV4Config>,
-    method: &str,
-    raw_uri_path: &str,
-    query: Option<&str>,
-    headers: &HeaderMap,
+    request: SigV4Request<'_>,
     req_id: &str,
     host_id: &str,
     now_unix: i64,
 ) -> Option<Response> {
+    let SigV4Request { method, raw_uri_path, query, headers } = request;
     // Lazy gate (P7): probe for SigV4 material BEFORE building anything.
     // With no config the layer is off; without an Authorization header and
     // without a presigned X-Amz-Signature there is nothing to verify. The
@@ -46,7 +54,7 @@ fn sigv4_gate(
     // header into owned Strings (tens of allocations) before discovering
     // that the request was anonymous — the common case.
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let has_presign = query.map_or(false, |q| q.contains("X-Amz-Signature"));
+    let has_presign = query.is_some_and(|q| q.contains("X-Amz-Signature"));
     if cfg.is_none() || (authorization.is_none() && !has_presign) {
         return None;
     }
@@ -62,7 +70,7 @@ fn sigv4_gate(
         method,
         uri_path: &decoded_path,
         raw_uri_path,
-        query_pairs: pairs.into_iter().map(|(k, v)| (k, v)).collect(),
+        query_pairs: pairs,
         headers: header_pairs,
         authorization,
     };
@@ -173,10 +181,12 @@ where
     // percent-decoded.
     if let Some(resp) = sigv4_gate(
         state.sigv4_config.as_ref(),
-        "GET",
-        original.path(),
-        query.as_deref(),
-        &headers,
+        SigV4Request {
+            method: "GET",
+            raw_uri_path: original.path(),
+            query: query.as_deref(),
+            headers: &headers,
+        },
         &req_id,
         &host_id,
         sigv4::SigV4Config::now_unix(),
@@ -186,13 +196,13 @@ where
     // List dispatch: S3 list operations live on the same path
     // space as objects but bypass the cache entirely (metadata path).
     if let Some(resp) =
-        crate::list::try_list(&state, &path_key, query.as_deref(), &req_id, &host_id).await
+        crate::list::try_list(&state, path_key, query.as_deref(), &req_id, &host_id).await
     {
         return resp;
     }
     // Single resolution seam (C2): routing + bucket alias + validation,
     // once. Everything below takes `rk` — no re-resolution, no re-validation.
-    let rk = match state.cache.resolve(&path_key) {
+    let rk = match state.cache.resolve(path_key) {
         Ok(rk) => rk,
         Err(e) => {
             return invalid_key_response(e, path_key, &req_id, &host_id, false);
@@ -410,17 +420,19 @@ where
     // Same SigV4 gate as GET (presigned/head-signed requests).
     if let Some(resp) = sigv4_gate(
         state.sigv4_config.as_ref(),
-        "HEAD",
-        original.path(),
-        query.as_deref(),
-        &headers,
+        SigV4Request {
+            method: "HEAD",
+            raw_uri_path: original.path(),
+            query: query.as_deref(),
+            headers: &headers,
+        },
         &req_id,
         &host_id,
         sigv4::SigV4Config::now_unix(),
     ) {
         return resp;
     }
-    let rk = match state.cache.resolve(&path_key) {
+    let rk = match state.cache.resolve(path_key) {
         Ok(rk) => rk,
         Err(e) => {
             return invalid_key_response(e, path_key, &req_id, &host_id, true);

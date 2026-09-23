@@ -816,7 +816,7 @@ mod tests {
             .unwrap();
         assert_eq!((run.start, run.end), (9000, 10_000), "clamped to the object");
         wait_terminal(&run).await;
-        let spans: Vec<(u64, u64)> = store::segments_for_key(&dir.path().to_path_buf(), "a.bin")
+        let spans: Vec<(u64, u64)> = store::segments_for_key(dir.path(), "a.bin")
             .into_iter()
             .map(|(s, e, _)| (s, e))
             .collect();

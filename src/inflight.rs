@@ -6,8 +6,12 @@ use tokio::sync::{OnceCell, Mutex};
 /// Both success and error are cached in the cell so concurrent waiters
 /// share the same outcome; the cell is removed after the first batch
 /// completes so later calls re-execute.
+/// One key's shared cell: the outcome behind an `Arc` (so a waiter can hold it
+/// after the map lock is released), inside the map, inside the lock.
+type Cells<V, E> = Arc<Mutex<HashMap<String, Arc<OnceCell<Result<V, E>>>>>>;
+
 pub struct Inflight<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> {
-    cells: Arc<Mutex<HashMap<String, Arc<OnceCell<Result<V, E>>>>>>,
+    cells: Cells<V, E>,
 }
 
 impl<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Default for Inflight<V, E> {
@@ -37,7 +41,7 @@ impl<V: Clone + Send + Sync + 'static, E: Clone + Send + Sync + 'static> Infligh
             let mut guard = self.cells.lock().await;
             Arc::clone(guard.entry(key.clone()).or_insert_with(|| Arc::new(OnceCell::new())))
         };
-        let res = cell.get_or_init(|| f()).await.clone();
+        let res = cell.get_or_init(f).await.clone();
         {
             let guard = self.cells.lock().await;
             if let Some(c) = guard.get(&key) {
