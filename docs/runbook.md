@@ -1564,6 +1564,58 @@ exemption list, where nothing is exempt and the refusal is reachable — three a
 (no stamp → 403, wrong stamp → 403, right stamp → 206). Section 16 therefore covers nine
 guards instead of six, and `--quick` measures 75 PASS / 0 FAIL.
 
+### The front's two IP lists, end to end (R9, 2026-09-23)
+
+`deploy/oracle/ip-filter-probe.sh` (run it on the node) answers both lists with
+assertions instead of a config line. It belongs on the node because only a `[::]`
+listener can exercise the mapped-peer path the LAB structurally cannot reach: the
+LAB front binds `127.0.0.1`, where an IPv4 peer is a plain v4 address.
+
+What the two lists are, from `front/src/lib.rs`:
+
+- `front_ip_block` is a **connection-time** filter (`ConnectionFilter`): the peer
+  is dropped before any HTTP exchange. The allow list plays no role there, so an
+  allow entry can never widen access.
+- `front_ip_allow` **only exempts a peer from the per-IP rate ceiling**
+  (`RateGate`). It is not an access list.
+
+The probe starts a throwaway instance on its own ports (7793/8093/9094) with its
+own cache dir and the same loopback OpenList, changing one knob per phase:
+
+```
+phase                                       reading
+1  ceiling 2/s, no allow list               burst of 6 -> 429 429 200 429 200 429
+2  allow = 127.0.0.1/32                     the same burst -> 200 x6, zero 429
+3  allow = 10.0.0.0/8 (non-matching)        429 x4 of 6: matching matters, not presence
+4  block = 127.0.0.1/32                     no answer at all (curl 000) - dropped at connect
+5  block = ::1/128 (pure v6 path)           same, over [::1]
+6  block = 192.0.2.0/24                     answered 200; log: peer=[::ffff:127.0.0.1]:54284
+7  the business dies (RST on the pooled     502 both requests, Content-Length: 0,
+   connection)                              Cache-Control: private, no-store; recovers after
+```
+
+Phase 2 is the one that would have failed before the canonicalizing matcher: a v4
+allow entry could not match the mapped peer, so the exemption was dead on the
+node's listener while the LAB (plain v4) saw nothing wrong.
+
+**What a dead business looks like at the front** (phase 7, measured twice):
+
+- The pooled request — the path a restart actually takes, since the front keeps
+  keep-alive connections to the business — gets a RST, and the front answers
+  `502 Bad Gateway` immediately: `Content-Length: 0`, `Cache-Control: private,
+  no-store`, `Connection: close`. The `no-store` matters: an origin outage is not
+  something the edge gets to keep.
+- A fresh connect that is refused is the same 502 (with pingora's small default
+  body instead of none).
+- The pathological shape is a **silent** peer (packets dropped, no RST): the
+  request that lands on the pooled connection then gets **no answer at all** until
+  the client's own timeout (access log `status=0`, `err=Downstream
+  ConnectionClosed ... Prematurely before response header is sent`). Nothing to
+  fix — a process death is not silent — but do not read a hang as a 502.
+
+Rerun: `scp deploy/oracle/ip-filter-probe.sh oracle-cdn:/home/opc/ && ssh oracle-cdn 'bash /home/opc/ip-filter-probe.sh'`
+(`KEEP=1` leaves the instance and the log behind for debugging).
+
 ### What the edge's cache label is worth (measured 2026-09-23)
 
 `eo-cache-status` reads like an account of where the bytes came from. It is not
