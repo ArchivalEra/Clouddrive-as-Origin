@@ -42,6 +42,20 @@ impl EntryMeta {
     pub fn eligible_at(&self, inactive_ttl_secs: u64) -> u64 {
         self.last_access_millis + inactive_ttl_secs * 1000
     }
+
+    /// Whether this row's metadata is old enough to need a fresh look
+    /// (`revalidate_ttl_secs`). The clock starts at the last revalidation, or at
+    /// admission when there has never been one — a row is not fresh merely
+    /// because nobody has asked about it yet.
+    ///
+    /// The boundary is inclusive: age == ttl is still fresh. Three call sites
+    /// used to write this comparison themselves (one of them the other way up),
+    /// so the threshold and the choice of timestamp had three places to drift.
+    pub fn revalidate_due(&self, now_millis: u64, revalidate_ttl_secs: u64) -> bool {
+        let age = now_millis
+            .saturating_sub(self.last_revalidated_millis.unwrap_or(self.created_at_millis));
+        age > revalidate_ttl_secs * 1000
+    }
 }
 
 #[cfg(test)]
@@ -111,5 +125,36 @@ mod tests {
             oversize: false,
         };
         assert_eq!(m.eligible_at(1200), 1000 + 1200 * 1000);
+    }
+
+    /// The rule the three call sites used to spell out for themselves: the
+    /// clock is the last revalidation, admission when there is none, and the
+    /// boundary is inclusive.
+    #[test]
+    fn revalidate_is_due_after_the_ttl_from_the_last_revalidation() {
+        let mut m = EntryMeta {
+            version: 1,
+            upstream_id: "primary".into(),
+            key: "a.png".into(),
+            size_bytes: 10,
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            created_at_millis: 1_000,
+            last_access_millis: 1_000,
+            last_revalidated_millis: None,
+            negative_until_millis: None,
+            oversize: false,
+        };
+        // No revalidation yet: the clock is admission.
+        assert!(!m.revalidate_due(1_000, 60), "just admitted is fresh");
+        assert!(!m.revalidate_due(61_000, 60), "the boundary itself is still fresh");
+        assert!(m.revalidate_due(61_001, 60), "one millisecond past it is due");
+        // A revalidation restarts the clock.
+        m.last_revalidated_millis = Some(500_000);
+        assert!(!m.revalidate_due(560_000, 60), "fresh again after a revalidation");
+        assert!(m.revalidate_due(560_001, 60));
+        // A clock that ran backwards is not a revalidation.
+        assert!(!m.revalidate_due(10, 60));
     }
 }
