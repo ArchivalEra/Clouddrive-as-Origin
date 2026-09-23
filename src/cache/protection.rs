@@ -112,7 +112,7 @@ mod tests {
         assert!(p.verdict("a.bin", now).pin.is_none(), "a lease has no neighbourhood");
         assert!(!p.verdict("b.bin", now).leased, "a viewer is not a lease");
         let pin = p.verdict("b.bin", now).pin.expect("a watch has a neighbourhood");
-        assert!(pin.start <= 0 && pin.end >= 100, "the pin covers the watched span: {pin:?}");
+        assert!(pin.start == 0 && pin.end >= 100, "the pin covers the watched span: {pin:?}");
     }
 
     /// Both protections expire on their own clocks, and the verdict follows:
@@ -125,9 +125,24 @@ mod tests {
         let _watched =
             watches.acquire_at("b.bin", (0, 100), Arc::new(crate::clock::MockClock::new(0)));
         assert!(p.in_use("b.bin", 500));
-        // A watched key with no pin configured holds nothing back from the
-        // budget, live or idle: only the neighbourhood ever does.
-        assert!(p.verdict("b.bin", 500).pin.is_none() || p.verdict("b.bin", 500).pin.is_some());
+        // A watched key with a pin CONFIGURED offers its neighbourhood to the
+        // budget: `pin` is that offer, and a budget pass may spend it.
+        assert!(
+            p.verdict("b.bin", 500).pin.is_some(),
+            "a configured pin is the neighbourhood a budget pass may spend"
+        );
+        // With no pin configured the same watch holds nothing back from the
+        // budget, live or idle (ADR-0018's other half) — the budget's question
+        // is answered by `pin`, not by "is anybody watching".
+        let no_pin_watches = Arc::new(Watches::new(1_000, 0));
+        let p_no_pin = Protection::new(Arc::clone(&leases), Arc::clone(&no_pin_watches));
+        let _watched_no_pin =
+            no_pin_watches.acquire_at("b.bin", (0, 100), Arc::new(crate::clock::MockClock::new(0)));
+        assert!(p_no_pin.in_use("b.bin", 500), "the watch is live either way");
+        assert!(
+            p_no_pin.verdict("b.bin", 500).pin.is_none(),
+            "no pin configured means nothing held back"
+        );
         drop(_watched);
         assert!(!p.in_use("b.bin", 5_000), "an idle watch stops holding the key");
     }

@@ -849,12 +849,6 @@ impl<C: Clock + Clone + 'static> Cache<C> {
             .ok()
     }
 
-    /// HEAD-grade metadata lookup: memory entry when fresh, else a single
-    /// upstream `stat` (a HEAD must be current — stale rows still cost one
-    /// stat, but bytes never move: no flights, no file reads, no file-row
-    /// installs; a confirmed absence installs a negative tombstone so
-    /// HEAD 404s share the negative-cache window with GET).
-
     /// [`Cache::head_meta`] for a pre-resolved key (no re-validation:
     /// [`ResolvedKey`] is valid by construction).
     pub async fn head_resolved(&self, rk: &ResolvedKey) -> Result<HitMeta, BackendError> {
@@ -2263,8 +2257,7 @@ mod tests {
         etag: Option<&str>,
         fail: Option<BackendError>,
     ) -> (Arc<Config>, Arc<MockClock>, Cache<MockClock>, Arc<AtomicUsize>) {
-        let mut cfg = Config::default();
-        cfg.cache_dir = dir;
+        let cfg = Config { cache_dir: dir, ..Config::default() };
         let cfg = Arc::new(cfg);
         let clock = Arc::new(MockClock::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2439,9 +2432,11 @@ mod tests {
     #[tokio::test]
     async fn inactive_expiry_via_tick() {
         let dir = tempdir().unwrap();
-        let mut cfg = Config::default();
-        cfg.cache_dir = dir.path().to_path_buf();
-        cfg.inactive_ttl_secs = 1;
+        let cfg = Config {
+            cache_dir: dir.path().to_path_buf(),
+            inactive_ttl_secs: 1,
+            ..Config::default()
+        };
         let cfg = Arc::new(cfg);
         let clock = Arc::new(MockClock::new(0));
         let calls = Arc::new(AtomicUsize::new(0));

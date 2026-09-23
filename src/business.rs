@@ -123,7 +123,6 @@ pub struct AppState<C: Clock + Clone> {
 /// Every failure (disabled, unsupported, rejected target, slow link)
 /// silently falls through to the water-pipe — the valve can only save
 /// bandwidth, never break a fetch.
-
 async fn get_key<C>(
     State(state): State<AppState<C>>,
     Path(path_key): Path<String>,
@@ -367,16 +366,6 @@ fn instrument_body(
 }
 
 /// Nocache profile (small-footprint nodes): every GET water-pipes
-/// origin-to-viewer with zero disk writes — no entries, no flights, no
-/// segments, no tombstones. Range or not, cold or not: everything goes
-/// through; only header metadata is stat'd. Every failure surfaces via
-/// the standard error mapping (no stale-if-error: there is no disk copy).
-
-/// Efficient profile (P2-a): ranged misses passthrough origin straight to
-/// the viewer while staging the served interval (no flight, no full fill).
-/// Fresh entries serve from disk via the B path below; every failure here
-/// falls through to it (stale-if-error included).
-
 /// HEAD: headers identical to GET, always 200 on success (even when ranged),
 /// always an empty body. Served from memory meta or a single stat — never a
 /// flight, never file bytes.

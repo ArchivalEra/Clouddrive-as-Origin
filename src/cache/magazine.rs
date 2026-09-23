@@ -547,9 +547,11 @@ mod tests {
     /// a 50 GB pull standing on an empty cache.
     #[test]
     fn a_resident_stray_never_evicts_the_magazine() {
-        let mut cfg = Config::default();
-        cfg.max_size_bytes = 1_000;
-        cfg.inactive_ttl_secs = 1200;
+        let cfg = Config {
+            max_size_bytes: 1_000,
+            inactive_ttl_secs: 1200,
+            ..Config::default()
+        };
 
         let mut st = CacheState::default();
         st.entries.insert("small.bin".into(), row("small.bin", 100, 10, false));
@@ -584,8 +586,7 @@ mod tests {
     /// and the disk is not a second silent eviction budget for them.
     #[test]
     fn strays_are_reclaimed_under_disk_pressure_oldest_first() {
-        let mut cfg = Config::default();
-        cfg.inactive_ttl_secs = 1200;
+        let cfg = Config { inactive_ttl_secs: 1200, ..Config::default() };
 
         let mut st = CacheState::default();
         st.entries.insert("stray-cold.bin".into(), row("stray-cold.bin", 3_000, 10, true));
@@ -624,9 +625,11 @@ mod tests {
     #[tokio::test]
     async fn an_install_does_not_unlink_a_file_under_a_live_lease() {
         let dir = tempdir().unwrap();
-        let mut cfg = Config::default();
-        cfg.cache_dir = dir.path().to_path_buf();
-        cfg.max_size_bytes = 250;
+        let cfg = Config {
+            cache_dir: dir.path().to_path_buf(),
+            max_size_bytes: 250,
+            ..Config::default()
+        };
         let meta = MetaStore::open(&dir.path().join(store::META_STORE_FILE)).unwrap();
         let state = Arc::new(RwLock::new(CacheState::default()));
         {
@@ -681,8 +684,7 @@ mod tests {
     #[tokio::test]
     async fn delete_refuses_a_store_path_and_nested_look_alikes() {
         let dir = tempdir().unwrap();
-        let mut cfg = Config::default();
-        cfg.cache_dir = dir.path().to_path_buf();
+        let cfg = Config { cache_dir: dir.path().to_path_buf(), ..Config::default() };
         let live = dir.path().join(store::META_STORE_FILE);
         std::fs::write(&live, b"database bytes").unwrap();
         // A real object alongside it, so the refusal is specific rather
