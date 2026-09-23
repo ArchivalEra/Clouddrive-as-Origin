@@ -1014,7 +1014,13 @@ async fn sigv4_gate_anonymous_passes_and_bad_signature_403s() {
     state.sigv4_config = Some(cfg.clone());
 
     // Anonymous request: no gate response (proceeds to the cache).
-    let gate = sigv4_gate(Some(&cfg), "GET", "/a.bin", None, &headers(&[]), "r", "h", 0);
+    let gate = sigv4_gate(
+        Some(&cfg),
+        SigV4Request { method: "GET", raw_uri_path: "/a.bin", query: None, headers: &headers(&[]) },
+        "r",
+        "h",
+        0,
+    );
     assert!(gate.is_none());
 
     // Tampered signature: 403 AccessDenied XML, no-store.
@@ -1034,7 +1040,14 @@ async fn sigv4_gate_anonymous_passes_and_bad_signature_403s() {
     // Skewed-clock check fires first; to reach the signature mismatch
     // we set "now" to the request's own time (2013-05-24T00:00:00Z).
     let now: i64 = 1_369_353_600;
-    let resp = sigv4_gate(Some(&cfg), "GET", "/a.bin", None, &h, "r", "h", now).unwrap();
+    let resp = sigv4_gate(
+        Some(&cfg),
+        SigV4Request { method: "GET", raw_uri_path: "/a.bin", query: None, headers: &h },
+        "r",
+        "h",
+        now,
+    )
+    .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();

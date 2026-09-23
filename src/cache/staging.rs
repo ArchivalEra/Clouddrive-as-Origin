@@ -240,6 +240,10 @@ impl Staging {
     /// A file the ledger has no record of sorts as `(t = 0, reads = 0)`, i.e.
     /// first to go: the only two ways to lose a record are decay and the
     /// ceiling, and both drop exactly the entries nobody was reading.
+    // The arguments are the pass's policy inputs, all of them live at the one
+    // call site and none of them travel together anywhere else; a bundle
+    // struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
     async fn pick_spans(
         &self,
         key: &str,

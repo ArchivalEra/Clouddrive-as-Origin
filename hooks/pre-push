@@ -6,13 +6,13 @@
 # The clippy half exists because the project's gate was `cargo build` alone:
 # clippy's own deny-by-default lints never ran, and one of them turned out to
 # be a test whose assertion could not fail (protection.rs). It runs ONLY when
-# the push touches Rust files, and it is a BUDGET, not -D warnings: the tree
-# carries style debt that a cleanup round is paying down, and the rule that
-# keeps it shrinking is "the count may not rise". Lower the number when you
-# fix some; never raise it.
+# the push touches Rust files, and it is a BUDGET, not -D warnings. The tree
+# carried 53 warnings (63 before the first paydown, 53 after it, 0 after the
+# second): the debt is paid, so the budget is 0 and every new warning is a
+# rejected push. Never raise this number.
 
 ZERO="0000000000000000000000000000000000000000"
-CLIPPY_BUDGET=53
+CLIPPY_BUDGET=0
 
 # CJK Unified Ideographs, Extension A, Compatibility Ideographs,
 # CJK punctuation/symbols, and fullwidth punctuation forms.

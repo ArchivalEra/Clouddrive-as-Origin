@@ -33,7 +33,7 @@ pub struct EntryMeta {
 
 impl EntryMeta {
     pub fn is_negative(&self, now_millis: u64) -> bool {
-        self.negative_until_millis.map_or(false, |until| now_millis < until)
+        self.negative_until_millis.is_some_and(|until| now_millis < until)
     }
 
     /// When this entry becomes eligible for eviction: last access plus the

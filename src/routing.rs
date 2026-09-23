@@ -16,7 +16,7 @@ pub struct RouteTable {
 
 impl RouteTable {
     pub fn new(mut rules: Vec<RouteRule>) -> Self {
-        rules.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        rules.sort_by_key(|r| std::cmp::Reverse(r.prefix.len()));
         Self { rules }
     }
 
