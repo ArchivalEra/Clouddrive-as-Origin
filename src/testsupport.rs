@@ -155,22 +155,6 @@ impl MockBackend {
         self
     }
 
-    pub fn stat_calls(&self) -> usize {
-        self.stat_calls.load(Ordering::SeqCst)
-    }
-    pub fn open_calls(&self) -> usize {
-        self.open_calls.load(Ordering::SeqCst)
-    }
-    pub fn direct_calls(&self) -> usize {
-        self.direct_calls.load(Ordering::SeqCst)
-    }
-    pub fn list_calls(&self) -> usize {
-        self.list_calls.load(Ordering::SeqCst)
-    }
-    pub fn opens(&self) -> Vec<(u64, Option<u64>)> {
-        self.opens.lock().unwrap().clone()
-    }
-
     fn slice(&self, range: Option<ByteRange>) -> Result<Vec<u8>, BackendError> {
         let Some(r) = range else { return Ok(self.bytes.clone()) };
         let start = r.offset as usize;

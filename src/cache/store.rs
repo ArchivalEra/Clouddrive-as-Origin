@@ -369,7 +369,7 @@ pub(crate) fn scan_segment_files(cache_dir: &Path) -> Vec<SegmentFile> {
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         if name.starts_with(".segpart.") {
             let _ = std::fs::remove_file(&path);
-        } else if name.starts_with(".seg.") && !name.starts_with(".segmeta.") {
+        } else if name.starts_with(".seg.") {
             match parse_seg_name(&name) {
                 Some(_) => seg_files.push(path),
                 None => {
@@ -462,7 +462,7 @@ pub fn segment_index(cache_dir: &Path) -> std::collections::HashMap<String, Vec<
     let mut idx: std::collections::HashMap<String, Vec<PathBuf>> = std::collections::HashMap::new();
     for path in top_level_files(cache_dir) {
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        if name.starts_with(".seg.") && !name.starts_with(".segmeta.") {
+        if name.starts_with(".seg.") {
             if let Some((key, _, _)) = parse_seg_name(&name) {
                 idx.entry(key).or_default().push(path);
             }
@@ -505,7 +505,7 @@ pub fn sweep_orphan_metas(cache_dir: &Path) {
     let mut live: HashSet<String> = HashSet::new();
     for path in &files {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if name.starts_with(".seg.") && !name.starts_with(".segmeta.") {
+        if name.starts_with(".seg.") {
             if let Some((key, _, _)) = parse_seg_name(&name) {
                 live.insert(key);
             }

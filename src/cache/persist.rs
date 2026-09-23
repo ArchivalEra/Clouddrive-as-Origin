@@ -186,28 +186,6 @@ impl MetaStore {
         })
     }
 
-    /// Remove an entry (expiry / eviction / tombstone drop).
-    pub async fn remove(&self, key: &str) -> anyhow::Result<Option<EntryMeta>> {
-        let db = self.db.lock().await;
-        blocking(|| {
-            let txn = db.begin_write()?;
-            // Copy out of the table before deserializing: guards borrow the
-            // table, so the table binding is dropped before leaving scope.
-            let removed_bytes: Option<Vec<u8>> = {
-                let mut entries = txn.open_table(ENTRIES)?;
-                let out = match entries.remove(key) {
-                    Ok(Some(v)) => Some(v.value().to_vec()),
-                    Ok(None) => None,
-                    Err(e) => return Err(e.into()),
-                };
-                drop(entries);
-                out
-            };
-            txn.commit()?;
-            removed_bytes.map(|b| serde_json::from_slice(&b)).transpose().map_err(anyhow::Error::from)
-        })
-    }
-
     /// Update last_access for an existing entry (coalesced flush path).
     /// Rewrites the entry row. No-op when absent.
     pub async fn bump_last_access(&self, key: &str, new_millis: u64) -> anyhow::Result<()> {
@@ -285,23 +263,6 @@ mod tests {
             negative_until_millis: None,
             oversize: false,
         }
-    }
-
-    #[tokio::test]
-    async fn insert_load_remove_roundtrip() {
-        let dir = tempdir().unwrap();
-        let store = MetaStore::open(&dir.path().join("redb.db")).unwrap();
-        store.insert(&meta("a.png", 100, 1000)).await.unwrap();
-        store.insert(&meta("b.png", 200, 2000)).await.unwrap();
-
-        let all = store.load_all().await.unwrap();
-        assert_eq!(all.len(), 2);
-
-        let removed = store.remove("a.png").await.unwrap().unwrap();
-        assert_eq!(removed.size_bytes, 100);
-        let all = store.load_all().await.unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].key, "b.png");
     }
 
     #[tokio::test]

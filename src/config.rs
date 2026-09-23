@@ -159,6 +159,14 @@ pub enum EvictionPolicy {
     Heat,
 }
 
+/// How long a key stays protected from policy eviction after the last body
+/// reading it ends (ADR-0017). A pause between two requests of the same
+/// viewing session must not cost a re-fetch, and the budget's own guard
+/// (`STAGE_MIN_AGE_MS`, 60 s) is too short to cover a viewer who is thinking.
+fn default_read_grace_secs() -> u64 {
+    300
+}
+
 /// One staged-read run fetches this much (ADR-0016).
 ///
 /// Measured: an upstream `open` costs a fixed ~640 ms whatever the range
@@ -168,14 +176,6 @@ pub enum EvictionPolicy {
 /// the time it is requested (measured wait ~ 0): the window has to exceed the
 /// reader's appetite, not the object. Larger = fewer opens and more disk
 /// churn per window.
-/// How long a key stays protected from policy eviction after the last body
-/// reading it ends (ADR-0017). A pause between two requests of the same
-/// viewing session must not cost a re-fetch, and the budget's own guard
-/// (`STAGE_MIN_AGE_MS`, 60 s) is too short to cover a viewer who is thinking.
-fn default_read_grace_secs() -> u64 {
-    300
-}
-
 fn default_session_window_bytes() -> u64 {
     64 * 1024 * 1024
 }
@@ -463,15 +463,10 @@ impl Config {
         let name = self.upstream(upstream_id).map(|u| u.cache_profile.as_str()).unwrap_or("efficient");
         match name {
             "nocache" => EffectiveProfile::nocache(),
-            "efficient" => match self.cache_profiles.get("efficient") {
-                Some(p) => EffectiveProfile {
-                    efficient: true,
-                    nocache: false,
-                    min_file_size: p.min_file_size,
-                    coverage_window_secs: p.coverage_window_secs,
-                },
-                None => EffectiveProfile::efficient(),
-            },
+            // "efficient" and any custom name resolve the same way: a
+            // [cache_profiles.<name>] table if one exists, the built-in default
+            // otherwise (boot validation rejects a dangling reference, so a
+            // missing table is a lookup for a name that cannot be configured).
             other => match self.cache_profiles.get(other) {
                 Some(p) => EffectiveProfile {
                     efficient: true,
@@ -479,8 +474,6 @@ impl Config {
                     min_file_size: p.min_file_size,
                     coverage_window_secs: p.coverage_window_secs,
                 },
-                // Boot validation rejects a dangling name, so this is a lookup
-                // for a name that cannot be configured: the default profile.
                 None => EffectiveProfile::efficient(),
             },
         }
