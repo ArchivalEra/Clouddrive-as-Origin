@@ -18,8 +18,11 @@ front_metrics_listen = "127.0.0.1:9090"
 front_ip_block = []
 # Client CIDRs exempt from per-IP rate limiting (ops path is never throttled).
 front_ip_allow = []
-# Per-client-IP requests/sec ceiling on the front. Omit = disabled;
-# threshold lands after the real-traffic baseline (wayfinder #45).
+# Per-client-IP requests/sec ceiling on the front. Omit = disabled. It stays
+# disabled on the CDN-facing plane by measurement — a per-IP ceiling barely bites
+# there (the edge fans one burst across ten pull IPs) and the edge turns a 429
+# into a 206 with a short body, so the failure is invisible. See the runbook's
+# "Would rate limiting be safe to enable?".
 # front_rate_rps = 500
 # Admission control (R4). The edge sets this header on every request it forwards
 # (`ModifyRequestHeader` on the CDN rule); the front then refuses a request from

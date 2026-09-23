@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Latency attribution report from the origin-cache /metrics endpoint
-# (wayfinder map #47, ticket T4).
+# Latency attribution report from the origin-cache /metrics endpoint.
 #
 # Scrapes the prometheus endpoint twice (start + end), computes the delta
 # for each latency histogram, and prints a percentile table per segment

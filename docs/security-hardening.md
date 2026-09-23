@@ -220,13 +220,15 @@ Two notes for anything doing address matching at the socket level: peers arrive 
 canonicalizing (see the runbook's origin-token section); nftables rules are unaffected, since
 the packet on the wire is IPv4.
 
-**R4 `ours`, blocked on a capability check — an origin-access secret instead of an IP list.**
-If EdgeOne can inject a request header on origin pull, the front can require it
-(a new config knob; today only the prewarm token exists), and then the allowlist
-stops being hostage to IP churn. The API model does contain request-header actions
-(`ModifyRequestHeader`, `HeaderParameters`), so this looks possible; it needs the
-EdgeOne-holding side to confirm it applies to **origin-pull** requests before any code is
-written. R3 is now the primary path — R4 stays as the belt to its braces.
+**R4 `ours` — DONE and live (2026-09-23).** This entry used to say "blocked on a
+capability check": whether EdgeOne can inject a request header on origin pull.
+It can. `rule-3usngannhvqa` carries a `ModifyRequestHeader` action setting
+`X-Origin-Token`, the front requires it from any non-exempt peer, and the
+four-way test passes (external direct 403, loopback 206, CDN 206, the real film
+206/1 MiB; `accept.sh` VERDICT=PASS). The allowlist is no longer hostage to IP
+churn, and it is kept only as defence in depth — see ADR-0025 for why admission
+is a token rather than an IP table. The requirement's original text follows for
+the record.
 
 **R5 `infra` — a host firewall with default-deny inbound.**
 firewalld or nftables, allowing only 22 (from the management CIDRs) and 7777

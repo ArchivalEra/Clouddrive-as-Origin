@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Two-client concurrent video seeking — robustness test for the ranged
-# cold-miss path (wayfinder: "two things watching video and scrubbing").
+# cold-miss path. Kept as a COUNTER-EXAMPLE: this shape (scattered seeks) is not
+# production, and the question behind it (should a cold pull start at the
+# requested offset, card C5) was dropped 2026-09-12 — see ADR-0004's "Not
+# decided here". Do not reach for it as a tool; the shard harness measures what
+# actually ships.
 #
 # Simulates two players seeking through a large file at the same time:
 # each client issues Range requests at scattered offsets, repeatedly.

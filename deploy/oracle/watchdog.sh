@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Oracle node health watchdog (map #30 T4): checks the systemd units, the
+# Oracle node health watchdog: checks the systemd units, the
 # disk watermark and the business-plane healthz, logs failures, and reports
 # a heartbeat to the blog-side Cloudflare Worker (interface agreed
 # 2026-09-16, see docs/status-reporting.md).
