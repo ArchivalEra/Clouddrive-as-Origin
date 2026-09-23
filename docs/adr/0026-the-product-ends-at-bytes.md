@@ -38,10 +38,14 @@ ranged `GET`/`HEAD`, answered as fast as the deployment allows. What a client
 does with those bytes is the client's program.
 
 - No manifest or playlist generation, no container parsing, no transcoding, no
-  content-type branching, no player page in the deliverable. This is not a new
-  constraint — it is what "a 200 GiB video, a 100 GiB tarball, a VM image and a
-  database dump are the same object to it" already required. This ADR applies it
-  to the last item that was still listed as product work.
+  media branch in what is served, no player page in the deliverable. This is not
+  a new constraint — it is what "a 200 GiB video, a 100 GiB tarball, a VM image
+  and a database dump are the same object to it" already required. This ADR
+  applies it to the last item that was still listed as product work.
+  The one extension-aware site, `src/mime.rs`, sets a response header for
+  provider APIs that answer `application/octet-stream` (spec §3.9); it never
+  selects which bytes are served, and it is not a precedent for reading the
+  container.
 - **Content preparation belongs to the content owner.** On the public web,
   adaptive streaming assumes the publisher produces HLS or DASH; every CDN makes
   that assumption, and a viewer page that hands an unindexed fMP4 to a bare
