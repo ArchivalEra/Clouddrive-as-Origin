@@ -1098,6 +1098,42 @@ The probe did sharpen *where* the leg is: that first response came back
 The stall is therefore on client <-> POP, not POP <-> origin. Same object, same
 route, same night: 300 bytes open-ended against 7.1 MB/s in shards.
 
+### The real player on the real film, from this vantage (2026-09-23)
+
+`deploy/lab/viewer/player-probe.mjs --target https://cdn-oracle.isui.ren/googledrive1
+--object <the 200 GiB film> --page test-page.html`, real Chromium, no proxy. Two
+runs the same evening:
+
+```
+long session (stopped at ~5 min)
+  187 requests in 273 s, every one `edgeHIT`, `readyState 0` the whole time
+  no `waiting`/`stalled` events — the media element kept re-asking, and the page
+  never reported playback
+short run (100 s, the one that prints the per-request table)
+  requests=249  bytes=74400  played=0s  ready=0  stalls=0  error=0
+  maxGapBetweenRequests=15805ms — 249 responses of exactly 300 bytes each
+  VERDICT: the player never loaded metadata (playback never began)
+```
+
+**The asymmetry is the finding.** In the same minutes, on the same object and the
+same route:
+
+```
+curl -r 0-   ->   206, 25,853,934 bytes in 30 s (0.86 MB/s), TTFB 0.14 s
+```
+
+The edge streams the open-ended shape to curl while answering the media element's
+open-ended requests with 300 bytes each, 249 times. Those requests are ordinary
+206s at the origin (265 asks in five minutes across fifteen pull peers), so the
+bytes are being paid for upstream while the viewer gets headers only.
+
+What this does NOT change: the shard shape still measures 7.06-7.1 MB/s with zero
+gaps through the same edge, which is what the product criterion needs. It does
+mean the open question is now specifically **the media element's own requests
+against this edge**, and it needs a vantage-independent instrument — the same
+probe run from the node (which the edge sees as a domestic IPv6 POP) or from a
+second domestic host — before anything is concluded about the player.
+
 ### The window decision: a jump pays the floor (ADR-0024, 2026-09-22)
 
 The reading that motivated it, and the reading after it, both on the node
