@@ -1430,6 +1430,47 @@ by the viewer timeout with a bare TIMEOUT row instead of totals. Parallel
 connections are the lever that works — 4 viewers measured 7.1 MB/s aggregate —
 and that is a client-side shape, not an origin setting.
 
+### A ready-made player on this object, and what it cannot fix (2026-09-23)
+
+hls.js/dash.js play segments, not files, and the product's object is one big
+progressive MP4. `deploy/lab/viewer/package-for-player.sh` closes that gap as a
+stream copy: `-f hls -hls_segment_type fmp4 -hls_flags single_file` writes ONE
+`.m4s` (init segment + fragments) and a VOD playlist whose entries are
+`#EXT-X-BYTERANGE` ranges of it — the same "one file, byte ranges" shape this
+origin already serves well (206 per range, one upstream open per window). No
+re-encode, and nothing media-aware comes near `src/`.
+
+Measured locally (`log-server.py` + `player-page.html` + `player-fetch-probe.mjs`,
+real Chromium, hls.js 1.x). The server's own log is the instrument: hls.js loads
+fragments inside a Web Worker, so those fetches are invisible to the page's
+resource timings and to playwright's request events.
+
+```
+content   leg/conn   segment    fetch time per 6 s of content   result
+2.5 Mbps  900 KB/s   1.95 MB    2.15 s                           plays, 30 s buffer, 0 stalls
+8 Mbps    900 KB/s   6.07 MB    6.7-7.4 s                        stalls every ~6 s (loses 11 s per 45 s)
+```
+
+Two things fall out of the request log:
+
+- **The player fetches one segment at a time.** Overlapping loads: zero, in
+  every run, throttled or not. It fills its buffer with a sequential burst
+  (six 2 MB segments back to back at t=3.1-3.5 s), then one segment per segment
+  duration. The 4-connection fan-out measured earlier (7.1 MB/s) is NOT
+  something an off-the-shelf player does for you.
+- **Smoothness is arithmetic**: a segment has to arrive faster than it plays.
+  Content below the leg's per-connection throughput plays; above it, the buffer
+  only postpones the stalls. The film's own ~15.5 Mbps is 11.6 MB per 6 s
+  segment = 12.9 s at the measured 900 KB/s, so a ready-made player alone does
+  not make the film playable on this leg — a rendition at ~2-4 Mbps does, and so
+  would a fan-out layer over the same player (the piece that turns one 900 KB/s
+  connection into the measured 7.1 MB/s).
+
+Repro (local, no network): `node deploy/lab/viewer/log-server.py 7900 <dir>
+900000` (the third argument is the per-connection rate), copy `player-page.html`
+and an `hls.min.js` (jsdelivr) into `<dir>`, then
+`node deploy/lab/viewer/player-fetch-probe.mjs "http://127.0.0.1:7900/player-page.html?src=hls.m3u8" 45`.
+
 ### The target-scale account: an object the node can never hold
 
 The product's object is a 3-hour video of 30-200 GB. Measured on the node against
