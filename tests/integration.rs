@@ -24,9 +24,7 @@ use origin_cache::{
 
 
 fn test_config(dir: std::path::PathBuf) -> Arc<Config> {
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir;
-    Arc::new(cfg)
+    Arc::new(Config { cache_dir: dir, ..Config::default() })
 }
 
 fn registry_with(backend: Arc<dyn StorageBackend>) -> BackendRegistry {
@@ -74,25 +72,26 @@ async fn single_flight_20_concurrent_same_key_one_fetch() {
 #[tokio::test]
 async fn two_upstream_routing_by_prefix() {
     let dir = tempdir().unwrap();
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.upstreams.push(origin_cache::config::UpstreamConfig {
-        id: "archive".into(),
-        backend_type: "openlist".into(),
-        base_url: "http://127.0.0.1:5245/dav".into(),
-        root_path: None,
-        username_env: "ARCHIVE_USER".into(),
-        password_env: "ARCHIVE_PASS".into(),
-        accept_invalid_certs: false,
-        cold_miss: origin_cache::config::ColdMiss::Proxy,
-        link_api_token_env: None,
-        cache_profile: "efficient".into(),
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        upstreams: vec![origin_cache::config::UpstreamConfig {
+            id: "archive".into(),
+            backend_type: "openlist".into(),
+            base_url: "http://127.0.0.1:5245/dav".into(),
+            root_path: None,
+            username_env: "ARCHIVE_USER".into(),
+            password_env: "ARCHIVE_PASS".into(),
+            accept_invalid_certs: false,
+            cold_miss: origin_cache::config::ColdMiss::Proxy,
+            link_api_token_env: None,
+            cache_profile: "efficient".into(),
+        }],
+        routes: RouteTable::new(vec![
+            RouteRule { prefix: "archive/".into(), upstream: "archive".into() },
+            RouteRule { prefix: "".into(), upstream: "primary".into() },
+        ]),
+        ..Config::default()
     });
-    cfg.routes = RouteTable::new(vec![
-        RouteRule { prefix: "archive/".into(), upstream: "archive".into() },
-        RouteRule { prefix: "".into(), upstream: "primary".into() },
-    ]);
-    let cfg = Arc::new(cfg);
     assert_eq!(cfg.routes.resolve("archive/a.png"), "archive");
     assert_eq!(cfg.routes.resolve("2026/b.png"), "primary");
 }
@@ -100,10 +99,11 @@ async fn two_upstream_routing_by_prefix() {
 #[tokio::test]
 async fn inactive_ttl_expiry_removes_file_and_meta() {
     let dir = tempdir().unwrap();
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.inactive_ttl_secs = 1;
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        inactive_ttl_secs: 1,
+        ..Config::default()
+    });
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
     let backend = CountingBackend::counting(b"x".to_vec(), None, Arc::clone(&calls), None);
@@ -121,11 +121,12 @@ async fn inactive_ttl_expiry_removes_file_and_meta() {
 #[tokio::test]
 async fn max_size_evicts_lru_order() {
     let dir = tempdir().unwrap();
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.max_size_bytes = 10;
-    cfg.inactive_ttl_secs = 3600;
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        max_size_bytes: 10,
+        inactive_ttl_secs: 3600,
+        ..Config::default()
+    });
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
     let backend = CountingBackend::counting(b"12345".to_vec(), None, Arc::clone(&calls), None);
@@ -146,10 +147,11 @@ async fn revalidation_uses_stat_and_serves_updated_content() {
     // v1 cached; backend version flips to v2; after the revalidate ttl the
     // next get must stat-compare (v1 != v2), refetch, and serve v2 bytes.
     let dir = tempdir().unwrap();
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.revalidate_ttl_secs = 1;
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        revalidate_ttl_secs: 1,
+        ..Config::default()
+    });
     let clock = Arc::new(MockClock::new(0));
     let version = Arc::new(AtomicUsize::new(1));
 
@@ -183,10 +185,11 @@ async fn revalidation_uses_stat_and_serves_updated_content() {
 async fn revalidation_not_modified_serves_revalidated() {
     // Same etag: stat says unmodified -> serve from disk (Revalidated).
     let dir = tempdir().unwrap();
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.revalidate_ttl_secs = 1;
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        revalidate_ttl_secs: 1,
+        ..Config::default()
+    });
     let clock = Arc::new(MockClock::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
     let backend = CountingBackend::counting(b"stable".to_vec(), Some("same".into()), Arc::clone(&calls), None);
@@ -971,11 +974,12 @@ async fn listing_snapshot_is_reused_then_expires() {
 async fn entry_count_cap_evicts_lru_even_under_byte_budget() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.max_size_bytes = 1 << 40; // huge: bytes never trigger
-    cfg.max_entries = 3; // the count cap is the only active budget
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        max_size_bytes: 1 << 40, // huge: bytes never trigger
+        max_entries: 3,          // the count cap is the only active budget
+        ..Config::default()
+    });
 
     let backend = CountingBackend::counting(b"tiny".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
@@ -1017,11 +1021,12 @@ async fn entry_count_cap_evicts_lru_even_under_byte_budget() {
 async fn staged_segment_bytes_join_the_disk_budget() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.inactive_ttl_secs = 1_200;
-    cfg.max_size_bytes = 4096; // tiny: staged bytes alone exceed it
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        inactive_ttl_secs: 1_200,
+        max_size_bytes: 4096, // tiny: staged bytes alone exceed it
+        ..Config::default()
+    });
 
     let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
@@ -1069,14 +1074,15 @@ async fn staged_segment_bytes_join_the_disk_budget() {
 async fn a_watch_keeps_the_viewers_window_while_the_budget_takes_other_keys() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.max_size_bytes = 3_072; // 4 KiB staged = 1 KiB over the cap
-    cfg.inactive_ttl_secs = 3_600; // long enough that the sweep is not the cause
-    cfg.read_grace_secs = 300;
-    cfg.watch_idle_secs = 900;
-    cfg.watch_pin_bytes = 4_096;
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        max_size_bytes: 3_072,         // 4 KiB staged = 1 KiB over the cap
+        inactive_ttl_secs: 3_600,      // long enough that the sweep is not the cause
+        read_grace_secs: 300,
+        watch_idle_secs: 900,
+        watch_pin_bytes: 4_096,
+        ..Config::default()
+    });
     let backend =
         CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
@@ -1127,12 +1133,13 @@ async fn a_watch_keeps_the_viewers_window_while_the_budget_takes_other_keys() {
 async fn a_leased_key_survives_the_budget_until_its_grace_expires() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.inactive_ttl_secs = 1_200;
-    cfg.read_grace_secs = 300;
-    cfg.max_size_bytes = 1_024; // one 2 KiB span is over budget on its own
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        inactive_ttl_secs: 1_200,
+        read_grace_secs: 300,
+        max_size_bytes: 1_024, // one 2 KiB span is over budget on its own
+        ..Config::default()
+    });
     let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
 
@@ -1166,11 +1173,12 @@ async fn a_leased_key_survives_the_budget_until_its_grace_expires() {
 async fn the_age_sweep_spares_a_key_being_read() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.inactive_ttl_secs = 1_200;
-    cfg.read_grace_secs = 300;
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        inactive_ttl_secs: 1_200,
+        read_grace_secs: 300,
+        ..Config::default()
+    });
     let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
 
@@ -1753,11 +1761,12 @@ async fn a_run_that_cannot_open_errors_its_reader_instead_of_hanging() {
 async fn a_merged_interval_still_evicts_one_file_at_a_time() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.inactive_ttl_secs = 1_200;
-    cfg.max_size_bytes = 3072; // four spans staged, budget for three
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        inactive_ttl_secs: 1_200,
+        max_size_bytes: 3072, // four spans staged, budget for three
+        ..Config::default()
+    });
     let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
 
@@ -1782,7 +1791,7 @@ async fn a_merged_interval_still_evicts_one_file_at_a_time() {
     cache.tick().await;
 
     assert_eq!(cache.snapshot().await.segment_bytes, 3072, "one span's worth must be freed");
-    assert!(paths[0].exists() == false, "the stalest span (lowest offset) goes first");
+    assert!(!paths[0].exists(), "the stalest span (lowest offset) goes first");
     assert!(paths[1].exists() && paths[2].exists() && paths[3].exists(), "the rest stay");
     let spans = cache.inspect("m.bin").await.ledger_spans;
     assert_eq!(
@@ -1800,11 +1809,12 @@ async fn a_merged_interval_still_evicts_one_file_at_a_time() {
 async fn a_decayed_interval_leaves_its_files_evictable() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.inactive_ttl_secs = 1_200;
-    cfg.max_size_bytes = 1024; // two spans staged, budget for one
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        inactive_ttl_secs: 1_200,
+        max_size_bytes: 1024, // two spans staged, budget for one
+        ..Config::default()
+    });
     let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
 
@@ -1839,11 +1849,12 @@ async fn a_decayed_interval_leaves_its_files_evictable() {
 async fn a_sequential_walk_past_the_ledger_ceiling_stays_evictable() {
     let dir = tempdir().unwrap();
     let clock = Arc::new(MockClock::new(0));
-    let mut cfg = Config::default();
-    cfg.cache_dir = dir.path().to_path_buf();
-    cfg.inactive_ttl_secs = 1_200;
-    cfg.max_size_bytes = 1000;
-    let cfg = Arc::new(cfg);
+    let cfg = Arc::new(Config {
+        cache_dir: dir.path().to_path_buf(),
+        inactive_ttl_secs: 1_200,
+        max_size_bytes: 1000,
+        ..Config::default()
+    });
     let backend = CountingBackend::counting(b"x".to_vec(), Some("v1".into()), Arc::new(AtomicUsize::new(0)), None);
     let cache = Arc::new(Cache::new(Arc::clone(&cfg), Arc::clone(&clock), registry_with(Arc::new(backend))));
 
@@ -2350,7 +2361,7 @@ async fn the_account_the_ledger_and_the_disk_never_disagree() {
     // windows: the walk stages constantly and evicts as it goes.
     let (cache, _opens) = run_fixture_capped(dir.path(), 1 << 20, 8192, 0, 24 * 1024);
 
-    let mut rng = Xorshift(0xC0FFEE_1234_5678);
+    let mut rng = Xorshift(0x00C0_FFEE_1234_5678);
     for round in 0..120u64 {
         // One 1 KiB read at a random window boundary.
         let off = (rng.next() % 1024) * 1024;
