@@ -4,19 +4,29 @@
 #   - writes the 2 systemd units (standard / nocache)
 #   - enables and starts them
 #
-# Usage:  sudo bash deploy/oracle/install.sh <path-to-release-binary> [--keep-env]
+# Usage:  sudo bash deploy/oracle/install.sh <path-to-release-binary> [--keep-env] [--new-token]
 #   --keep-env: do not overwrite an existing origin-cache.env (preserves
-#               real secrets across reinstalls).
+#               real secrets across reinstalls)
+#   --new-token: with --keep-env, generate ORIGIN_TOKEN if the existing env file
+#               is missing it (the one value that can be generated; the edge
+#               rule must be updated with the same value, see the runbook)
 set -euo pipefail
 
-SRC_BIN="${1:-}"
+SRC_BIN=""
 KEEP_ENV=0
-[ "${2:-}" = "--keep-env" ] && KEEP_ENV=1
+NEW_TOKEN=0
+for a in "$@"; do
+  case "$a" in
+    --keep-env) KEEP_ENV=1 ;;
+    --new-token) NEW_TOKEN=1 ;;
+    *) [ -z "$SRC_BIN" ] && SRC_BIN="$a" ;;
+  esac
+done
 APP=/opt/origin-cache
 REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 USER=opc
 
-[ -n "$SRC_BIN" ] && [ -x "$SRC_BIN" ] || { echo "usage: $0 /path/to/origin-cache [--keep-env]"; exit 1; }
+[ -n "$SRC_BIN" ] && [ -x "$SRC_BIN" ] || { echo "usage: $0 /path/to/origin-cache [--keep-env] [--new-token]"; exit 1; }
 
 mkdir -p "$APP/cache-standard" "$APP/cache-nocache" "$APP/acme-webroot"
 install -m 0755 "$SRC_BIN" "$APP/origin-cache"
@@ -27,20 +37,22 @@ install -m 0644 "$REPO_DIR/deploy/oracle/config-nocache.toml"  "$APP/config-noca
 install -m 0755 "$REPO_DIR/deploy/oracle/watchdog.sh" "$APP/watchdog.sh"
 chown -R "$USER:$USER" "$APP"
 
-# Environment file: contains real secrets at runtime, written by the
-# operator (never committed). Template printed for reference.
+# Environment file: contains real secrets at runtime, never committed. The rule
+# that it defines every variable the installed config names -- and that a
+# missing ORIGIN_TOKEN is a refusal, not a silent gate-off -- lives in
+# env-file.sh, so it can be exercised on its own.
+ENV_TOOL="$REPO_DIR/deploy/oracle/env-file.sh"
 if [ "$KEEP_ENV" = 1 ] && [ -f "$APP/origin-cache.env" ]; then
-  echo "keeping existing $APP/origin-cache.env"
-else
-  cat > "$APP/origin-cache.env" <<'ENV'
-OPENLIST_USERNAME=REPLACE_ME
-OPENLIST_PASSWORD=REPLACE_ME
-ORIGIN_PREWARM_SECRET=REPLACE_ME
-ORIGIN_TLS_CERT_PATH=/etc/ssl/dib.l.cd/cdn-oracle/cert.pem
-ORIGIN_TLS_KEY_PATH=/etc/ssl/dib.l.cd/cdn-oracle/key.pem
-ENV
+  if [ "$NEW_TOKEN" = 1 ]; then
+    bash "$ENV_TOOL" "$APP/origin-cache.env" "$REPO_DIR/deploy/oracle/config-efficient.toml" --keep --new-token
+  else
+    bash "$ENV_TOOL" "$APP/origin-cache.env" "$REPO_DIR/deploy/oracle/config-efficient.toml" --keep
+  fi
   chown "$USER:$USER" "$APP/origin-cache.env"
   chmod 600 "$APP/origin-cache.env"
+else
+  bash "$ENV_TOOL" "$APP/origin-cache.env" "$REPO_DIR/deploy/oracle/config-efficient.toml" --fresh
+  chown "$USER:$USER" "$APP/origin-cache.env"
 fi
 
 cat > /etc/systemd/system/origin-cache-efficient.service <<UNIT

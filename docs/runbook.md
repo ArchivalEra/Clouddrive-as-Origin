@@ -152,7 +152,10 @@ which ADR-0022 retired. On a node still running the old names:
 ```sh
 # 1. Put the new files in place (install.sh does this too).
 sudo install -m 0644 deploy/oracle/config-efficient.toml /opt/origin-cache/
-sudo cp deploy/oracle/origin-cache-efficient.service /etc/systemd/system/   # see install.sh
+# The unit file is a heredoc inside install.sh, not a file in this repo:
+sudo bash deploy/oracle/install.sh /opt/origin-cache/origin-cache --keep-env
+# It writes and (re)starts both units, so the explicit swap below is the older,
+# manual way of doing the same thing -- useful only if install.sh cannot run.
 # 2. Swap the units. The port does not change, so EdgeOne keeps pointing at it,
 #    but NOTHING is listening on 7777 for the seconds between the two commands.
 sudo systemctl daemon-reload
@@ -175,17 +178,45 @@ Two things NOT to touch:
 Keep the old unit file on disk until the new one is verified serving, so a
 rollback is one `enable --now` away.
 
+## First install (three steps, 2026-09-23)
+
+```sh
+# 1. The mechanical install. On a fresh node this writes a template env file
+#    with a REAL ORIGIN_TOKEN generated and printed once.
+sudo bash deploy/oracle/install.sh /path/to/origin-cache
+# acceptance: the last lines print ORIGIN_TOKEN=<64 hex> and no FAIL line.
+
+# 2. Put that same value into the edge's origin stamp (the ModifyRequestHeader
+#    action on the origin's L7 rule). The two values must match exactly.
+# acceptance: a direct GET to :7777 with no stamp -> 403.
+
+# 3. Fill the REPLACE_ME entries (OpenList credentials, prewarm secret) and
+#    restart the planes.
+sudo -n systemctl restart origin-cache-efficient origin-cache-nocache
+# acceptance: bash deploy/oracle/accept.sh -> VERDICT=PASS
+```
+
+On an existing node `--keep-env` keeps the secrets but **refuses to continue if
+the file is missing a variable the installed config names** -- the config names
+its environment variables and a named-but-unset one is a boot failure, which is
+exactly how a fresh install came to be broken once (ORIGIN_TOKEN). `--new-token`
+generates the token and tells you to update the edge rule before restarting.
+`deploy/oracle/env-file.sh` is that same rule on its own, so a file can be
+checked without installing anything.
+
 ## Provisioning a fresh node
 
-`deploy/oracle/install.sh <binary> [--keep-env]` does the mechanical part:
-configs, both service units with `ExecStopPost`, the watchdog script and its
-timer, the logrotate and journald configs. What it cannot do, because these
+`deploy/oracle/install.sh <binary> [--keep-env] [--new-token]` does the mechanical
+part: configs, both service units with `ExecStopPost`, the watchdog script and
+its timer, the logrotate and journald configs, and the env file (checked against
+the config it installs -- see "First install"). What it cannot do, because these
 are node-local and secret-bearing:
 
 1. **`/opt/origin-cache/origin-cache.env`** -- OpenList credentials,
-   `ORIGIN_PREWARM_SECRET`, and the TLS cert/key paths. `install.sh` writes
-   `REPLACE_ME` placeholders on a fresh node; `--keep-env` preserves the real
-   file on reinstall.
+   `ORIGIN_PREWARM_SECRET`, `ORIGIN_TOKEN`, and the TLS cert/key paths.
+   `install.sh` generates the token and writes `REPLACE_ME` for the rest on a
+   fresh node; `--keep-env` preserves the real file on reinstall and refuses if
+   it is incomplete.
 2. **TLS material** at the paths that env file names
    (`/etc/ssl/dib.l.cd/<host>/cert.pem` + `key.pem` here).
 3. **acme.sh** with a deploy hook, so renewal reinstalls the cert and

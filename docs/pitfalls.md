@@ -418,3 +418,16 @@ entry for being obvious in hindsight — hindsight is the point.
     `--progress-secs N` on both (`multi-viewer.mjs`, `player-probe.mjs`), reading
     the page's own live counters (`reader.js` publishes `window.__readerStats`),
     with `<- NOT PLAYING` on the probe so a player that never starts says so.
+
+55. **A "trial run" of the binary is only safe when it cannot reach the live
+    cache.** Handing a valid-but-wrong config (one mis-typed env var name) to the
+    production binary opened the live metadata store *before* the admission check
+    fired: the running unit held the lock, so the store layer quarantined
+    `redb.db` aside and created an empty one. Nothing looked wrong — the running
+    unit kept serving from its still-open inode — and the next restart would have
+    come up on an empty database. *Fix:* every rehearsal gets its own `cache_dir`
+    and its own ports (the checks now also run before the store is touched, but
+    the habit is the fix); `install.sh`'s env-file rehearsal, the deploy recipe's
+    fake-config run and anything that starts the binary share this rule. If it
+    does happen: `mv -f <quarantined> redb.db` restores the name, and the running
+    unit's fd already points at the real inode.
