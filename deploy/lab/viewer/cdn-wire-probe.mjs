@@ -32,7 +32,8 @@ const pagePath = arg('page', 'test-page.html');
 const secs = Number(arg('secs', '20'));
 const windowBytes = Number(arg('window', '0'));
 const chrome = process.env.CHROME || '/usr/bin/chromium';
-const pwDir = process.env.PW || '/home/archivalera/.npm/_npx/9833c18b2d85bc59/node_modules/playwright-core';
+// PW first (documented), then PW_DIR — the name run-lab.sh exports.
+const pwDir = process.env.PW || process.env.PW_DIR || '/home/archivalera/.npm/_npx/9833c18b2d85bc59/node_modules/playwright-core';
 
 const { chromium } = await import(join(pwDir, 'index.mjs')).catch(async () => await import(pwDir));
 const url = `${base}/${object}`;

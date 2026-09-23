@@ -60,8 +60,10 @@ head-of-line blocking.
 
 Cold ranged misses still fetch the whole object, so a seek holds a stream
 permit for the full pull. Whether the pull should start at the requested offset
-is tracked separately in `docs/notes/c5-pump-start-options.md`; it needs
-EdgeOne cold-request ordering data before it can graduate.
+was investigated as card C5 and dropped (2026-09-12): the shape it would have
+served needs EdgeOne cold-request ordering data the free plan does not keep, so
+the question is closed rather than tracked. `deploy/seek-storm.sh` reproduces the
+scattered-seek shape that motivated it and is kept as a counter-example.
 
 ## Amendment (2026-09-19): the passthrough holds the stream gate for the transfer
 

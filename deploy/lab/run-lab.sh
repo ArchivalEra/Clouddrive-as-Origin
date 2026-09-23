@@ -613,9 +613,13 @@ note "14. N browser viewers of one object (ADR-0016/0019)"
 #
 # What is asserted is what a viewer feels (no stall, identical bytes read) and
 # what the origin pays (opens per window, not per request) — the same claims the
-# single-client sections make, now with several viewers at once. Skipped, not
-# failed, where node or playwright-core is absent: this section measures.
+# single-client sections make, now with several viewers at once. A missing node
+# or playwright-core FAILS in --quick and only skips in --smoke: the two browser
+# sections are the strongest evidence in the suite, and a gate that can silently
+# drop them is not a gate. Exported, so the probes (which read PW or PW_DIR)
+# agree with this script about where playwright-core lives.
 PW_DIR=${PW_DIR:-/home/archivalera/.npm/_npx/9833c18b2d85bc59/node_modules/playwright-core}
+export PW_DIR
 VIEWER_OBJ=viewer-object.mp4
 VIEWER_SIZE=3416888
 if command -v node >/dev/null 2>&1 && [ -d "$PW_DIR" ] && [ -f "$LAB/dav-data/media/$VIEWER_OBJ" ]; then
@@ -715,7 +719,11 @@ if command -v node >/dev/null 2>&1 && [ -d "$PW_DIR" ] && [ -f "$LAB/dav-data/me
   [ "${ukeys:-0}" -ge 1 ] && ok "the working-window class is visible (cache_unkeepable_keys=$ukeys)" \
     || bad "cache_unkeepable_keys=${ukeys:-0} (want >=1)"
 else
-  echo "    skipped: node, playwright-core or the test object is missing"
+  if [ "$SMOKE" = 1 ]; then
+    echo "    skipped in --smoke: node, playwright-core or the test object is missing"
+  else
+    bad "14 needs node + playwright-core + media/$VIEWER_OBJ (set PW_DIR, or run --smoke)"
+  fi
 fi
 
 # --- a real player's request shape (note 15) ---
@@ -739,7 +747,11 @@ if command -v node >/dev/null 2>&1 && [ -d "$PW_DIR" ] && [ -f "$LAB/dav-data/me
   [ "${preqs:-0}" -ge 1 ] && ok "the player's request shape was recorded ($preqs requests)" \
     || bad "the player's request shape was not recorded"
 else
-  note "15. skipped (node, playwright-core or the clip is missing)"
+  if [ "$SMOKE" = 1 ]; then
+    note "15. skipped in --smoke (node, playwright-core or the clip is missing)"
+  else
+    bad "15 needs node + playwright-core + media/$VIEWER_OBJ (set PW_DIR, or run --smoke)"
+  fi
 fi
 
 # --- the front's own guards (note 16) ---

@@ -83,7 +83,9 @@ const progressSecs = Number(arg('progress-secs', '0'));
 const objects = (arg('objects', '') || '').split(',').filter(Boolean);
 const uniqueSeeds = args.includes('--unique-seeds');
 const chrome = process.env.CHROME || '/usr/bin/chromium';
-const pwDir = process.env.PW || '/home/archivalera/.npm/_npx/9833c18b2d85bc59/node_modules/playwright-core';
+// PW first (documented), then PW_DIR — the name run-lab.sh exports, so a
+// standalone run and a LAB run agree on where playwright-core lives.
+const pwDir = process.env.PW || process.env.PW_DIR || '/home/archivalera/.npm/_npx/9833c18b2d85bc59/node_modules/playwright-core';
 
 const { chromium } = await import(join(pwDir, 'index.mjs')).catch(async () => await import(pwDir));
 const readerSrc = readFileSync(join(here, 'reader.js'), 'utf8');
