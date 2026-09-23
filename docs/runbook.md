@@ -1199,7 +1199,9 @@ it: 7.06-7.1 MB/s in 5 MiB shards, zero gaps, checksums verified. Playing an fMP
 means MSE with a manifest - the hls.js-on-a-single-file-playlist path the LAB
 already carries, or a DASH manifest over the fragments - which is a **client-side
 packaging** decision, not an origin change. A viewer page that hands this object
-to a bare `<video>` fails identically from every vantage, CDN or not.
+to a bare `<video>` fails identically from every vantage, CDN or not. That
+boundary is a decision now, not only a diagnosis: **ADR-0026**, the product ends
+at bytes.
 
 ### The window decision: a jump pays the floor (ADR-0024, 2026-09-22)
 

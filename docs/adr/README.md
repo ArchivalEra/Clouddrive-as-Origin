@@ -34,6 +34,7 @@ time, and `docs/spec.md` is the acceptance contract they add up to.
 | [0022](0022-the-standard-profile-is-retired-and-one-key-one-view.md) | The `standard` profile is retired; one read-only view of one key | amended by the `promised_len` rename (ADR-0021's contract, one name) |
 | [0024](0024-the-window-decision.md) | The window decision: a floor for a jump, a ramp for a walk, and a boundary that hands over | amends 0016; leaves 0019's cap arithmetic untouched |
 | [0025](0025-admission-is-a-token-not-an-ip-table.md) | Admission is a token the edge stamps, not an IP table | why the origin-pull catalog is not the gate (R3/R4); `front_ip_allow` is only the rate-limit exemption |
+| [0026](0026-the-product-ends-at-bytes.md) | The product ends at bytes: no client-side packaging | the fMP4 finding as a scope decision — a manifest and MSE are the client's program |
 | [0023](0023-a-covered-read-answers-from-the-ledger.md) | **Proposal, not a decision — and retired by measurement:** a covered read answers its metadata from the ledger instead of paying a provider stat | the 108 ms stat came from the synthetic object; on the real 200 GiB film the stat is ~6 ms against an 824 ms open, so there is nothing to win |
 
 Cross-cutting: **ADR-0012's rule** (a guard is a deadline, not an exemption) is

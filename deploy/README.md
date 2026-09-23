@@ -57,6 +57,11 @@ Every one of these needs `node`, `chromium` and `playwright-core`
 (`PW` or `PW_DIR`; `run-lab.sh` exports `PW_DIR` for the suite).
 None of them may go through a proxy: they measure the CDN.
 
+Everything in this directory is an instrument or a fixture, never a deliverable
+(ADR-0026): a manifest, MSE and a player page belong to the client. The two
+viewer-side pieces below exist so the wire can be measured with a real player and
+so an end-to-end demo stays reproducible.
+
 | artifact | answers | where | needs | reading in |
 | --- | --- | --- | --- | --- |
 | `multi-viewer.mjs` | N viewers, sharded reads, gaps, checksums, `edgeHIT/edgeMISS`; `--cold-band` for genuinely cold bands, `--retries`/`--attempt-timeout-secs`/`--max-bytes` for long runs | workstation (or node) | browsers | runbook "Multi-viewer accounts", "Surviving the leg" |
