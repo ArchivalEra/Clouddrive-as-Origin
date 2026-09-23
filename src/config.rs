@@ -275,6 +275,22 @@ pub struct RawConfig {
     /// disabled (threshold set after the real-traffic baseline).
     #[serde(default)]
     pub front_rate_rps: Option<u32>,
+    /// Admission control (R4): the header the edge stamps on every origin pull
+    /// (`ModifyRequestHeader` on the CDN rule) and the env var holding the value
+    /// it must carry. Both absent = off. Both set = a request from a
+    /// non-exempt peer that does not carry the stamp is refused, which closes
+    /// the bypass where anyone who learns the origin's address pulls from it
+    /// directly, past the CDN and past its accounting.
+    #[serde(default)]
+    pub front_origin_token_header: Option<String>,
+    #[serde(default)]
+    pub front_origin_token_env: Option<String>,
+    /// Client CIDRs exempt from the origin token. Defaults to loopback: the
+    /// node's own probes (accept.sh, the LAB, the watchdog) reach the front
+    /// over loopback and carry no stamp. An empty list means every peer must be
+    /// stamped, which is how the LAB exercises the refusal.
+    #[serde(default = "default_origin_token_exempt")]
+    pub front_origin_token_exempt: Vec<String>,
     /// Proxy service worker threads. Absent = 2 (P6: pingora's default of
     /// 1 serializes TLS/H2 on a single core).
     #[serde(default)]
@@ -346,6 +362,12 @@ pub struct RawConfig {
 
 fn default_front_listen() -> SocketAddr { "127.0.0.1:8443".parse().unwrap() }
 fn default_listen_addr() -> SocketAddr { "127.0.0.1:8080".parse().unwrap() }
+/// The node's own probes come from loopback, so loopback is exempt by default.
+/// Listing it explicitly (rather than special-casing it in the front) keeps the
+/// exemption visible in the config and lets a deployment take it away.
+fn default_origin_token_exempt() -> Vec<String> {
+    vec!["127.0.0.1/32".into(), "::1/128".into()]
+}
 fn default_cache_dir() -> PathBuf { "/var/lib/origin-cache".into() }
 fn default_max_entries() -> usize {
     500_000
@@ -370,6 +392,10 @@ pub struct Config {
     pub front_ip_block: Vec<String>,
     pub front_ip_allow: Vec<String>,
     pub front_rate_rps: Option<u32>,
+    /// Admission control (R4): see `RawConfig`.
+    pub front_origin_token_header: Option<String>,
+    pub front_origin_token_env: Option<String>,
+    pub front_origin_token_exempt: Vec<String>,
     pub front_threads: Option<usize>,
     pub cache_dir: PathBuf,
     pub max_size_bytes: u64,
@@ -483,6 +509,16 @@ impl Config {
             anyhow::bail!(
                 "front_threads = 0 is invalid: pingora asserts a non-zero thread \
                  count, and the resulting panic left the process alive with no listener"
+            );
+        }
+        // R4: half a gate is not a gate. The header says what the edge stamps,
+        // the env var says where the expected value lives — one without the
+        // other is a deployment mistake that would either check nothing or check
+        // against nothing.
+        if raw.front_origin_token_header.is_some() != raw.front_origin_token_env.is_some() {
+            anyhow::bail!(
+                "front_origin_token_header and front_origin_token_env must be set together \
+                 (header = what the edge stamps, env = where the expected value lives)"
             );
         }
         if raw.max_size_bytes == 0 {
@@ -602,6 +638,9 @@ impl Config {
             front_ip_block: raw.front_ip_block,
             front_ip_allow: raw.front_ip_allow,
             front_rate_rps: raw.front_rate_rps,
+            front_origin_token_header: raw.front_origin_token_header,
+            front_origin_token_env: raw.front_origin_token_env,
+            front_origin_token_exempt: raw.front_origin_token_exempt,
             front_threads: raw.front_threads,
             cache_dir: raw.cache_dir,
             max_size_bytes: raw.max_size_bytes,
@@ -638,6 +677,9 @@ impl Default for Config {
             front_ip_block: Vec::new(),
             front_ip_allow: Vec::new(),
             front_rate_rps: None,
+            front_origin_token_header: None,
+            front_origin_token_env: None,
+            front_origin_token_exempt: default_origin_token_exempt(),
             front_threads: None,
             cache_dir: default_cache_dir(),
             max_size_bytes: default_max_size(),

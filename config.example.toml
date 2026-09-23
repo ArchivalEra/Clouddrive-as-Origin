@@ -21,6 +21,19 @@ front_ip_allow = []
 # Per-client-IP requests/sec ceiling on the front. Omit = disabled;
 # threshold lands after the real-traffic baseline (wayfinder #45).
 # front_rate_rps = 500
+# Admission control (R4). The edge sets this header on every request it forwards
+# (`ModifyRequestHeader` on the CDN rule); the front then refuses a request from
+# a non-exempt peer that does not carry the expected value. The value itself
+# lives in the environment, named here -- never in a config file. The two knobs
+# are set together or not at all, and a named env var that is unset is a boot
+# failure: an admission control that quietly stops applying is worse than none.
+# See docs/security-hardening.md.
+# front_origin_token_header = "X-Origin-Token"
+# front_origin_token_env = "ORIGIN_TOKEN"
+# Client CIDRs exempt from that check. Default = loopback, because the node's own
+# probes (accept.sh, the LAB, the watchdog) reach the front over loopback and
+# carry no edge stamp. [] requires the stamp from every peer.
+# front_origin_token_exempt = ["127.0.0.1/32", "::1/128"]
 # Proxy service worker threads (ADR-0004 era P6). Omit = 2; pingora's own
 # default of 1 serializes TLS/H2 on a single core.
 # front_threads = 2

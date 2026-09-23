@@ -13,7 +13,7 @@
 //! connections, upstream reuse) via `pingora::apps`' PrometheusHttpApp,
 //! which serves the crate-wide default registry.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 use anyhow::Context;
@@ -52,6 +52,13 @@ pub struct FrontOptions {
     /// Per-client-IP requests/sec ceiling; None disables rate limiting
     /// (threshold lands with the real-traffic baseline, map ticket 45).
     pub rate_rps: Option<u32>,
+    /// Admission control (R4): `Some((header, value))` requires `header` to
+    /// carry `value` on every request from a peer outside `origin_token_exempt`.
+    /// None = off, which serves whoever reaches the port.
+    pub origin_token: Option<(String, String)>,
+    /// Client CIDRs exempt from the origin token: the node's own probes
+    /// (`accept.sh`, the LAB, the watchdog) come from loopback.
+    pub origin_token_exempt: Vec<String>,
     /// Service worker threads for the proxy listener. Pingora's default is
     /// 1, which serializes all TLS/H2/byte movement on one core (P6).
     /// None keeps the framework default; callers size it to the box.
@@ -75,6 +82,26 @@ fn parse_cidrs(list: &[String]) -> anyhow::Result<Vec<IpNet>> {
     list.iter().map(|s| parse_cidr(s)).collect()
 }
 
+/// Match a peer address against a CIDR list, canonicalizing first.
+///
+/// The front listens on `[::]`, so an IPv4 peer arrives as an IPv4-mapped IPv6
+/// address (`::ffff:a.b.c.d`) and an IPv4 CIDR does not contain it. Measured on
+/// the node: the loopback exemption for the origin token missed `accept.sh`
+/// entirely, and the same hole was latent in `front_ip_block` and
+/// `front_ip_allow`, where an operator writes a v4 CIDR that then never matches.
+/// Mapping the form back is what makes a list mean what it says whichever
+/// socket the peer came in on.
+fn ip_in_any(nets: &[IpNet], ip: &IpAddr) -> bool {
+    let canonical = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(*v6),
+        },
+        v4 => *v4,
+    };
+    nets.iter().any(|n| n.contains(&canonical))
+}
+
 /// Connection-time gate: refused CIDRs never reach the TLS handshake.
 /// The allow list plays no role here — it only exempts from rate
 /// limiting — so an allow entry can never accidentally widen access.
@@ -85,7 +112,7 @@ struct IpFilter {
 
 impl IpFilter {
     fn accepts(&self, addr: &SocketAddr) -> bool {
-        !self.block.iter().any(|n| n.contains(&addr.ip()))
+        !ip_in_any(&self.block, &addr.ip())
     }
 }
 
@@ -120,7 +147,7 @@ impl RateGate {
         let Some(std_addr) = addr.as_inet() else {
             return false;
         };
-        if self.exempt.iter().any(|n| n.contains(&std_addr.ip())) {
+        if ip_in_any(&self.exempt, &std_addr.ip()) {
             return false;
         }
         // rps == 0 means rate limiting is disabled — never gate.
@@ -131,6 +158,70 @@ impl RateGate {
         }
         self.rate.observe(&std_addr.ip().to_string(), 1) > self.rps as isize
     }
+}
+
+/// Admission control (R4): the edge stamps every request it forwards with a
+/// secret header (`ModifyRequestHeader` on the CDN rule), so a request that does
+/// not carry it did not come from the edge — it came straight at the origin,
+/// past the CDN and past its accounting. Refusing those is what closes that
+/// bypass, and it does so without depending on the pull nodes' addresses, which
+/// are not published on this plan (docs/security-hardening.md R3).
+///
+/// `exempt` CIDRs are the peers that legitimately carry no stamp. A peer we
+/// cannot name is NOT exempt: no address, no trust.
+struct OriginTokenGate {
+    header: http::HeaderName,
+    value: Vec<u8>,
+    exempt: Vec<IpNet>,
+}
+
+impl OriginTokenGate {
+    fn new(header: &str, value: &str, exempt: Vec<IpNet>) -> anyhow::Result<Self> {
+        if value.is_empty() {
+            anyhow::bail!("origin token value is empty");
+        }
+        Ok(Self {
+            header: header
+                .parse()
+                .with_context(|| format!("parse origin token header name {header:?}"))?,
+            value: value.as_bytes().to_vec(),
+            exempt,
+        })
+    }
+
+    /// Must this peer carry the stamp?
+    fn requires(&self, peer: Option<&pingora::protocols::l4::socket::SocketAddr>) -> bool {
+        match peer.and_then(|a| a.as_inet()) {
+            Some(std_addr) => !ip_in_any(&self.exempt, &std_addr.ip()),
+            None => true,
+        }
+    }
+
+    fn accepts(&self, headers: &http::HeaderMap) -> bool {
+        let got = headers
+            .get(&self.header)
+            .map(http::HeaderValue::as_bytes)
+            .unwrap_or(b"");
+        constant_time_eq(got, &self.value)
+    }
+}
+
+/// Compare a presented secret with the expected one without leaking how much of
+/// it matched: `==` on slices returns at the first difference, and a timing
+/// signal over a secret is a way to learn it one byte at a time. The length
+/// check is not constant-time; lengths are not the secret. This duplicates the
+/// business plane's `sigv4::constant_time_eq` deliberately — this crate does not
+/// depend on the plane's surface (see the `/_internal/` note above), and a
+/// shared utility is where that coupling would start.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Per-request front state. `start` exists for the access-log duration
@@ -277,6 +368,7 @@ pub fn acceptor_from_env(
 pub struct BusinessProxy {
     pub business: SocketAddr,
     rate: Option<std::sync::Arc<RateGate>>,
+    origin_token: Option<OriginTokenGate>,
 }
 
 #[async_trait::async_trait]
@@ -326,6 +418,15 @@ impl ProxyHttp for BusinessProxy {
         let path = session.req_header().uri.path();
         if path.starts_with("/_internal/") && !path.starts_with("/_internal/prewarm/") {
             return Err(Error::new(ErrorType::HTTPStatus(404)));
+        }
+        // R4 admission control, ahead of the rate gate: a request that is not
+        // from the edge must not spend the budget that exists to protect the
+        // origin, and the answer depends on nothing the request says beyond the
+        // stamp. 403 says "not for you" without describing what lives here.
+        if let Some(gate) = self.origin_token.as_ref() {
+            if gate.requires(session.client_addr()) && !gate.accepts(&session.req_header().headers) {
+                return Err(Error::new(ErrorType::HTTPStatus(403)));
+            }
         }
         if let Some(gate) = self.rate.as_ref() {
             if let Some(addr) = session.client_addr() {
@@ -491,6 +592,26 @@ pub fn run_front(opts: FrontOptions) -> anyhow::Result<()> {
     server.bootstrap();
 
     let ip_allow = parse_cidrs(&opts.ip_allow)?;
+    // R4: build the admission gate from plain strings, the same way the CIDR
+    // lists are built here rather than in the config layer.
+    let origin_token = match &opts.origin_token {
+        Some((header, value)) => Some(OriginTokenGate::new(
+            header,
+            value,
+            parse_cidrs(&opts.origin_token_exempt)?,
+        )?),
+        None => None,
+    };
+    match &origin_token {
+        Some(g) => info!(
+            header = %g.header,
+            exempt = opts.origin_token_exempt.len(),
+            "front origin-token admission control active"
+        ),
+        // Off is a choice, not a default to be discovered later: whoever reaches
+        // this port without the stamp is served, so say it at boot.
+        None => warn!("front origin-token admission control OFF: any peer that reaches this port is served"),
+    }
     let rate = opts.rate_rps.map(|rps| {
         std::sync::Arc::new(RateGate {
             rate: pingora_limits::rate::Rate::new(std::time::Duration::from_secs(1)),
@@ -502,6 +623,7 @@ pub fn run_front(opts: FrontOptions) -> anyhow::Result<()> {
     let proxy = BusinessProxy {
         business: opts.business,
         rate,
+        origin_token,
     };
     // Build the proxy service directly rather than via
     // `http_proxy_service`: its builder path leaves `h2_options` at None
@@ -591,6 +713,118 @@ mod tests {
         };
         assert!(!f.accepts(&addr("203.0.113.5:1")));
         assert!(f.accepts(&addr("198.51.100.5:1")));
+    }
+
+    /// R4: the gate accepts exactly one value, under any spelling of the header
+    /// name, and nothing else — no header, a wrong value, or a value that is a
+    /// prefix of the secret all fail.
+    #[test]
+    fn origin_token_gate_accepts_only_the_stamp() {
+        let gate = OriginTokenGate::new(
+            "X-Origin-Token",
+            "s3cret-value",
+            vec![parse_cidr("127.0.0.0/8").unwrap()],
+        )
+        .unwrap();
+        let mut h = http::HeaderMap::new();
+        assert!(!gate.accepts(&h), "no header must not pass");
+        h.insert(
+            http::HeaderName::from_static("x-origin-token"),
+            "wrong".parse().unwrap(),
+        );
+        assert!(!gate.accepts(&h), "a wrong value must not pass");
+        h.insert(
+            http::HeaderName::from_static("x-origin-token"),
+            "s3cret".parse().unwrap(),
+        );
+        assert!(!gate.accepts(&h), "a prefix of the secret must not pass");
+        h.insert(
+            http::HeaderName::from_static("x-origin-token"),
+            "s3cret-value".parse().unwrap(),
+        );
+        assert!(gate.accepts(&h), "the stamped value must pass");
+        // The edge writes the header name in its own spelling. HTTP field names
+        // are case-insensitive, and this is the spelling the node's config
+        // carries ("X-Origin-Token"), so the lookup has to be too. (from_static
+        // refuses mixed case by design; `parse` is the case-insensitive path.)
+        let mut spelled = http::HeaderMap::new();
+        spelled.insert(
+            "X-Origin-Token".parse::<http::HeaderName>().unwrap(),
+            "s3cret-value".parse().unwrap(),
+        );
+        assert!(gate.accepts(&spelled));
+        // An empty configured value is refused at construction, not accepted as
+        // "send the header empty-handed".
+        assert!(OriginTokenGate::new("X-Origin-Token", "", vec![]).is_err());
+    }
+
+    /// R4: who has to carry the stamp. Loopback is the node's own probes; a peer
+    /// we cannot name is refused (fail closed); an empty exempt list means even
+    /// loopback must be stamped, which is the arm the LAB exercises.
+    #[test]
+    fn origin_token_gate_exempts_loopback_only() {
+        use pingora::protocols::l4::socket::SocketAddr as PSockAddr;
+        let gate = OriginTokenGate::new(
+            "X-Origin-Token",
+            "s3cret-value",
+            vec![
+                parse_cidr("127.0.0.1/32").unwrap(),
+                parse_cidr("::1/128").unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(
+            !gate.requires(Some(&PSockAddr::Inet(addr("127.0.0.1:5")))),
+            "loopback is the node's own probes"
+        );
+        assert!(!gate.requires(Some(&PSockAddr::Inet(addr("[::1]:5")))));
+        assert!(
+            gate.requires(Some(&PSockAddr::Inet(addr("203.0.113.9:5")))),
+            "a remote peer must be stamped"
+        );
+        assert!(gate.requires(None), "no address, no trust");
+        let strict = OriginTokenGate::new("X-Origin-Token", "s3cret-value", vec![]).unwrap();
+        assert!(
+            strict.requires(Some(&PSockAddr::Inet(addr("127.0.0.1:5")))),
+            "with no exempt list even loopback is stamped"
+        );
+        // The form the dual-stack listener actually reports for a v4 peer, and
+        // the reason every list here goes through `ip_in_any`: measured on the
+        // node, this exact address failed to match `127.0.0.1/32` and the
+        // exemption silently did not apply.
+        assert!(
+            !gate.requires(Some(&PSockAddr::Inet(addr("[::ffff:127.0.0.1]:5")))),
+            "an IPv4-mapped loopback peer is loopback"
+        );
+    }
+
+    /// Every CIDR list in this crate means the same thing on either socket:
+    /// `[::]` reports an IPv4 peer in the mapped form, so an IPv4 CIDR has to
+    /// match it. This is the regression that cost the loopback exemption on the
+    /// node (A8's second arm), where `accept.sh` was refused at its own front.
+    #[test]
+    fn cidr_lists_match_mapped_ipv4_peers() {
+        let v4 = vec![parse_cidr("127.0.0.1/32").unwrap()];
+        assert!(ip_in_any(&v4, &addr("127.0.0.1:1").ip()));
+        assert!(
+            ip_in_any(&v4, &addr("[::ffff:127.0.0.1]:1").ip()),
+            "a mapped v4 peer must match a v4 CIDR"
+        );
+        assert!(!ip_in_any(&v4, &addr("[::1]:1").ip()));
+        let block = vec![parse_cidr("203.0.113.0/24").unwrap()];
+        assert!(ip_in_any(&block, &addr("[::ffff:203.0.113.9]:1").ip()));
+        let v6 = vec![parse_cidr("::1/128").unwrap()];
+        assert!(ip_in_any(&v6, &addr("[::1]:1").ip()));
+        assert!(!ip_in_any(&v6, &addr("127.0.0.1:1").ip()));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_bytes() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"abc", b""));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]

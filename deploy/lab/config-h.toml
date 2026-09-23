@@ -1,0 +1,44 @@
+# CDN-LAB config H: the origin-token admission gate (R4, LAB section 16).
+#
+# The gate exists to close the bypass where a peer that learns the origin's
+# address pulls from it directly, past the CDN. Its own unit tests cover the
+# comparison and the exemption rule; what they cannot cover is the wiring --
+# whether the filter really consults the gate on a live connection, and whether
+# the peer's address is really the thing that decides. That needs a running
+# front.
+#
+# The exemption list is deliberately EMPTY here: on a test box every request
+# comes from loopback, so with the default list (loopback exempt) the refusal
+# would be unreachable and the assertion would pass for the wrong reason.
+# config-f runs the same knobs with the DEFAULT list, so the two instances
+# together assert both arms: config-f's requests are served unstamped (loopback
+# is exempt), and this instance's are refused (nothing is).
+front_listen = "127.0.0.1:7784"
+front_metrics_listen = "127.0.0.1:9097"
+front_origin_token_header = "X-Origin-Token"
+front_origin_token_env = "CDN_LAB_ORIGIN_TOKEN"
+front_origin_token_exempt = []
+listen_addr = "127.0.0.1:8088"
+cache_dir = "/mnt/hdd/CDN-LAB/cache-h"
+max_size_bytes = 268435456
+inactive_ttl_secs = 1200
+revalidate_ttl_secs = 60
+negative_ttl_secs = 60
+concurrency_per_upstream = 3
+prewarm_shared_secret_env = "CDN_LAB_PREWARM_SECRET"
+session_window_bytes = 262144
+[cache_profiles.efficient]
+min_file_size = 4
+
+[[upstreams]]
+id = "media"
+type = "openlist"
+base_url = "http://127.0.0.1:5244/dav"
+root_path = "media"
+username_env = "CDN_LAB_DAV_USER"
+password_env = "CDN_LAB_DAV_PASS"
+cache_profile = "efficient"
+
+[[routes]]
+prefix = ""
+upstream = "media"
