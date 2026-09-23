@@ -83,6 +83,13 @@ pub(crate) enum RequestedSpan {
 ///
 /// `Multi` is rejected by [`parse`] before this is reached, and `Absent` needs no
 /// size at all — both are here so a caller can pass whatever it parsed.
+///
+/// Deliberately NOT delegating to `cache::resolve_range`: that one clamps a
+/// range against a KNOWN object size on the serve path, while this one decides
+/// what a request means before any size is known (a suffix needs the size,
+/// `Multi` is a 416, an absent range is the whole object). They overlap only on
+/// the `Single` arm, and merging them would put request parsing and
+/// size-dependent clamping behind one interface.
 pub(crate) fn resolve(parsed: &ClientRange, size: u64) -> RequestedSpan {
     match parsed {
         ClientRange::Absent => RequestedSpan::Whole,
