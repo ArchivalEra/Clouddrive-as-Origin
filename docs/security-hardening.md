@@ -80,10 +80,21 @@ Two more facts, both relevant:
   peer, and the four-way test passes — external direct 403, loopback 206, CDN 206, the real
   film through the CDN 206/1 MiB. `accept.sh` on the node: **VERDICT=PASS**. Details, config
   and the two traps paid for on the way are in the runbook's "The origin token" section.
-- **R5 is now unblocked in principle** but still belongs to the infrastructure agent: with
-  the token live, a host default-deny can be written against the *token* rather than an
-  address list (allow 22 + 7777, let the front do the identifying). R3's address list stays
-  the cleaner end state if the plan ever changes.
+- **The updater for R3 exists**: `deploy/oracle/origin-pull-cidrs.sh` reads the ranges, keeps
+  a state hash, and emits them in the shape each consumer needs — nftables set members for the
+  node (`--mode apply-nft`) or OCI ingress rules as JSON plus the `oci` command that would
+  apply them (`--mode emit-oci`, which this repo never runs). It is **not** a wrapper around
+  the vendor CLI: `--fetch` runs the one documented read invocation (endpoint and proxy
+  handling spelled out), or you hand it a file. Running it today: `AUTH=no STATUS=offline
+  312 IPv4 + 184 IPv6`, and **it refuses to apply** — those ranges are the catalog, not what
+  EdgeOne is bound to, so an allowlist built on them would block the pull nodes in use. That
+  refusal is the tool's whole point, and `--force` overrides it only with that reason printed.
+  It prints the `ConfirmOriginACLUpdate` step when Tencent announces a new version; doing that
+  needs write access, so it is left to whoever holds it. Self-tested (`--self-test`, twelve
+  checks over both authorities, the refusal, idempotence and the pending-update path).
+- **R5** stays the infrastructure agent's: with the token live (R4) a default-deny can be
+  written against the token, and with this tool the pull-range arm can be kept in step once
+  origin protection is available.
 - **What remains**: R8 (rate ceiling — still a decision, and it interacts with the edge's
   pull IPs), R9 (`front_ip_allow` end-to-end), R11 (public or not), R12 (retention/alerts),
   R10 (rotate the upstream credential to read-only).
@@ -130,6 +141,27 @@ open, the CDN path is untouched, and nothing depends on IP churn.
 
 **R5 `infra` — a host firewall with default-deny inbound.** Blocked until R3 or R4 lands: a
 default-deny needs to know which peers legitimately pull.
+
+## Handing the updater to whoever owns the cloud perimeter
+
+`deploy/oracle/origin-pull-cidrs.sh` is self-contained (bash + python3; `tccli` only for
+`--fetch`, `nft` only for `--mode apply-nft`). It needs **read-only** EdgeOne access — the
+account it was developed against was downgraded to read-only and it still runs — and root only
+to touch a firewall. Three things to agree on before it is wired into anything:
+
+1. **What it may write.** It updates members of an *existing* nftables set and never creates
+   one; `--mode emit-oci` only prints. The firewall those members belong to (R5) is a decision,
+   not a side effect of running a sync.
+2. **What it refuses.** While the zone reports `Status: offline` — true today, and true for as
+   long as the plan lacks origin protection — it applies nothing and says why, because the
+   catalog ranges are not binding. Anything that consumes it must treat exit code 2 as
+   "not authoritative", not as a transient failure to retry.
+3. **Cadence.** Tencent's own guidance for this data is a poll roughly every three days; on a
+   `NextOriginACL`, apply the new set and then confirm it (`ConfirmOriginACLUpdate`, a write
+   this repo does not make).
+
+The state file (`origin-pull-cidrs.state`) is what makes a re-run cheap and a change visible:
+same hash, nothing to do; new hash, the set is different from the last one applied.
 
 **R4 `ours`, blocked on a capability check — an origin-access secret instead of an IP list.**
 If EdgeOne can inject a request header on origin pull, the front can require it
