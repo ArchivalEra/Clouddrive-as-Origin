@@ -49,6 +49,23 @@ Two more facts, both relevant:
 
 ## Status (2026-09-23, updated)
 
+- **R11 decided: the content is public.** No signed access; the unsigned business route and
+  the unsigned S3 listing are the intended surface. What the exposure must NOT have is a
+  write path, and that is now proven rather than claimed: `PUT`/`DELETE`/`PATCH`/`POST`/`MKCOL`
+  against the exposed route all return **405** (the only POST is the token-guarded prewarm
+  under `/_internal/`, which the front refuses by prefix on the public hostname), the listing
+  after the probes shows nothing created, and `src/` contains no upstream write verb at all
+  (`grep -rE '"(PUT|POST|DELETE|MKCOL|COPY|MOVE)"'` over `src/` — only `PROPFIND` and
+  ranged `GET`). Because of that, **R10 is closed as "keep the credential writable"** by the
+  owner's decision: the only peer that can reach the credential's endpoint is the origin
+  itself, over loopback.
+- **OpenList is isolated to loopback** (the owner's word for it was "absolute isolation"): `scheme.address =
+  "127.0.0.1"` in `/opt/openlist/data/config.json` (backup next to it,
+  `config.json.pre-isolation`), so it listens on **127.0.0.1:5244 only** — the perimeter
+  rule that blocked 5244 is now belt to that braces. Verified: external connect refused,
+  loopback UI 200, origin's CDN path unaffected, `accept.sh` VERDICT=PASS. Its other
+  services (S3 :5246, FTP :5221, SFTP :5222, MCP) are all `enable: false`, and would follow
+  the loopback bind if ever enabled.
 - **Done and verified**: R1, R2, R6 — the perimeter is now a whitelist (22, 7777, the proxy
   stack, ICMP); 7778, 5244 and 111 are closed to the internet; rpcbind is disabled. Verified
   from an external host: 5244 and 7778 now time out (they answered 200 before), the CDN path
@@ -234,15 +251,20 @@ A7 on the plane that carries the CDN.
 Once R3's list is authoritative, the allow path (never exercised end to end) gets
 a real assertion, not a config line.
 
-**R10 `infra`/`ours` — make the origin's upstream credential read-only.**
-A dedicated OpenList user with read permission only, used by
-`OPENLIST_USERNAME`/`OPENLIST_PASSWORD`; rotate the current one. Acceptance: A6.
+**R10 `infra`/`ours` — make the origin's upstream credential read-only. CLOSED BY DECISION, superseded by isolation (2026-09-23).**
+The owner chose writable ("more convenient") with a stronger mitigation: **network isolation**
+(OpenList bound to `127.0.0.1:5244`, verified above) plus a **read-only-by-construction**
+exposed surface — the S3/business route registers only `GET`/`HEAD` handlers, every write
+verb is refused with 405 before anything is parsed, and `src/` contains no upstream write
+call to audit. The credential therefore sits on an endpoint that only the origin itself can
+reach, doing only reads. If OpenList ever becomes reachable beyond loopback, this
+requirement comes back, and A6 (a PUT with it fails) is the test.
 
-**R11 `decision` — is the content public?**
+**R11 `decision` — is the content public? DECIDED: yes (2026-09-23).**
 The business route *and* the S3 listing answer unsigned (`?list-type=2` → 200
-without signing). If the content is not meant to be public, the fix is signed
-access (a code change), not perimeter work. Needs the owner's answer before
-anything is built.
+without signing), and that is the intended surface. No signed access will be built; the
+exposure's security property is the one R4 gives it (the caller is either the edge or
+nobody) plus the 405 write refusal above.
 
 **R12 `infra` + `ours` — retention and alerting.**
 journald holds ~211 MB (~2.5 days); the watchdog sends a heartbeat to the
