@@ -58,8 +58,9 @@ echo "  budget ${BUDGET_S}s: $pass pass / $fail fail"
 echo
 echo "NOTE: a failure here is not automatically the origin's fault. Latency"
 echo "from a client crosses the CDN edge first, and that segment has been"
-echo "measured as the dominant cost (see docs/notes/ and the perf-attribution"
-echo "map). Compare against the origin-side numbers before blaming this node:"
+echo "measured as the dominant cost (see the runbook's 'The real 30-hour film,'"
+echo "which carries the per-segment account). Compare against the origin-side"
+echo "numbers before blaming this node:"
 echo "  ssh $SSH_HOST 'curl -s http://127.0.0.1:8080/_internal/healthz'"
 echo "  ssh $SSH_HOST 'deploy/metrics-report.sh http://127.0.0.1:9090/metrics 30'"
 [ "$fail" -eq 0 ]

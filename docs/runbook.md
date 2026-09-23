@@ -816,7 +816,8 @@ sudo dd if=/opt/origin-cache/cache-standard/<key> of=/dev/null bs=1M count=200
 If local reads are fast and `metrics-report` blames the upstream segment,
 the problem is OpenList or the provider — not this service. If the whole
 path is fast from the node but slow from a client, the time is in the edge
-segment (see `docs/notes/` for the EdgeOne findings).
+segment (the per-segment account is in "The real 30-hour film, and the route it
+exposes").
 
 ### Reading the shaping account (efficient profile)
 
@@ -1827,22 +1828,26 @@ origin's pull. The origin's job for such an object is the first pull of each
 region, and it does that with one `open` per request because nothing can be
 staged — which is where the run machinery stops helping.
 
-Read this as the boundary of what the cache currently buys. An object larger than
-the magazine is neither a magazine member nor a resident stray (ADR-0013/0014),
-so **nothing about it is cached, and the run machinery never starts** — a run is
-gated on staging admission, so a 1 MiB-granularity walk pays one ~1.2 s provider
-open per MiB (a stageable object pays about one per 64 MiB window: 512 shards ->
-12 opens). Sequential playback is still feasible (24 shards in 27 s is ~0.9 MiB/s,
-and a player asks for ranges far larger than 1 MiB, which amortizes the open:
-16 MiB cost 1 open and 1.5 s), but every seek costs ~0.9 s, and scrubbing across
-a 200 GiB object is a seek per gesture.
+Read this as the boundary of what the cache bought BEFORE ADR-0019, kept for the
+measurements it took (the CDN-side table above is still the best account of an
+edge re-scrub). Everything from here to the end of this subsection is that older
+reading, and it must not be quoted as current:
 
-That is the next mechanism's case, and it is measurable from here: a NO-RETENTION
-run — one open per window, readers riding the watermark, nothing written to disk
-— would make the walk cost one open per window instead of one per request with
-zero disk cost, which is exactly what an object too large to keep needs.
+> It said an object larger than the magazine is "neither a magazine member nor a
+> resident stray" (ADR-0013/0014), so nothing is cached and **the run machinery
+> never starts** — a run was gated on staging admission, so a 1 MiB-granularity
+> walk paid one ~1.2 s provider open per MiB (a stageable object pays about one
+> per 64 MiB window: 512 shards -> 12 opens). Sequential playback was still
+> feasible (24 shards in 27 s is ~0.9 MiB/s, and a player asks for ranges far
+> larger than 1 MiB, which amortizes the open: 16 MiB cost 1 open and 1.5 s), but
+> every seek cost ~0.9 s, and scrubbing across a 200 GiB object was a seek per
+> gesture. That was the case the next mechanism was built for, and ADR-0019
+> answered it: admission asks about the WRITE, an un-keepable key gets a run like
+> any other, and the same 24-shard walk now costs **1** upstream open — measured,
+> in "A run for an object the node can never hold" above.
 
-Two knobs govern what leaves the window (ADR-0015), both span-level:
+The two knobs that govern what leaves the window (ADR-0015), both span-level,
+are unchanged by that:
 
 ```toml
 eviction_policy = "lru"   # default: the stalest span in the least-recently-
