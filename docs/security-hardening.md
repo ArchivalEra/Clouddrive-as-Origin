@@ -163,6 +163,34 @@ to touch a firewall. Three things to agree on before it is wired into anything:
 The state file (`origin-pull-cidrs.state`) is what makes a re-run cheap and a change visible:
 same hash, nothing to do; new hash, the set is different from the last one applied.
 
+### How to tell who actually pulls (and one way this went wrong)
+
+The front's access record used to carry `xff` and no peer, and `xff` is **the client EdgeOne
+was serving**, not the address that opened the connection. Read as if it were the puller, it
+produced an audit that concluded the origin-pull catalog "does not contain the node that is
+actually pulling" — the two addresses counted (both in Zhejiang Mobile, one of them this
+workstation's own direct egress) are clients, and clients are of course not in a catalog of
+Tencent's pull ranges. The record now carries `peer=` as well, so one line answers both
+questions:
+
+```
+front access ... status="206" bytes=1048576 proto="h2"
+   peer=[::ffff:43.168.149.241]:5276   xff=39.172.36.93
+   ^ who pulled (a Tencent range, in the catalog)   ^ who was being served (a client)
+```
+
+Measured that way, the six addresses pulling today are all in the catalog
+(`43.175.104.138/162/143`, `43.174.106.43`, `43.168.149.241`, `43.168.146.198` — every one
+inside `43.160.0.0/12`). So the catalog *does* describe today's pullers; what it is not is
+**binding**, because the zone reports `offline`, and it is **versioned** (the current family
+activates 2026-10-12), so a new version can move the set. That is the honest risk statement
+for `--force`: it would probably work today and has no guarantee behind it.
+
+Two notes for anything doing address matching at the socket level: peers arrive IPv4-mapped
+(`[::ffff:a.b.c.d]`) on the `[::]` listener, which is why the front's own CIDR lists needed
+canonicalizing (see the runbook's origin-token section); nftables rules are unaffected, since
+the packet on the wire is IPv4.
+
 **R4 `ours`, blocked on a capability check — an origin-access secret instead of an IP list.**
 If EdgeOne can inject a request header on origin pull, the front can require it
 (a new config knob; today only the prewarm token exists), and then the allowlist

@@ -568,6 +568,18 @@ impl ProxyHttp for BusinessProxy {
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("-");
+        // The PEER, not just the forwarded client. `xff` is whoever EdgeOne was
+        // serving; the peer is who actually opened the connection, and for an
+        // origin pull that is the pull node itself. Without this column the
+        // question "which addresses pull from us?" cannot be answered from the
+        // log at all, which is how an audit of the origin-pull ranges came to
+        // read client addresses (both in Zhejiang Mobile) as if they were pull
+        // nodes. It arrives IPv4-mapped on the `[::]` listener, so it is logged
+        // as the socket reports it.
+        let peer = session
+            .client_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "-".to_string());
         tracing::info!(
             method = %session.req_header().method,
             path = %session.req_header().uri.path(),
@@ -575,6 +587,7 @@ impl ProxyHttp for BusinessProxy {
             bytes = session.body_bytes_sent(),
             duration_ms = ctx.start.elapsed().as_millis(),
             proto = proto_of(session),
+            peer = %peer,
             xff = %xff,
             err = ?e.as_ref().map(|e| e.to_string()),
             "front access",

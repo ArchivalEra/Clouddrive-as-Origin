@@ -584,6 +584,17 @@ to this project and was not touched.
 
 ### Who pulls, and how to tell (2026-09-22)
 
+**Added 2026-09-23: ask what you mean.** The access record now carries `peer=` next to
+`xff=`, because `xff` is the client EdgeOne was *serving*, never the address that opened the
+connection. An audit that read `xff` as the puller concluded the origin-pull catalog does not
+contain the pulling node; the two addresses it counted are clients (both Zhejiang Mobile, one
+of them this workstation's own egress). The real pullers — six Tencent addresses, every one
+inside `43.160.0.0/12` — are in the catalog. One line answers it now:
+
+```
+peer=[::ffff:43.168.149.241]:5276  xff=39.172.36.93     # puller, then client
+```
+
 Asking "does the edge ever pull from us with no viewer?" through the CDN's own
 hourly metric gives the wrong answer, so the instrument matters more than the
 number.
