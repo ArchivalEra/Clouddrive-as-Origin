@@ -885,8 +885,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                     // Fresh enough to serve from memory: a HEAD must be
                     // current, so a stale row still costs one stat (bytes
                     // never move — flights and file reads stay untouched).
-                    let age = now.saturating_sub(meta.last_revalidated_millis.unwrap_or(meta.created_at_millis));
-                    if age <= self.config.revalidate_ttl_secs * 1000 {
+                    if !meta.revalidate_due(now, self.config.revalidate_ttl_secs) {
                         let hdrs = EntryHeaders {
                             size_bytes: meta.size_bytes,
                             etag: meta.etag.clone(),
@@ -944,7 +943,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
     /// my CDN rather than proxy the bytes". Something we hold but have not
     /// revalidated is exactly what that operator wants redirected. The
     /// efficient profile deliberately does NOT use this gate — see
-    /// [`Cache::has_durable_entry`].
+    /// [`Cache::entry_exists`].
     async fn memory_hit_fresh(&self, raw_key: &str) -> bool {
         let key = match validate_key(raw_key) {
             Ok(k) => k,
@@ -954,8 +953,7 @@ impl<C: Clock + Clone + 'static> Cache<C> {
         let s = self.state.read().await;
         match s.entries.get(&key) {
             Some(m) if m.negative_until_millis.is_none() => {
-                let age = now.saturating_sub(m.last_revalidated_millis.unwrap_or(m.created_at_millis));
-                age <= self.config.revalidate_ttl_secs * 1000
+                !m.revalidate_due(now, self.config.revalidate_ttl_secs)
             }
             _ => false,
         }
@@ -1681,9 +1679,10 @@ impl<C: Clock + Clone + 'static> Cache<C> {
                     if meta.negative_until_millis.is_some() {
                         (false, None)
                     } else {
-                        let age = now
-                            .saturating_sub(meta.last_revalidated_millis.unwrap_or(meta.created_at_millis));
-                        (age > self.config.revalidate_ttl_secs * 1000, meta.etag.clone())
+                        (
+                            meta.revalidate_due(now, self.config.revalidate_ttl_secs),
+                            meta.etag.clone(),
+                        )
                     }
                 }
                 None => (false, None),
