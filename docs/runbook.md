@@ -1380,6 +1380,56 @@ the first pull of a region, and overlapping viewer traffic is absorbed by the
 edge. `--no-proxy-server` is passed to the browser, and nothing here may run
 through an HTTP proxy: the proxy's RTT is the thing being measured.
 
+### Surviving the leg: retries, an attempt timeout, and a fixture that proves them (2026-09-23)
+
+A viewer on a long session is only as long as the leg under it is willing to be.
+Measured on this path: of 3-4 concurrent requests, one waited 8.7 s, 11.9 s,
+90 s, and once over 300 s, with the origin's counters flat throughout — and the
+first two-hour session died 12.5 s in with `Failed to fetch`. Three knobs, all
+defaulting to 0, are what a harness sets when it wants survival rather than a
+strict reading:
+
+```
+--retries N              retry a failed attempt (resuming at the first byte the
+                         chunk is still missing) and count what it spent
+--attempt-timeout-secs N turn a stalled attempt into a failed one — a hang never
+                         rejects, so without this a retry cannot see it
+--max-bytes N            the reader's hard stop (its default is 64 MiB)
+```
+
+The report carries `retries=` per viewer and in the total line, and the live
+progress line carries it too. A retry-induced wait shows up as a gap as well:
+the reader reports what a viewer felt, and a viewer that waited did wait.
+
+`deploy/lab/flaky-server.py` is the counterweight — a ranged fixture that, on
+request, drops every Nth response after a prefix (`abort-every`) or stalls it
+forever (`stall-every`). Six runs, one per row, 4 chunks x 256 KiB:
+
+```
+clean, retries 0              bytes=1048576 ck=1752696832
+clean, --max-bytes 524288     2 requests, (capped) — and it STOPS asking
+drops every 2nd, retries 0    ERROR=network error
+drops every 2nd, retries 3    bytes=1048576 retries=3 ck=1752696832
+hangs every 2nd, retries 3    TIMEOUT (retries are blind to a hang)
+hangs every 2nd, retries 3,
+  --attempt-timeout-secs 2    bytes=1048576 retries=3 ck=1752696832
+```
+
+The checksum column is the assertion: a run over a leg that both drops and hangs
+must account exactly like the clean run, byte for byte. The first version of the
+retry rolled a failed attempt's bytes back out of the totals and then resumed
+past them — the fixture caught it as a total exactly 3 x 65536 bytes short.
+Resuming means no rollback; only re-requesting the same range would need one.
+
+**One serial connection through this POP sustains ~0.9 MB/s** (measured over 5
+minutes on the real film: 52 MiB/min steady, all edge HITs, one gap per ~50 s).
+That is below the film's own 1.94 MB/s, and it is why a two-hour session is
+sized at 1400 x 5 MiB (7 GB) rather than the 2800 chunks that equal the film's
+two hours of content: the larger target would need ~4.3 h and would be cut off
+by the viewer timeout with a bare TIMEOUT row instead of totals. Parallel
+connections are the lever that works — 4 viewers measured 7.1 MB/s aggregate —
+and that is a client-side shape, not an origin setting.
+
 ### The target-scale account: an object the node can never hold
 
 The product's object is a 3-hour video of 30-200 GB. Measured on the node against
