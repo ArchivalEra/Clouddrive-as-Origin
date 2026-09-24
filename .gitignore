@@ -21,6 +21,7 @@
 !/hooks/**
 !/docs/**
 !/skills/**
+!/.github/**
 !/config.example.toml
 !/docs/adr/**
 !/Cargo.toml

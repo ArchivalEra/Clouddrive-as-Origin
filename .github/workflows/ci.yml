@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: build (workspace: origin + front)
+        run: cargo build --locked --workspace
+
+      - name: test (workspace)
+        run: cargo test --locked --workspace
+
+      # The pre-push hook's clippy budget is 0; CI denies instead of counting.
+      - name: clippy (budget 0, enforced)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The pre-push hook's other half, so a push cannot be the first place a
+      # CJK character is caught.
+      - name: no CJK in tracked files
+        run: |
+          pattern='[\x{3000}-\x{303F}\x{3400}-\x{4DBF}\x{4E00}-\x{9FFF}\x{F900}-\x{FAFF}\x{FF01}-\x{FF5E}]'
+          offenders=$(git grep -I -P -l -e "$pattern" HEAD -- . || true)
+          if [ -n "$offenders" ]; then
+            echo "CJK found in: $offenders"
+            exit 1
+          fi
