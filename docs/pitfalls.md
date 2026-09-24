@@ -533,3 +533,22 @@ entry for being obvious in hindsight — hindsight is the point.
     the repo is on the HDD. *Fix:* write anything that takes hours — sessions
     JSONL, progress logs, monitor lines, baselines — under `/mnt/hdd`, and treat
     `/tmp` as the scratch space it is.
+
+66. **A test that passes on a tmpfs `/tmp` has not passed.** The suite had been
+    green for months on a machine whose `/tmp` is RAM, and the first CI run on a
+    runner with a real disk went red: `cargo test --lib` failed
+    `business::tests::a_partially_covered_range_needs_one_open_and_stages_the_rest`
+    (242 passed, 1 failed), twice. The seal's ledger accounting lags the response
+    it belongs to — nanoseconds on a tmpfs, milliseconds to tens of milliseconds
+    on a disk — so three sites that asserted immediately after a response were
+    racing, and the tmpfs had been hiding it. Reproduced locally in **one** run
+    with `TMPDIR=/mnt/hdd/tmp cargo test`; two more sites surfaced under that
+    (the fully-covered-seek test's stage-to-seek step, and the random
+    consistency walk's per-round account-equals-disk assert, 3 of 6 runs).
+    *Fix:* wait for the RECORD, never assert on the response (pitfalls 50/51) —
+    `wait_ledger` before span asserts, and in the consistency walk wait until
+    the account and the disk agree; the budget invariant also needs
+    tick, settle, re-tick, because a span that seals after a tick is over budget
+    until the next one. *Rule:* run the suite once with `TMPDIR` pointed at a
+    real disk (CI does that implicitly), and treat "green locally" as evidence
+    about the filesystem, not about the code.

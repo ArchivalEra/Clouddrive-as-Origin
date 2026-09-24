@@ -2377,9 +2377,20 @@ async fn the_account_the_ledger_and_the_disk_never_disagree() {
         );
         drop(served);
 
-        wait_settled(&cache).await;
-        let snap = cache.snapshot().await;
-        let k: KeyState = cache.inspect("a.bin").await;
+        // The seal's ledger accounting can lag the response and the disk —
+        // barely on a tmpfs, a lot on a real disk — so wait for the two views
+        // to AGREE before asserting. The record, not the response (pitfalls
+        // 50/51); `wait_settled`'s 15 ms stability window is not that promise.
+        let mut snap = cache.snapshot().await;
+        let mut k: KeyState = cache.inspect("a.bin").await;
+        for _ in 0..WAIT_TRIES {
+            if snap.segment_bytes == k.staged_bytes && ledger_is_backed_by_disk(&k) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            snap = cache.snapshot().await;
+            k = cache.inspect("a.bin").await;
+        }
         assert_eq!(
             snap.segment_bytes, k.staged_bytes,
             "round {round}: the account must equal what is on disk"
@@ -2392,9 +2403,20 @@ async fn the_account_the_ledger_and_the_disk_never_disagree() {
         );
 
         // Every few rounds, run the reaper — the budget must come back inside.
+        // A span that SEALS after a tick is over budget until the next tick
+        // (the trim runs per tick and cannot trim what is not yet on disk),
+        // and on a real disk a seal can land after the trim it missed — so
+        // tick-and-settle until the account is stable inside the budget,
+        // bounded, before asserting (pitfalls 50/51: wait for records).
         if round % 20 == 19 {
-            cache.tick().await;
-            wait_settled(&cache).await;
+            for _ in 0..5 {
+                cache.tick().await;
+                wait_settled(&cache).await;
+                let snap = cache.snapshot().await;
+                if snap.total_bytes + snap.segment_bytes <= cache.config.max_size_bytes {
+                    break;
+                }
+            }
             let snap = cache.snapshot().await;
             let budget = cache.config.max_size_bytes;
             assert!(

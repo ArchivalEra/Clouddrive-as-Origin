@@ -544,6 +544,10 @@ async fn a_fully_covered_seek_is_served_from_stage_without_upstream() {
         let (status, _, _) = body_text(resp).await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     }
+    // Both seals must be in the ledger before the seek: on a real disk the
+    // seal lags the response it belongs to, and a seek that arrives first
+    // finds no coverage and opens upstream (pitfalls 50/51).
+    wait_ledger(&fx, "a.bin", &[(0, 5), (5, 10)]).await;
     reset(&fx);
     fx.state.cache.clock.advance(5_000);
     let resp = get_key(
@@ -619,6 +623,11 @@ async fn a_partially_covered_range_needs_one_open_and_stages_the_rest() {
         1,
         "the remainder is one exact-Range open, not one per gap"
     );
+    // The seal of the tail span lands after the response it belongs to (the
+    // body's last byte does not carry the ledger with it) — on a tmpfs /tmp
+    // that race is invisible, on a real disk it is not. Wait for the record,
+    // never assert on the response (pitfalls 50/51).
+    wait_ledger(&fx, "a.bin", &[(0, 5), (5, 10)]).await;
     assert_eq!(
         staged_segments(&fx, "a.bin").await,
         vec![(0, 5), (5, 10)],
