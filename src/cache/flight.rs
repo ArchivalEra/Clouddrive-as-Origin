@@ -864,9 +864,16 @@ mod tests {
     /// The stall budget measures inactivity, not total wall time: a reader
     /// parked ahead of the writer must survive a wait LONGER than one
     /// budget as long as progress keeps arriving. One deadline covering the
-    /// whole wait trips at the first budget (150 ms here, while the writer
-    /// still needs ~300 ms to reach the reader) and kills the body of a
-    /// perfectly healthy pull.
+    /// whole wait trips at the first budget and kills the body of a perfectly
+    /// healthy pull.
+    ///
+    /// The writer's steps must sit comfortably INSIDE the budget or the test
+    /// measures the machine: 100 ms steps against a 150 ms budget passed on a
+    /// workstation and failed on CI's runner, where a step stretched past the
+    /// budget and the reader was (correctly) told its writer had stalled. 30 ms
+    /// steps against the same 150 ms budget leave a 5x margin, while the reader
+    /// still waits ~330 ms - more than two budgets - so the re-arming is what
+    /// keeps it alive.
     #[tokio::test]
     async fn far_ahead_reader_survives_a_flowing_writer_beyond_one_budget() {
         use futures::StreamExt;
@@ -875,11 +882,12 @@ mod tests {
         let finalp = dir.path().join("flow.bin");
         let budget = std::time::Duration::from_millis(150);
         let flight = std::sync::Arc::new(FlightShared::new(tmp.clone(), finalp.clone(), budget));
-        let total = 4 * 1024 * 1024u64;
+        const MIB: u64 = 1024 * 1024;
+        const STEP: u64 = MIB / 2;
+        let total = 12 * STEP; // 6 MiB in 12 steps
         let meta = ObjectMeta { size_bytes: total, etag: None, last_modified: None, mime_hint: None };
         let _ = flight.progress_tx.send(FlightProgress::Meta(meta));
 
-        const MIB: u64 = 1024 * 1024;
         let driver = {
             let flight = flight.clone();
             let tmp = tmp.clone();
@@ -888,10 +896,10 @@ mod tests {
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
                 let mut f = tokio::fs::File::create(&tmp).await.unwrap();
-                for i in 1..=4u64 {
-                    f.write_all(&vec![i as u8; MIB as usize]).await.unwrap();
-                    let _ = flight.progress_tx.send(FlightProgress::Growing(i * MIB));
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                for i in 1..=12u64 {
+                    f.write_all(&vec![i as u8; STEP as usize]).await.unwrap();
+                    let _ = flight.progress_tx.send(FlightProgress::Growing(i * STEP));
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 }
                 f.sync_all().await.unwrap();
                 drop(f);
