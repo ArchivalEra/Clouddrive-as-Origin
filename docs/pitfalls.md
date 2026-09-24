@@ -222,7 +222,7 @@ entry for being obvious in hindsight — hindsight is the point.
 
 34. **A proxy can hide which vantage you are measuring — and this one exits from
     the origin host.** `http_proxy`/`ALL_PROXY` here point at 127.0.0.1:2080,
-    whose egress is 129.146.127.22, the origin node itself; a CDN measurement
+    whose egress is the origin node itself; a CDN measurement
     taken through it would look like the origin talking to the edge. *Fix:* use
     `--noproxy '*'` (or `--no-proxy-server` for a browser) AND prove it — curl
     prints `Established connection to <host> (<pop-ip>) from <local-ip>` when it

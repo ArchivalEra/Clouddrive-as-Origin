@@ -1,16 +1,16 @@
 # Clouddrive-as-Origin Runbook (oracle node)
 
-Operational procedures for the oracle node (`129.146.127.22`, `opc@the-vnic`).
-SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
-`sudo` where noted.
+Operational procedures for the oracle node. SSH: `ssh oracle-cdn` (an
+`ssh`-config alias; the node's address lives there, not in this repo). All
+commands run as `opc` with `sudo` where noted.
 
 ## Topology
 
-- **EdgeOne** → origin-pull `apple.dib.l.cd:7777` (https) only, Host header
-  `cdn-oracle.isui.ren`. Edge cert is EdgeOne-managed; origin cert is Let's
-  Encrypt `cdn-oracle.isui.ren` (DNS-01 via dnspod). Port 80 is **not** an
-  origin path: it is filtered at the cloud layer and nothing listens on it
-  (see "Retired: port-80 helper").
+- **EdgeOne** → origin-pull to the origin's hostname on port **7777** (https)
+  only, Host header `cdn-oracle.isui.ren`. Edge cert is EdgeOne-managed; origin
+  cert is Let's Encrypt `cdn-oracle.isui.ren` (DNS-01 via dnspod). Port 80 is
+  **not** an origin path: it is filtered at the cloud layer and nothing listens
+  on it (see "Retired: port-80 helper").
 - **origin-cache** (2 systemd units): `origin-cache-efficient` `[::]:7777` TLS
   (the name is historical — it runs the default, `efficient`, profile) /
   `origin-cache-nocache` `[::]:7778`.
@@ -29,8 +29,8 @@ SSH: `ssh oracle-cdn` (2080 proxy + agent). All commands run as `opc` with
 
 ## Traffic switch (EdgeOne → oracle)
 
-1. EdgeOne console: add origin `apple.dib.l.cd` port 7777 (https), Host
-   header `cdn-oracle.isui.ren`, origin cert verification ON.
+1. EdgeOne console: add origin (the node's pull hostname) port 7777 (https),
+   Host header `cdn-oracle.isui.ren`, origin cert verification ON.
 2. Verify the origin is serving. From the node (the public path does not
    expose healthz by design -- see "Health checks"):
    ```sh
@@ -653,7 +653,7 @@ of them this workstation's own egress). The real pullers — six Tencent address
 inside `43.160.0.0/12` — are in the catalog. One line answers it now:
 
 ```
-peer=[::ffff:43.168.149.241]:5276  xff=39.172.36.93     # puller, then client
+peer=[::ffff:43.168.149.241]:5276  xff=<the client's address>     # puller, then client
 ```
 
 Asking "does the edge ever pull from us with no viewer?" through the CDN's own
@@ -1057,20 +1057,20 @@ at the head with real sample tables (stts/stss/ctts/stsc/stsz/stco) plus
 So the last unknown for the criterion is the vantage — and asking where the
 vantage actually lands corrected the guess above:
 
-- This workstation's DIRECT egress is 39.172.36.80 = China Mobile, Zhejiang
-  Huzhou (three services agree), and all three domestic public resolvers
+- This workstation's DIRECT egress is China Mobile, Zhejiang Huzhou (three
+  services agree), and all three domestic public resolvers
   (223.5.5.5, 119.29.29.29, 114.114.114.114) return the same Singapore addresses
   for this hostname. Nothing classified it as overseas: **the zone has no
   mainland acceleration, so a Chinese viewer is served from Singapore.**
-- The origin itself is in Phoenix, Arizona (Oracle Cloud, 129.146.127.22), and
-  the NODE's own lookup also lands on a Singapore POP. A Chinese viewer's bytes
-  therefore cross the border twice — Zhejiang -> Singapore -> Phoenix — which is
-  exactly what 0.4-1.4 MB/s with stalls looks like.
-- For the record on the 2080 proxy: it exits at 129.146.127.22, the ORIGIN host
-  itself. Every measurement in this document is direct — `--noproxy '*'`,
-  verified by curl's own `Established connection to cdn-oracle.isui.ren
-  (43.174.246.108) from 10.194.6.139`, and the browser probes pass
-  `--no-proxy-server`. No CDN account here is a proxy account.
+- The origin itself is in Phoenix, Arizona (Oracle Cloud), and the NODE's own
+  lookup also lands on a Singapore POP. A Chinese viewer's bytes therefore cross
+  the border twice — Zhejiang -> Singapore -> Phoenix — which is exactly what
+  0.4-1.4 MB/s with stalls looks like.
+- For the record on the 2080 proxy: it exits at the ORIGIN host itself. Every
+  measurement in this document is direct — `--noproxy '*'`, verified by curl's
+  own `Established connection to cdn-oracle.isui.ren (<pop-ip>) from <the
+  workstation's egress>`, and the browser probes pass `--no-proxy-server`. No
+  CDN account here is a proxy account.
 
 What the criterion needs next is a deployment decision, not a code change:
 mainland acceleration for the zone (which needs the domain's filing), or an

@@ -595,7 +595,8 @@ plain `GET /<key>` contract above.
      Host rewriting rules on routes serving signed traffic — any of
      them breaks the signature.
 
-  **Live-verified 2026-09-09 (oracle node, EdgeOne → apple.dib.l.cd:7777)**:
+  **Live-verified 2026-09-09 (oracle node, EdgeOne → the origin's pull hostname,
+  port 7777)**:
   | Behavior | Test | Result |
   |---|---|---|
   | Authorization forwarded to origin | SigV4-signed GET via EdgeOne domain | 200 (origin verified the signature — header arrived intact) |

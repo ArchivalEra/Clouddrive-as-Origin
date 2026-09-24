@@ -7,8 +7,8 @@
 # metadata database and every staged sidecar — a rename would orphan both and
 # start the node on an empty cache.
 
-# Dual-stack front: EdgeOne origin-pull arrives over IPv6 (apple.dib.l.cd
-# is IPv6-only), so bind [::] not 0.0.0.0.
+# Dual-stack front: the CDN's origin-pull hostname is IPv6-only, so bind
+# [::] not 0.0.0.0.
 front_listen = "[::]:7777"
 front_metrics_listen = "127.0.0.1:9090"
 # Client CIDRs refused at connection time (before TLS handshake).

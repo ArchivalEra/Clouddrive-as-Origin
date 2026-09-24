@@ -8,7 +8,8 @@ how the retired ones were found.
 
 Legend for *where*: **workstation** = the machine this repo is cloned on,
 **node** = `ssh oracle-cdn` (aarch64, production), **compile** =
-the x86_64 cross-build box (`ssh -i ~/.ssh/compile-key archivalera@192.168.137.136`),
+the x86_64 cross-build box (an `ssh`-config alias; `deploy-node.sh` takes
+`COMPILE_HOST`/`COMPILE_KEY`/`NODE` as env overrides),
 **client** = a host with a real internet vantage (not the node, not a proxy).
 
 ## `deploy/oracle/` — the node

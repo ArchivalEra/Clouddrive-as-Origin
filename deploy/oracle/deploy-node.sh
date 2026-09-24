@@ -21,7 +21,9 @@
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-COMPILE_HOST=${COMPILE_HOST:-archivalera@192.168.137.136}
+# Hosts come from ssh-config aliases, never literals: NODE is the production
+# node, COMPILE_HOST the cross-build box. Override either from the environment.
+COMPILE_HOST=${COMPILE_HOST:-compile}
 COMPILE_KEY=${COMPILE_KEY:-$HOME/.ssh/compile-key}
 NODE=${NODE:-oracle-cdn}
 ASSUME_YES=0
