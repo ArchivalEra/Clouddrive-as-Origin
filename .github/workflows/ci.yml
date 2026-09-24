@@ -19,7 +19,7 @@ jobs:
         with:
           components: clippy
 
-      - name: build (workspace: origin + front)
+      - name: "build (origin + front)"
         run: cargo build --locked --workspace
 
       - name: test (workspace)
