@@ -12,6 +12,12 @@ repo has actually hit, with evidence), `docs/adr/README.md` (one line per
 decision, and which ones amend which), and `deploy/README.md` (what every
 instrument under `deploy/` answers, where it runs, and where its reading lives).
 
+To **use** it — stand up a node, point a CDN and clients at it, take its account
+— read `docs/usage.md`. That page has an agent-shaped twin at
+`skills/clouddrive-origin/SKILL.md` (symlink it into `~/.zcode/skills/` or
+`~/.agents/skills/` and an agent picks it up by itself): the same operations, plus
+the hard rules and the list of questions measurement has already closed.
+
 EdgeOne (or any CDN) origin-pulls `GET /<key>` over HTTPS. On hit the
 service streams from local disk; on miss it fetches from the owning
 OpenList upstream, streams to the client while writing to disk
