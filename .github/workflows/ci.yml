@@ -72,13 +72,20 @@ jobs:
         run: |
           {
             echo "## CI failure diagnostics"
+            echo '```'
+            ls -la ci-*.log 2>&1 || true
             for f in ci-*.log; do
               [ -f "$f" ] || continue
-              if grep -qE "FAILED|^error|error\[|panicked" "$f"; then
-                echo "### $f"
-                echo '```'
-                tail -80 "$f"
-                echo '```'
-              fi
+              echo "### $f (unconditional tail)"
+              tail -100 "$f"
             done
-          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}" 2>&1 || true
+          # Belt and braces: also emit the tails as plain output, in case the
+          # summary write itself is what is broken.
+          for f in ci-*.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f ====="
+            tail -60 "$f"
+          done
+          exit 0
