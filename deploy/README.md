@@ -34,6 +34,7 @@ the x86_64 cross-build box (`ssh -i ~/.ssh/compile-key archivalera@192.168.137.1
 | `ip-filter-probe.sh` | the front's two IP lists end to end (R9), incl. a dead business -> 502 | node | loopback instance on 7793/8093/9094 | runbook "The front's two IP lists" |
 | `origin-pull-cidrs.sh` | keeps a firewall in step with EdgeOne's origin-pull ranges; refuses non-authoritative data (exit 2) | node or anywhere | tccli (read-only), or a saved JSON | `docs/security-hardening.md` (R3) |
 | `journald-origin-cache.conf`, `logrotate-origin-cache` | retention caps for the journal and the watchdog log | node | — | R12 |
+| `cold-load.sh` | continuous COLD load on production: random shards over a whole object, N in parallel, against the loopback business plane (so a workstation pays nothing and the account comes from the counters) | node | — | runbook "Ten viewers on the real film through MSE" |
 
 ## `deploy/lab/` — the acceptance suite
 
@@ -72,6 +73,9 @@ so an end-to-end demo stays reproducible.
 | `cdn-wire-probe.mjs` | who ended each request, from the wire | workstation | browsers | pitfall 27 |
 | `player-page.html` + `range-fanout-sw.js` | a ready-made player (hls.js) behind a range fan-out worker | served from the bucket through the CDN | `hls.min.js` + a single-file playlist next to it in the bucket | runbook "The glue that gives a ready-made player more speed" |
 | `package-for-player.sh` | packages an ordinary MP4 for that player without re-encoding | workstation | ffmpeg | runbook same |
+| `fmp4-index.mjs` | an HLS byte-range playlist for part of a REMOTE fMP4, built by walking its `moof`/`mdat` headers (no download of the payload, no re-encode); also probes for a real index in the tail | workstation | node | runbook "Ten viewers on the real film through MSE"; pitfall 64 |
+| `player-swarm.mjs` | N viewer slots that play → seek → watch → die for hours, one JSON line per session | workstation | node + `PW_DIR` | runbook same |
+| `swarm-report.mjs` | turns that JSONL into outcomes, latencies, stalls and the interleaving timeline | workstation | node | runbook same |
 | `log-server.py` | a tiny local origin for viewer experiments | workstation | python3 | — |
 
 ## `deploy/` (loose)
