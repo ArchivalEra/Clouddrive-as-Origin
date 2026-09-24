@@ -13,15 +13,62 @@
 // records what the player did rather than what it looked like: every fragment
 // load with its byte count and timing (so parallelism can be read off the
 // overlap), every error, and every waiting/stalled event.
+//
+// Parameters (all optional; with none the behaviour is the plain probe the LAB
+// has always run):
+//   ?src=<playlist>       the media playlist (same origin as this page)
+//   ?plain=1              skip hls.js and hand the URL to the media element
+//   ?fanout=N             register the range fan-out service worker
+//   ?seek-after=<secs>    seconds of playback before the one scripted seek
+//                         (0 disables; default: no seek)
+//   ?seek=<secs>          where to seek to, in presentation time
+//   ?watch=<secs>         stop cleanly this many seconds AFTER the seek
+//   ?t0=<epochMillis>     optional: stamp events on the harness's clock instead
+//
+// `window.__probe.snapshot()` returns the whole account as plain JSON, which is
+// what the swarm harness reads (and what makes a session self-describing even
+// when the browser is closed right after).
 const q = new URLSearchParams(location.search);
 const src = q.get('src');
 const v = document.getElementById('v');
-const p = window.__probe = { events: [], frags: [], errors: [], t0: performance.now() };
+const p = window.__probe = {
+  events: [], frags: [], errors: [], t0: performance.now(), done: false, stopReason: null,
+  seek: null, stalls: [], stalledMs: 0, playedMs: 0, firstPlaying: null, startupMs: null,
+  params: Object.fromEntries(q.entries()),
+};
 const t = () => Math.round(performance.now() - p.t0);
-v.addEventListener('playing', () => p.events.push({ t: t(), ev: 'playing' }));
-v.addEventListener('waiting', () => p.events.push({ t: t(), ev: 'waiting' }));
-v.addEventListener('stalled', () => p.events.push({ t: t(), ev: 'stalled' }));
+const nowMs = () => performance.now();
+p.events.push({ t: t(), ev: 'page-loaded' });
+
+let lastPlaying = null;
+let stalledSince = null;
+v.addEventListener('playing', () => {
+  p.events.push({ t: t(), ev: 'playing' });
+  if (p.firstPlaying === null) {
+    p.firstPlaying = nowMs();
+    p.startupMs = t();
+  }
+  lastPlaying = nowMs();
+  if (stalledSince !== null) {
+    p.stalledMs += nowMs() - stalledSince;
+    stalledSince = null;
+  }
+  if (p.seek && p.seek.resumeMs === null && p.seek.issuedAt !== null) {
+    p.seek.resumeMs = Math.round(nowMs() - p.seek.issuedAt);
+  }
+});
+const stallStart = (ev) => {
+  p.events.push({ t: t(), ev });
+  if (p.firstPlaying !== null) {
+    p.stalls.push({ t: t(), ev });
+    if (stalledSince === null) stalledSince = nowMs();
+  }
+  lastPlaying = null;
+};
+v.addEventListener('waiting', () => stallStart('waiting'));
+v.addEventListener('stalled', () => stallStart('stalled'));
 v.addEventListener('error', () => p.events.push({ t: t(), ev: 'video-error' }));
+v.addEventListener('seeked', () => p.events.push({ t: t(), ev: 'seeked', to: v.currentTime }));
 
 function start() {
   if (window.Hls && Hls.isSupported()) {
@@ -29,14 +76,24 @@ function start() {
     hls.on(Hls.Events.MANIFEST_PARSED, () => p.events.push({ t: t(), ev: 'manifest-parsed' }));
     hls.on(Hls.Events.FRAG_LOADED, (_e, d) => {
       const s = d.frag.stats || {};
-      p.frags.push({
+      const rec = {
         t: t(),
         sn: d.frag.sn,
         bytes: s.total,
         start: Math.round(s.loading.start - p.t0),
         first: Math.round(s.loading.first - p.t0),
         end: Math.round(s.loading.end - p.t0),
-      });
+        fragStart: d.frag.start,
+        dur: d.frag.duration,
+      };
+      p.frags.push(rec);
+      // The first fragment fetched after the seek is the seek's own latency:
+      // time from `currentTime = x` to the first byte of the segment holding x.
+      if (p.seek && p.seek.issuedAt !== null && p.seek.firstByteMs === null) {
+        p.seek.firstByteMs = Math.round(s.loading.first - p.seek.issuedAt);
+        p.seek.fragSn = d.frag.sn;
+        p.seek.fragStart = d.frag.start;
+      }
     });
     hls.on(Hls.Events.ERROR, (_e, d) =>
       p.errors.push({ t: t(), type: d.type, details: d.details, fatal: !!d.fatal }));
@@ -50,6 +107,69 @@ function start() {
   }
   v.play().catch((e) => p.events.push({ t: t(), ev: 'play-rejected', msg: String(e) }));
 }
+
+function finish(reason) {
+  if (p.done) return;
+  p.done = true;
+  p.stopReason = reason;
+  if (stalledSince !== null) {
+    p.stalledMs += nowMs() - stalledSince;
+    stalledSince = null;
+  }
+  p.playedMs = p.firstPlaying === null ? 0 : Math.round(nowMs() - p.firstPlaying);
+  p.buffered = [];
+  for (let i = 0; i < v.buffered.length; i++) p.buffered.push([v.buffered.start(i), v.buffered.end(i)]);
+  p.ready = v.readyState;
+  p.currentTime = v.currentTime;
+  v.pause();
+  p.events.push({ t: t(), ev: 'done', reason });
+}
+
+function schedule() {
+  const seekAfter = Number(q.get('seek-after') || 0);
+  const seekTo = Number(q.get('seek') || 0);
+  const watch = Number(q.get('watch') || 0);
+  if (seekAfter > 0) {
+    const waitSeek = setInterval(() => {
+      if (p.firstPlaying === null) return;
+      clearInterval(waitSeek);
+      setTimeout(() => {
+        p.seek = { target: seekTo, issuedAt: nowMs(), firstByteMs: null, resumeMs: null };
+        p.events.push({ t: t(), ev: 'seek-issued', to: seekTo });
+        try { v.currentTime = seekTo; } catch (e) { p.events.push({ t: t(), ev: 'seek-threw', msg: String(e) }); }
+        if (watch > 0) setTimeout(() => finish('watched'), watch * 1000);
+      }, seekAfter * 1000);
+    }, 100);
+    // A session that never starts playing must still end by itself.
+    setTimeout(() => { if (p.firstPlaying === null) finish('never-played'); }, (seekAfter + 120) * 1000);
+  } else if (watch > 0) {
+    const waitPlay = setInterval(() => {
+      if (p.firstPlaying === null) return;
+      clearInterval(waitPlay);
+      setTimeout(() => finish('watched'), watch * 1000);
+    }, 100);
+    setTimeout(() => { if (p.firstPlaying === null) finish('never-played'); }, 120 * 1000);
+  }
+}
+
+p.snapshot = () => ({
+  params: p.params,
+  done: p.done,
+  stopReason: p.stopReason,
+  startupMs: p.startupMs,
+  seek: p.seek,
+  stalls: p.stalls.length,
+  stalledMs: p.stalledMs,
+  playedMs: p.playedMs,
+  bytes: p.frags.reduce((a, f) => a + (f.bytes || 0), 0),
+  frags: p.frags.length,
+  errors: p.errors,
+  fatalErrors: p.errors.filter((e) => e.fatal).length,
+  events: p.events.slice(-40),
+  ready: v.readyState,
+  currentTime: v.currentTime,
+  buffered: (() => { const out = []; for (let i = 0; i < v.buffered.length; i++) out.push([v.buffered.start(i), v.buffered.end(i)]); return out; })(),
+});
 
 // `?fanout=N` puts the range fan-out service worker in front of the player. The
 // player is never told: the worker splits each media range request into N
@@ -81,9 +201,11 @@ async function boot() {
     p.events.push({ t: t(), ev: 'plain' });
     v.src = src;
     v.play().catch((e) => p.events.push({ t: t(), ev: 'play-rejected', msg: String(e) }));
+    schedule();
     return;
   }
   start();
+  schedule();
 }
 boot();
 </script>
