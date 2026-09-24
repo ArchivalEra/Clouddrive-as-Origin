@@ -484,3 +484,52 @@ entry for being obvious in hindsight — hindsight is the point.
     re-run before believing a single §15 failure — but if it recurs on a quiet
     machine, treat it as a lead, not as noise: compare the body duration against
     the object size (1.3 MB in 30 s is four orders off, not a slow disk).
+
+62. **A browser-side fixture that works against a local server can hang against
+    the CDN.** `deploy/lab/viewer/range-fanout-sw.js` (the service worker that
+    splits a media range into N parallel sub-ranges — the "glue" that measured
+    7.1 MB/s against a local 900 KB/s server) never delivers a body byte when
+    the same page is served from the CDN: the synthesized response arrives in
+    ~4 ms with `Content-Range: bytes A-B/*` and `Content-Length` set, and then
+    nothing — for a 1 KiB range and for a 4 MB range alike, 30 s timeouts in
+    both cases, while the identical fetch without the worker streams fine. The
+    worker's own `fetch()` never settles. **Nothing is concluded about the
+    cause** (recursion, a Chromium quirk with worker-initiated ranged fetches,
+    or the CDN's HTTP/2 handling are all open); what is concluded is that a
+    local-server measurement of a client-side fixture does not transfer to the
+    CDN, and that the 2026-09-24 run had to go without it. *Fix before relying
+    on it:* reproduce it with the worker's own `fetch` instrumented, and treat
+    "measured against log-server.py" as unproven for any remote target.
+
+63. **Ten Chromium contexts on an 8-core / 7 GiB box put it at load ~30, and
+    then the client-side failures are not the origin's.** Measured over 4.5
+    hours: 32 of 279 viewer sessions failed, 23 of them `page.goto` timing out
+    at 60 s **on an 8 KB page**, and 8 hls.js `fragLoadTimeOut` — while the
+    origin's own counters showed zero 5xx and a healthy store throughout. Ten
+    contexts (their renderers, decoders, network and audio threads) plus
+    continuous rebuffering is simply more than 8 cores want; the box swaps
+    (22 GB of swap free, 0.3-1 GB of RAM available) and the scheduler delays
+    everything the harness does. *Fix:* either accept it and report the load
+    next to every client-side number, or shrink the swarm — but do not read a
+    workstation failure as a product one.
+
+64. **An fMP4's own headers are a cheap index; its payloads are not.** Building
+    an HLS byte-range playlist for the 200 GiB film needed no re-encode and no
+    download of the object: each `moof` states its size and carries its samples'
+    durations, and the following `mdat` states its size, so a walk can hop from
+    fragment to fragment reading ~600 bytes each. 1811 ranged reads and 113 MiB
+    of bytes covered 3.2 GiB (30 minutes, 899 segments) — 3.5% of the window's
+    bytes. The corollary is what makes it worth remembering: the *edge* still
+    pulls a 1 MiB shard per little read, so an index walk over the WHOLE object
+    would pull ~half of 200 GiB from the provider (~2.8 h at the measured
+    ~20 MB/s). Index a prefix, not a film.
+
+65. **`/tmp` is tmpfs: a long run's data dies with the machine.** The first
+    attempt at the 2026-09-24 swarm (ten viewers, 4.5 h) started at 17:13Z and
+    was ~1.5 h in with 50+ sessions when a power cut took the machine — and the
+    sessions file, the driver log and the index walk's output went with it,
+    because all of it had been written to `/tmp`. The fixtures survived only
+    because they were in the bucket (Google Drive) and the tools only because
+    the repo is on the HDD. *Fix:* write anything that takes hours — sessions
+    JSONL, progress logs, monitor lines, baselines — under `/mnt/hdd`, and treat
+    `/tmp` as the scratch space it is.

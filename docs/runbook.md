@@ -1785,6 +1785,102 @@ The origin side of the same passes is healthy and matches the design: ~1 stat
 and ~1 staged answer per 1 MiB shard (502 for 500 MiB), and one `open` per
 ~8 MiB — the window floor of ADR-0024, exactly 64 opens for 500 MiB.
 
+### Ten viewers on the real film through MSE, for four and a half hours (2026-09-24)
+
+The end-to-end version of everything above, on the real object, in the shape the
+product is for. Ten browser viewers (one Chromium, ten isolated contexts, on an
+8-core/7 GiB workstation, `--no-proxy-server`), each one: open the player page,
+start playing, watch 5 s, **seek** somewhere else, watch 10 minutes, die — the
+slot refilled immediately, staggered at the start, jittered afterwards, for
+4.5 h. Concurrency was 10 by construction and 8.79 on average, so the
+interleaving is measured, not asserted: at any moment some viewers were
+cold-starting, some mid-playback, some seeking, some leaving.
+
+The player is a real one: hls.js on an HLS byte-range playlist for the film's
+first 30 minutes, built by `deploy/lab/viewer/fmp4-index.mjs` — 899 segments of
+2 s (3.64 MiB), init `2464@0`, every URI pointing at the original object. The
+playlist is built by walking the file's own `moof` headers (1811 tiny ranged
+reads, 113 MiB of bytes for 3.2 GiB of coverage; each `mdat`'s payload is
+skipped by its own header's length). Ten fragments a second of seek targets were
+chosen uniformly in `[30, 1170]` s, so a session's seek lands on a different byte
+range every time.
+
+**The viewer side** (279 sessions, `deploy/lab/viewer/player-swarm.mjs` +
+`swarm-report.mjs`):
+
+```
+outcomes        237 watched (85%)  32 driver_error (11%)  8 startup_failed  2 never-played  1 fatal
+startup         p50 2.90 s   p90 5.52 s
+seek TTFB       p50 267 ms   p90 1.24 s   max 15.2 s
+seek resume     p50 2.56 s   p90 5.47 s          (first frame after the seek)
+bytes           167.14 GiB consumed, median 714 MiB per session
+stalls          626 in 39.8 h of playback: median 1 per session (p90 4, max 72)
+```
+
+The 20-minute buckets are flat for the whole run (12-14 GiB, ~20 stalls each), so
+nothing degraded over four and a half hours. The failures are the workstation's,
+not the origin's: 23 of them are `page.goto` timing out at 60 s on an 8 KB page
+while the box sat at load ~30, and 8 are hls.js's own `fragLoadTimeOut` — see
+pitfall 63.
+
+**The origin side** (counters snapshot immediately before and after; deltas):
+
+```
+open            +28,562   mean 766 ms, 96.2% <= 1 s, 99.7% <= 2.5 s, none over 30 s
+stat            +10,956   mean 1.6 ms
+serve_source    stage +85,524   upstream +11,108   disk +248
+body bytes      stage +446.5 GB  upstream +58.0 GB   (0.9 GB of it per GiB served)
+sessions        sealed +8,038   chained +3,762   open_failed +1
+unkeepable      trimmed +150.1 GB (the 200 GiB object's working window churning)
+healthz         ok, degraded=false, store ready, segment_bytes 202 MB, disk free 161.6 GB (flat)
+front 5xx       0
+```
+
+**What EdgeOne absorbed, and the shape it depends on.** In the same 300 minutes
+the front served the edge **957 requests / 0.338 GiB** while the viewers consumed
+167.14 GiB: the edge held the whole 30-minute window and answered ~99.8% of the
+viewer traffic itself. That is the opposite of what the shard-walk shape measured
+on 2026-09-23 (section above: "warm" pass re-pulled 500 MiB in full). Both are
+measurements of the same POP; the difference is the request shape — 899 fixed,
+repeatedly-requested playlist segments versus fresh 1 MiB shards walked once per
+pass. The rule from that section still holds and is what produced this number:
+**the origin's counters and front-access log are the authority for bytes**, and
+they say the edge is the hot path for playlist-shaped traffic.
+
+**The cold half.** A warm edge would have left the origin's cold path unmeasured,
+so a second, labelled leg ran for the same four hours: on the node, against its
+own loopback business plane (not through the CDN), eight parallel random 5 MiB
+ranges spread over the whole 200 GiB object, no pauses
+(`deploy/oracle/cold-load.sh` as run in the run directory). It asked for 96,200
+ranges and got 469.5 GiB back, with **7 × 502 and 2 curl-level timeouts** — the
+only failures of the whole day.
+
+```
+cold leg        96,200 requests, 469.5 GiB delivered, 206 × 96,191  (99.993%)
+upstream share  58.0 GB of 504.5 GB served = 11.5%   (stage 88.5%)
+opens            +28,562 for ~96,700 responses = 1 open per 3.4 responses (1 per ~17.6 MB)
+the 7 failures   one minute (01:24Z): upstream "authentication required (re-auth needed)"
+                 -> the origin answers 502 rather than inventing bytes; the viewers never saw it
+                 7/96,200 = 0.007%, plus one upstream `500` that the retry absorbed
+```
+
+The 11.5% upstream share is the window mechanism doing the job it was designed
+for: random 5 MiB reads, each opening a window of at least 8 MiB, overlap so
+heavily that the overwhelming majority of "cold" reads land inside bytes already
+staged. The origin's answer to a random 5 MiB read is therefore usually its own
+disk (body TTFB from stage: p50 ~6-10 ms, p90 ~50 ms, ~10% taking 0.5-2.5 s while
+a window filled), and the provider only pays for the first touch.
+
+**What this does and does not say.** It says: with ten concurrent MSE viewers,
+a 15 Mbps film, seeks every ten minutes, and continuous fresh-range traffic, the
+origin stays up (no restart, no degraded health, zero 5xx at the front), keeps
+its byte budget (disk flat, staged bytes bounded, trims by design), and keeps
+paying one upstream open per ~17 MB rather than per request. It does not say the
+workstation leg is fine — that leg is the limit on the client side (load ~30 on 8
+cores; the stall arithmetic is unchanged: ~1.9 MB/s per viewer against a
+~0.9 MB/s single connection, which is why the fan-out worker exists and why its
+failure against the CDN, pitfall 62, matters).
+
 ### The target-scale account: an object the node can never hold
 
 The product's object is a 3-hour video of 30-200 GB. Measured on the node against
