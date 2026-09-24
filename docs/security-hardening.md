@@ -204,7 +204,7 @@ questions:
 
 ```
 front access ... status="206" bytes=1048576 proto="h2"
-   peer=[::ffff:<edge-ip>]:5276   xff=<client-ip>
+   peer=[::ffff:<edge-ip>]:5276   xff=<the client's address>
    ^ who pulled (a Tencent range, in the catalog)   ^ who was being served (a client)
 ```
 
