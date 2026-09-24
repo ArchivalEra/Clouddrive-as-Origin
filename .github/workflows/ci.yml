@@ -10,8 +10,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # A failing test should say where, since CI logs are not readable by the
-  # token this repo is pushed with.
+  # A failing test should say where. The token this repo is pushed with cannot
+  # download run logs, so every step below writes its output to a file and the
+  # diagnostics step copies any failing one into the job summary, which the
+  # check-run API does expose.
   RUST_BACKTRACE: 1
 
 jobs:
@@ -28,28 +30,28 @@ jobs:
           components: clippy
 
       - name: "build (origin + front)"
-        run: cargo build --locked --workspace
+        run: cargo build --locked --workspace > ci-build.log 2>&1 || { cat ci-build.log; exit 1; }
 
-      # One step per test target: a failing step names the failing target,
-      # which is the part that matters when the logs are out of reach.
+      # One step per test target: a failing step names the failing target, and
+      # the diagnostics step (below) carries its output into the job summary.
       - name: "test (workspace lib)"
-        run: cargo test --locked --workspace --lib
+        run: cargo test --locked --workspace --lib > ci-test-lib.log 2>&1
 
       - name: "test (integration)"
-        run: cargo test --locked --test integration
+        run: cargo test --locked --test integration > ci-test-integration.log 2>&1
 
       - name: "test (openlist)"
-        run: cargo test --locked --test openlist
+        run: cargo test --locked --test openlist > ci-test-openlist.log 2>&1
 
       - name: "test (watchdog script)"
-        run: cargo test --locked --test watchdog_script
+        run: cargo test --locked --test watchdog_script > ci-test-watchdog.log 2>&1
 
       - name: "test (front)"
-        run: cargo test --locked -p origin-front --lib
+        run: cargo test --locked -p origin-front --lib > ci-test-front.log 2>&1
 
       # The pre-push hook's clippy budget is 0; CI denies instead of counting.
       - name: "clippy (budget 0, enforced)"
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings > ci-clippy.log 2>&1
 
       # The pre-push hook's other half, so a push cannot be the first place a
       # CJK character is caught.
@@ -61,3 +63,22 @@ jobs:
             echo "CJK found in: $offenders"
             exit 1
           fi
+
+      # Any failing step's log lands in the job summary: the check-run API
+      # exposes that without admin rights, so a failure is diagnosable from
+      # outside the Actions UI.
+      - name: "diagnostics: failing logs into the job summary"
+        if: failure()
+        run: |
+          {
+            echo "## CI failure diagnostics"
+            for f in ci-*.log; do
+              [ -f "$f" ] || continue
+              if grep -qE "FAILED|^error|error\[|panicked" "$f"; then
+                echo "### $f"
+                echo '```'
+                tail -80 "$f"
+                echo '```'
+              fi
+            done
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
