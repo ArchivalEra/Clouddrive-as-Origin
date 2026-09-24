@@ -9,24 +9,46 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # A failing test should say where, since CI logs are not readable by the
+  # token this repo is pushed with.
+  RUST_BACKTRACE: 1
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the toolchain the tree is verified against (1.98.0, the
+      # version every local rehearsal runs). Bump it deliberately, with a
+      # local rehearsal, never by chasing `stable`.
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy
 
       - name: "build (origin + front)"
         run: cargo build --locked --workspace
 
-      - name: test (workspace)
-        run: cargo test --locked --workspace
+      # One step per test target: a failing step names the failing target,
+      # which is the part that matters when the logs are out of reach.
+      - name: "test (workspace lib)"
+        run: cargo test --locked --workspace --lib
+
+      - name: "test (integration)"
+        run: cargo test --locked --test integration
+
+      - name: "test (openlist)"
+        run: cargo test --locked --test openlist
+
+      - name: "test (watchdog script)"
+        run: cargo test --locked --test watchdog_script
+
+      - name: "test (front)"
+        run: cargo test --locked -p origin-front --lib
 
       # The pre-push hook's clippy budget is 0; CI denies instead of counting.
-      - name: clippy (budget 0, enforced)
+      - name: "clippy (budget 0, enforced)"
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # The pre-push hook's other half, so a push cannot be the first place a
