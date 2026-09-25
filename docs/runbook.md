@@ -1864,6 +1864,19 @@ the 7 failures   one minute (01:24Z): upstream "authentication required (re-auth
                  7/96,200 = 0.007%, plus one upstream `500` that the retry absorbed
 ```
 
+**Correction (2026-09-24, after the fact): those 96,200 ranges were not spread
+over the object.** The generator drew its offsets from `RANDOM * 32768 + RANDOM`
+— 30 bits, max 1,073,741,823 — and took it modulo ~2.1e11, a modulo that never
+wrapped: every read landed in the film's **first ~1 GiB** (about its first ten
+minutes), which also overlaps the window the viewers were playing. The volumes,
+the call counts, the 7 x 502 and the clean healthz all stand; what does not stand
+is reading this leg as "the whole object's cold path". It is a hot-region random
+walk at 8-way parallelism, and that locality is most of the explanation for the
+figures below — 0.3 upstream opens per 5 MiB request is far too good for genuine
+random reads over 200 GiB. `cold-load.sh` is fixed (a 32-bit `SRANDOM` scaled
+across the object, verified over 10,000 draws: 0-199 GiB, mean 100 GiB), and
+pitfall 67 records the trap.
+
 The 11.5% upstream share is the window mechanism doing the job it was designed
 for: random 5 MiB reads, each opening a window of at least 8 MiB, overlap so
 heavily that the overwhelming majority of "cold" reads land inside bytes already
