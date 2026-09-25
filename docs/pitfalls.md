@@ -557,11 +557,17 @@ entry for being obvious in hindsight — hindsight is the point.
     (`cache::flight::tests::far_ahead_reader_survives_a_flowing_writer_beyond_one_budget`)
     whose writer paced 100 ms steps against a 150 ms stall budget — a 1.5x
     margin against the machine, which the runner blew; it now paces 30 ms steps
-    (5x inside the budget) and still waits more than two budgets. Two more
-    occasionally flake under ARTIFICIAL 8x oversubscription (a reaper-tick wait
-    and a session read-out chain) and were not chased: the gate is CI on a
-    normal runner, and the LAB's own guard already says the timing assertions
-    measure the machine.
+    (5x inside the budget) and still waits more than two budgets. A fifth came
+    later, on CI's runner, from the same drawer: a session test asserted that a
+    floor-sized window arrives in ONE chunk, while how the flight's watermark
+    hands bytes over is the writer's PACING - reproduced under load as a first
+    poll of 44 KiB against a 64 KiB floor. What the test is about is that the
+    window is read OUT (that is what earns the successor's doubling), so it now
+    accumulates and asserts the total; the sibling tests that assert a PARTIAL
+    first chunk were right as they were. One test still flakes only under
+    ARTIFICIAL 8x oversubscription (a reaper-tick wait) and was not chased: the
+    gate is CI on a normal runner, and the LAB's own guard already says the
+    timing assertions measure the machine.
 
 67. **Bash's `RANDOM` is 15 bits, and a modulo that never wraps is not a random
     offset.** `cold-load.sh` drew `off=$(( (RANDOM * 32768 + RANDOM) % (TOTAL -
