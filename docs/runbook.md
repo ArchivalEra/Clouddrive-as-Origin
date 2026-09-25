@@ -656,6 +656,15 @@ inside `43.160.0.0/12` — are in the catalog. One line answers it now:
 peer=[::ffff:43.168.149.241]:5276  xff=<the client's address>     # puller, then client
 ```
 
+**Added 2026-09-25: `xff` is a chain EdgeOne APPENDS to, so read its LAST element.**
+Sent on purpose with a forged prefix (`-H 'X-Forwarded-For: 203.0.113.7'`, from a
+workstation whose egress is `129.146.127.22`), one request arrived at the origin as
+`xff=203.0.113.7,129.146.127.22` — the caller's claim first, the real client behind it.
+Two rules follow. When attributing, use the last element, because everything before it is
+caller-supplied. And never key a control on `xff` — a per-IP limit keyed on it is bypassed
+by rotating the prefix — `peer=` is the unforgeable column, and the token gate (ADR-0025)
+is what makes a peer worth trusting. Pitfall 68.
+
 Asking "does the edge ever pull from us with no viewer?" through the CDN's own
 hourly metric gives the wrong answer, so the instrument matters more than the
 number.
@@ -1822,6 +1831,16 @@ nothing degraded over four and a half hours. The failures are the workstation's,
 not the origin's: 23 of them are `page.goto` timing out at 60 s on an 8 KB page
 while the box sat at load ~30, and 8 are hls.js's own `fragLoadTimeOut` — see
 pitfall 63.
+
+**Where the viewer numbers come from (2026-09-25).** `bytes` and `mediaReqs` are
+counted on the WIRE — CDP `Network.dataReceived` per media request — not read out
+of the page, and the report prints how many sessions were counted that way
+(`counted on the wire in N/M`). The page's own fields are only the fallback
+(`pageBytes`, `pageMediaReqs`), and the seek's arrival is read through an alias
+(`firstByteMs ?? dataArrivedMs`) because the two pages in play name it
+differently. That is not bookkeeping neatness: a bare `<video>` page has no
+hls.js fragment events to sum and reports neither name, so the earlier driver
+returned empty `bytes` and `seek TTFB` lines for a whole run (pitfall 69).
 
 **The origin side** (counters snapshot immediately before and after; deltas):
 

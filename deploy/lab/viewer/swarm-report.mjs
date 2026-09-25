@@ -43,6 +43,9 @@ const seekResume = rows.map((r) => num(r.seekResumeMs)).filter((v) => v != null)
 const played = rows.map((r) => num(r.playedMs) || 0);
 const stalls = rows.map((r) => r.stalls || 0);
 const bytes = rows.map((r) => r.bytes || 0);
+// The byte account is the wire's when the driver could attach (see
+// player-swarm.mjs): a bare `<video>` page reports no bytes of its own.
+const onWire = rows.filter((r) => r.wireBytes != null).length;
 const wall = (Date.parse(rows.at(-1).endedAt) - Date.parse(rows[0].startedAt)) / 1000;
 
 console.log(`sessions   : ${rows.length} over ${(wall / 3600).toFixed(2)} h`);
@@ -56,7 +59,7 @@ console.log(`startup    : p50=${fmt(pct(startup, 50))}ms p90=${fmt(pct(startup, 
 console.log(`seek TTFB  : p50=${fmt(pct(seekFirst, 50))}ms p90=${fmt(pct(seekFirst, 90))}ms max=${seekFirst.length ? Math.max(...seekFirst) : '-'}ms  (n=${seekFirst.length})`);
 console.log(`seek resume: p50=${fmt(pct(seekResume, 50))}ms p90=${fmt(pct(seekResume, 90))}ms  (n=${seekResume.length})`);
 console.log(`played     : total ${(sum(played) / 3600000).toFixed(2)} h, median ${(pct(played, 50) / 1000).toFixed(0)}s per session`);
-console.log(`bytes      : ${(sum(bytes) / 2 ** 30).toFixed(2)} GiB, median ${(pct(bytes, 50) / 2 ** 20).toFixed(1)} MiB per session`);
+console.log(`bytes      : ${(sum(bytes) / 2 ** 30).toFixed(2)} GiB, median ${(pct(bytes, 50) / 2 ** 20).toFixed(1)} MiB per session (counted on the wire in ${onWire}/${rows.length})`);
 console.log(
   `stalls     : ${sum(stalls)} across sessions; ${stalls.filter((s) => s > 0).length}/${rows.length} sessions stalled; ` +
     `p50=${pct(stalls, 50)} p90=${pct(stalls, 90)} max=${Math.max(...stalls)}`,

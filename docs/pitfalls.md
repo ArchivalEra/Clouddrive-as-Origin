@@ -583,3 +583,40 @@ entry for being obvious in hindsight — hindsight is the point.
     to the range (`rnd * (range >> 20) / 4096`), never a full-width random
     multiplied by the full size (that overflows 64 bits); then verify the
     distribution over a few thousand draws before running anything.
+
+68. **`xff` is an appended chain, and its leading elements are the client's own
+    claim.** Measured 2026-09-25 through the production edge: one request
+    carrying `X-Forwarded-For: 203.0.113.7`, sent from a workstation whose egress
+    is `129.146.127.22`, reached the origin as
+
+    ```
+    peer=[::ffff:43.175.104.162]:59764  xff=203.0.113.7,129.146.127.22
+    ```
+
+    — the forged address is *first*, and EdgeOne appended the real client behind
+    it. Two consequences, both load-bearing. For forensics, **only the last
+    element is a fact**; everything before it was typed by whoever sent the
+    request. For any control, **`xff` must never be the key**: a per-IP limit
+    keyed on it is bypassed by rotating the prefix, which is the same failure as
+    trusting any header the caller controls. The unforgeable identity in the log
+    is `peer=`, and the token gate (ADR-0025) is what makes the peer worth
+    trusting. This is also the answer to the old "overwrite or append?" question
+    (issue #46): the edge appends, so an origin that wrote its own
+    `X-Forwarded-For` would be adding a third layer to a chain it cannot verify —
+    which is why the front logs the header verbatim and writes nothing.
+
+69. **A harness's account must not depend on the page it is measuring.** The
+    viewer driver read `bytes` and `seek.firstByteMs` out of the page's
+    `window.__probe.snapshot()`, which is a fine contract for the repo's own
+    hls.js page and no contract at all for a bare `<video>`: that page has no
+    fragment events to sum and no such field names, so a whole run's `bytes` and
+    `seek TTFB` lines came back empty (measured on the 2026-09-25 10-slot
+    calibration: `bytes 0.00 GiB`, `seek TTFB (n=0)`, 18 sessions). Resource
+    Timing cannot fill the gap either — a cross-origin media response reports
+    `transferSize: 0` without `Timing-Allow-Origin`, which the CDN does not send.
+    *Fix:* the driver counts the bytes itself from CDP `Network.dataReceived`
+    (the `cdn-wire-probe.mjs` recipe) and reads the page's fields through aliases
+    (`firstByteMs ?? dataArrivedMs`), so a session is measured whatever page it
+    ran in; the report says how many sessions were counted on the wire. Verified
+    with the bare-`<video>` page against the CDN: 1 session, `bytes 34.8 MiB`
+    (`pageBytes: null`, wire 1/1), `seek TTFB p50 2602 ms (n=1)`.
