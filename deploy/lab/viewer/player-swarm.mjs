@@ -30,6 +30,8 @@ const flag = (name, dflt = null) => {
 const num = (name, dflt) => Number(flag(name, dflt));
 
 const TARGET = (flag('target') || 'http://127.0.0.1:7779').replace(/\/$/, '');
+// `--page` may be an absolute URL (a locally-served instrumented page); then
+// TARGET is only used where the page itself points its media.
 const PAGE = flag('page', 'media/player-page.html');
 const SRC = flag('src', 'miku-30min.m3u8');
 const SLOTS = num('slots', 10);
@@ -38,6 +40,18 @@ const PLAY_SECS = num('play-secs', 5);
 const WATCH_SECS = num('watch-secs', 600);
 const FANOUT = num('fanout', 4);
 const WINDOW_SECS = num('window-secs', 1800);
+// The window's base: seek targets land inside [WINDOW_START, WINDOW_START +
+// WINDOW_SECS], so every viewer shares ONE window of the content (the merge
+// scenario). 0 = the content's beginning. With `--duration-secs` set, the
+// targets and the opening positions are RANDOM over the whole duration instead
+// (the truly-random shape), and WINDOW_* is ignored.
+const WINDOW_START = num('window-start', 0);
+const DURATION_SECS = num('duration-secs', 0);
+// Asynchronous starts: each slot's FIRST session begins at t0 + uniform(0,
+// ASYNC_START_SECS), independently drawn - the slots never line up, and the
+// refills inherit the desynchronization (a session dies when ITS ten minutes
+// are up, whenever that is).
+const ASYNC_START_SECS = num('async-start-secs', 0);
 const STAGGER_SECS = num('stagger-secs', 180);
 const JITTER_SECS = num('jitter-secs', 60);
 const STARTUP_TIMEOUT_SECS = num('startup-timeout-secs', 120);
@@ -67,9 +81,24 @@ const rnd = () => {
   return seed / 2 ** 32;
 };
 const seekTarget = () => {
-  // Leave room for the whole watch window after the seek.
-  const max = Math.max(30, WINDOW_SECS - WATCH_SECS - 30);
-  return Math.round(30 + rnd() * (max - 30));
+  // With a duration: random over the WHOLE video, leaving room for the watch
+  // window after the seek. Without one: inside the shared window.
+  if (DURATION_SECS > 0) {
+    const hi = Math.max(1, DURATION_SECS - WATCH_SECS - 30);
+    return Math.round(30 + rnd() * (hi - 30));
+  }
+  const lo = WINDOW_START + 30;
+  const hi = Math.max(lo + 1, WINDOW_START + WINDOW_SECS - WATCH_SECS - 30);
+  return Math.round(lo + rnd() * (hi - lo));
+};
+// The session's OPENING position (where the first 5 seconds play): random over
+// the whole video when a duration is given, else the window's start.
+const startOffset = () => {
+  if (DURATION_SECS > 0) {
+    const hi = Math.max(1, DURATION_SECS - 60);
+    return Math.round(rnd() * hi);
+  }
+  return WINDOW_START;
 };
 const jitterMs = () => Math.round(rnd() * JITTER_SECS * 1000);
 
@@ -109,14 +138,17 @@ function progress(running) {
 // ---------------------------------------------------------------- one session
 async function session(browser, slot, id) {
   const target = seekTarget();
+  const start = startOffset();
   const url =
-    `${TARGET}/${PAGE}?src=${encodeURIComponent(SRC)}&seek-after=${PLAY_SECS}&seek=${target}&watch=${WATCH_SECS}` +
+    `${PAGE.startsWith('http') ? PAGE : `${TARGET}/${PAGE}`}` +
+    `?src=${encodeURIComponent(SRC)}&start=${start}&seek-after=${PLAY_SECS}&seek=${target}&watch=${WATCH_SECS}` +
     (FANOUT > 0 ? `&fanout=${FANOUT}` : '');
   const started = Date.now();
   const rec = {
     slot,
     session: id,
     startedAt: new Date(started).toISOString(),
+    start,
     target,
     url,
     outcome: 'unknown',
@@ -217,7 +249,14 @@ process.on('SIGTERM', () => stop('SIGTERM'));
 
 let counter = 0;
 const slotLoop = async (slot) => {
-  const startAt = t0 + slot * STAGGER_SECS * 1000;
+  // Asynchronous by construction: with ASYNC_START_SECS each slot draws its
+  // own uniform delay, so ten slots never line up; with STAGGER_SECS the slots
+  // still spread (i * stagger). Refills happen per slot whenever the previous
+  // session dies, which keeps them staggered for the whole run.
+  const startAt =
+    ASYNC_START_SECS > 0
+      ? t0 + rnd() * ASYNC_START_SECS * 1000
+      : t0 + slot * STAGGER_SECS * 1000;
   if (startAt > Date.now()) await new Promise((r) => setTimeout(r, startAt - Date.now()));
   while (!stopping && Date.now() < deadline) {
     if (!browser.isConnected()) {
