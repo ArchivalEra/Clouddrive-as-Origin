@@ -45,7 +45,13 @@ echo "cold-load: ${SECS}s, ${PAR} parallel ${MIB} MiB shards, object ${TOTAL} by
 while [ "$SECONDS" -lt "$END" ]; do
   pids=""
   for _ in $(seq 1 "$PAR"); do
-    off=$(( (RANDOM * 32768 + RANDOM) % (TOTAL - SHARD) ))
+    # A 32-bit random scaled across the object. The first version used
+    # `RANDOM * 32768 + RANDOM` - 30 bits, max 1 073 741 823 - against a 200 GiB
+    # object, so the modulo never wrapped and EVERY read landed in the first
+    # ~1 GiB. Scale first (`>> 20` keeps the product inside 64 bits), never
+    # multiply the full size by a full-width random.
+    rnd32=${SRANDOM:-$(( (RANDOM << 15 | RANDOM) * 4 ))}
+    off=$(( (rnd32 * ((TOTAL - SHARD) >> 20)) / 4096 ))
     (
       code=$(curl -s -m 40 -o /dev/null -w '%{http_code} %{size_download}' \
         -r "$off-$((off + SHARD - 1))" "$FILM")

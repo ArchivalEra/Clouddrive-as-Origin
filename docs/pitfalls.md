@@ -552,3 +552,28 @@ entry for being obvious in hindsight — hindsight is the point.
     until the next one. *Rule:* run the suite once with `TMPDIR` pointed at a
     real disk (CI does that implicitly), and treat "green locally" as evidence
     about the filesystem, not about the code.
+    Four faults came out of this in one afternoon, none of them in `src/`:
+    three tests that asserted before the record landed, and one
+    (`cache::flight::tests::far_ahead_reader_survives_a_flowing_writer_beyond_one_budget`)
+    whose writer paced 100 ms steps against a 150 ms stall budget — a 1.5x
+    margin against the machine, which the runner blew; it now paces 30 ms steps
+    (5x inside the budget) and still waits more than two budgets. Two more
+    occasionally flake under ARTIFICIAL 8x oversubscription (a reaper-tick wait
+    and a session read-out chain) and were not chased: the gate is CI on a
+    normal runner, and the LAB's own guard already says the timing assertions
+    measure the machine.
+
+67. **Bash's `RANDOM` is 15 bits, and a modulo that never wraps is not a random
+    offset.** `cold-load.sh` drew `off=$(( (RANDOM * 32768 + RANDOM) % (TOTAL -
+    SHARD) ))`: 30 bits, max 1,073,741,823, against a 200 GiB object
+    (214,743,121,920 possible offsets). The dividend was always smaller than the
+    modulus, so the modulo did nothing and **every one of 96,200 reads landed in
+    the first 1 GiB** — 0.5% of the file — while the script, the runbook and the
+    summary all called it "random ranges over the whole object". *Fingerprint:*
+    the origin paid only 0.3 upstream opens per 5 MiB request and 11.5% of the
+    bytes came from upstream, which is impossible for genuine random reads over
+    200 GiB — when a number is that good, check the generator before believing
+    it. *Fix:* a 32-bit source (`SRANDOM`, or `RANDOM<<15|RANDOM` twice) SCALED
+    to the range (`rnd * (range >> 20) / 4096`), never a full-width random
+    multiplied by the full size (that overflows 64 bits); then verify the
+    distribution over a few thousand draws before running anything.
