@@ -637,11 +637,22 @@ mod tests {
         let run = start(&sessions, &slot, 16 * 1024 * 1024).await;
         assert_eq!(run.end - run.start, floor, "a jump opens the floor");
 
-        // Read that window out (one chunk, because the floor IS one chunk) and
-        // let the tick chain the next one.
+        // Read that window OUT (that is what earns the ramp) and let the tick
+        // chain the next one. How many chunks that takes is the writer's
+        // pacing, not a policy: under load the first poll returns a partial
+        // piece (measured 44 KiB against a 64 KiB floor on CI's runner), so
+        // what is asserted is the total read out of the window, not that it
+        // arrived in one piece.
         let mut body = Sessions::<MockClock>::reader(Arc::clone(&run), 0, floor);
-        let first = futures::StreamExt::next(&mut body).await.expect("a chunk").unwrap();
-        assert_eq!(first.len() as u64, floor, "one chunk reads the floor out");
+        let mut got = 0u64;
+        while got < floor {
+            let chunk = futures::StreamExt::next(&mut body)
+                .await
+                .expect("the floor is readable")
+                .unwrap();
+            got += chunk.len() as u64;
+        }
+        assert_eq!(got, floor, "the whole floor is read out");
         wait_terminal(&run).await;
         sessions.tick().await;
 
