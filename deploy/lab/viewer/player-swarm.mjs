@@ -135,6 +135,35 @@ function progress(running) {
   );
 }
 
+// ---------------------------------------------------------------- the wire
+// The page is one witness of what a session transferred; the wire is another,
+// and for a bare `<video>` it is the only one. The repo's page reports bytes
+// from hls.js fragment events, which a plain media element never emits, and
+// Resource Timing cannot fill that gap: a cross-origin media response carries
+// `transferSize: 0` unless the server sends `Timing-Allow-Origin`, which the CDN
+// does not. So the driver counts what CDP saw arrive, the way cdn-wire-probe.mjs
+// does -- the session's byte account stops depending on which page is under test
+// (issue #61: the bundle's page reports `seek.dataArrivedMs` and no bytes at
+// all, so the report's `bytes` and `seek TTFB` lines came back empty).
+async function wireAccount(ctx, page, mediaUrl) {
+  const cdp = await ctx.newCDPSession(page);
+  await cdp.send('Network.enable');
+  const urls = new Map();
+  const acct = { bytes: 0, requests: 0, failed: 0 };
+  const isMedia = (u) => typeof u === 'string' && u.startsWith(mediaUrl);
+  cdp.on('Network.responseReceived', (e) => {
+    urls.set(e.requestId, e.response.url);
+    if (isMedia(e.response.url)) acct.requests++;
+  });
+  cdp.on('Network.dataReceived', (e) => {
+    if (isMedia(urls.get(e.requestId))) acct.bytes += e.dataLength;
+  });
+  cdp.on('Network.loadingFailed', (e) => {
+    if (isMedia(urls.get(e.requestId))) acct.failed++;
+  });
+  return acct;
+}
+
 // ---------------------------------------------------------------- one session
 async function session(browser, slot, id) {
   const target = seekTarget();
@@ -160,6 +189,11 @@ async function session(browser, slot, id) {
     stalledMs: 0,
     playedMs: 0,
     bytes: 0,
+    pageBytes: null,
+    pageMediaReqs: null,
+    wireBytes: null,
+    mediaReqs: null,
+    mediaFailures: null,
     frags: 0,
     fatalErrors: 0,
     errors: [],
@@ -172,6 +206,8 @@ async function session(browser, slot, id) {
   try {
     ctx = await browser.newContext({ viewport: { width: 640, height: 400 } });
     const page = await ctx.newPage();
+    // Attach before the navigation, so the first media request is counted.
+    const wire = await wireAccount(ctx, page, SRC).catch(() => null);
     page.on('pageerror', (e) => rec.errors.push(`pageerror: ${String(e).slice(0, 160)}`));
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
@@ -190,17 +226,27 @@ async function session(browser, slot, id) {
       }
     }
     if (rec.outcome === 'unknown') rec.outcome = 'budget_timeout';
+    // The page's fields are read through aliases: the two pages in play here
+    // name the seek's arrival differently (`firstByteMs` for hls.js, the
+    // bundle's `dataArrivedMs` for a bare <video>), and a session must not go
+    // unmeasured because of a name.
+    const pageBytes = snap && typeof snap.bytes === 'number' ? snap.bytes : null;
+    rec.pageBytes = pageBytes;
+    rec.pageMediaReqs = snap && snap.mediaReqs != null ? snap.mediaReqs : null;
+    rec.wireBytes = wire ? wire.bytes : null;
+    rec.mediaReqs = wire ? wire.requests : null;
+    rec.mediaFailures = wire ? wire.failed : null;
+    rec.bytes = (wire && wire.bytes) || pageBytes || 0;
     if (snap) {
       rec.startupMs = snap.startupMs;
-      rec.seekFirstByteMs = snap.seek ? snap.seek.firstByteMs : null;
+      rec.seekFirstByteMs = snap.seek ? snap.seek.firstByteMs ?? snap.seek.dataArrivedMs ?? null : null;
       rec.seekResumeMs = snap.seek ? snap.seek.resumeMs : null;
-      rec.seekFragStart = snap.seek ? snap.seek.fragStart : null;
+      rec.seekFragStart = snap.seek ? snap.seek.fragStart ?? null : null;
       rec.stalls = snap.stalls;
       rec.stalledMs = snap.stalledMs;
       rec.playedMs = snap.playedMs;
       rec.playedContentSecs = snap.currentTime;
-      rec.bytes = snap.bytes;
-      rec.frags = snap.frags;
+      rec.frags = snap.frags ?? 0;
       rec.fatalErrors = snap.fatalErrors;
       rec.errors = (snap.errors || []).slice(0, 3).map((e) => `${e.type}/${e.details}${e.fatal ? ' (fatal)' : ''}`);
       rec.stopReason = snap.stopReason;
