@@ -46,6 +46,7 @@ the x86_64 cross-build box (an `ssh`-config alias; `deploy-node.sh` takes
 | `flaky-server.py` | a ranged fixture that aborts or stalls on schedule (proves the retry knobs) | workstation | python3 | runbook "Surviving the leg" |
 | `fake-total-server.py` | the same bytes with a different advertised total (object vs transport) | workstation | python3 | pitfall 30 |
 | `probe-cold-viewers.sh` | N viewers on genuinely COLD bands, both sides accounted | workstation | the CDN, the node's fill-account | runbook "Multi-viewer accounts through the CDN" |
+| `probe-shard-size.sh` | what a range SIZE changes on the client<->edge leg: TTFB, total, average rate and the fit `total = c + size*k`, plus how many ranges the edge answered from its own cache | workstation | a media URL | runbook "Range size: what it changes" (its origin half is `deploy/oracle/shard-sweep-origin.sh`) |
 | `probe-edgeone-big.sh` | the target-scale account through the CDN, from the NODE | node | — | runbook same |
 | `probe-edgeone-range-shape.sh` | what the CDN does with each range SHAPE | node | — | pitfall 27 |
 | `probe-edgeone-viewers.sh` | N concurrent viewers through the CDN, from the NODE | node | — | runbook "…from the NODE" |
@@ -85,3 +86,4 @@ so an end-to-end demo stays reproducible.
 | --- | --- | --- | --- | --- |
 | `measure-client-ttfb.sh` | client-side first-byte latency (spec §10) | client | a URL | `docs/spec.md` §10 |
 | `metrics-report.sh` | latency attribution from the origin's /metrics | node (or via `ssh -L`) | the metrics port 9090 | runbook "Requests are slow" |
+| `shard-sweep-origin.sh` | what a range size costs the ORIGIN: upstream opens/stat and upstream bytes per size, cold then warm, each size on its own offsets | node (loopback) | the metrics port 9090 | runbook "Range size: what it changes" (its client half is `deploy/lab/probe-shard-size.sh`) |
