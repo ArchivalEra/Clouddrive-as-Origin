@@ -2046,6 +2046,62 @@ the disk can hold it (ADR-0014), and through the pipe otherwise. Note the
 staged-byte eviction knob in the cache section: `eviction_policy = "lru"`
 (default) or `"heat"` (ADR-0015).
 
+## Range size: what it changes, and what it does not (2026-09-26)
+
+"How fast is a 2 MiB range versus a 10 MiB one?" keeps coming back as "it cannot
+be measured", and the honest answer is that **which number you read decides** —
+three different questions hide behind the word speed. Two instruments, one per
+vantage:
+
+```sh
+deploy/lab/probe-shard-size.sh --url <media URL>        # client, through the CDN
+deploy/oracle/shard-sweep-origin.sh --key <object key>  # ON the node, loopback
+```
+
+Client side, the 60 GiB Matroska film, four sizes round-robin, three bands each
+(2026-09-26; every row `eo-cache-status: HIT`, so this is the client↔edge leg —
+the edge held that object):
+
+| range | TTFB | total | average rate |
+|---|---|---|---|
+| 2 MiB | 0.47–1.13 s | 2.86–3.69 s | 0.57–0.73 MB/s |
+| 4 MiB | 0.46–0.94 s | 3.60–4.34 s | 0.97–1.16 MB/s |
+| 5 MiB | 0.47–0.71 s | 3.57–5.13 s | 1.02–1.47 MB/s |
+| 10 MiB | 0.48–0.72 s | 4.94–5.86 s | 1.79–2.12 MB/s |
+
+Fit: **total ≈ 2.6–3.0 s + 0.24–0.27 s/MiB** (marginal ≈ 3.7–4.1 MiB/s). So the
+first byte does not care about the range at all; the average rate climbs with the
+range only because a per-request constant gets amortised; and this leg is noisy
+enough (300 B/s ↔ 7 MB/s has been measured minutes apart, pitfall 60) that one
+sample per size decides nothing — the tool takes five and reports medians.
+
+Origin side (same film, same day, node loopback, sequential, cold — each size on
+its own offsets, 512 MiB apart, because reading the same offsets at every size
+makes 4/5/10 MiB measure a *warm* stage):
+
+| range | upstream opens / stat | upstream bytes | total | warm |
+|---|---|---|---|---|
+| 2 MiB | 1–2 / 1 | 2 MiB | 1.28–1.32 s | 3–4 ms, 0 opens |
+| 4 MiB | 1 / 1 | 4 MiB | 1.20–1.39 s | 4–6 ms, 0 opens |
+| 5 MiB | 1–2 / 1 | 5 MiB | 1.25–1.35 s | 6–9 ms, 0 opens |
+| 10 MiB | 1 / 1 | 10 MiB | 1.38–1.66 s | 8–10 ms, 0 opens |
+
+**Read that as: a shard size buys calls per byte, not transfer rate.** The cold
+path pays one upstream open and one stat per request and pulls exactly the bytes
+asked for (no amplification on the ranged path), with a ~1 s first-byte constant
+— so the total is flat across a 5× range of sizes, and a 2 MiB read costs one
+open per 2 MiB where a 10 MiB read costs one per 10 MiB. That is the number the
+provider sees, and it is the one that matters for how a client's read pattern
+looks from outside; the client's rate is a symptom of the leg it is on. (Under
+many readers at once the flight/window machinery changes the shape — one open
+covering ~17.6 MB across attached readers, ADR-0016/0024 — which is the merge
+this project exists to get.)
+
+For this film the bitrate is the yardstick: 64.44 GB over 24.1 h is **0.71
+MiB/s**, so the slowest measured 2 MiB average (0.57–0.73 MB/s) sits right on the
+bitrate line — smoothness comes from reading ahead and from the edge, not from
+asking for bigger ranges.
+
 ## Reading the suite, and where the knowledge lives
 
 Every instrument under `deploy/` — what it answers, where it runs, what it
