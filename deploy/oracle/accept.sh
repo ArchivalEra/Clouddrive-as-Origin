@@ -12,7 +12,6 @@ FRONT=https://127.0.0.1:7777
 BIZ=http://127.0.0.1:8080
 BIZ_NC=http://127.0.0.1:8081
 METRICS=http://127.0.0.1:9090/metrics
-KEY=googledrive1/test-page.html
 VERDICT=0
 fail() { echo "  FAIL: $1"; VERDICT=1; }
 
@@ -46,8 +45,36 @@ printf '%s' "$h" | grep -q '"stray_bytes":0' || fail "a fresh node has no strays
 echo "  nocache:  $(hz $BIZ_NC | pick status entries stray_bytes)"
 
 echo "=== ordinary paths unchanged ==="
-full=$(code "$FRONT/$KEY"); echo "  GET /$KEY -> $full"
-[ "$full" = 200 ] || fail "an ordinary GET must be 200"
+# Which object to run the read contract against is the operator's business: the
+# bucket is theirs and its contents change (the 2 KB page this used to name was
+# gone by 2026-09-27, and the surviving objects are 60 GiB and 200 GiB). So the
+# fixture is discovered -- and the whole-object GET, the one check that must
+# never point at a film, runs only when the smallest object is actually small.
+# Override with KEY=<key under googledrive1/> when a specific object is wanted.
+if [ -z "${KEY:-}" ]; then
+  KEYS=$(curl -fsS --max-time 10 "$BIZ/googledrive1/?list-type=2" 2>/dev/null | python3 -c '
+import re, sys, urllib.parse
+print("\n".join(urllib.parse.quote(k) for k in re.findall(r"<Key>(.*?)</Key>", sys.stdin.read())))' || true)
+  [ -n "$KEYS" ] || fail "the origin listed no objects to run the read contract against"
+  KEY=""; SMALLEST=""
+  for k in $KEYS; do
+    n=$(curl -sS --max-time 20 -I "$BIZ/googledrive1/$k" 2>/dev/null \
+      | grep -i '^content-length:' | tr -d '\r' | awk '{print $2}')
+    [ -n "$n" ] || continue
+    if [ -z "$SMALLEST" ] || [ "$n" -lt "$SMALLEST" ]; then SMALLEST=$n; KEY="googledrive1/$k"; fi
+  done
+  [ -n "$KEY" ] || fail "no listed object reported a length; set KEY=<key> to name one"
+else
+  SMALLEST=$(curl -sS --max-time 20 -I "$BIZ/$KEY" 2>/dev/null \
+    | grep -i '^content-length:' | tr -d '\r' | awk '{print $2}')
+fi
+echo "  fixture object: ${KEY:-<none>} (${SMALLEST:-?} bytes; KEY=<key> overrides)"
+if [ -n "${SMALLEST:-}" ] && [ "$SMALLEST" -le 1048576 ]; then
+  full=$(code "$FRONT/$KEY"); echo "  GET /$KEY -> $full"
+  [ "$full" = 200 ] || fail "an ordinary GET must be 200"
+else
+  echo "  (whole-object GET not attempted: the smallest listed object is ${SMALLEST:-?} bytes)"
+fi
 hdr=$(curl --noproxy '*' -k -sS --max-time 60 -D - -o /dev/null -H 'range: bytes=0-99' "$FRONT/$KEY")
 rcode=$(printf '%s' "$hdr" | head -1 | awk '{print $2}')
 cr=$(printf '%s' "$hdr" | grep -i '^content-range:' | tr -d '\r')
