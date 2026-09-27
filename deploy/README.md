@@ -26,6 +26,7 @@ the x86_64 cross-build box (an `ssh`-config alias; `deploy-node.sh` takes
 | `watchdog.sh` + `.service`/`.timer` | unit/disk/healthz checks and the heartbeat to the blog Worker | node | the env file, cloudflared | runbook "Health checks", "The blog card says the node is offline" |
 | `test-watchdog.sh` | behavioural test for `watchdog.sh` | node | — | runbook same |
 | `fill-account.sh` | the origin's side of a CDN round: asks, bytes, latency, clients (`xff`) | node | loopback access | runbook "Who pulls, and how to tell" |
+| `merge-account.sh` | the origin's half of the merge account: `mark` before a workload, `report` after it — bytes delivered per upstream open, `open`+`stat` per GiB, attached share, and the front window since the mark | node | loopback metrics | runbook "Reading the shaping account" |
 | `window-decision-probe.sh` | a jump pays the floor (ADR-0024), measured on the real provider | node | `efficient-walk.toml` instance | ADR-0024, runbook "The window decision" |
 | `efficient-walk.sh` + `.toml` | the staged-read runs (ADR-0016) against the real provider | node | a loopback instance on 7791/8091/9094 | runbook "Reading the shaping account" |
 | `efficient-walk-pair.sh` + `efficient-walk-nowatch.toml` | the watch account (ADR-0018): the same walk with the viewer protections off | node | same instance | ADR-0018 |

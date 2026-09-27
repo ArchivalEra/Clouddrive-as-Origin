@@ -942,6 +942,17 @@ old behaviour. For a viewer scrubbing forward continuously, expect roughly
 `bytes / session_window_bytes` opens; for random seeking, expect one per seek
 no matter how large the window is.
 
+`deploy/oracle/merge-account.sh` reads the whole account in two commands: `mark`
+before a workload and `report` after it. The mark is what makes the window
+exact — the counters are cumulative since the process started, so without it
+"this run" is a guess; the report diffs them and adds the front-access window
+since the mark (the edge's asks, split from the loopback probes by `xff`). It
+prints bytes delivered per `open`, `open`+`stat` per GiB delivered (the
+provider's view), the attached share, and how much of the volume went out
+windowed vs as open-ended passthrough. The viewer side of that table — how many
+requests and bytes the browsers really moved — comes from the harness's own
+report on the machine that ran it, never from here.
+
 A key that is **being read** is not evicted at all (ADR-0017): the body holds a
 read lease for its whole life (a viewer who disconnects drops it), and policy
 eviction keeps skipping the key for `read_grace_secs` (default 300) after the
