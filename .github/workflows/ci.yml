@@ -29,6 +29,14 @@ jobs:
         with:
           components: clippy
 
+      # The signing-contract suite shells out to deploy/oracle/presign.py to
+      # prove the shipped signer and the verifier agree; its python3-dependent
+      # tests print-and-skip when the tool is absent (the house rule for
+      # external tools), so CI asserts the tool is present instead of letting
+      # that half of the gate disappear quietly.
+      - name: "python3 (the signing contract shells out to presign.py)"
+        run: python3 --version
+
       - name: "build (origin + front)"
         run: cargo build --locked --workspace > ci-build.log 2>&1 || { cat ci-build.log; exit 1; }
 
@@ -45,6 +53,9 @@ jobs:
 
       - name: "test (watchdog script)"
         run: cargo test --locked --test watchdog_script > ci-test-watchdog.log 2>&1
+
+      - name: "test (signing contract)"
+        run: cargo test --locked --test signing_contract > ci-test-signing.log 2>&1
 
       - name: "test (front)"
         run: cargo test --locked -p origin-front --lib > ci-test-front.log 2>&1
