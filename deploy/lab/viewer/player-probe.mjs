@@ -54,7 +54,7 @@ const objectUrl = `${base}/${objectPath}`;
 
 // Vantage knobs. `PROXY=socks5://127.0.0.1:1080` gives the browser another
 // egress (an `ssh -D` tunnel to the node) without a browser anywhere but here;
-// `HOST_MAP="MAP cdn.example.com <addr>"` pins the address the far side's
+// `HOST_MAP="MAP your-cdn-host <addr>"` pins the address the far side's
 // resolver returned, so the run measures THAT vantage's route and POP rather
 // than this machine's DNS answer wearing a tunnel.
 const proxy = process.env.PROXY || '';

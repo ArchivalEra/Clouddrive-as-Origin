@@ -26,7 +26,7 @@ snap() { # print the two counters we diff
 echo "=== viewers=$VIEWERS cold-band run (chunks=$CHUNKS x 5 MiB, 2 seeks)"
 echo "  origin before (opens stats): $(snap)"
 timeout 400 node deploy/lab/viewer/multi-viewer.mjs \
-  --target https://cdn.example.com/googledrive1 \
+  --target "${BASE:?set BASE to the CDN base URL, e.g. https://your-cdn-host}/googledrive1" \
   --object "$FILM" --page test-page.html --size 214748364800 \
   --viewers "$VIEWERS" --chunks "$CHUNKS" --chunk-bytes 5242880 --seeks 2 \
   --gap-ms 1500 --cold-band --viewer-timeout-secs 240 2>&1 | tail -"$((VIEWERS + 3))"

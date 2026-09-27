@@ -24,7 +24,8 @@ import { join } from 'node:path';
 
 const args = process.argv.slice(2);
 const arg = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
-const target = arg('target', 'https://cdn.example.com/googledrive1');
+// Defaults to the LAB (a local front); pass --target for a real deployment.
+const target = arg('target', 'http://127.0.0.1:7779/media');
 const objectPath = arg('object', 'demo.bin');
 const pagePath = arg('page', 'test-page.html');
 const mediaSecs = Number(arg('secs', '30'));

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The target-scale account through the CDN (cdn.example.com), from a host
+# The target-scale account through the CDN, from a host
 # with direct internet — the node is the usual one. NEVER through an HTTP proxy:
 # the RTT it adds is exactly the number this probe is trying to measure.
 #
@@ -28,7 +28,7 @@
 set -u
 OBJ=${1:-round3.mp4}
 SHARDS=${2:-24}
-BASE=${BASE:-https://cdn.example.com}/googledrive1/$OBJ
+BASE=${BASE:?set BASE to the CDN base URL, e.g. https://your-cdn-host}/googledrive1/$OBJ
 MET=${ORIGIN_METRICS:-http://127.0.0.1:9090/metrics}
 CHUNK=$((1024 * 1024))
 

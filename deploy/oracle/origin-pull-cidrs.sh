@@ -101,7 +101,7 @@ if [ "$SELF_TEST" = 1 ]; then
   T=$(mktemp -d)
   trap 'rm -rf "$T"' EXIT
   cat >"$T/online.json" <<'JSON'
-{"OriginACLInfo":{"Status":"online","OriginACLFamily":"gaz","L7Hosts":["cdn.example.com"],"L4ProxyIds":[],
+{"OriginACLInfo":{"Status":"online","OriginACLFamily":"gaz","L7Hosts":["origin.example.com"],"L4ProxyIds":[],
  "CurrentOriginACL":{"Version":"gaz-0.0.5-20261012","EntireAddresses":{"IPv4":["2.2.2.0/24","1.1.1.0/24"],"IPv6":["2402:4e00::/36"]}},"NextOriginACL":null}}
 JSON
   cat >"$T/offline.json" <<'JSON'

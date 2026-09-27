@@ -428,7 +428,7 @@ repo** — it is injected at runtime via an environment variable (e.g.
     behavior (verified from the origin node itself, ruling out client
     links). Real-world consumers (video seeking, resumable downloads,
     database clients) use Range requests natively. EdgeOne sharded
-    origin-pull is enabled for `cdn.example.com/*` so the edge only
+    origin-pull is enabled for `<cdn-host>/*` so the edge only
     origin-pulls missing shards. **This section governs the client↔edge
     hop only** — it does not describe the upstream hop above.
 

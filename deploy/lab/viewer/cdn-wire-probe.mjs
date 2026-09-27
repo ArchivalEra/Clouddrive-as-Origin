@@ -26,7 +26,9 @@ const arg = (name, def) => {
   const i = args.indexOf(`--${name}`);
   return i >= 0 && args[i + 1] ? args[i + 1] : def;
 };
-const base = arg('base', 'https://cdn.example.com/googledrive1').replace(/\/$/, '');
+// Defaults to the LAB (a local front, whose objects live under media/), like
+// every instrument here: a probe against a real deployment names its host.
+const base = arg('base', 'http://127.0.0.1:7779/media').replace(/\/$/, '');
 const object = arg('object', 'round3.mp4');
 const pagePath = arg('page', 'test-page.html');
 const secs = Number(arg('secs', '20'));

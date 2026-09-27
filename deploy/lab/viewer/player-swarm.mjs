@@ -11,7 +11,7 @@
 // read back before the context is closed and appended as one JSON line, so the
 // run can be accounted for even if the driver is killed afterwards.
 //
-//   node player-swarm.mjs --target https://cdn.example.com \
+//   node player-swarm.mjs --target https://your-cdn-host \
 //     --page googledrive1/player-page.html --src miku-30min.m3u8 \
 //     --slots 10 --hours 4.5 --play-secs 5 --watch-secs 600 --fanout 4 \
 //     --window-secs 1800 --out /tmp/swarm-sessions.jsonl

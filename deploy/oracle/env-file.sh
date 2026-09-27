@@ -47,8 +47,8 @@ OPENLIST_USERNAME=REPLACE_ME
 OPENLIST_PASSWORD=REPLACE_ME
 ORIGIN_PREWARM_SECRET=REPLACE_ME
 ORIGIN_TOKEN=$token
-ORIGIN_TLS_CERT_PATH=/etc/ssl/example.com/<cdn-host>/cert.pem
-ORIGIN_TLS_KEY_PATH=/etc/ssl/example.com/<cdn-host>/key.pem
+ORIGIN_TLS_CERT_PATH=/etc/ssl/CHANGE-ME-zone/CHANGE-ME-host/cert.pem
+ORIGIN_TLS_KEY_PATH=/etc/ssl/CHANGE-ME-zone/CHANGE-ME-host/key.pem
 ENV
   chmod 600 "$ENV_FILE"
   echo "wrote $ENV_FILE (template; fill the REPLACE_ME entries before first start)"

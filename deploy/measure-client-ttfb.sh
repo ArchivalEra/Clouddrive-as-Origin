@@ -19,8 +19,8 @@
 #     cold = "cold" clears the origin cache for the key over ssh before each
 #            trial (requires ssh access to the origin node).
 # Example:
-#   deploy/measure-client-ttfb.sh https://cdn.example.com/googledrive1/test-page.html 3
-#   deploy/measure-client-ttfb.sh https://cdn.example.com/googledrive1/test-page.html 2 cold
+#   deploy/measure-client-ttfb.sh https://your-cdn-host/googledrive1/test-page.html 3
+#   deploy/measure-client-ttfb.sh https://your-cdn-host/googledrive1/test-page.html 2 cold
 set -u
 
 URL="${1:?usage: measure-client-ttfb.sh <url> [trials] [cold]}"

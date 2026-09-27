@@ -23,7 +23,7 @@
 #   origin, the metrics URL and the per-sample seconds.
 set -u
 OBJ=${1:-round3.mp4}
-BASE=${BASE:-https://cdn.example.com}/googledrive1/$OBJ
+BASE=${BASE:?set BASE to the CDN base URL, e.g. https://your-cdn-host}/googledrive1/$OBJ
 ORIGIN=${ORIGIN:-http://127.0.0.1:8080}/googledrive1/$OBJ
 MET=${ORIGIN_METRICS:-http://127.0.0.1:9090/metrics}
 SAMPLE=${SAMPLE:-8}

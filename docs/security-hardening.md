@@ -30,7 +30,7 @@ OCI subnet's security list allows.
 
 | port | what | bound to | reached from the internet | intended? |
 |---|---|---|---|---|
-| 7777 | origin front (TLS) | `*` | yes — `curl -k --resolve cdn.example.com:7777:<node-ip> https://…:7777/googledrive1/test-page.html` → **200**, `accept-ranges: bytes` | yes: EdgeOne pulls here |
+| 7777 | origin front (TLS) | `*` | yes — `curl -k --resolve $CDN_HOST:7777:<node-ip> https://…:7777/googledrive1/test-page.html` → **200**, `accept-ranges: bytes` | yes: EdgeOne pulls here |
 | 7778 | nocache plane (zero disk) | `*` | yes — `http://<node-ip>:7778/googledrive1/test-page.html` → **200** | **no** |
 | 5244 | OpenList (the Google Drive gateway) | `*` | yes — `/` → **200**, `/dav/` → 401 | **no** |
 | 22 | ssh | `0.0.0.0` + `[::]` | key-only (`passwordauthentication no`, root `without-password`) | yes |
@@ -79,7 +79,7 @@ Two more facts, both relevant:
   API, but enabling it is refused on the free plan — verbatim error code:
   `OperationDenied.PlanNotSupportOriginProtection` ("the plan does not support origin
   protection"; announcement: https://www.tencentcloud.com/announce/detail/100833). Attempted
-  2026-09-23 with `EnableOriginACL --L7EnableMode specific --L7Hosts '["cdn.example.com"]'`;
+  2026-09-23 with `EnableOriginACL --L7EnableMode specific --L7Hosts '["$CDN_HOST"]'`;
   the zone still reads `Status: "offline"`. **R4 is now the primary path** because it needs no
   plan change; R3 stays available to anyone who upgrades.
 - **R5 waits on R4 or on an upgrade**: a host default-deny needs the pull ranges, and without
@@ -297,7 +297,7 @@ cap and at least one alert condition (unit down, disk watermark, healthz).
 
 ## Acceptance tests (run from an external host unless stated)
 
-- **A1** `curl -k --resolve cdn.example.com:7777:<node-ip> https://cdn.example.com:7777/googledrive1/test-page.html`
+- **A1** `curl -k --resolve $CDN_HOST:7777:<node-ip> https://$CDN_HOST:7777/googledrive1/test-page.html`
   must fail to connect (today: 200).
 - **A2** `curl http://<node-ip>:5244/` must fail (today: 200), while
   `ssh <node> 'curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5244/'`

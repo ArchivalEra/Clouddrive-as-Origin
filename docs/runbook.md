@@ -6,9 +6,17 @@ commands run as `opc` with `sudo` where noted.
 
 ## Topology
 
+The production hostname and zone are deployment-specific; this document writes
+them as `$CDN_HOST` (the CDN domain you configured) and `$ZONE` (its DNS zone).
+Set them once and the commands below are literal:
+
+```sh
+CDN_HOST=your-cdn-host.example   # the hostname EdgeOne serves and pulls with
+```
+
 - **EdgeOne** → origin-pull to the origin's hostname on port **7777** (https)
-  only, Host header `cdn.example.com`. Edge cert is EdgeOne-managed; origin
-  cert is Let's Encrypt `cdn.example.com` (DNS-01 via dnspod). Port 80 is
+  only, Host header `$CDN_HOST`. Edge cert is EdgeOne-managed; origin
+  cert is Let's Encrypt `$CDN_HOST` (DNS-01 via your DNS provider). Port 80 is
   **not** an origin path: it is filtered at the cloud layer and nothing listens
   on it (see "Retired: port-80 helper").
 - **origin-cache** (2 systemd units): `origin-cache-efficient` `[::]:7777` TLS
@@ -30,7 +38,7 @@ commands run as `opc` with `sudo` where noted.
 ## Traffic switch (EdgeOne → oracle)
 
 1. EdgeOne console: add origin (the node's pull hostname) port 7777 (https),
-   Host header `cdn.example.com`, origin cert verification ON.
+   Host header `$CDN_HOST`, origin cert verification ON.
 2. Verify the origin is serving. From the node (the public path does not
    expose healthz by design -- see "Health checks"):
    ```sh
@@ -38,12 +46,12 @@ commands run as `opc` with `sudo` where noted.
    ```
    And from your own machine, that the CDN reaches it:
    ```sh
-   curl -sI https://cdn.example.com/googledrive1/<known-key> | head -3
+   curl -sI https://$CDN_HOST/googledrive1/<known-key> | head -3
    ```
 3. Switch the site's origin to the new config. EdgeOne propagates in
    seconds.
 4. Watch: `sudo journalctl -u origin-cache-efficient -f` for origin-pull
-   traffic; `curl -sI https://cdn.example.com/<key>` for `age`/`eo-cache-status`.
+   traffic; `curl -sI https://$CDN_HOST/<key>` for `age`/`eo-cache-status`.
 
 **Rollback**: EdgeOne console → switch origin back to the previous config.
 One click, seconds. No origin-side change needed.
@@ -276,7 +284,7 @@ are node-local and secret-bearing:
    fresh node; `--keep-env` preserves the real file on reinstall and refuses if
    it is incomplete.
 2. **TLS material** at the paths that env file names
-   (`/etc/ssl/example.com/<host>/cert.pem` + `key.pem` here).
+   (`/etc/ssl/$ZONE/$CDN_HOST/cert.pem` + `key.pem` here).
 3. **acme.sh** with a deploy hook, so renewal reinstalls the cert and
    restarts the service (see "Certificate expiry / renewal").
 4. **The cloudflared tunnel** (`/etc/cloudflared/token`, `cloudflared.service`)
@@ -360,11 +368,11 @@ timeouts rather than reviving that script.
 
 acme.sh auto-renews (next: 2026-11-07). A deploy hook
 (`~/.acme.sh/deploy/origin-cache.sh`, registered as `Le_DeployHook` in
-the domain conf) installs the new cert to `/etc/ssl/example.com/<cdn-host>/`
+the domain conf) installs the new cert to `/etc/ssl/$ZONE/$CDN_HOST/`
 and restarts `origin-cache-efficient` automatically — no manual step.
 
-Verify: `sudo openssl x509 -in /etc/ssl/example.com/<cdn-host>/cert.pem -noout -dates`.
-If renewal failed: `sudo ~/.acme.sh/acme.sh --renew -d cdn.example.com --dns dns_dp`
+Verify: `sudo openssl x509 -in /etc/ssl/$ZONE/$CDN_HOST/cert.pem -noout -dates`.
+If renewal failed: `sudo ~/.acme.sh/acme.sh --renew -d $CDN_HOST --dns dns_dp`
 (needs `DP_Id`/`DP_Key` from `~/dnspod`).
 
 ### Log rotation
@@ -655,7 +663,7 @@ by hand into `deploy/` would still be tracked).
 
 ### What the origin-pull settings actually are (read 2026-09-22)
 
-Read with the read-only key, one call per layer. The zone is `example.com`
+Read with the read-only key, one call per layer. The zone is `$ZONE`
 (`<zone-id>`), area `overseas`, type `partial`, `ActiveStatus: active`
 (the `Status: pending` field is the zone *type*'s provisioning state and does not
 affect serving), and the plan is **`plan-free`** -- which decides what is
@@ -664,8 +672,8 @@ available at all.
 | layer | what is set |
 | --- | --- |
 | site-wide | `UpstreamHTTP2` **on**, `HTTP2` (client) on, `SmartRouting` **off**, `AccelerateMainland` off, `OfflineCache` on, `CachePrefresh` on at 90% of TTL, `Cache` follow-origin, `MaxAge` 600 s, `PostMaxSize` 800 MiB |
-| rules (exactly one) | `rule-<id>`, enabled, priority 1, condition `${http.request.uri.path} in ['/*'] and ${http.request.host} in ['cdn.example.com']`, action `RangeOriginPull` **on** -- and nothing else set on it |
-| domain `cdn.example.com` | `online`, `OriginProtocol: FOLLOW`, HTTP port 80 / HTTPS port **7777**, `HostHeader: cdn.example.com`, free certificate |
+| rules (exactly one) | `rule-<id>`, enabled, priority 1, condition `${http.request.uri.path} in ['/*'] and ${http.request.host} in ['$CDN_HOST']`, action `RangeOriginPull` **on** -- and nothing else set on it |
+| domain `$CDN_HOST` | `online`, `OriginProtocol: FOLLOW`, HTTP port 80 / HTTPS port **7777**, `HostHeader: $CDN_HOST`, free certificate |
 
 So **both knobs the origin-leg discussion named are already on**: sharded origin
 pull (as a rule action, scoped to that host) and HTTP/2 to the origin. Lever B is
@@ -698,7 +706,7 @@ UTC, hourly:
 - `l7Flow_request_hy` came back all zeros, which is a metric a free plan does not
   appear to retain -- read it as unavailable, not as "no origin pulls"
 
-The other domain in the zone (`pages.example.com`, origin `baidu.com`) is unrelated
+The other domain in the zone (a personal DNS record, origin `baidu.com`) is unrelated
 to this project and was not touched.
 
 ### Who pulls, and how to tell (2026-09-22)
@@ -1135,7 +1143,7 @@ vantage actually lands corrected the guess above:
   0.4-1.4 MB/s with stalls looks like.
 - For the record on the 2080 proxy: it exits at the ORIGIN host itself. Every
   measurement in this document is direct — `--noproxy '*'`, verified by curl's
-  own `Established connection to cdn.example.com (<pop-ip>) from <the
+  own `Established connection to $CDN_HOST (<pop-ip>) from <the
   workstation's egress>`, and the browser probes pass `--no-proxy-server`. No
   CDN account here is a proxy account.
 
@@ -1532,7 +1540,7 @@ workstation's path to the edge, not the origin or the edge. Reproduce it:
 
 ```sh
 # From the workstation: 3 concurrent GETs of the SAME small object.
-P=https://cdn.example.com/googledrive1/test-page.html
+P=https://$CDN_HOST/googledrive1/test-page.html
 for i in 1 2 3; do curl -s --noproxy '*' -m 90 -o /dev/null \
   -w "v$i ttfb=%{time_starttransfer}s total=%{time_total}s\n" "$P" & done; wait
 ```

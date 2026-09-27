@@ -59,8 +59,8 @@ preserved by `--keep-env` afterwards; `0600`, owned by `opc`.
 
 ```sh
 # TLS material for the front plane (must match the EdgeOne origin Host).
-ORIGIN_TLS_CERT_PATH=/etc/ssl/example.com/<cdn-host>/cert.pem
-ORIGIN_TLS_KEY_PATH=/etc/ssl/example.com/<cdn-host>/key.pem
+ORIGIN_TLS_CERT_PATH=/etc/ssl/$ZONE/$CDN_HOST/cert.pem
+ORIGIN_TLS_KEY_PATH=/etc/ssl/$ZONE/$CDN_HOST/key.pem
 # OpenList web-UI credentials (loopback http is allowed).
 OPENLIST_USERNAME=...
 OPENLIST_PASSWORD=...

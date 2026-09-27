@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # EdgeOne live regression (deploy/lab/run-edgeone.sh).
 #
-# Exercises the full Clouddrive-as-Origin feature surface through the
-# production EdgeOne domain (cdn.example.com). Run from a machine
-# with internet access; the domain must be live.
+# Exercises the full Clouddrive-as-Origin feature surface through a
+# production EdgeOne domain. Run from a machine with internet access; the
+# domain must be live.
 #
-# Usage:  bash deploy/lab/run-edgeone.sh
+# Usage:  BASE=https://your-cdn-host bash deploy/lab/run-edgeone.sh
 # Exit 0 = all PASS, 1 = any FAIL.
 set -u
 
-BASE="https://cdn.example.com"
+BASE=${BASE:?set BASE to the CDN base URL, e.g. https://your-cdn-host}
 PASS=0; FAIL=0
 
 ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
