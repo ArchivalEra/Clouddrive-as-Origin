@@ -133,6 +133,63 @@ for a plane with many untrusted clients (the LAB's `config-f.toml` runs at 2 rps
 If it is ever turned on here, watch `front_requests_total{status="429"}` on 9090
 plus the front-access log; rollback is the same line removed.
 
+## Content reads are presigned (ADR-0027, 2026-09-27)
+
+A content read (GET/HEAD on the public route) must present a SigV4 **presigned
+URL** a tenant signed; the front refuses everything else (403) before the
+cache, the ledger or the provider is touched, and each `session` marker lives
+under a request/byte budget (over budget → `503 SlowDown`). The motivation is
+the request flood — thousands of ranged reads a second at fresh offsets, which
+one-open-per-window cannot absorb and per-IP limiting cannot see (R8). The
+decision, the residual exposure (a lifted URL still works against warm edge
+content) and the budgets' visibility caveat live in the ADR; this section is
+how to run it.
+
+**Minting a URL** (what a site backend does per viewing session):
+
+```sh
+python3 deploy/oracle/presign.py --host cdn.example --key googledrive1/film.mkv \
+    --session viewer-17 --expires 3600 --id AKID --secret SECRET
+# prints one URL; the player treats it as the object's address
+```
+
+The host must be the hostname the CLIENT requests (a presigned URL signs the
+Host header, and the edge forwards it — spec §6). The `session` value is an
+opaque per-viewer marker: it is signed, so only the credential holder could
+bind it, and it is the key the budgets charge.
+
+**Config** (`config.example.toml` has every knob): `front_content_auth = true`
+turns the gate on; `sigv4_credentials_path` names a 0600 JSON file of
+`[{"id","secret","prefix","session_rps","session_mib_per_min"}]` (one entry per
+tenant; `prefix` confines a tenant to its keys; without the file the single
+`SIGV4_*` env pair is the tenant). Missing, unreadable, unparseable or
+group-readable → boot failure. Loopback is exempt by default, so `accept.sh`
+and the watchdog sign nothing; `front_content_auth_exempt = []` refuses
+everyone unsigned (the LAB's arm, section 16b).
+
+**Rollout order** (each step verified before the next):
+
+1. **Edge console first**: the cache key must IGNORE the query string (spec §6,
+   requirement 2). Verify: two presigned URLs for one object, different
+   sessions → both `eo-cache-status: HIT` on the same entry. Skipping this
+   makes every session a distinct cache key — the flood returns authenticated.
+2. Deploy the binary and the config with `front_content_auth` **absent**
+   (behavior identical to today); confirm `origin_content_auth_total` appears
+   on the metrics port and `accept.sh` is PASS.
+3. Flip `front_content_auth = true` (one line + restart) at a quiet hour;
+   watch `origin_content_auth_total{outcome="deny"}` and the front log's
+   `auth=` field. The player must already send presigned URLs — coordinate
+   with the site first, or every viewer 403s.
+4. An external check from now on signs: `presign.py` output straight into
+   curl, `Range: bytes=0-1023` → 206.
+
+**Rollback**: remove the `front_content_auth` line, restart. Unsigned reads
+work again immediately; the signed ones keep working too.
+
+Credential rotation = edit the file + restart the unit (the store loads once
+at boot). A tenant that misbehaves is dropped by deleting its entry; its keys
+stop serving within one restart.
+
 ## Looking at ONE key (2026-09-21)
 
 `curl -s 'http://127.0.0.1:8080/_internal/healthz?key=googledrive1%2Fround3.mp4' | jq .key`

@@ -40,7 +40,7 @@ struct SigV4Request<'a> {
 /// passes through (D1 anonymous-first). Config comes from named env
 /// vars once at boot; `None` disables the layer entirely.
 fn sigv4_gate(
-    cfg: Option<&sigv4::SigV4Config>,
+    store: Option<&sigv4::CredentialStore>,
     request: SigV4Request<'_>,
     req_id: &str,
     host_id: &str,
@@ -55,7 +55,7 @@ fn sigv4_gate(
     // that the request was anonymous — the common case.
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
     let has_presign = query.is_some_and(|q| q.contains("X-Amz-Signature"));
-    if cfg.is_none() || (authorization.is_none() && !has_presign) {
+    if store.is_none() || (authorization.is_none() && !has_presign) {
         return None;
     }
     let decoded_path = raw_uri_path.percent_decoded();
@@ -74,7 +74,7 @@ fn sigv4_gate(
         headers: header_pairs,
         authorization,
     };
-    match sigv4::verify_optional(cfg, &input, now_unix) {
+    match sigv4::verify_optional(store, &input, now_unix) {
         sigv4::VerifyOutcome::Anonymous | sigv4::VerifyOutcome::Verified(_) => None,
         // The reason string stays out of the response body: AWS-compatible
         // clients only need the code; the detail lives in the log.
@@ -119,9 +119,10 @@ pub struct AppState<C: Clock + Clone> {
     /// Owned by the listing module rather than by `Cache`: the key is a
     /// listing concept and `Cache` had a pair of methods with one caller.
     pub listings: crate::list::ListingCache,
-    /// Inbound SigV4 credentials (named env vars, read once at boot).
-    /// `None` = anonymous-first everywhere (the #28 default).
-    pub sigv4_config: Option<sigv4::SigV4Config>,
+    /// Inbound SigV4 credentials (a 0600 JSON file or the single env pair,
+    /// read once at boot). `None` = anonymous-first everywhere (the #28
+    /// default).
+    pub sigv4_store: Option<Arc<sigv4::CredentialStore>>,
 }
 
 /// A relief valve (P1): cold + redirect-capable upstream → 307 to the
@@ -180,7 +181,7 @@ where
     // path is exactly what the client signed; the business path may be
     // percent-decoded.
     if let Some(resp) = sigv4_gate(
-        state.sigv4_config.as_ref(),
+        state.sigv4_store.as_deref(),
         SigV4Request {
             method: "GET",
             raw_uri_path: original.path(),
@@ -189,7 +190,7 @@ where
         },
         &req_id,
         &host_id,
-        sigv4::SigV4Config::now_unix(),
+        sigv4::now_unix(),
     ) {
         return resp;
     }
@@ -419,7 +420,7 @@ where
     let (req_id, host_id) = request_ids();
     // Same SigV4 gate as GET (presigned/head-signed requests).
     if let Some(resp) = sigv4_gate(
-        state.sigv4_config.as_ref(),
+        state.sigv4_store.as_deref(),
         SigV4Request {
             method: "HEAD",
             raw_uri_path: original.path(),
@@ -428,7 +429,7 @@ where
         },
         &req_id,
         &host_id,
-        sigv4::SigV4Config::now_unix(),
+        sigv4::now_unix(),
     ) {
         return resp;
     }
@@ -513,7 +514,7 @@ where
                 // resolution path can produce it any more.
                 "profile": if prof.nocache { "nocache" } else { "efficient" },
                 "cold_miss": format!("{:?}", u.cold_miss).to_lowercase(),
-                "sigv4_layer": state.sigv4_config.is_some(),
+                "sigv4_layer": state.sigv4_store.is_some(),
             })
         })
         .collect();
@@ -560,7 +561,7 @@ where
         "prewarm_inflight": snap.prewarm_inflight,
         "disk_free_bytes": snap.disk_free_bytes,
         "disk_reserve_bytes": snap.disk_reserve_bytes,
-        "sigv4_enabled": state.sigv4_config.is_some(),
+        "sigv4_enabled": state.sigv4_store.is_some(),
         "upstreams": upstreams,
     });
     if let Some(k) = key_view {

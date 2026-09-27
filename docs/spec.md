@@ -584,16 +584,23 @@ plain `GET /<key>` contract above.
   included) and the full query string on origin-pull, and its cache
   key is the client URL + query — it does NOT include the
   Authorization header, so signed and anonymous requests share one
-  cache entry. Two operator-side requirements:
+  cache entry. Since content reads are presigned (ADR-0027), these are
+  operator-side REQUIREMENTS, not options:
   1. Do NOT add Authorization or signature params to the cache key
      (default behavior is already correct).
-  2. If presigned URLs are used, configure the EdgeOne cache key to
-     IGNORE the entire query string — origin-pull still carries the
-     full query, so verification keeps working while every presigned
-     request hits the same cache entry.
+  2. Configure the EdgeOne cache key to IGNORE the entire query
+     string — origin-pull still carries the full query, so
+     verification keeps working while every presigned request hits
+     the same cache entry. Without this, every session's URL is a
+     distinct cache key, the hit rate collapses, and the origin sees
+     every request: the request flood comes back authenticated.
+     Verify after the change: two presigned URLs for the same object
+     (different sessions) both land `eo-cache-status: HIT` on one
+     entry.
   3. Do NOT enable origin-pull URL rewriting / query stripping /
      Host rewriting rules on routes serving signed traffic — any of
-     them breaks the signature.
+     them breaks the signature (the Host header is what a presigned
+     URL signs).
 
   **Live-verified 2026-09-09 (oracle node, EdgeOne → the origin's pull hostname,
   port 7777)**:
@@ -615,6 +622,10 @@ front_listen = "0.0.0.0:443"            # Pingora front plane
 listen_addr = "127.0.0.1:8080"          # axum business plane (loopback only)
 tls_cert_env = "ORIGIN_TLS_CERT_PATH"
 tls_key_env = "ORIGIN_TLS_KEY_PATH"
+
+# Content-read admission (ADR-0027) — see config.example.toml for every knob
+front_content_auth = true               # presigned URLs required for GET/HEAD
+sigv4_credentials_path = "/var/lib/origin-cache/content-auth.json"
 
 # Cache & TTLs
 cache_dir = "/var/lib/origin-cache"

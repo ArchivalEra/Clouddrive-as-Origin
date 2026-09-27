@@ -42,7 +42,7 @@ the x86_64 cross-build box (an `ssh`-config alias; `deploy-node.sh` takes
 | artifact | answers | where | needs | reading in |
 | --- | --- | --- | --- | --- |
 | `run-lab.sh` | the whole suite: `--smoke` (~1 min, core set), `--quick` (everything but the 3 GB pull), default (all) | workstation | `cargo build`, a quiet box (load < 6, no orphan chromium), for sections 14/15 `node` + `PW_DIR` | runbook "Reading the suite" |
-| `config-a..h.toml` | one instance per question: a = default profile, b = nocache, c = short coverage window, d = tiny magazine, e = watch, f = front guards + rate ceiling, g = the production window vs shard shape, h = empty token exemption | workstation | — | the LAB output itself; ADRs 0016/0018/0024 |
+| `config-a..i.toml` | one instance per question: a = default profile, b = nocache, c = short coverage window, d = tiny magazine, e = watch, f = front guards + rate ceiling, g = the production window vs shard shape, h = empty token exemption, i = content auth on with an empty exemption (ADR-0027) | workstation | — | the LAB output itself; ADRs 0016/0018/0024/0027 |
 | `flaky-server.py` | a ranged fixture that aborts or stalls on schedule (proves the retry knobs) | workstation | python3 | runbook "Surviving the leg" |
 | `fake-total-server.py` | the same bytes with a different advertised total (object vs transport) | workstation | python3 | pitfall 30 |
 | `probe-cold-viewers.sh` | N viewers on genuinely COLD bands, both sides accounted | workstation | the CDN, the node's fill-account | runbook "Multi-viewer accounts through the CDN" |
@@ -87,3 +87,4 @@ so an end-to-end demo stays reproducible.
 | `measure-client-ttfb.sh` | client-side first-byte latency (spec §10) | client | a URL | `docs/spec.md` §10 |
 | `metrics-report.sh` | latency attribution from the origin's /metrics | node (or via `ssh -L`) | the metrics port 9090 | runbook "Requests are slow" |
 | `shard-sweep-origin.sh` | what a range size costs the ORIGIN: upstream opens/stat and upstream bytes per size, cold then warm, each size on its own offsets | node (loopback) | the metrics port 9090 | runbook "Range size: what it changes" (its client half is `deploy/lab/probe-shard-size.sh`) |
+| `presign.py` | mint one presigned URL (SigV4 query auth) for a site backend or an external check — the ticket `front_content_auth` admits | workstation / site backend | credentials in env or flags | runbook "Content reads are presigned" (ADR-0027) |

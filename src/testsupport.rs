@@ -977,7 +977,7 @@ impl FixtureBuilder {
         ));
         Fixture {
             _dir: dir,
-            state: AppState { cache, config: Arc::new(cfg), sigv4_config: None, listings: Default::default() },
+            state: AppState { cache, config: Arc::new(cfg), sigv4_store: None, listings: Default::default() },
             stat_calls,
             open_calls,
             direct_calls,

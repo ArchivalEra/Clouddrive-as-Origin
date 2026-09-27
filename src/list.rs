@@ -796,7 +796,7 @@ mod tests {
             Arc::new(MockClock::new(0)),
             BackendRegistry::new(slots),
         ));
-        AppState { cache, config: Arc::new(cfg), sigv4_config: None, listings: Default::default() }
+        AppState { cache, config: Arc::new(cfg), sigv4_store: None, listings: Default::default() }
     }
 
     async fn list_at(state: &AppState<MockClock>, path: &str, query: &str) -> (StatusCode, axum::http::HeaderMap, String) {

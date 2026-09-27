@@ -122,14 +122,50 @@ prewarm_shared_secret_env = "ORIGIN_PREWARM_SECRET"
 
 # --- S3-compatible inbound (spec §6.1) ---
 # SigV4 verification of inbound requests (header auth + presigned URLs).
-# OPTIONAL verify-if-present: unsigned requests pass through; set BOTH
-# env vars to enable, leave both unset to disable the layer entirely.
+# OPTIONAL verify-if-present on the business plane: unsigned requests pass
+# through; set BOTH env vars to enable, leave both unset to disable.
 # SIGV4_ACCESS_KEY_ID = "SIGV4_ACCESS_KEY_ID"
 # SIGV4_SECRET_ACCESS_KEY = "SIGV4_SECRET_ACCESS_KEY"
 # EdgeOne note (spec §6.1): the cache key must NOT include the
 # Authorization header (default), and presigned traffic requires the
 # cache key configured to ignore the entire query string. Never enable
 # origin-pull URL rewriting or query stripping on signed routes.
+
+# --- content-read admission (ADR-0027) ---
+# Content reads (GET/HEAD on the public route) require a SigV4 PRESIGNED URL
+# the credential store knows, and each `session` parameter lives under a
+# request/byte budget. This is the anti-hotlink layer: a lifted plain URL is
+# refused at the front (403) before the cache or the provider is touched, and
+# a session firing thousands of ranged reads a second is slowed (503
+# SlowDown) after its first few. The ticket is standard S3 query auth — a
+# site backend presigns with `deploy/oracle/presign.py` or any SDK and hands
+# the player a plain URL. Default OFF; flipping it on is the runbook rollout,
+# gated on the edge's cache-key change (spec §6, requirement 2 — WITHOUT it
+# every session is a distinct cache key and the flood comes back
+# authenticated).
+# front_content_auth = true
+# Client CIDRs exempt (the node's own probes sign nothing). Default = loopback;
+# [] requires a signature from every peer (the LAB's refusal arm).
+# front_content_auth_exempt = ["127.0.0.1/32", "::1/128"]
+# Longest X-Amz-Expires honoured (the protocol allows 7 days; a leaked URL that
+# works for a week is not a policy). Default 6 h — a viewing session fits, a
+# scrape does not.
+# front_content_auth_max_expiry_secs = 21600
+# Per-session budgets: requests/second and MiB/minute (observed from the bytes
+# responses actually sent). Generous for a viewer reading ahead at a film's
+# bitrate, far below a scraper. Over budget = 503 SlowDown (the S3-standard
+# back-off), which the edge may mask from the viewer (R8) — the budget is a
+# backstop, not a QoS mechanism.
+# front_content_auth_session_rps = 30
+# front_content_auth_session_mib_per_min = 1024
+# The credential store: multi-tenant, a 0600 JSON file of
+#   [{"id": "tenant-a", "secret": "...", "prefix": "googledrive1/",
+#     "session_rps": 30, "session_mib_per_min": 1024}]
+# `prefix` confines a tenant to keys under it; the budget fields override the
+# defaults per tenant. Unset = the single SIGV4_* env pair. A file that is
+# group-readable, unparseable, or empty is a BOOT FAILURE (fail-closed), and
+# so is front_content_auth = true with no credentials at all.
+# sigv4_credentials_path = "/var/lib/origin-cache/content-auth.json"
 
 # --- upstreams ---
 # One upstream = one OpenList instance (or one WebDAV mount on it).

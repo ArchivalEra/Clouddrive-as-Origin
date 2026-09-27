@@ -83,6 +83,32 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Content-read admission (ADR-0027). The credential store loads here,
+    // before anything opens the database, for the same reason the origin
+    // token does: a misnamed credentials file must kill the boot, not
+    // half-serve with the gate missing. With front_content_auth off the
+    // store still backs the business plane's verify-if-present layer, so a
+    // signed listing keeps working either way.
+    let sigv4_store: Option<Arc<origin_cache::sigv4::CredentialStore>> =
+        origin_cache::sigv4::CredentialStore::load(cfg.sigv4_credentials_path.as_deref())
+            .context("load SigV4 credentials")?
+            .map(Arc::new);
+    let content_auth: Option<Arc<dyn front::ContentAuth>> = if cfg.front_content_auth {
+        match sigv4_store.as_ref() {
+            Some(store) if !store.is_empty() => Some(Arc::new(origin_cache::content_auth::ContentGate::from_config(
+                Arc::clone(store),
+                &cfg,
+            ))),
+            _ => anyhow::bail!(
+                "front_content_auth is on but no credentials loaded: name sigv4_credentials_path, \
+                 or set SIGV4_ACCESS_KEY_ID/SIGV4_SECRET_ACCESS_KEY. A content gate with no \
+                 credentials would refuse every read."
+            ),
+        }
+    } else {
+        None
+    };
+
     let clock = Arc::new(SystemClock);
     let mut slots = HashMap::new();
     for u in &cfg.upstreams {
@@ -113,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     let app_state = origin_cache::business::AppState {
         cache,
         config: Arc::clone(&cfg),
-        sigv4_config: origin_cache::sigv4::SigV4Config::from_env(),
+        sigv4_store: sigv4_store.clone(),
         listings: Default::default(),
     };
 
@@ -160,6 +186,8 @@ async fn main() -> anyhow::Result<()> {
         rate_rps: cfg.front_rate_rps,
         origin_token,
         origin_token_exempt: cfg.front_origin_token_exempt.clone(),
+        content_auth,
+        content_auth_exempt: cfg.front_content_auth_exempt.clone(),
         // The box has 2 cores; the business plane already runs its own
         // workers on them. Pingora's default of 1 thread serializes every
         // TLS/H2/byte-move on one core (P6). Two proxy threads let TLS and

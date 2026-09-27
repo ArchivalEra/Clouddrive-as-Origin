@@ -962,7 +962,7 @@ async fn prewarm_secret_gate_blocks_anonymous() {
     let state = AppState {
         cache: fx.state.cache.clone(),
         config: Arc::new(cfg),
-        sigv4_config: None,
+        sigv4_store: None,
         listings: Default::default(),
     };
     // Wrong token: rejected.
@@ -995,7 +995,7 @@ async fn prewarm_401s_when_the_named_secret_is_missing() {
     let state = AppState {
         cache: fx.state.cache.clone(),
         config: Arc::new(cfg),
-        sigv4_config: None,
+        sigv4_store: None,
         listings: Default::default(),
     };
     // Even a caller who guesses the (empty) secret cannot get through.
@@ -1015,12 +1015,9 @@ async fn prewarm_401s_when_the_named_secret_is_missing() {
 #[tokio::test]
 async fn sigv4_gate_anonymous_passes_and_bad_signature_403s() {
     let fx = base(b"0123456789").build();
-    let cfg = crate::sigv4::SigV4Config {
-        access_key_id: "AKIDEXAMPLE".into(),
-        secret_access_key: "s3cr3t".into(),
-    };
+    let cfg = crate::sigv4::store_with("AKIDEXAMPLE", "s3cr3t");
     let mut state = fx.state.clone();
-    state.sigv4_config = Some(cfg.clone());
+    state.sigv4_store = Some(std::sync::Arc::new(cfg.clone()));
 
     // Anonymous request: no gate response (proceeds to the cache).
     let gate = sigv4_gate(
@@ -1258,7 +1255,7 @@ async fn root_router_preserves_v2_and_v1_listing() {
             Arc::clone(&fx.state.config), Arc::new(MockClock::new(0)), BackendRegistry::new(slots),
         )),
         config: Arc::clone(&fx.state.config),
-        sigv4_config: None,
+        sigv4_store: None,
         listings: Default::default(),
     };
     for (uri, v2) in [("/?list-type=2&delimiter=/", true), ("/?delimiter=/", false)] {

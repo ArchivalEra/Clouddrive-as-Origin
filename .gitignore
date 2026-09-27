@@ -30,3 +30,9 @@
 !/front/**
 !/deploy/**
 !/tests/**
+
+# --- never tracked, even under a whitelisted directory ---
+# Python bytecode: deploy/oracle/presign.py is run in place, and a stray
+# __pycache__ would otherwise ride in on the deploy/** whitelist.
+__pycache__/
+*.pyc

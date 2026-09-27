@@ -72,7 +72,7 @@ echo $$ > "$LOCK"
 
 cleanup() {
   rm -f "$LOCK"
-  for pid in "$PID_A" "$PID_B" "$PID_C" "$PID_D" "$PID_E" "$PID_F" "$PID_G" "$PID_H" "$PID_DAV"; do
+  for pid in "$PID_A" "$PID_B" "$PID_C" "$PID_D" "$PID_E" "$PID_F" "$PID_G" "$PID_H" "$PID_I" "$PID_DAV"; do
     [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null
   done
   # Belt and braces: an instance this run failed to track would keep `wait`
@@ -107,8 +107,22 @@ done
 # The cache dirs must start EMPTY: they persist across runs, the ledger is
 # rebuilt from whatever sidecars are on disk at boot, and every staged-bytes
 # assertion below would otherwise be measuring the previous run.
-rm -rf "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e" "$LAB/cache-f" "$LAB/cache-g" "$LAB/cache-h"
-mkdir -p "$LAB/dav-data/media/2026/08" "$LAB/dav-data/archive" "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e" "$LAB/cache-f" "$LAB/cache-g" "$LAB/cache-h"
+rm -rf "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e" "$LAB/cache-f" "$LAB/cache-g" "$LAB/cache-h" "$LAB/cache-i"
+mkdir -p "$LAB/dav-data/media/2026/08" "$LAB/dav-data/archive" "$LAB/cache-a" "$LAB/cache-b" "$LAB/cache-c" "$LAB/cache-d" "$LAB/cache-e" "$LAB/cache-f" "$LAB/cache-g" "$LAB/cache-h" "$LAB/cache-i"
+# Content-auth credentials (ADR-0027): the multi-tenant 0600 file the
+# production deployment uses. Two tenants — the first unrestricted (the same
+# pair the SigV4 section uses), one confined to media/ so the prefix
+# assertion has both arms.
+(
+  umask 077
+  cat > "$LAB/content-auth.json" <<JSON
+[
+ {"id": "$SIGV4_AK", "secret": "$SIGV4_SK"},
+ {"id": "AKLLABTENANTB", "secret": "labsk_b", "prefix": "media/"}
+]
+JSON
+)
+chmod 600 "$LAB/content-auth.json"
 echo "hello-origin" > "$LAB/dav-data/media/hello.txt"
 head -c 1048576 /dev/urandom > "$LAB/dav-data/media/big1mb.bin"
 # A second 1 MiB object: the eviction test needs two keys staging at once.
@@ -165,6 +179,7 @@ cd "$REPO"
 "$BIN" "$REPO/deploy/lab/config-f.toml" > "$LAB/cache-f/serve.log" 2>&1 & PID_F=$!
 "$BIN" "$REPO/deploy/lab/config-g.toml" > "$LAB/cache-g/serve.log" 2>&1 & PID_G=$!
 "$BIN" "$REPO/deploy/lab/config-h.toml" > "$LAB/cache-h/serve.log" 2>&1 & PID_H=$!
+"$BIN" "$REPO/deploy/lab/config-i.toml" > "$LAB/cache-i/serve.log" 2>&1 & PID_I=$!
 # Readiness is POLLED, never a fixed sleep: boot measures 1-11 s on the node
 # (aarch64 with a cold page cache), and a single-shot probe fails a healthy
 # instance. `-f` matters too: without it a 404 (or any error page) still exits
@@ -185,6 +200,7 @@ probe_up 8084 eviction || { echo "FAIL: eviction not up"; tail -3 "$LAB/cache-d/
 probe_up 8085 watch    || { echo "FAIL: watch not up";    tail -3 "$LAB/cache-e/serve.log"; exit 1; }
 probe_up 8086 front    || { echo "FAIL: front guards not up"; tail -3 "$LAB/cache-f/serve.log"; exit 1; }
 probe_up 8087 default  || { echo "FAIL: default window not up"; tail -3 "$LAB/cache-g/serve.log"; exit 1; }
+probe_up 8089 content-auth || { echo "FAIL: content-auth not up"; tail -3 "$LAB/cache-i/serve.log"; exit 1; }
 # healthz may have been answered by a stale leftover instance — assert the
 # fresh processes are actually alive (boot panic = redb/port conflict).
 kill -0 "$PID_A" 2>/dev/null || { echo "FAIL: standard process died at boot"; tail -5 "$LAB/cache-a/serve.log"; exit 1; }
@@ -195,6 +211,7 @@ kill -0 "$PID_E" 2>/dev/null || { echo "FAIL: watch process died at boot";    ta
 kill -0 "$PID_F" 2>/dev/null || { echo "FAIL: front guards died at boot"; tail -5 "$LAB/cache-f/serve.log"; exit 1; }
 kill -0 "$PID_G" 2>/dev/null || { echo "FAIL: default-window instance died at boot"; tail -5 "$LAB/cache-g/serve.log"; exit 1; }
 kill -0 "$PID_H" 2>/dev/null || { echo "FAIL: origin-token instance died at boot"; tail -5 "$LAB/cache-h/serve.log"; exit 1; }
+kill -0 "$PID_I" 2>/dev/null || { echo "FAIL: content-auth instance died at boot"; tail -5 "$LAB/cache-i/serve.log"; exit 1; }
 
 # Every request is BOUNDED. Without a timeout a single stalled request hangs the
 # whole suite with no output at all — which is exactly what happened once, in
@@ -822,6 +839,69 @@ code=$(H -m 20 -o /dev/null -w "%{http_code}" -H "X-Origin-Token: not-the-token"
 code=$(H -m 20 -o /dev/null -w "%{http_code}" -H "X-Origin-Token: $CDN_LAB_ORIGIN_TOKEN" -r 0-1023 "http://127.0.0.1:7784/media/$WALK_OBJ")
 [ "$code" = 206 ] || [ "$code" = 200 ] && ok "the stamped request is served ($code)" \
   || bad "a correctly stamped request returned $code (want 206)"
+
+# ADR-0027: content reads are presigned. config-i runs the gate with an EMPTY
+# exemption list (every peer must present a signature), a 300 s expiry cap and
+# a 3 req/s session ceiling, so every arm is reachable live: the unsigned
+# refusal, the wrong-secret mismatch, the missing session marker, the stale
+# date, the over-long expiry, the flood trip, the recovery, and the tenant
+# confinement. The signer is the tool operators hand to site backends
+# (deploy/oracle/presign.py), so this section also cross-checks it against the
+# verifier end to end.
+note "16b. content reads are presigned (ADR-0027)"
+AUTH_HOST=127.0.0.1:7785
+PRESIGN="$REPO/deploy/oracle/presign.py"
+signed() { # expires [id] [secret] [date] [key] [session]
+  python3 "$PRESIGN" --scheme http --host "$AUTH_HOST" --key "${5:-media/$WALK_OBJ}" \
+    --expires "$1" --id "${2:-$SIGV4_AK}" --secret "${3:-$SIGV4_SK}" \
+    ${4:+--date "$4"} --session "${6:-lab-sess}"
+}
+code=$(H -m 20 -o /dev/null -w "%{http_code}" -r 0-1023 "http://$AUTH_HOST/media/$WALK_OBJ")
+[ "$code" = 403 ] && ok "an unsigned content read is refused (403)" \
+  || bad "an unsigned content read returned $code (want 403)"
+url=$(signed 300)
+code=$(curl -s -o /tmp/lab-signed.bin -m 20 -w "%{http_code}" -r 0-1023 "$url")
+size=$(stat -c%s /tmp/lab-signed.bin 2>/dev/null || echo 0)
+{ [ "$code" = 206 ] && [ "$size" = 1024 ]; } \
+  && ok "a presigned read is served byte-exactly (206, 1024 B)" \
+  || bad "a presigned read returned $code/$size B (want 206/1024)"
+url=$(signed 300 "$SIGV4_AK" "labsk_wrong")
+code=$(H -m 20 -o /dev/null -w "%{http_code}" -r 0-1023 "$url")
+[ "$code" = 403 ] && ok "a URL signed with an unknown secret is refused" \
+  || bad "a wrong-secret URL returned $code (want 403)"
+url=$(python3 "$PRESIGN" --scheme http --host "$AUTH_HOST" --key "media/$WALK_OBJ" --expires 300 --id "$SIGV4_AK" --secret "$SIGV4_SK")
+code=$(H -m 20 -o /dev/null -w "%{http_code}" -r 0-1023 "$url")
+[ "$code" = 403 ] && ok "a URL without its session marker is refused" \
+  || bad "a sessionless URL returned $code (want 403)"
+url=$(signed 300 "$SIGV4_AK" "$SIGV4_SK" "$(date -u -d '-400 seconds' +%Y%m%dT%H%M%SZ)")
+code=$(H -m 20 -o /dev/null -w "%{http_code}" -r 0-1023 "$url")
+[ "$code" = 403 ] && ok "an expired URL is refused" \
+  || bad "an expired URL returned $code (want 403)"
+url=$(signed 301)
+code=$(H -m 20 -o /dev/null -w "%{http_code}" -r 0-1023 "$url")
+[ "$code" = 403 ] && ok "a URL that outlives the deployment's expiry cap is refused" \
+  || bad "an over-cap URL returned $code (want 403)"
+slow=0
+for _ in $(seq 1 12); do
+  url=$(signed 300)
+  code=$(curl -s -o /dev/null -m 20 -w "%{http_code}" -r 0-1023 "$url")
+  [ "$code" = 503 ] && slow=$((slow + 1))
+done
+[ "$slow" -ge 1 ] && ok "a session firing 12 rapid reads is slowed ($slow x 503 SlowDown)" \
+  || bad "the session budget never tripped (0 x 503)"
+sleep 1.2
+url=$(signed 300)
+code=$(H -m 20 -o /dev/null -w "%{http_code}" -r 0-1023 "$url")
+[ "$code" = 206 ] && ok "and the session is served again once the window slides" \
+  || bad "after the window slid the session still got $code (want 206)"
+url=$(signed 300 AKLLABTENANTB labsk_b "" "media/$WALK_OBJ" lab-b)
+code=$(H -m 20 -o /dev/null -w "%{http_code}" -r 0-1023 "$url")
+[ "$code" = 206 ] && ok "a prefix-confined credential reads inside its prefix" \
+  || bad "a confined credential got $code inside its own prefix (want 206)"
+url=$(signed 300 AKLLABTENANTB labsk_b "" "other/hidden.bin" lab-b)
+code=$(H -m 20 -o /dev/null -w "%{http_code}" -r 0-1023 "$url")
+[ "$code" = 403 ] && ok "and cannot read outside it (403, before routing)" \
+  || bad "a confined credential got $code outside its prefix (want 403)"
 
 # --- the production DEFAULT window against the CDN's shard shape (note 17) ---
 # Every other efficient config here sets a 256 KiB window so its numbers are

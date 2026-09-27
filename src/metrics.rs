@@ -54,6 +54,19 @@ pub static CACHE_SERVE: LazyLock<HistogramVec> = LazyLock::new(|| {
     .expect("register cache_serve_duration_seconds")
 });
 
+/// Content-read admission verdicts (ADR-0027). Labels: `outcome`
+/// (allow/deny) and `reason` — a closed set of static strings owned by the
+/// content gate and the SigV4 verifier, never a path, key, session or
+/// address (the cardinality rule every metric here follows).
+pub static CONTENT_AUTH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "origin_content_auth_total",
+        "content-read admission decisions",
+        &["outcome", "reason"]
+    )
+    .expect("register origin_content_auth_total")
+});
+
 /// Responses by where their bytes come from (`disk` or `upstream`), counted
 /// when the response is built. This is the counter that answers "how much of
 /// this workload are we serving ourselves?" — the question that decides

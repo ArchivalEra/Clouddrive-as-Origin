@@ -278,11 +278,17 @@ call to audit. The credential therefore sits on an endpoint that only the origin
 reach, doing only reads. If OpenList ever becomes reachable beyond loopback, this
 requirement comes back, and A6 (a PUT with it fails) is the test.
 
-**R11 `decision` — is the content public? DECIDED: yes (2026-09-23).**
+**R11 `decision` — is the content public? DECIDED: yes (2026-09-23); SUPERSEDED for reads by ADR-0027 (2026-09-27).**
 The business route *and* the S3 listing answer unsigned (`?list-type=2` → 200
-without signing), and that is the intended surface. No signed access will be built; the
-exposure's security property is the one R4 gives it (the caller is either the edge or
-nobody) plus the 405 write refusal above.
+without signing), and that was the intended surface: the exposure's security property
+was the one R4 gives it (the caller is either the edge or nobody) plus the 405 write
+refusal above. A real player population turned the remaining risk into the product's
+main one — a client firing thousands of ranged reads a second, which per-IP limiting
+cannot see (R8) — so content READS now require a SigV4 presigned URL with per-session
+budgets (`front_content_auth`, ADR-0027). This entry's write-side findings (405 on
+every write verb, no upstream write call in `src/`) are unchanged. The R4 property is
+also unchanged: the token still decides who may pull from the port at all; the presign
+layer decides who may read content through it.
 
 **R12 `infra` + `ours` — retention and alerting.**
 journald holds ~211 MB (~2.5 days); the watchdog sends a heartbeat to the

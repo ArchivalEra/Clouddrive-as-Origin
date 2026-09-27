@@ -14,6 +14,7 @@
 //! verified; anything else passes through untouched (D1 anonymous-first).
 //! v4a (ECDSA-P256) is deferred (no verifier crate exists); v2 unsupported.
 
+use anyhow::Context;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -319,6 +320,10 @@ fn canonical_query(pairs: &[(String, String)], skip_signature: bool) -> String {
 #[derive(Debug)]
 pub struct VerifiedRequest {
     pub access_key_id: String,
+    /// The presigned URL's `X-Amz-Expires` (0 for header-auth requests,
+    /// which carry no expiry). The content gate enforces its own, shorter
+    /// policy cap on top of the protocol's 7-day maximum.
+    pub expires_secs: u64,
 }
 
 /// Environment handed to the verifier by the middleware: everything the
@@ -437,11 +442,118 @@ fn path_forms_differ(decoded: &str, raw: &str) -> bool {
 // Credential source.
 // ---------------------------------------------------------------------------
 
-/// Single-tenant credential pair from named env vars (#28).
+/// One tenant's credential: the secret plus the policy that travels with
+/// it. `prefix` confines the credential to keys under that prefix (a site
+/// with its own key cannot read another tenant's); the two session caps
+/// override the gate's defaults for this tenant alone.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CredentialEntry {
+    pub secret: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub session_rps: Option<u32>,
+    #[serde(default)]
+    pub session_mib_per_min: Option<u64>,
+}
+
+/// The credential table every verifier consults. Multi-tenant by shape:
+/// each entry is one site/app with its own secret, so a leaked key is
+/// revocable per tenant and usage is attributable per tenant. Loaded once
+/// at boot from a 0600 JSON file, or — for a single-tenant deployment and
+/// the LAB — from the two SIGV4_* env vars, which is the pre-existing
+/// shape and still works unchanged.
 #[derive(Clone)]
-pub struct SigV4Config {
-    pub access_key_id: String,
-    pub secret_access_key: String,
+pub struct CredentialStore {
+    entries: std::collections::HashMap<String, CredentialEntry>,
+}
+
+impl CredentialStore {
+    /// Single-tenant pair from `SIGV4_ACCESS_KEY_ID` / `SIGV4_SECRET_ACCESS_KEY`.
+    /// `None` = no credentials at all (every request anonymous).
+    pub fn from_env() -> Option<Self> {
+        let id = std::env::var("SIGV4_ACCESS_KEY_ID").ok()?;
+        let secret = std::env::var("SIGV4_SECRET_ACCESS_KEY").ok()?;
+        if id.is_empty() || secret.is_empty() {
+            return None;
+        }
+        Some(Self {
+            entries: std::collections::HashMap::from([(
+                id,
+                CredentialEntry { secret, prefix: None, session_rps: None, session_mib_per_min: None },
+            )]),
+        })
+    }
+
+    /// Multi-tenant table from a JSON file. The file holds secrets, so it
+    /// must not be readable by group/other — a boot failure, not a warning,
+    /// because a credential file that half the box can read is not a
+    /// credential file (the same fail-closed rule the env file follows).
+    pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)
+                .with_context(|| format!("read credentials file {}", path.display()))?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                anyhow::bail!(
+                    "credentials file {} is too open (mode {:04o}): secrets would be readable \
+                     beyond the owner. chmod 600 it.",
+                    path.display(),
+                    mode & 0o7777
+                );
+            }
+        }
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("read credentials file {}", path.display()))?;
+        #[derive(serde::Deserialize)]
+        struct FileRow {
+            id: String,
+            #[serde(flatten)]
+            entry: CredentialEntry,
+        }
+        let rows: Vec<FileRow> = serde_json::from_str(&raw)
+            .with_context(|| format!("parse credentials file {} as [{{id, secret, ...}}]", path.display()))?;
+        if rows.is_empty() {
+            anyhow::bail!("credentials file {} is empty", path.display());
+        }
+        let mut entries = std::collections::HashMap::new();
+        for row in rows {
+            if row.id.is_empty() || row.entry.secret.is_empty() {
+                anyhow::bail!("credentials file {} has an empty id or secret", path.display());
+            }
+            if entries.insert(row.id, row.entry).is_some() {
+                anyhow::bail!("credentials file {} lists an id twice", path.display());
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    /// `Some(path)` wins (multi-tenant file); `None` falls back to the env
+    /// pair. A named-but-unreadable file is a boot failure, never a silent
+    /// fallthrough to anonymous.
+    pub fn load(path: Option<&str>) -> anyhow::Result<Option<Self>> {
+        match path {
+            Some(p) if !p.trim().is_empty() => Ok(Some(Self::from_file(std::path::Path::new(p))?)),
+            _ => Ok(Self::from_env()),
+        }
+    }
+
+    /// The tenant behind an access key id. `pub(crate)`: the content gate
+    /// reads the policy fields; the secrets never leave this crate.
+    pub(crate) fn lookup(&self, id: &str) -> Option<&CredentialEntry> {
+        self.entries.get(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Default clock-skew tolerance: ±900 s in both directions (s3s default,
@@ -451,26 +563,66 @@ const MAX_SKEW_SECS: i64 = 900;
 /// `X-Amz-Expires` upper bound: 7 days (AWS max, s3s boundary-tested).
 const MAX_PRESIGNED_EXPIRES_SECS: u64 = 604_800;
 
-impl SigV4Config {
-    /// Reads `SIGV4_ACCESS_KEY_ID` / `SIGV4_SECRET_ACCESS_KEY`.
-    /// `None` = SigV4 disabled (every request anonymous).
-    pub fn from_env() -> Option<Self> {
-        let id = std::env::var("SIGV4_ACCESS_KEY_ID").ok()?;
-        let secret = std::env::var("SIGV4_SECRET_ACCESS_KEY").ok()?;
-        if id.is_empty() || secret.is_empty() {
-            return None;
-        }
-        Some(Self { access_key_id: id, secret_access_key: secret })
-    }
+/// Current Unix time in seconds (the middleware's clock; tests inject
+/// their own).
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
-    /// Current Unix time in seconds (the middleware's clock; tests inject
-    /// via `now_unix` on the verify entry points below).
-    pub fn now_unix() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    }
+/// A store for tests outside this module (the entries map is private on
+/// purpose; production tables come from a file or the env).
+#[cfg(test)]
+pub(crate) fn store_with(id: &str, secret: &str) -> CredentialStore {
+    test_store(vec![(
+        id.to_string(),
+        CredentialEntry { secret: secret.to_string(), prefix: None, session_rps: None, session_mib_per_min: None },
+    )])
+}
+
+#[cfg(test)]
+pub(crate) fn test_store(entries: Vec<(String, CredentialEntry)>) -> CredentialStore {
+    CredentialStore { entries: entries.into_iter().collect() }
+}
+
+/// The CLIENT side of the presigned flow, for tests outside this module:
+/// build the query string of a presigned URL exactly the way an SDK would,
+/// through the same canonical machinery the verifier uses (pinned against
+/// s3s vectors above). Signs `host: cdn.example`, scope `us-east-1/s3`,
+/// scope date taken from `amz_date`.
+#[cfg(test)]
+pub(crate) fn test_presign(
+    access_key: &str,
+    secret: &str,
+    amz_date: &str,
+    expires: u64,
+    uri_path: &str,
+    extra_pairs: &[(String, String)],
+) -> String {
+    let scope_date = &amz_date[..8];
+    let mut pairs: Vec<(String, String)> = vec![
+        ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+        ("X-Amz-Credential".to_string(), format!("{access_key}/{scope_date}/us-east-1/s3/aws4_request")),
+        ("X-Amz-Date".to_string(), amz_date.to_string()),
+        ("X-Amz-Expires".to_string(), expires.to_string()),
+        ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
+    ];
+    pairs.extend(extra_pairs.iter().cloned());
+    let qs = canonical_query(&pairs, true);
+    let canonical = format!(
+        "GET\n{}\n{qs}\nhost:cdn.example\n\nhost\nUNSIGNED-PAYLOAD",
+        uri_encode_string(uri_path, false)
+    );
+    let sts = string_to_sign(&canonical, amz_date, scope_date, "us-east-1", "s3");
+    let sig = calculate_signature(&sts, secret, scope_date, "us-east-1", "s3");
+    pairs.push(("X-Amz-Signature".to_string(), sig));
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={}", uri_encode_string(v, true)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Verify an inbound request per the #28 contract: optional
@@ -478,14 +630,14 @@ impl SigV4Config {
 /// present -> verify (header form first, then presigned query form).
 /// `now_unix` is injectable for tests.
 pub fn verify_optional(
-    cfg: Option<&SigV4Config>,
+    store: Option<&CredentialStore>,
     input: &VerifyInput<'_>,
     now_unix: i64,
 ) -> VerifyOutcome {
-    let Some(cfg) = cfg else { return VerifyOutcome::Anonymous };
+    let Some(store) = store else { return VerifyOutcome::Anonymous };
     // Presigned form: X-Amz-Signature in the query.
     if input.query_pairs.iter().any(|(k, _)| k == "X-Amz-Signature") {
-        return match verify_presigned(cfg, input, now_unix) {
+        return match verify_presigned(store, input, now_unix) {
             Ok(v) => VerifyOutcome::Verified(v),
             Err(e) => VerifyOutcome::Failed(e),
         };
@@ -493,7 +645,7 @@ pub fn verify_optional(
     // Header form.
     if let Some(auth) = input.authorization {
         if auth.starts_with("AWS4-HMAC-SHA256") {
-            return match verify_header(cfg, input, auth, now_unix) {
+            return match verify_header(store, input, auth, now_unix) {
                 Ok(v) => VerifyOutcome::Verified(v),
                 Err(e) => VerifyOutcome::Failed(e),
             };
@@ -507,7 +659,7 @@ pub fn verify_optional(
 
 /// Look up request headers: lowercase name -> all values in request order.
 fn verify_header(
-    cfg: &SigV4Config,
+    store: &CredentialStore,
     input: &VerifyInput<'_>,
     auth_header: &str,
     now_unix: i64,
@@ -556,10 +708,9 @@ fn verify_header(
         return Err("request time too skewed");
     }
 
-    // Access key must be ours.
-    if credential.access_key_id != cfg.access_key_id {
-        return Err("unknown access key");
-    }
+    // Access key must be one of ours; the signature is checked against
+    // THAT tenant's secret.
+    let entry = store.lookup(&credential.access_key_id).ok_or("unknown access key")?;
     if credential.aws_service != "s3" {
         return Err("unsupported service in credential scope");
     }
@@ -568,6 +719,9 @@ fn verify_header(
     let names: Vec<&str> = signed_headers_raw.split(';').collect();
     if names.is_empty() {
         return Err("empty SignedHeaders");
+    }
+    if !names.contains(&"host") {
+        return Err("host header is not signed");
     }
     let lookup = header_lookup(&input.headers);
     let canonical_headers = canonical_headers(&names, &lookup).ok_or("signed header missing from request")?;
@@ -614,17 +768,17 @@ fn verify_header(
             canonical_raw.as_deref(),
             &sts_iso,
             &credential,
-            &cfg.secret_access_key,
+            &entry.secret,
             &expected,
         ) {
         return Err("signature does not match");
     }
 
-    Ok(VerifiedRequest { access_key_id: credential.access_key_id })
+    Ok(VerifiedRequest { access_key_id: credential.access_key_id, expires_secs: 0 })
 }
 
 fn verify_presigned(
-    cfg: &SigV4Config,
+    store: &CredentialStore,
     input: &VerifyInput<'_>,
     now_unix: i64,
 ) -> Result<VerifiedRequest, &'static str> {
@@ -671,9 +825,9 @@ fn verify_presigned(
         return Err("request has expired");
     }
 
-    if credential.access_key_id != cfg.access_key_id {
-        return Err("unknown access key");
-    }
+    // Access key must be one of ours; the signature is checked against
+    // THAT tenant's secret.
+    let entry = store.lookup(&credential.access_key_id).ok_or("unknown access key")?;
     if credential.aws_service != "s3" {
         return Err("unsupported service in credential scope");
     }
@@ -682,6 +836,9 @@ fn verify_presigned(
     // UNSIGNED-PAYLOAD; only the listed headers (usually just `host`) are
     // signed; X-Amz-Signature is excluded from the canonical query.
     let names: Vec<String> = signed_headers_raw.split(';').map(|s| s.to_ascii_lowercase()).collect();
+    if !names.iter().any(|n| n == "host") {
+        return Err("host header is not signed");
+    }
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let lookup = header_lookup(&input.headers);
     let canonical_headers = canonical_headers(&name_refs, &lookup).ok_or("signed header missing from request")?;
@@ -714,13 +871,13 @@ fn verify_presigned(
         canonical_raw.as_deref(),
         &sts_iso,
         &credential,
-        &cfg.secret_access_key,
+        &entry.secret,
         signature,
     ) {
         return Err("signature does not match");
     }
 
-    Ok(VerifiedRequest { access_key_id: credential.access_key_id })
+    Ok(VerifiedRequest { access_key_id: credential.access_key_id, expires_secs })
 }
 
 #[cfg(test)]
@@ -842,9 +999,17 @@ mod tests {
         assert!(CredentialV4::parse("AKID/20130524/us-east-1/s3/aws4_request/extra").is_none());
     }
 
-    fn fixture() -> (SigV4Config, VerifyInput<'static>) {
-        let cfg = SigV4Config { access_key_id: "AKIDEXAMPLE".into(), secret_access_key: "secret".into() };
-        (cfg, VerifyInput {
+    fn store() -> CredentialStore {
+        let mut s = CredentialStore { entries: Default::default() };
+        s.entries.insert(
+            "AKIDEXAMPLE".into(),
+            CredentialEntry { secret: "secret".into(), prefix: None, session_rps: None, session_mib_per_min: None },
+        );
+        s
+    }
+
+    fn fixture() -> (CredentialStore, VerifyInput<'static>) {
+        (store(), VerifyInput {
             method: "GET",
             uri_path: "/bucket/obj.txt",
             raw_uri_path: "/bucket/obj.txt",
@@ -863,7 +1028,7 @@ mod tests {
     #[test]
     fn header_auth_roundtrip_and_rejections() {
         let (cfg, mut input) = fixture();
-        let secret = cfg.secret_access_key.clone();
+        let secret = "secret".to_string();
         // Build the signature the way a client would.
         let names = vec!["host", "x-amz-content-sha256", "x-amz-date"];
         let lookup = header_lookup(&input.headers);
@@ -886,14 +1051,24 @@ mod tests {
         assert!(matches!(outcome, VerifyOutcome::Verified(_)));
 
         // Wrong secret: signature mismatch.
-        let bad = SigV4Config { access_key_id: "AKIDEXAMPLE".into(), secret_access_key: "other".into() };
+        let mut bad_entries = std::collections::HashMap::new();
+        bad_entries.insert(
+            "AKIDEXAMPLE".to_string(),
+            CredentialEntry { secret: "other".into(), prefix: None, session_rps: None, session_mib_per_min: None },
+        );
+        let bad = CredentialStore { entries: bad_entries };
         assert!(matches!(
             verify_optional(Some(&bad), &input, now),
             VerifyOutcome::Failed("signature does not match")
         ));
 
         // Unknown access key.
-        let unknown = SigV4Config { access_key_id: "AKIDOTHER".into(), secret_access_key: secret.clone() };
+        let mut unknown_entries = std::collections::HashMap::new();
+        unknown_entries.insert(
+            "AKIDOTHER".to_string(),
+            CredentialEntry { secret: secret.clone(), prefix: None, session_rps: None, session_mib_per_min: None },
+        );
+        let unknown = CredentialStore { entries: unknown_entries };
         assert!(matches!(
             verify_optional(Some(&unknown), &input, now),
             VerifyOutcome::Failed("unknown access key")
@@ -927,7 +1102,7 @@ mod tests {
     #[test]
     fn presigned_roundtrip_expiry_and_excludes_signature() {
         let (cfg, mut input) = fixture();
-        let secret = cfg.secret_access_key.clone();
+        let secret = "secret".to_string();
         // A presigned GET: signed headers = host only, expires 300.
         input.query_pairs = vec![
             ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),

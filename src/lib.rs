@@ -4,6 +4,7 @@ pub mod cache;
 pub mod client_range;
 pub mod clock;
 pub mod config;
+pub mod content_auth;
 pub mod inflight;
 pub mod key;
 pub mod list;

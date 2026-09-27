@@ -110,6 +110,13 @@ list surface is the same path with `?list-type=2`.
   (that is why the fixtures live in the bucket).
 - Content-type is passed through, with a fallback table for the generic
   `application/octet-stream` many provider APIs return (spec §3.9).
+- **Signed content** (ADR-0027, off until the rollout flips it on): with
+  `front_content_auth`, reads require a SigV4 **presigned URL** — a site
+  backend mints one per viewing session with `deploy/oracle/presign.py` (or
+  any S3 SDK) and hands the player a plain URL; each session lives under
+  request/byte budgets, a lifted plain URL is refused at the front, and the
+  edge's cache key must ignore the query string first (spec §6). See the
+  runbook's "Content reads are presigned" for the rollout and rotation.
 
 Two client-shape cautions, both properties of content, not of this service: an
 unindexed **fragmented MP4** will not play in a bare `<video>` (needs MSE plus a

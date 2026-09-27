@@ -291,6 +291,41 @@ pub struct RawConfig {
     /// stamped, which is how the LAB exercises the refusal.
     #[serde(default = "default_origin_token_exempt")]
     pub front_origin_token_exempt: Vec<String>,
+    /// Content-read admission (ADR-0027): when true, GET/HEAD on the public
+    /// route must present a SigV4 presigned URL the credential store knows,
+    /// and each session lives under a request/byte budget. Anonymous content
+    /// reads are refused (403); an over-budget session is slowed (503).
+    /// Default false — flipping it on production is the rollout in the
+    /// runbook, gated on the edge's cache-key change and on clients that sign.
+    #[serde(default)]
+    pub front_content_auth: bool,
+    /// Client CIDRs exempt from the content gate. Defaults to loopback (the
+    /// node's own probes sign nothing); an empty list refuses everything
+    /// unsigned, which is how the LAB exercises the gate.
+    #[serde(default = "default_origin_token_exempt")]
+    pub front_content_auth_exempt: Vec<String>,
+    /// Longest `X-Amz-Expires` the content gate honours. The protocol allows
+    /// 7 days; a leaked URL that works for a week is not a policy this
+    /// deployment wants, so the default is 6 hours — a viewing session fits,
+    /// a scrape does not.
+    #[serde(default = "default_content_auth_max_expiry")]
+    pub front_content_auth_max_expiry_secs: u64,
+    /// Per-session request ceiling (requests/second; enforced over a sliding
+    /// window). This is the flood control: one session issuing thousands of
+    /// range requests a second is slowed (503) after the first few.
+    #[serde(default = "default_content_auth_session_rps")]
+    pub front_content_auth_session_rps: u32,
+    /// Per-session byte ceiling (MiB/minute), observed from the bytes each
+    /// response actually sent. Generous for a viewer reading ahead, far below
+    /// a scraper's pull rate.
+    #[serde(default = "default_content_auth_session_mib")]
+    pub front_content_auth_session_mib_per_min: u64,
+    /// Multi-tenant SigV4 credentials (a 0600 JSON file of
+    /// `[{id, secret, prefix?, session_rps?, session_mib_per_min?}]`). Set =
+    /// the file is the credential source and must parse; unset = the single
+    /// `SIGV4_ACCESS_KEY_ID` / `SIGV4_SECRET_ACCESS_KEY` pair, unchanged.
+    #[serde(default)]
+    pub sigv4_credentials_path: Option<String>,
     /// Proxy service worker threads. Absent = 2 (P6: pingora's default of
     /// 1 serializes TLS/H2 on a single core).
     #[serde(default)]
@@ -368,6 +403,15 @@ fn default_listen_addr() -> SocketAddr { "127.0.0.1:8080".parse().unwrap() }
 fn default_origin_token_exempt() -> Vec<String> {
     vec!["127.0.0.1/32".into(), "::1/128".into()]
 }
+fn default_content_auth_max_expiry() -> u64 {
+    21_600
+}
+fn default_content_auth_session_rps() -> u32 {
+    30
+}
+fn default_content_auth_session_mib() -> u64 {
+    1024
+}
 fn default_cache_dir() -> PathBuf { "/var/lib/origin-cache".into() }
 fn default_max_entries() -> usize {
     500_000
@@ -396,6 +440,13 @@ pub struct Config {
     pub front_origin_token_header: Option<String>,
     pub front_origin_token_env: Option<String>,
     pub front_origin_token_exempt: Vec<String>,
+    /// Content-read admission (ADR-0027): see `RawConfig`.
+    pub front_content_auth: bool,
+    pub front_content_auth_exempt: Vec<String>,
+    pub front_content_auth_max_expiry_secs: u64,
+    pub front_content_auth_session_rps: u32,
+    pub front_content_auth_session_mib_per_min: u64,
+    pub sigv4_credentials_path: Option<String>,
     pub front_threads: Option<usize>,
     pub cache_dir: PathBuf,
     pub max_size_bytes: u64,
@@ -634,6 +685,12 @@ impl Config {
             front_origin_token_header: raw.front_origin_token_header,
             front_origin_token_env: raw.front_origin_token_env,
             front_origin_token_exempt: raw.front_origin_token_exempt,
+            front_content_auth: raw.front_content_auth,
+            front_content_auth_exempt: raw.front_content_auth_exempt,
+            front_content_auth_max_expiry_secs: raw.front_content_auth_max_expiry_secs,
+            front_content_auth_session_rps: raw.front_content_auth_session_rps,
+            front_content_auth_session_mib_per_min: raw.front_content_auth_session_mib_per_min,
+            sigv4_credentials_path: raw.sigv4_credentials_path,
             front_threads: raw.front_threads,
             cache_dir: raw.cache_dir,
             max_size_bytes: raw.max_size_bytes,
@@ -673,6 +730,12 @@ impl Default for Config {
             front_origin_token_header: None,
             front_origin_token_env: None,
             front_origin_token_exempt: default_origin_token_exempt(),
+            front_content_auth: false,
+            front_content_auth_exempt: default_origin_token_exempt(),
+            front_content_auth_max_expiry_secs: default_content_auth_max_expiry(),
+            front_content_auth_session_rps: default_content_auth_session_rps(),
+            front_content_auth_session_mib_per_min: default_content_auth_session_mib(),
+            sigv4_credentials_path: None,
             front_threads: None,
             cache_dir: default_cache_dir(),
             max_size_bytes: default_max_size(),

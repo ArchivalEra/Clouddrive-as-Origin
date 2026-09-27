@@ -56,8 +56,8 @@ pitfall 62; unsolved, not a blocker).
 
 ```sh
 cargo build --release --offline
-bash deploy/lab/run-lab.sh --smoke     # PASS=35 FAIL=0, ~1 min
-bash deploy/lab/run-lab.sh --quick     # PASS=75 FAIL=0, ~10 min (needs node+chromium+PW_DIR)
+bash deploy/lab/run-lab.sh --smoke     # PASS=45 FAIL=0, ~1 min
+bash deploy/lab/run-lab.sh --quick     # PASS=85 FAIL=0, ~10 min (needs node+chromium+PW_DIR)
 ```
 The suite refuses to run on a busy box (`load > 6` or a live `chromium`) because
 its timing assertions include the machine. Browsers are sections 14/15.
@@ -120,7 +120,7 @@ media — there is no CORS.
 ## Definition of done for a change
 
 `cargo test --offline` (expect 319) → a reverse validation (break it, name the
-test that goes red) → `run-lab.sh --quick` (75/0) → node deploy + `accept.sh`
+test that goes red) → `run-lab.sh --quick` (85/0) → node deploy + `accept.sh`
 VERDICT=PASS → docs (ADR / spec / runbook / pitfalls / `deploy/README.md`) →
 commit in English → push with `timeout 100` retries and verify
 `git rev-parse HEAD origin/main` are equal → update `.zcode/handoff.md`.
