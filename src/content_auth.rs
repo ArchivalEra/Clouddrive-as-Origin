@@ -362,6 +362,28 @@ X-Amz-Signature=48ee4d7a5fc6a2913a7e37d7f9749e4908b29114398b17a619fe4062311e8e9f
         assert_eq!(allow_id(&ask(&g, pq)), "tenant-a");
     }
 
+    /// SigV4 signs the METHOD, so the two methods the gate carries need two
+    /// tickets: a GET ticket refuses a HEAD (and vice versa). Players that
+    /// probe with HEAD must ask the backend for a HEAD URL.
+    #[test]
+    fn method_is_part_of_the_ticket() {
+        let g = gate(&Arc::new(AtomicI64::new(NOW)));
+        let head_ticket = sigv4::test_presign_method(
+            "HEAD", "tenant-a", "secret-a", DATE, 300, "/googledrive1/film.mkv",
+            &[("session".into(), "viewer-1".into())],
+        );
+        let head_req = |q: &str| {
+            g.admit(&ContentRequest { method: "HEAD", path_and_query: q, host: Some("cdn.example") })
+        };
+        assert_eq!(allow_id(&head_req(&format!("/googledrive1/film.mkv?{head_ticket}"))), "tenant-a");
+        let get_ticket = sigv4::test_presign("tenant-a", "secret-a", DATE, 300, "/googledrive1/film.mkv",
+            &[("session".into(), "viewer-1".into())]);
+        assert_eq!(
+            deny_reason(head_req(&format!("/googledrive1/film.mkv?{get_ticket}"))).0,
+            "signature does not match"
+        );
+    }
+
     /// No signature at all: the door stays shut. This is the whole flood
     /// story — a lifted plain URL cannot pull a cold byte.
     #[test]

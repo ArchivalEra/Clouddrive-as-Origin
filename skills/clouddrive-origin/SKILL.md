@@ -84,6 +84,24 @@ Snapshot the counters *before* a load and subtract: `backend_call_duration_secon
 `cache_serve_source_total`, `cache_session_total{sealed,chained,open_failed}`,
 `cache_body_bytes_total`, `cache_unkeepable_trim_bytes_total`. One open per
 window is the design target (measured: 1 per ~17.6 MB under random load).
+Content-read admission has its own counter: `origin_content_auth_total{outcome,reason}`
+(`deny` reasons are the closed set `docs/signing.md` tabulates).
+
+### Sign a content read (ADR-0027)
+
+```sh
+python3 deploy/oracle/presign.py --host <the host the CLIENT requests> \
+  --key googledrive1/<object> --session <per-viewer id> --expires 3600 \
+  --id <access key> --secret <secret>          # or SIGV4_ACCESS_KEY_ID/_SECRET
+```
+The URL is a plain GET (or `--method HEAD`) ticket; SigV4 signs the METHOD, the
+HOST and every query parameter, so a HEAD needs its own ticket, the session
+marker cannot be added after minting, and `S3SigV4QueryAuth` (not
+`SigV4QueryAuth`) is the SDK class that produces what we verify. Reads over a
+session's budgets come back `503 SlowDown`. `front_content_auth` is OFF by
+default; minting is harmless while it is off, and the rollout order (edge
+cache key ignoring the query FIRST) is in the runbook. Full how-to:
+`docs/signing.md`.
 
 ### Run a viewer load test
 

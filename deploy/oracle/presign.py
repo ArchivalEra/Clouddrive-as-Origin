@@ -56,6 +56,12 @@ def main() -> int:
     ap.add_argument("--id", default=os.environ.get("SIGV4_ACCESS_KEY_ID", ""))
     ap.add_argument("--secret", default=os.environ.get("SIGV4_SECRET_ACCESS_KEY", ""))
     ap.add_argument("--scheme", default="https")
+    ap.add_argument(
+        "--method",
+        default="GET",
+        choices=["GET", "HEAD"],
+        help="HTTP method the URL authorizes (SigV4 signs the method: a GET URL is not valid for HEAD)",
+    )
     ap.add_argument("--date", default="", help="override X-Amz-Date (YYYYmmddTHHMMSSZ), for reproducible vectors")
     args = ap.parse_args()
 
@@ -85,7 +91,7 @@ def main() -> int:
         pairs.append(("session", args.session))
 
     canonical_request = "\n".join([
-        "GET",
+        args.method,
         uri_encode(args.key, True),
         canonical_query(pairs),
         f"host:{args.host}",

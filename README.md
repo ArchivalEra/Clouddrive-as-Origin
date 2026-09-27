@@ -102,6 +102,7 @@ To stand up a node, point a CDN and clients at it, and take its account, read
 ## Docs
 
 `docs/usage.md` (use it) · `docs/spec.md` (the contract) ·
+`docs/signing.md` (signed content reads: mint, use, troubleshoot) ·
 `docs/adr/README.md` (decisions) · `docs/runbook.md` (measurements) ·
 `docs/pitfalls.md` (traps, with evidence) · `docs/security-hardening.md` (the
 exposure and its closures) · `deploy/README.md` (instruments).

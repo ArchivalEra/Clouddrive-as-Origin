@@ -115,8 +115,10 @@ list surface is the same path with `?list-type=2`.
   backend mints one per viewing session with `deploy/oracle/presign.py` (or
   any S3 SDK) and hands the player a plain URL; each session lives under
   request/byte budgets, a lifted plain URL is refused at the front, and the
-  edge's cache key must ignore the query string first (spec §6). See the
-  runbook's "Content reads are presigned" for the rollout and rotation.
+  edge's cache key must ignore the query string first (spec §6). The full
+  how-to — minting, the HEAD/GET ticket split, the budget rules, the
+  symptom table — is **`docs/signing.md`**; the rollout and rotation are in
+  the runbook's "Content reads are presigned".
 
 Two client-shape cautions, both properties of content, not of this service: an
 unindexed **fragmented MP4** will not play in a bare `<video>` (needs MSE plus a

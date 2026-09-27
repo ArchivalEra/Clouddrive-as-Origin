@@ -5,6 +5,7 @@ and closes the door the flood test pointed at: a hostile or buggy client
 firing thousands of ranged reads per second at fresh offsets. Companions:
 ADR-0025 (admission to the PORT is the edge's token — unchanged, a different
 layer), `docs/security-hardening.md` R11 (superseded for the content surface),
+`docs/signing.md` (how a backend mints a URL and what every refusal means),
 `deploy/oracle/presign.py` (the signer site backends use), and the runbook's
 "Content reads are presigned" section (rollout).
 

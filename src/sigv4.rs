@@ -601,6 +601,21 @@ pub(crate) fn test_presign(
     uri_path: &str,
     extra_pairs: &[(String, String)],
 ) -> String {
+    test_presign_method("GET", access_key, secret, amz_date, expires, uri_path, extra_pairs)
+}
+
+/// As above, for the other method the origin gates (SigV4 signs the method,
+/// so a HEAD ticket is a separate URL from a GET ticket).
+#[cfg(test)]
+pub(crate) fn test_presign_method(
+    method: &str,
+    access_key: &str,
+    secret: &str,
+    amz_date: &str,
+    expires: u64,
+    uri_path: &str,
+    extra_pairs: &[(String, String)],
+) -> String {
     let scope_date = &amz_date[..8];
     let mut pairs: Vec<(String, String)> = vec![
         ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
@@ -612,7 +627,7 @@ pub(crate) fn test_presign(
     pairs.extend(extra_pairs.iter().cloned());
     let qs = canonical_query(&pairs, true);
     let canonical = format!(
-        "GET\n{}\n{qs}\nhost:cdn.example\n\nhost\nUNSIGNED-PAYLOAD",
+        "{method}\n{}\n{qs}\nhost:cdn.example\n\nhost\nUNSIGNED-PAYLOAD",
         uri_encode_string(uri_path, false)
     );
     let sts = string_to_sign(&canonical, amz_date, scope_date, "us-east-1", "s3");

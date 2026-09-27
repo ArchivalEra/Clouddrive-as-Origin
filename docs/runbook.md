@@ -145,7 +145,8 @@ decision, the residual exposure (a lifted URL still works against warm edge
 content) and the budgets' visibility caveat live in the ADR; this section is
 how to run it.
 
-**Minting a URL** (what a site backend does per viewing session):
+**Minting a URL** (what a site backend does per viewing session; the full
+how-to, including the SDK route and the symptom table, is `docs/signing.md`):
 
 ```sh
 python3 deploy/oracle/presign.py --host cdn.example --key googledrive1/film.mkv \
