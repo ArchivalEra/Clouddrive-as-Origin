@@ -78,6 +78,8 @@ so an end-to-end demo stays reproducible.
 | `fmp4-index.mjs` | an HLS byte-range playlist for part of a REMOTE fMP4, built by walking its `moof`/`mdat` headers (no download of the payload, no re-encode); also probes for a real index in the tail | workstation | node | runbook "Ten viewers on the real film through MSE"; pitfall 64 |
 | `player-swarm.mjs` | N viewer slots that play → seek → watch → die for hours, one JSON line per session | workstation | node + `PW_DIR` | runbook same |
 | `swarm-report.mjs` | turns that JSONL into outcomes, latencies, stalls and the interleaving timeline | workstation | node | runbook same |
+| `make-bundle.sh` | builds the STANDALONE viewer bundle (driver, report, page, wrapper scripts, shard sweeps, signer) into a directory outside the repo, with a `MANIFEST.sha256`; `--check <dir>` says whether a shipped copy is still current | workstation | bash, sed, sha256sum | runbook "Shipping the viewer bundle" |
+| `bundle/` | the bundle's own sources — the wrapper scripts (`run.sh`, `preflight.sh`, `detach.sh`, `monitor.sh`, `install.sh`), the bare-`<video>` page and its README; `make-bundle.sh` copies them (and the repo's instruments) into the artefact | — | — | runbook same |
 | `log-server.py` | a tiny local origin for viewer experiments | workstation | python3 | — |
 
 ## `deploy/` (loose)

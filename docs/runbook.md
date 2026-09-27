@@ -2168,6 +2168,37 @@ MiB/s**, so the slowest measured 2 MiB average (0.57–0.73 MB/s) sits right on 
 bitrate line — smoothness comes from reading ahead and from the edge, not from
 asking for bigger ranges.
 
+## Shipping the viewer bundle (2026-09-27)
+
+The viewer load tests sometimes run on a machine that has no checkout — the
+compile box, which is faster than the node and idle between builds. What goes
+there is a **standalone bundle**, and since 2026-09-27 it is a **product of this
+repo** rather than a hand-maintained second copy:
+
+```sh
+deploy/lab/viewer/make-bundle.sh /tmp/viewer-swarm      # build
+scp -r /tmp/viewer-swarm <far-side>:~/viewer-swarm/     # ship
+deploy/lab/viewer/make-bundle.sh --check <far-side copy>  # is that copy current?
+```
+
+Inside the bundle: `swarm.mjs` and `report.mjs` (the repo's `player-swarm.mjs`
+and `swarm-report.mjs`, renamed), `video-page.html` and the wrapper scripts
+(`run.sh`, `preflight.sh`, `detach.sh`, `monitor.sh`, `install.sh`), the two
+shard sweeps, `presign.py`, and `MANIFEST.sha256`. The far side verifies with
+`sha256sum -c MANIFEST.sha256`.
+
+Why it is generated rather than checked in: it drifted. A driver was edited on
+the far side and back-ported by hand, and the repo grew tolerance code for a
+page variant that existed nowhere else — the seam was in the wrong place. Now
+there is one home per instrument (the repo, under `deploy/lab/viewer/bundle/`
+for the wrapper scripts) and the far-side copy is compared against what the
+repo generates, not against memory. The generator refuses to write inside the
+repo (the bundle is deliberately not a repo artefact: it is what a deployment
+runs, not what this project ships), and it asserts every rename anchor, so a
+renamed file fails the build instead of silently producing a bundle whose
+usage text names something that is not there. `tests/bundle_generator.rs`
+holds all of that in CI, including "a modified copy is reported as stale".
+
 ## Reading the suite, and where the knowledge lives
 
 Every instrument under `deploy/` — what it answers, where it runs, what it

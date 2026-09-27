@@ -57,6 +57,9 @@ jobs:
       - name: "test (signing contract)"
         run: cargo test --locked --test signing_contract > ci-test-signing.log 2>&1
 
+      - name: "test (bundle generator)"
+        run: cargo test --locked --test bundle_generator > ci-test-bundle.log 2>&1
+
       - name: "test (front)"
         run: cargo test --locked -p origin-front --lib > ci-test-front.log 2>&1
 

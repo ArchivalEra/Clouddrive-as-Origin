@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>viewer session</title>
+<style>body{font:14px system-ui;margin:16px}video{width:320px;background:#000}</style>
+</head>
+<body>
+<video id="v" muted playsinline></video>
+<script>
+// One viewer session against ONE remote video, instrumented. Served from
+// localhost; the media is a cross-origin absolute URL (a plain media element
+// needs no CORS). Parameters:
+//   ?src=<absolute media url>   the video this session plays
+//   ?seek-after=<secs>          seconds of playback before the scripted seek
+//   ?seek=<secs>                where the seek goes (presentation time)
+//   ?watch=<secs>               stop cleanly this long after the seek
+// The account is window.__probe.snapshot(): startup, the seek's timing,
+// stalls and stalled milliseconds, the media's request count from the
+// resource timing buffer, and errors.
+const q = new URLSearchParams(location.search);
+const src = q.get('src');
+const v = document.getElementById('v');
+const p = window.__probe = {
+  events: [], errors: [], t0: performance.now(), done: false, stopReason: null,
+  seek: null, stalls: [], stalledMs: 0, playedMs: 0, firstPlaying: null,
+  startupMs: null, params: Object.fromEntries(q.entries()),
+};
+const t = () => Math.round(performance.now() - p.t0);
+const nowMs = () => performance.now();
+p.events.push({ t: t(), ev: 'page-loaded' });
+
+let stalledSince = null;
+v.addEventListener('playing', () => {
+  p.events.push({ t: t(), ev: 'playing' });
+  if (p.firstPlaying === null) { p.firstPlaying = nowMs(); p.startupMs = t(); }
+  if (stalledSince !== null) { p.stalledMs += nowMs() - stalledSince; stalledSince = null; }
+  if (p.seek && p.seek.resumeMs === null && p.seek.issuedAt !== null) {
+    p.seek.resumeMs = Math.round(nowMs() - p.seek.issuedAt);
+  }
+});
+const stallStart = (ev) => {
+  p.events.push({ t: t(), ev });
+  if (p.firstPlaying !== null) {
+    p.stalls.push({ t: t(), ev });
+    if (stalledSince === null) stalledSince = nowMs();
+  }
+};
+v.addEventListener('waiting', () => stallStart('waiting'));
+v.addEventListener('stalled', () => stallStart('stalled'));
+v.addEventListener('error', () => p.errors.push({ t: t(), ev: 'video-error', code: v.error ? v.error.code : null }));
+v.addEventListener('seeked', () => p.events.push({ t: t(), ev: 'seeked', to: v.currentTime }));
+
+function mediaRequests() {
+  const entries = performance.getEntriesByType('resource');
+  return entries.filter((e) => e.initiatorType === 'video' || e.name === src).length;
+}
+function finish(reason) {
+  if (p.done) return;
+  p.done = true;
+  p.stopReason = reason;
+  if (stalledSince !== null) { p.stalledMs += nowMs() - stalledSince; stalledSince = null; }
+  p.playedMs = p.firstPlaying === null ? 0 : Math.round(nowMs() - p.firstPlaying);
+  p.events.push({ t: t(), ev: 'done', reason });
+  try { v.pause(); } catch (e) {}
+}
+
+function schedule() {
+  const seekAfter = Number(q.get('seek-after') || 0);
+  const seekTo = Number(q.get('seek') || 0);
+  const watch = Number(q.get('watch') || 0);
+  if (seekAfter > 0) {
+    const waitStart = setInterval(() => {
+      if (p.firstPlaying === null) return;
+      clearInterval(waitStart);
+      setTimeout(() => {
+        p.seek = { target: seekTo, issuedAt: nowMs(), dataArrivedMs: null, resumeMs: null };
+        p.events.push({ t: t(), ev: 'seek-issued', to: seekTo });
+        try { v.currentTime = seekTo; } catch (e) { p.events.push({ t: t(), ev: 'seek-threw', msg: String(e) }); }
+        const pollData = setInterval(() => {
+          if (p.seek.dataArrivedMs !== null) { clearInterval(pollData); return; }
+          for (let i = 0; i < v.buffered.length; i++) {
+            if (v.buffered.start(i) <= seekTo && v.buffered.end(i) > seekTo) {
+              p.seek.dataArrivedMs = Math.round(nowMs() - p.seek.issuedAt);
+              clearInterval(pollData);
+              return;
+            }
+          }
+        }, 100);
+        if (watch > 0) setTimeout(() => finish('watched'), watch * 1000);
+      }, seekAfter * 1000);
+    }, 100);
+    setTimeout(() => { if (p.firstPlaying === null) finish('never-played'); }, (seekAfter + 180) * 1000);
+  } else if (watch > 0) {
+    const waitPlay = setInterval(() => {
+      if (p.firstPlaying === null) return;
+      clearInterval(waitPlay);
+      setTimeout(() => finish('watched'), watch * 1000);
+    }, 100);
+    setTimeout(() => { if (p.firstPlaying === null) finish('never-played'); }, 180 * 1000);
+  }
+}
+
+p.snapshot = () => ({
+  params: p.params,
+  done: p.done,
+  stopReason: p.stopReason,
+  startupMs: p.startupMs,
+  seek: p.seek ? { target: p.seek.target, issuedAt: p.seek.issuedAt, dataArrivedMs: p.seek.dataArrivedMs, resumeMs: p.seek.resumeMs } : null,
+  stalls: p.stalls.length,
+  stalledMs: Math.round(p.stalledMs),
+  playedMs: p.playedMs,
+  mediaReqs: mediaRequests(),
+  errors: p.errors,
+  fatalErrors: p.errors.length,
+  events: p.events.slice(-40),
+  ready: v.readyState,
+  currentTime: v.currentTime,
+  buffered: (() => { const out = []; for (let i = 0; i < v.buffered.length; i++) out.push([v.buffered.start(i), v.buffered.end(i)]); return out; })(),
+});
+
+v.src = src;
+// `?start=<secs>`: the session's opening position, set as soon as metadata
+// exists (an 80-hour Matroska seeks fine at loadedmetadata).
+const start = Number(q.get('start') || 0);
+v.addEventListener('loadedmetadata', () => {
+  if (start > 0) {
+    p.events.push({ t: t(), ev: 'start-position', to: start });
+    try { v.currentTime = start; } catch (e) { p.events.push({ t: t(), ev: 'start-threw', msg: String(e) }); }
+  }
+}, { once: true });
+v.play().catch((e) => p.events.push({ t: t(), ev: 'play-rejected', msg: String(e) }));
+schedule();
+</script>
+</body>
+</html>
