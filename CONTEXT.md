@@ -114,6 +114,23 @@ order, the un-keepable class) and every mutation finishes there. No caller holds
 the staged state across an await, and no call site has to know that ADR-0008's
 ordering rule exists — that is what "structural" means here.
 
+**signed read** — a content read (`GET`/`HEAD` on the public route) that carries
+a SigV4 presigned URL: standard S3 query-string authentication plus one signed
+parameter this deployment defines, `session`, which the per-session budgets
+charge. The signature proves the request came from a credential holder; the
+session marker bounds how fast one viewing session may spend (ADR-0027). Off by
+default (`front_content_auth`), and loopback probes stay exempt, so the node's
+own instruments sign nothing.
+
+**the signing contract** — `signing.rs`: the one place that says what a signed
+read must carry (parameter names), how long it may live (the protocol maximum
+and the deployment caps) and why one may be refused (`Reason`, a closed set
+whose spellings are also the metric labels and the rows of `docs/signing.md`).
+The verifier, the gate, the external signer (`deploy/oracle/presign.py`) and the
+documentation are its four consumers; `tests/signing_contract.rs` runs the
+signer against the gate and the document against the taxonomy, so none of the
+four can drift from the others without a test going red.
+
 ## Architecture terms
 
 **module / interface / implementation** — an interface is everything a caller must

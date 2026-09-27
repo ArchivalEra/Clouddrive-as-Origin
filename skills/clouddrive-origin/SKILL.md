@@ -96,12 +96,16 @@ python3 deploy/oracle/presign.py --host <the host the CLIENT requests> \
 ```
 The URL is a plain GET (or `--method HEAD`) ticket; SigV4 signs the METHOD, the
 HOST and every query parameter, so a HEAD needs its own ticket, the session
-marker cannot be added after minting, and `S3SigV4QueryAuth` (not
-`SigV4QueryAuth`) is the SDK class that produces what we verify. Reads over a
-session's budgets come back `503 SlowDown`. `front_content_auth` is OFF by
-default; minting is harmless while it is off, and the rollout order (edge
-cache key ignoring the query FIRST) is in the runbook. Full how-to:
-`docs/signing.md`.
+marker cannot be added after minting (and `--session` is required — the tool
+refuses to mint without it, `--no-session` reproduces the refusal on purpose),
+and `S3SigV4QueryAuth` (not `SigV4QueryAuth`) is the SDK class that produces
+what we verify. Reads over a session's budgets come back `503 SlowDown`.
+`front_content_auth` is OFF by default; minting is harmless while it is off,
+and the rollout order (edge cache key ignoring the query FIRST) is in the
+runbook. Full how-to: `docs/signing.md`. The protocol itself — parameters,
+caps, and every refusal — lives in `src/signing.rs`; the signer and the doc
+table are checked against it by `tests/signing_contract.rs`, so **do not** add
+a refusal string or a knob default anywhere else.
 
 ### Run a viewer load test
 

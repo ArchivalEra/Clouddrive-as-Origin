@@ -36,7 +36,10 @@ python3 deploy/oracle/presign.py \
 # -> https://cdn.example.com/googledrive1/film.mkv?X-Amz-Algorithm=...&X-Amz-Signature=...
 ```
 
-Add `--method HEAD` for a HEAD ticket (see "Method matters" below).
+Add `--method HEAD` for a HEAD ticket (see "Method matters" below). `--session`
+is required: the tool refuses to mint a URL without it, because the origin
+refuses to serve one (`--no-session` exists to reproduce that refusal on
+purpose, and is never a working ticket).
 
 If the backend already speaks S3, an SDK can sign it too — but use the **S3**
 query signer, not the generic one, and note that the high-level helpers
@@ -170,6 +173,16 @@ file (`sigv4_credentials_path`):
 
 Operators can watch the same decisions as a bounded metric:
 `origin_content_auth_total{outcome="allow|deny", reason="..."}`.
+
+Every reason above is a value of the contract's closed taxonomy
+(`src/signing.rs::Reason`), and this table is checked against it by
+`tests/signing_contract.rs` in both directions: a refusal that can reach a
+caller but is missing here fails the suite, a row naming something the code
+cannot produce fails it too, and the status column must equal what the code
+answers. Adding a row here without adding a variant (or the reverse) is
+therefore a test failure rather than a documentation bug waiting to be found.
+The same suite runs the signer below against the origin's verifier, so the tool
+cannot drift from this document either.
 
 ## The one CDN setting this depends on
 

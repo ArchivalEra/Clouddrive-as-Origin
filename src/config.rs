@@ -580,6 +580,18 @@ impl Config {
                  disabling the disk cache (and the staged-segment sweep)"
             );
         }
+        // ADR-0027: the content-auth caps are validated by the module that
+        // enforces them, so a knob that would turn the gate into a wall cannot
+        // reach the gate at all. (Whether a credential store actually loaded is
+        // checked in main.rs, which knows — config parsing stays a pure
+        // function of the file.)
+        crate::signing::Caps {
+            max_expiry_secs: raw.front_content_auth_max_expiry_secs,
+            session_rps: raw.front_content_auth_session_rps,
+            session_mib_per_min: raw.front_content_auth_session_mib_per_min,
+        }
+        .validate()
+        .map_err(|e| anyhow::anyhow!(e))?;
         {
             // Duplicate ids were silently resolved by "last one wins" in the
             // slot map, so one upstream's config vanished with no message.
@@ -883,6 +895,17 @@ mod tests {
             ("max_size_bytes = 0", "max_size_bytes"),
             // Expires every entry on every tick.
             ("inactive_ttl_secs = 0", "inactive_ttl_secs"),
+            // ADR-0027 caps: a zero here refuses every signed read (or every
+            // session after its first request) instead of disabling the knob.
+            ("front_content_auth_max_expiry_secs = 0", "front_content_auth_max_expiry_secs"),
+            ("front_content_auth_session_rps = 0", "front_content_auth_session_rps"),
+            (
+                "front_content_auth_session_mib_per_min = 0",
+                "front_content_auth_session_mib_per_min",
+            ),
+            // Over the protocol maximum is also a configuration error, not a
+            // silently clamped wish.
+            ("front_content_auth_max_expiry_secs = 604801", "front_content_auth_max_expiry_secs"),
         ] {
             let err = Config::from_toml_str(&with_field(field))
                 .unwrap_err()
@@ -1144,5 +1167,55 @@ mod tests {
             upstream = "a"
         "#;
         assert!(Config::from_toml_str(toml).is_err());
+    }
+
+    /// Every knob must be documented where an operator looks: a field added to
+    /// the config but never mentioned in `config.example.toml` is a knob only
+    /// its author knows. The review that produced this test found the inverse
+    /// rot too — a documented example block (commented on purpose, the default
+    /// is off) that no parse test ever touched, because comments are invisible
+    /// to TOML.
+    ///
+    /// The field list is read from this file's own source (`include_str!`, so
+    /// it is the source as compiled) rather than from a serialized default,
+    /// which would need `Serialize` on half the config types and would still go
+    /// stale the same way.
+    #[test]
+    fn every_config_field_is_documented_in_the_example() {
+        let source = include_str!("config.rs");
+        let body = source
+            .split_once("pub struct RawConfig {")
+            .expect("RawConfig in this file")
+            .1
+            .split("\n}")
+            .next()
+            .expect("struct body");
+        let fields: Vec<&str> = body
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix("pub ")?;
+                let (name, _) = rest.split_once(':')?;
+                let name = name.trim();
+                (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                    .then_some(name)
+            })
+            .collect();
+        assert!(fields.len() > 20, "the RawConfig scan found too few fields: {fields:?}");
+
+        let example = include_str!("../config.example.toml");
+        let documents = |name: &str| {
+            // Word-boundary match: `front_content_auth` must not be satisfied
+            // by `front_content_auth_exempt`.
+            example.match_indices(name).any(|(i, _)| {
+                let after = example[i + name.len()..].chars().next();
+                !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+        };
+        let missing: Vec<&str> = fields.iter().copied().filter(|f| !documents(f)).collect();
+        assert!(
+            missing.is_empty(),
+            "these config knobs are not mentioned in config.example.toml: {missing:?}"
+        );
     }
 }
