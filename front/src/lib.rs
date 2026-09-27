@@ -30,10 +30,9 @@ use prometheus::{
 };
 use tracing::{info, warn};
 
-/// Prewarm is a tiny authenticated POST; anything materially larger at
-/// the front is abuse and gets rejected before reaching the business
-/// plane (whose token check stays authoritative).
-pub const PREWARM_MAX_BODY: usize = 64 * 1024;
+mod admission;
+
+pub use admission::{Admission, Identity, RequestHead, Verdict, PREWARM_MAX_BODY};
 
 /// Everything the front plane needs at boot. CIDR lists are plain
 /// strings here; parsing (and its errors) happen in this crate so the
@@ -142,79 +141,6 @@ impl pingora::listeners::ConnectionFilter for IpFilter {
     }
 }
 
-/// Per-client-IP rate limiter (sliding window from pingora-limits).
-/// `exempt` CIDRs (the ops path) bypass it entirely.
-struct RateGate {
-    rate: pingora_limits::rate::Rate,
-    rps: u32,
-    exempt: Vec<IpNet>,
-}
-
-impl RateGate {
-    fn exceeds(&self, addr: &pingora::protocols::l4::socket::SocketAddr) -> bool {
-        // UDS peers have no IP to rate-limit; only inet sockets gate.
-        let Some(std_addr) = addr.as_inet() else {
-            return false;
-        };
-        if ip_in_any(&self.exempt, &std_addr.ip()) {
-            return false;
-        }
-        // rps == 0 means rate limiting is disabled — never gate.
-        // `observe` counts this request in the 1s window and returns the
-        // running count; strictly over the ceiling means refuse.
-        if self.rps == 0 {
-            return false;
-        }
-        self.rate.observe(&std_addr.ip().to_string(), 1) > self.rps as isize
-    }
-}
-
-/// Admission control (R4): the edge stamps every request it forwards with a
-/// secret header (`ModifyRequestHeader` on the CDN rule), so a request that does
-/// not carry it did not come from the edge — it came straight at the origin,
-/// past the CDN and past its accounting. Refusing those is what closes that
-/// bypass, and it does so without depending on the pull nodes' addresses, which
-/// are not published on this plan (docs/security-hardening.md R3).
-///
-/// `exempt` CIDRs are the peers that legitimately carry no stamp. A peer we
-/// cannot name is NOT exempt: no address, no trust.
-struct OriginTokenGate {
-    header: http::HeaderName,
-    value: Vec<u8>,
-    exempt: Vec<IpNet>,
-}
-
-impl OriginTokenGate {
-    fn new(header: &str, value: &str, exempt: Vec<IpNet>) -> anyhow::Result<Self> {
-        if value.is_empty() {
-            anyhow::bail!("origin token value is empty");
-        }
-        Ok(Self {
-            header: header
-                .parse()
-                .with_context(|| format!("parse origin token header name {header:?}"))?,
-            value: value.as_bytes().to_vec(),
-            exempt,
-        })
-    }
-
-    /// Must this peer carry the stamp?
-    fn requires(&self, peer: Option<&pingora::protocols::l4::socket::SocketAddr>) -> bool {
-        match peer.and_then(|a| a.as_inet()) {
-            Some(std_addr) => !ip_in_any(&self.exempt, &std_addr.ip()),
-            None => true,
-        }
-    }
-
-    fn accepts(&self, headers: &http::HeaderMap) -> bool {
-        let got = headers
-            .get(&self.header)
-            .map(http::HeaderValue::as_bytes)
-            .unwrap_or(b"");
-        constant_time_eq(got, &self.value)
-    }
-}
-
 /// Compare a presented secret with the expected one without leaking how much of
 /// it matched: `==` on slices returns at the first difference, and a timing
 /// signal over a secret is a way to learn it one byte at a time. The length
@@ -279,44 +205,6 @@ pub trait ContentAuth: Send + Sync {
     fn observe(&self, credential: &str, session: Option<&str>, bytes: u64);
 }
 
-/// The front-side half of the content gate: the seam types above know
-/// nothing about CIDRs, and the exemption list is a front concern (the
-/// same shape as the origin-token exemption). `check` returns `None` for
-/// "not this gate's business" — wrong method, an internal path, or an
-/// exempt peer — so the call site stays a flat match.
-struct ContentAuthGate {
-    auth: std::sync::Arc<dyn ContentAuth>,
-    exempt: Vec<IpNet>,
-}
-
-impl ContentAuthGate {
-    fn check(
-        &self,
-        method: &str,
-        path: &str,
-        path_and_query: &str,
-        host: Option<&str>,
-        peer: Option<&std::net::IpAddr>,
-    ) -> Option<ContentDecision> {
-        // Content reads only. Writes do not exist on this origin (the
-        // business route registers GET/HEAD alone), and everything under
-        // /_internal/ is the node's own surface with its own admission.
-        if !matches!(method, "GET" | "HEAD") || path.starts_with("/_internal/") {
-            return None;
-        }
-        // The node's own probes (accept.sh, the LAB, the watchdog) come
-        // from the exemption list, the same peers the origin token
-        // exempts. A peer we cannot name is not exempt.
-        if let Some(ip) = peer {
-            if ip_in_any(&self.exempt, ip) {
-                return None;
-            }
-        }
-        Some(self.auth.admit(&ContentRequest { method, path_and_query, host }))
-    }
-}
-
-
 /// Per-request front state. `start` exists for the access-log duration
 /// (map ticket 00); the connection gauge lives on `new_ctx`/`logging`
 /// bookends which are both guaranteed to run. `prewarm_body_bytes`
@@ -332,12 +220,12 @@ pub struct FrontCtx {
     connected_at: Option<Instant>,
     upstream_ttfb_at: Option<Instant>,
     prewarm_body_bytes: usize,
-    /// The content gate's verdict for this request: the identity an
-    /// `Allow` carried (for the access log and the byte accounting) or
-    /// the reason a `Deny` gave (the access log must be able to say why
-    /// a request never reached the business plane).
-    auth_identity: Option<(String, Option<String>)>,
-    auth_deny: Option<&'static str>,
+    /// The door's verdict for this request: the identity a `Serve` carried
+    /// (which the access log prints and the byte accounting charges) or the
+    /// reason a `Refuse` gave, so one log line says why a request never
+    /// reached the business plane.
+    identity: Option<Identity>,
+    refusal: Option<&'static str>,
 }
 
 /// Latency histogram buckets, milliseconds through minutes: the edge
@@ -466,9 +354,8 @@ pub fn acceptor_from_env(
 /// loopback. No cache semantics here — pure byte movement.
 pub struct BusinessProxy {
     pub business: SocketAddr,
-    rate: Option<std::sync::Arc<RateGate>>,
-    origin_token: Option<OriginTokenGate>,
-    content_auth: Option<ContentAuthGate>,
+    /// The door: the gates and the order they run in (`admission.rs`).
+    admission: Admission,
 }
 
 #[async_trait::async_trait]
@@ -482,101 +369,57 @@ impl ProxyHttp for BusinessProxy {
             connected_at: None,
             upstream_ttfb_at: None,
             prewarm_body_bytes: 0,
-            auth_identity: None,
-            auth_deny: None,
+            identity: None,
+            refusal: None,
         }
     }
 
-    /// Prewarm body-size gate, declared-length path: an over-cap
-    /// content-length is rejected before reading a single body byte.
-    /// Uses the error path (not the Ok(true) short-circuit) so that
-    /// `logging` still runs — the connection gauge stays paired and the
-    /// 413 shows up in metrics and the access log. The per-IP rate gate
-    /// shares this error-path discipline (429s must be observable).
+    /// The door. The order itself lives in `admission.rs` (with tests that
+    /// cross it); this method only translates a Pingora session into a
+    /// `RequestHead`, applies the verdict, and keeps the error-path discipline
+    /// every refusal shares: an `Err` (not an `Ok(true)` short-circuit) so
+    /// `logging` still runs, the connection gauge stays paired, and the status
+    /// shows up in metrics and the access log.
     async fn request_filter(
         &self,
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> ProxyResult<bool> {
-        // Everything under /_internal/ is the node's own surface, and exactly
-        // ONE entry in it belongs on the public hostname: prewarm, an
-        // authenticated write-side entry point the upload pipeline calls there,
-        // with every deployed config setting its shared secret. healthz -- and
-        // whatever internal route is added next -- discloses the upstream
-        // topology and configuration and is read on the business plane's
-        // loopback port instead. Refusing it here removes the path
-        // structurally rather than adding a token that can be leaked or
-        // misconfigured.
-        //
-        // The rule is the PREFIX, not a name. It used to name healthz exactly,
-        // so this front had to be told about every internal route the business
-        // plane grew -- and a rename on either side silently republished the
-        // route, because the two crates cannot see each other's spelling (this
-        // crate does not depend on the plane at all). A refusal that has to be
-        // kept in sync is not a refusal.
-        //
-        // 404, not 403: a caller should not learn that a private surface exists
-        // here at all.
-        let path = session.req_header().uri.path();
-        if path.starts_with("/_internal/") && !path.starts_with("/_internal/prewarm/") {
-            return Err(Error::new(ErrorType::HTTPStatus(404)));
-        }
-        // R4 admission control, ahead of the rate gate: a request that is not
-        // from the edge must not spend the budget that exists to protect the
-        // origin, and the answer depends on nothing the request says beyond the
-        // stamp. 403 says "not for you" without describing what lives here.
-        if let Some(gate) = self.origin_token.as_ref() {
-            if gate.requires(session.client_addr()) && !gate.accepts(&session.req_header().headers) {
-                return Err(Error::new(ErrorType::HTTPStatus(403)));
-            }
-        }
-        // Content-read admission (ADR-0027), ahead of the rate gate for the
-        // same reason the token gate is: a request that cannot name itself
-        // must not spend the budget that exists to protect the origin. The
-        // gate owns signature verification and the per-session budgets; the
-        // front owns the door, the log line and the CIDR exemptions.
-        if let Some(gate) = self.content_auth.as_ref() {
-            let req = session.req_header();
-            let path = req.uri.path();
-            let peer_ip = session.client_addr().and_then(|a| a.as_inet()).map(|a| a.ip());
-            let check = gate.check(
-                req.method.as_str(),
-                path,
-                req.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(path),
-                req.headers.get("host").and_then(|v| v.to_str().ok()),
-                peer_ip.as_ref(),
-            );
-            match check {
-                None => {}
-                Some(ContentDecision::Allow { credential, session: sess }) => {
-                    ctx.auth_identity = Some((credential, sess));
-                }
-                Some(ContentDecision::Deny { status, reason }) => {
-                    ctx.auth_deny = Some(reason);
-                    warn!(reason, path, "content auth denied");
-                    return Err(Error::new(ErrorType::HTTPStatus(status)));
-                }
-            }
-        }
-        if let Some(gate) = self.rate.as_ref() {
-            if let Some(addr) = session.client_addr() {
-                if gate.exceeds(addr) {
-                    return Err(Error::new(ErrorType::HTTPStatus(429)));
-                }
-            }
-        }
-        if session.req_header().uri.path().starts_with("/_internal/prewarm/") {
-            let declared = session
-                .req_header()
+        let req = session.req_header();
+        let path = req.uri.path();
+        let head = RequestHead {
+            method: req.method.as_str(),
+            path,
+            path_and_query: req.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(path),
+            host: req.headers.get("host").and_then(|v| v.to_str().ok()),
+            // The `[::]` listener reports an IPv4 peer mapped; the admission
+            // module canonicalizes before matching, so either form works.
+            peer: session.client_addr().and_then(|a| a.as_inet()).map(|a| a.ip()),
+            declared_len: req
                 .headers
                 .get(http::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<usize>().ok());
-            if declared.is_some_and(|v| v > PREWARM_MAX_BODY) {
-                return Err(Error::new(ErrorType::HTTPStatus(413)));
+                .and_then(|v| v.parse::<u64>().ok()),
+            headers: &req.headers,
+        };
+        match self.admission.check(&head) {
+            Verdict::Serve { identity } => {
+                ctx.identity = identity;
+                Ok(false)
+            }
+            Verdict::Refuse { status, reason } => {
+                ctx.refusal = Some(reason);
+                if status != 404 {
+                    // A refusal that is not the private-surface 404 is worth a
+                    // line: the access log carries the reason, but a warning
+                    // next to the request makes a spike visible while
+                    // tailing. (The 404 stays quiet on purpose — a probe
+                    // should not even learn the surface exists.)
+                    warn!(status, reason, path, "request refused at the door");
+                }
+                Err(Error::new(ErrorType::HTTPStatus(status)))
             }
         }
-        Ok(false)
     }
 
     /// Prewarm body-size gate, chunked backstop: content-length can lie
@@ -593,7 +436,7 @@ impl ProxyHttp for BusinessProxy {
             if let Some(b) = body {
                 ctx.prewarm_body_bytes = ctx.prewarm_body_bytes.saturating_add(b.len());
             }
-            if ctx.prewarm_body_bytes > PREWARM_MAX_BODY {
+            if self.admission.prewarm_body_exceeds(ctx.prewarm_body_bytes) {
                 return Err(Error::new(ErrorType::HTTPStatus(413)));
             }
         }
@@ -712,13 +555,15 @@ impl ProxyHttp for BusinessProxy {
             .unwrap_or_else(|| "-".to_string());
         // Byte accounting for the content gate (ADR-0027): the identity was
         // decided at the door, the size was only known once the body moved.
-        // Denied requests carry no identity and observe nothing.
-        if let (Some(gate), Some((credential, sess))) = (&self.content_auth, ctx.auth_identity.as_ref()) {
-            gate.auth.observe(credential, sess.as_deref(), session.body_bytes_sent() as u64);
+        // Refused requests carry no identity and are charged nothing.
+        if let Some(identity) = ctx.identity.as_ref() {
+            self.admission.account(identity, session.body_bytes_sent() as u64);
         }
-        let auth = match (&ctx.auth_identity, ctx.auth_deny) {
-            (Some((c, Some(s))), _) => format!("{c}/{s}"),
-            (Some((c, None)), _) => c.clone(),
+        let auth = match (&ctx.identity, ctx.refusal) {
+            (Some(identity), _) => match identity.session.as_deref() {
+                Some(session_id) => format!("{}/{session_id}", identity.credential),
+                None => identity.credential.clone(),
+            },
             (None, Some(reason)) => format!("DENIED:{reason}"),
             (None, None) => "-".to_string(),
         };
@@ -747,59 +592,32 @@ pub fn run_front(opts: FrontOptions) -> anyhow::Result<()> {
     let mut server = Server::new(None).context("create pingora server")?;
     server.bootstrap();
 
-    let ip_allow = parse_cidrs(&opts.ip_allow)?;
-    // R4: build the admission gate from plain strings, the same way the CIDR
-    // lists are built here rather than in the config layer.
-    let origin_token = match &opts.origin_token {
-        Some((header, value)) => Some(OriginTokenGate::new(
-            header,
-            value,
-            parse_cidrs(&opts.origin_token_exempt)?,
-        )?),
-        None => None,
-    };
-    match &origin_token {
-        Some(g) => info!(
-            header = %g.header,
+    // The door: gates + order, built from the plain strings the config layer
+    // carries (CIDR parsing and its errors belong to this crate).
+    let admission = Admission::from_options(&opts)?;
+    // Boot state, because an admission control that is silently absent is
+    // worse than one that refuses: each knob that is off says so, and each one
+    // that is on names its exemptions.
+    match opts.origin_token.as_ref() {
+        Some((header, _)) => info!(
+            header = %header,
             exempt = opts.origin_token_exempt.len(),
             "front origin-token admission control active"
         ),
-        // Off is a choice, not a default to be discovered later: whoever reaches
-        // this port without the stamp is served, so say it at boot.
-        None => warn!("front origin-token admission control OFF: any peer that reaches this port is served"),
+        None => warn!(
+            "front origin-token admission control OFF: any peer that reaches this port is served"
+        ),
     }
-    let rate = opts.rate_rps.map(|rps| {
-        std::sync::Arc::new(RateGate {
-            rate: pingora_limits::rate::Rate::new(std::time::Duration::from_secs(1)),
-            rps,
-            exempt: ip_allow,
-        })
-    });
-    // Content-read admission (ADR-0027): the decision comes from the gate the
-    // binary handed in; the CIDR exemptions are parsed here, next to the other
-    // front gates. Boot log states the shape, because an admission control
-    // that is silently absent is worse than one that refuses.
-    let content_auth = match &opts.content_auth {
-        Some(auth) => {
-            let exempt = parse_cidrs(&opts.content_auth_exempt)?;
-            info!(
-                exempt = opts.content_auth_exempt.len(),
-                "front content auth active: content reads require a signature (ADR-0027)"
-            );
-            Some(ContentAuthGate { auth: std::sync::Arc::clone(auth), exempt })
-        }
-        None => {
-            warn!("front content auth OFF: content reads are served to any peer that reaches this port");
-            None
-        }
-    };
+    if opts.content_auth.is_some() {
+        info!(
+            exempt = opts.content_auth_exempt.len(),
+            "front content auth active: content reads require a signature (ADR-0027)"
+        );
+    } else {
+        warn!("front content auth OFF: content reads are served to any peer that reaches this port");
+    }
 
-    let proxy = BusinessProxy {
-        business: opts.business,
-        rate,
-        origin_token,
-        content_auth,
-    };
+    let proxy = BusinessProxy { business: opts.business, admission };
     // Build the proxy service directly rather than via
     // `http_proxy_service`: its builder path leaves `h2_options` at None
     // in pingora 0.8.1 (the field exists but has no setter and is marked
@@ -890,89 +708,6 @@ mod tests {
         assert!(f.accepts(&addr("198.51.100.5:1")));
     }
 
-    /// R4: the gate accepts exactly one value, under any spelling of the header
-    /// name, and nothing else — no header, a wrong value, or a value that is a
-    /// prefix of the secret all fail.
-    #[test]
-    fn origin_token_gate_accepts_only_the_stamp() {
-        let gate = OriginTokenGate::new(
-            "X-Origin-Token",
-            "s3cret-value",
-            vec![parse_cidr("127.0.0.0/8").unwrap()],
-        )
-        .unwrap();
-        let mut h = http::HeaderMap::new();
-        assert!(!gate.accepts(&h), "no header must not pass");
-        h.insert(
-            http::HeaderName::from_static("x-origin-token"),
-            "wrong".parse().unwrap(),
-        );
-        assert!(!gate.accepts(&h), "a wrong value must not pass");
-        h.insert(
-            http::HeaderName::from_static("x-origin-token"),
-            "s3cret".parse().unwrap(),
-        );
-        assert!(!gate.accepts(&h), "a prefix of the secret must not pass");
-        h.insert(
-            http::HeaderName::from_static("x-origin-token"),
-            "s3cret-value".parse().unwrap(),
-        );
-        assert!(gate.accepts(&h), "the stamped value must pass");
-        // The edge writes the header name in its own spelling. HTTP field names
-        // are case-insensitive, and this is the spelling the node's config
-        // carries ("X-Origin-Token"), so the lookup has to be too. (from_static
-        // refuses mixed case by design; `parse` is the case-insensitive path.)
-        let mut spelled = http::HeaderMap::new();
-        spelled.insert(
-            "X-Origin-Token".parse::<http::HeaderName>().unwrap(),
-            "s3cret-value".parse().unwrap(),
-        );
-        assert!(gate.accepts(&spelled));
-        // An empty configured value is refused at construction, not accepted as
-        // "send the header empty-handed".
-        assert!(OriginTokenGate::new("X-Origin-Token", "", vec![]).is_err());
-    }
-
-    /// R4: who has to carry the stamp. Loopback is the node's own probes; a peer
-    /// we cannot name is refused (fail closed); an empty exempt list means even
-    /// loopback must be stamped, which is the arm the LAB exercises.
-    #[test]
-    fn origin_token_gate_exempts_loopback_only() {
-        use pingora::protocols::l4::socket::SocketAddr as PSockAddr;
-        let gate = OriginTokenGate::new(
-            "X-Origin-Token",
-            "s3cret-value",
-            vec![
-                parse_cidr("127.0.0.1/32").unwrap(),
-                parse_cidr("::1/128").unwrap(),
-            ],
-        )
-        .unwrap();
-        assert!(
-            !gate.requires(Some(&PSockAddr::Inet(addr("127.0.0.1:5")))),
-            "loopback is the node's own probes"
-        );
-        assert!(!gate.requires(Some(&PSockAddr::Inet(addr("[::1]:5")))));
-        assert!(
-            gate.requires(Some(&PSockAddr::Inet(addr("203.0.113.9:5")))),
-            "a remote peer must be stamped"
-        );
-        assert!(gate.requires(None), "no address, no trust");
-        let strict = OriginTokenGate::new("X-Origin-Token", "s3cret-value", vec![]).unwrap();
-        assert!(
-            strict.requires(Some(&PSockAddr::Inet(addr("127.0.0.1:5")))),
-            "with no exempt list even loopback is stamped"
-        );
-        // The form the dual-stack listener actually reports for a v4 peer, and
-        // the reason every list here goes through `ip_in_any`: measured on the
-        // node, this exact address failed to match `127.0.0.1/32` and the
-        // exemption silently did not apply.
-        assert!(
-            !gate.requires(Some(&PSockAddr::Inet(addr("[::ffff:127.0.0.1]:5")))),
-            "an IPv4-mapped loopback peer is loopback"
-        );
-    }
-
     /// Every CIDR list in this crate means the same thing on either socket:
     /// `[::]` reports an IPv4 peer in the mapped form, so an IPv4 CIDR has to
     /// match it. This is the regression that cost the loopback exemption on the
@@ -1000,25 +735,6 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(!constant_time_eq(b"abc", b""));
         assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn rate_gate_exempts_allowlist() {
-        use pingora::protocols::l4::socket::SocketAddr as PSockAddr;
-        let g = RateGate {
-            rate: pingora_limits::rate::Rate::new(std::time::Duration::from_secs(1)),
-            rps: 1,
-            exempt: vec![parse_cidr("127.0.0.0/8").unwrap()],
-        };
-        let loopback = PSockAddr::Inet(addr("127.0.0.1:1"));
-        for _ in 0..10 {
-            assert!(!g.exceeds(&loopback), "exempt ip must never exceed");
-        }
-        // a non-exempt ip exceeds on the 2nd event within the window
-        // (observe counts the current event: 1st = 1 <= rps, 2nd = 2 > rps)
-        let other = PSockAddr::Inet(addr("192.0.2.1:1"));
-        assert!(!g.exceeds(&other));
-        assert!(g.exceeds(&other));
     }
 
     fn rendered() -> String {
@@ -1115,108 +831,8 @@ mod tests {
         }
     }
 
-    /// A fake adapter: records what it was asked, answers from a script.
-    /// The seam's test surface is `ContentAuthGate::check` — the same call
-    /// `request_filter` makes, without a Pingora session in the way.
-    struct FakeGate {
-        asked: std::sync::Mutex<Vec<String>>,
-        answer: std::sync::Mutex<Option<ContentDecision>>,
-    }
-    impl FakeGate {
-        fn denying(status: u16, reason: &'static str) -> Self {
-            Self {
-                asked: std::sync::Mutex::new(Vec::new()),
-                answer: std::sync::Mutex::new(Some(ContentDecision::Deny { status, reason })),
-            }
-        }
-        fn allowing() -> Self {
-            Self {
-                asked: std::sync::Mutex::new(Vec::new()),
-                answer: std::sync::Mutex::new(Some(ContentDecision::Allow {
-                    credential: "tenant-a".into(),
-                    session: Some("sess-1".into()),
-                })),
-            }
-        }
-    }
-    impl ContentAuth for FakeGate {
-        fn admit(&self, request: &ContentRequest<'_>) -> ContentDecision {
-            self.asked
-                .lock()
-                .unwrap()
-                .push(format!("{} {}", request.method, request.path_and_query));
-            self.answer.lock().unwrap().clone().expect("scripted answer")
-        }
-        fn observe(&self, _credential: &str, _session: Option<&str>, _bytes: u64) {}
-    }
-
-    fn gate(exempt: &[&str], fake: std::sync::Arc<FakeGate>) -> ContentAuthGate {
-        ContentAuthGate { auth: fake, exempt: exempt.iter().map(|s| parse_cidr(s).unwrap()).collect() }
-    }
-
-    fn ip(s: &str) -> std::net::IpAddr {
-        s.parse().unwrap()
-    }
-
-    /// The gate's scope: content reads only — GET and HEAD on the public
-    /// route, from peers the exemption list does not name. Everything else
-    /// is "not my business" (None), and the adapter is never asked.
-    #[test]
-    fn content_gate_scope_is_content_reads_from_unexempt_peers() {
-        let fake = std::sync::Arc::new(FakeGate::allowing());
-        let g = gate(&["127.0.0.0/8"], std::sync::Arc::clone(&fake));
-        for (method, path, asked) in [
-            ("GET", "/googledrive1/film.mkv", true),
-            ("HEAD", "/googledrive1/film.mkv", true),
-            ("get", "/googledrive1/film.mkv", false), // methods are case-sensitive HTTP verbs here
-            ("POST", "/googledrive1/film.mkv", false),
-            ("PUT", "/googledrive1/film.mkv", false),
-            ("GET", "/_internal/prewarm/x", false),
-            ("GET", "/_internal/healthz", false),
-        ] {
-            let saw = g.check(method, path, path, Some("cdn.example"), Some(&ip("198.51.100.9")));
-            assert_eq!(saw.is_some(), asked, "{method} {path}");
-        }
-        assert_eq!(
-            fake.asked.lock().unwrap().len(),
-            2,
-            "only the two content reads reached the adapter"
-        );
-    }
-
-    /// The exemption list is a front concern and uses the mapped-peer
-    /// matching the other gates use: a v4 loopback peer arrives as
-    /// `::ffff:127.0.0.1` on the `[::]` listener and must still be exempt.
-    #[test]
-    fn content_gate_exemption_covers_mapped_loopback() {
-        let g = gate(&["127.0.0.1"], std::sync::Arc::new(FakeGate::allowing()));
-        let v4_mapped = ip("::ffff:127.0.0.1");
-        assert!(
-            g.check("GET", "/x", "/x", None, Some(&v4_mapped)).is_none(),
-            "mapped loopback must be exempt"
-        );
-        assert!(g.check("GET", "/x", "/x", None, Some(&ip("198.51.100.9"))).is_some());
-        // A peer we cannot name is NOT exempt.
-        assert!(g.check("GET", "/x", "/x", None, None).is_some());
-    }
-
-    /// A Deny passes through unchanged — status and the fixed reason — so
-    /// the error path and the log line can both carry it.
-    #[test]
-    fn content_gate_passes_denial_through() {
-        let fake = std::sync::Arc::new(FakeGate::denying(403, "missing signature"));
-        let g = gate(&[], std::sync::Arc::clone(&fake));
-        match g.check("GET", "/x", "/x?y=1", Some("cdn.example"), Some(&ip("203.0.113.9"))) {
-            Some(ContentDecision::Deny { status, reason }) => {
-                assert_eq!(status, 403);
-                assert_eq!(reason, "missing signature");
-            }
-            other => panic!("expected a denial, got {other:?}"),
-        }
-        assert_eq!(
-            fake.asked.lock().unwrap().first().map(String::as_str),
-            Some("GET /x?y=1"),
-            "the adapter sees the raw, still-encoded path and query"
-        );
-    }
+    // The gate's scope and its exemption list are covered where the gate
+    // lives (`admission.rs`, which owns the order and the CIDRs); this module
+    // keeps the tests for what stays here — the CIDR helpers, the connection
+    // filter, the metrics surface and the TLS choice.
 }

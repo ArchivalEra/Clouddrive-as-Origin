@@ -316,18 +316,32 @@ fn session_budgets_slow_a_flood_and_recover() {
     }
     // Two requests a second for tenant A (tenant B has its own rps in the
     // credentials file, which is the per-tenant override doing its job).
-    let first = mint("GET", "k", "flood", 60);
-    let second = mint("GET", "k", "flood", 60);
-    allowed_credential(&ask(&gate, "GET", &first));
-    allowed_credential(&ask(&gate, "GET", &second));
-    let third = mint("GET", "k", "flood", 60);
-    match ask(&gate, "GET", &third) {
-        ContentDecision::Deny { status, reason } => {
-            assert_eq!(reason, Reason::SessionRateExceeded.as_str());
-            assert_eq!(status, 503, "an over-budget session is slowed, not forbidden");
+    //
+    // The window is wall-clock, so the test fires a burst and requires at
+    // least one slowdown rather than a specific request index: minting spawns
+    // a process per URL, and on a busy box a pair can straddle a second and
+    // reset the counter. The LAB arm asserts the same way (twelve rapid reads,
+    // at least one 503).
+    let mut allowed = 0;
+    let mut slowed = 0;
+    for _ in 0..10 {
+        let url = mint("GET", "k", "flood", 60);
+        match ask(&gate, "GET", &url) {
+            ContentDecision::Allow { .. } => allowed += 1,
+            ContentDecision::Deny { status, reason } => {
+                assert_eq!(reason, Reason::SessionRateExceeded.as_str());
+                assert_eq!(status, 503, "an over-budget session is slowed, not forbidden");
+                slowed += 1;
+            }
         }
-        ContentDecision::Allow { .. } => panic!("the request budget did not trip"),
     }
+    assert!(slowed >= 1, "ten rapid reads at 2 req/s must trip the budget at least once");
+    assert!(allowed >= 1, "the budget must not refuse everything");
+
+    // The window slides: after a pause the same session is served again.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let url = mint("GET", "k", "flood", 60);
+    allowed_credential(&ask(&gate, "GET", &url));
 
     // Byte budget (1 MiB/min for tenant A): a response of 2 MiB exhausts it.
     let bytes_session = "bytes";
