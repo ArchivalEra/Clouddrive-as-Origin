@@ -564,10 +564,17 @@ entry for being obvious in hindsight — hindsight is the point.
     poll of 44 KiB against a 64 KiB floor. What the test is about is that the
     window is read OUT (that is what earns the successor's doubling), so it now
     accumulates and asserts the total; the sibling tests that assert a PARTIAL
-    first chunk were right as they were. One test still flakes only under
-    ARTIFICIAL 8x oversubscription (a reaper-tick wait) and was not chased: the
-    gate is CI on a normal runner, and the LAB's own guard already says the
-    timing assertions measure the machine.
+    first chunk were right as they were. A sixth surfaced the same way as the
+    others — under load, not under a code change: `spawned_reaper_expires_
+    entries_without_manual_tick` waited for the reaper's ledger row to vanish
+    and THEN asserted the file was unlinked, and the reaper does those in two
+    steps (the gap widens on a busy box; caught 2026-09-27 at load ~9 after
+    being seen once and left unnamed the same day). The fix is the rule this
+    pitfall keeps restating: wait for the state you assert on — the wait now
+    covers `entries == 0 && !path.exists()` — not for a proxy of it. The
+    lesson to carry: "it only flakes under artificial load" is a hypothesis,
+    not a verdict; the machine was real, the race was real, and naming it took
+    one grep of the assertion.
 
 67. **Bash's `RANDOM` is 15 bits, and a modulo that never wraps is not a random
     offset.** `cold-load.sh` drew `off=$(( (RANDOM * 32768 + RANDOM) % (TOTAL -

@@ -403,11 +403,17 @@ async fn spawned_reaper_expires_entries_without_manual_tick() {
     // real-time moment to fire (the loop interval is wall time, the TTL is
     // mock-clock time).
     clock.advance(1_201_000);
-    wait_until("the spawned reaper to expire the entry", || async {
-        cache.snapshot().await.entries == 0
+    // The reaper drops the ledger row and unlinks the file in two steps, and
+    // under load the gap between them is visible: waiting for `entries == 0`
+    // and then asserting the file raced the unlink. That is how this test
+    // flaked on a busy box. Wait for the state being asserted, not for a proxy
+    // of it (pitfall 66).
+    let path = cache.config.cache_dir.join("old.png");
+    wait_until("the spawned reaper to expire the entry and delete its file", || async {
+        cache.snapshot().await.entries == 0 && !path.exists()
     })
     .await;
-    assert!(!cache.config.cache_dir.join("old.png").exists(), "expired file must be deleted");
+    assert!(!path.exists(), "expired file must be deleted");
 }
 
 // ---------------------------------------------------------------------------
