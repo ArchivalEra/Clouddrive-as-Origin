@@ -26,11 +26,8 @@ use origin_front::{ContentAuth, ContentDecision, ContentRequest};
 
 use crate::config::Config;
 use crate::metrics::CONTENT_AUTH_TOTAL;
+use crate::signing::{param, Reason, PROTOCOL_MAX_EXPIRES_SECS, SESSION_MAX_LEN};
 use crate::sigv4::{self, CredentialStore, VerifyInput};
-
-/// The longest `X-Amz-Expires` honoured regardless of config — AWS's own
-/// presigned ceiling. The deployment's shorter cap is config.
-const PROTOCOL_MAX_EXPIRES_SECS: u64 = 604_800;
 
 /// Sessions tracked at once. A session costs a few hundred bytes; this cap
 /// bounds the table under a flood of fresh session ids, which is the same
@@ -39,11 +36,6 @@ const SESSION_TABLE_CAP: usize = 4096;
 
 /// How long an untouched session stays droppable when the table is full.
 const SESSION_IDLE_SECS: i64 = 300;
-
-/// A `session` parameter is an opaque budget key, not an identity: bounded
-/// length, printable ASCII, so it can neither flood the log with control
-/// characters nor grow a map entry without bound.
-const SESSION_MAX_LEN: usize = 128;
 
 /// Queries are parsed to verify them, so bound them before parsing.
 const MAX_QUERY_BYTES: usize = 8 * 1024;
@@ -103,7 +95,7 @@ impl SessionTables {
     /// The request half of the budget: count one request, and refuse when the
     /// session's byte window is already exhausted (the bytes themselves are
     /// only known after the body moved — see `ContentAuth::observe`).
-    fn admit(&mut self, key: &str, now: i64, rps: u64, bytes_per_min: u64) -> Result<(), &'static str> {
+    fn admit(&mut self, key: &str, now: i64, rps: u64, bytes_per_min: u64) -> Result<(), Reason> {
         if self.sessions.len() >= SESSION_TABLE_CAP {
             self.sessions.retain(|_, s| now - s.last_seen <= SESSION_IDLE_SECS);
             // Still full after the age sweep: a live flood of fresh sessions.
@@ -126,10 +118,10 @@ impl SessionTables {
         });
         entry.last_seen = now;
         if entry.requests.used(now) + 1 > rps {
-            return Err("session rate exceeded");
+            return Err(Reason::SessionRateExceeded);
         }
         if entry.bytes.used(now) >= bytes_per_min {
-            return Err("session bytes exceeded");
+            return Err(Reason::SessionBytesExceeded);
         }
         entry.requests.add(now, 1);
         Ok(())
@@ -199,14 +191,14 @@ impl ContentAuth for ContentGate {
         // Bound before parsing: the verifier is on the flood path, and an
         // unbounded query is itself a way to spend our memory.
         if query.len() > MAX_QUERY_BYTES {
-            return deny(403, "malformed request");
+            return deny(Reason::MalformedRequest);
         }
         let pairs: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
             .take(MAX_QUERY_PAIRS + 1)
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         if pairs.len() > MAX_QUERY_PAIRS {
-            return deny(403, "malformed request");
+            return deny(Reason::MalformedRequest);
         }
         let decoded_path = percent_encoding::percent_decode_str(raw_path).decode_utf8_lossy().into_owned();
         // The session marker is signed like any other query parameter (the
@@ -215,7 +207,7 @@ impl ContentAuth for ContentGate {
         // after the signature: a refusal says the least specific thing
         // first — an unsigned request learns nothing about what else is
         // required.
-        let session_param = pairs.iter().find(|(k, _)| k == "session").map(|(_, v)| v.clone());
+        let session_param = pairs.iter().find(|(k, _)| k == param::SESSION).map(|(_, v)| v.clone());
         let header_pairs: Vec<(String, String)> = match request.host {
             Some(h) => vec![("host".to_string(), h.to_string())],
             None => vec![],
@@ -230,27 +222,27 @@ impl ContentAuth for ContentGate {
         };
         let verified = match sigv4::verify_optional(Some(&self.store), &input, now) {
             sigv4::VerifyOutcome::Verified(v) => v,
-            sigv4::VerifyOutcome::Anonymous => return deny(403, "missing signature"),
-            sigv4::VerifyOutcome::Failed(reason) => return deny(403, reason),
+            sigv4::VerifyOutcome::Anonymous => return deny(Reason::MissingSignature),
+            sigv4::VerifyOutcome::Failed(reason) => return deny(reason),
         };
         let session = match session_param.as_deref() {
             Some(s) if Self::valid_session(s) => Some(s.to_string()),
-            Some(_) => return deny(403, "malformed session"),
-            None => return deny(403, "missing session"),
+            Some(_) => return deny(Reason::MalformedSession),
+            None => return deny(Reason::MissingSession),
         };
         if verified.expires_secs > self.max_expiry_secs {
-            return deny(403, "expires too long");
+            return deny(Reason::ExpiresTooLong);
         }
         // Tenant confinement: a credential reads only under its prefix, so a
         // site's key cannot pull another site's objects.
         let entry = match self.store.lookup(&verified.access_key_id) {
             Some(e) => e,
-            None => return deny(403, "unknown access key"),
+            None => return deny(Reason::UnknownAccessKey),
         };
         if let Some(prefix) = &entry.prefix {
             let allowed = decoded_path.strip_prefix('/').is_some_and(|key| key.starts_with(prefix.as_str()));
             if !allowed {
-                return deny(403, "outside key prefix");
+                return deny(Reason::OutsideKeyPrefix);
             }
         }
         let key: Box<str> =
@@ -263,10 +255,10 @@ impl ContentAuth for ContentGate {
             .max(1);
         let mut tables = match self.tables.lock() {
             Ok(t) => t,
-            Err(_) => return deny(503, "session rate exceeded"),
+            Err(_) => return deny(Reason::SessionRateExceeded),
         };
         if let Err(reason) = tables.admit(&key, now, rps, bytes_per_min) {
-            return deny(503, reason);
+            return deny(reason);
         }
         CONTENT_AUTH_TOTAL.with_label_values(&["allow", "ok"]).inc();
         ContentDecision::Allow { credential: verified.access_key_id, session }
@@ -282,11 +274,13 @@ impl ContentAuth for ContentGate {
     }
 }
 
-/// Every refusal goes through here so the metric keeps a bounded label set:
-/// `reason` is always one of the gate's own (or the verifier's) fixed strings.
-fn deny(status: u16, reason: &'static str) -> ContentDecision {
-    CONTENT_AUTH_TOTAL.with_label_values(&["deny", reason]).inc();
-    ContentDecision::Deny { status, reason }
+/// Every refusal goes through here, so the metric's `reason` label is always
+/// one of [`Reason`]'s spellings — a closed set the documentation check in
+/// `tests/signing_contract.rs` enumerates. The status comes from the reason,
+/// so a refusal cannot be labelled 403 and answer 503.
+fn deny(reason: Reason) -> ContentDecision {
+    CONTENT_AUTH_TOTAL.with_label_values(&["deny", reason.as_str()]).inc();
+    ContentDecision::Deny { status: reason.status(), reason: reason.as_str() }
 }
 
 #[cfg(test)]

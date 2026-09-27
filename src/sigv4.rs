@@ -15,6 +15,7 @@
 //! v4a (ECDSA-P256) is deferred (no verifier crate exists); v2 unsupported.
 
 use anyhow::Context;
+use crate::signing::{param, Reason, PROTOCOL_MAX_EXPIRES_SECS};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -292,7 +293,7 @@ fn signed_headers_list(signed_names: &[&str]) -> String {
 fn canonical_query(pairs: &[(String, String)], skip_signature: bool) -> String {
     let mut qs: Vec<(String, String)> = Vec::new();
     for (n, v) in pairs {
-        if skip_signature && n == "X-Amz-Signature" {
+        if skip_signature && n == param::SIGNATURE {
             continue;
         }
         qs.push((uri_encode_string(n, true), uri_encode_string(v, true)));
@@ -347,7 +348,7 @@ pub enum VerifyOutcome {
     /// No SigV4 material present: anonymous passthrough (D1).
     Anonymous,
     Verified(VerifiedRequest),
-    Failed(&'static str),
+    Failed(Reason),
 }
 
 /// Derive the SigV4 signing key:
@@ -560,9 +561,6 @@ impl CredentialStore {
 /// AWS SigV4 reference window).
 const MAX_SKEW_SECS: i64 = 900;
 
-/// `X-Amz-Expires` upper bound: 7 days (AWS max, s3s boundary-tested).
-const MAX_PRESIGNED_EXPIRES_SECS: u64 = 604_800;
-
 /// Current Unix time in seconds (the middleware's clock; tests inject
 /// their own).
 pub fn now_unix() -> i64 {
@@ -651,7 +649,7 @@ pub fn verify_optional(
 ) -> VerifyOutcome {
     let Some(store) = store else { return VerifyOutcome::Anonymous };
     // Presigned form: X-Amz-Signature in the query.
-    if input.query_pairs.iter().any(|(k, _)| k == "X-Amz-Signature") {
+    if input.query_pairs.iter().any(|(k, _)| k == param::SIGNATURE) {
         return match verify_presigned(store, input, now_unix) {
             Ok(v) => VerifyOutcome::Verified(v),
             Err(e) => VerifyOutcome::Failed(e),
@@ -678,30 +676,36 @@ fn verify_header(
     input: &VerifyInput<'_>,
     auth_header: &str,
     now_unix: i64,
-) -> Result<VerifiedRequest, &'static str> {
+) -> Result<VerifiedRequest, Reason> {
     // Parse `Credential=.../SignedHeaders=.../Signature=...`.
-    let rest = auth_header.strip_prefix("AWS4-HMAC-SHA256").ok_or("unsupported auth scheme")?;
+    let rest = auth_header
+        .strip_prefix("AWS4-HMAC-SHA256")
+        .ok_or(Reason::UnsupportedAuthScheme)?;
     let mut credential: Option<CredentialV4> = None;
     let mut signed_headers_raw: Option<String> = None;
     let mut signature: Option<String> = None;
     for part in rest.split(',') {
         let part = part.trim();
-        let Some((k, v)) = part.split_once('=') else { return Err("malformed authorization header") };
+        let Some((k, v)) = part.split_once('=') else {
+            return Err(Reason::MalformedAuthorizationHeader);
+        };
         match k {
-            "Credential" => credential = Some(CredentialV4::parse(v).ok_or("malformed credential scope")?),
+            "Credential" => {
+                credential = Some(CredentialV4::parse(v).ok_or(Reason::MalformedCredential)?)
+            }
             "SignedHeaders" => signed_headers_raw = Some(v.to_ascii_lowercase()),
             "Signature" => {
                 if !is_sha256_checksum(v) {
-                    return Err("malformed signature");
+                    return Err(Reason::MalformedSignature);
                 }
                 signature = Some(v.to_string());
             }
             _ => {}
         }
     }
-    let credential = credential.ok_or("missing Credential")?;
-    let signed_headers_raw = signed_headers_raw.ok_or("missing SignedHeaders")?;
-    let signature = signature.ok_or("missing Signature")?;
+    let credential = credential.ok_or(Reason::MissingCredential)?;
+    let signed_headers_raw = signed_headers_raw.ok_or(Reason::MissingSignedHeaders)?;
+    let signature = signature.ok_or(Reason::MissingSignature)?;
 
     // x-amz-date must be signed and present as a header.
     let amz_date_raw = input
@@ -709,37 +713,37 @@ fn verify_header(
         .iter()
         .find(|(k, _)| k == "x-amz-date")
         .map(|(_, v)| v.clone())
-        .ok_or("missing x-amz-date header")?;
-    let amz_date = AmzDate::parse(&amz_date_raw).ok_or("malformed x-amz-date")?;
+        .ok_or(Reason::MissingRequestDate)?;
+    let amz_date = AmzDate::parse(&amz_date_raw).ok_or(Reason::MalformedRequestDate)?;
 
     // Credential-scope date must match x-amz-date's date (s3s invariant).
     if credential.date != amz_date.fmt_date() {
-        return Err("credential scope date does not match x-amz-date");
+        return Err(Reason::CredentialScopeDateMismatch);
     }
 
     // Clock skew ±900s (s3s default).
-    let req_unix = amz_date.to_unix().ok_or("invalid x-amz-date")?;
+    let req_unix = amz_date.to_unix().ok_or(Reason::InvalidRequestDate)?;
     if (now_unix - req_unix).abs() > MAX_SKEW_SECS {
-        return Err("request time too skewed");
+        return Err(Reason::RequestTimeSkewed);
     }
 
     // Access key must be one of ours; the signature is checked against
     // THAT tenant's secret.
-    let entry = store.lookup(&credential.access_key_id).ok_or("unknown access key")?;
+    let entry = store.lookup(&credential.access_key_id).ok_or(Reason::UnknownAccessKey)?;
     if credential.aws_service != "s3" {
-        return Err("unsupported service in credential scope");
+        return Err(Reason::UnsupportedService);
     }
 
     // Build canonical request. Signed headers: client list, request values.
     let names: Vec<&str> = signed_headers_raw.split(';').collect();
     if names.is_empty() {
-        return Err("empty SignedHeaders");
+        return Err(Reason::EmptySignedHeaders);
     }
     if !names.contains(&"host") {
-        return Err("host header is not signed");
+        return Err(Reason::HostNotSigned);
     }
     let lookup = header_lookup(&input.headers);
-    let canonical_headers = canonical_headers(&names, &lookup).ok_or("signed header missing from request")?;
+    let canonical_headers = canonical_headers(&names, &lookup).ok_or(Reason::SignedHeaderAbsent)?;
     let signed_list = signed_headers_list(&names);
     // Payload hash comes from the signed x-amz-content-sha256 header
     // (UNSIGNED-PAYLOAD when the client omits it — non-S3 clients).
@@ -752,7 +756,7 @@ fn verify_header(
     // Streaming payloads cannot be verified without chunk-level machinery
     // (we never proxy SigV4-streamed uploads) — reject explicitly.
     if payload_hash.starts_with("STREAMING-") {
-        return Err("streaming payloads are not supported");
+        return Err(Reason::StreamingPayload);
     }
     let canonical_decoded = format!(
         "{}\n{}\n{}\n{}\n{}",
@@ -786,7 +790,7 @@ fn verify_header(
             &entry.secret,
             &expected,
         ) {
-        return Err("signature does not match");
+        return Err(Reason::SignatureMismatch);
     }
 
     Ok(VerifiedRequest { access_key_id: credential.access_key_id, expires_secs: 0 })
@@ -796,55 +800,55 @@ fn verify_presigned(
     store: &CredentialStore,
     input: &VerifyInput<'_>,
     now_unix: i64,
-) -> Result<VerifiedRequest, &'static str> {
+) -> Result<VerifiedRequest, Reason> {
     let get = |name: &str| -> Option<&str> {
         input.query_pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     };
     // All six X-Amz-* params required; duplicates break get_unique but a
     // single find suffices for well-formed clients.
-    let algorithm = get("X-Amz-Algorithm").ok_or("missing X-Amz-Algorithm")?;
+    let algorithm = get(param::ALGORITHM).ok_or(Reason::MissingAlgorithm)?;
     if algorithm != "AWS4-HMAC-SHA256" {
-        return Err("unsupported X-Amz-Algorithm");
+        return Err(Reason::UnsupportedAlgorithm);
     }
-    let credential_raw = get("X-Amz-Credential").ok_or("missing X-Amz-Credential")?;
-    let credential = CredentialV4::parse(credential_raw).ok_or("malformed X-Amz-Credential")?;
-    let date_raw = get("X-Amz-Date").ok_or("missing X-Amz-Date")?;
-    let amz_date = AmzDate::parse(date_raw).ok_or("malformed X-Amz-Date")?;
-    let expires_raw = get("X-Amz-Expires").ok_or("missing X-Amz-Expires")?;
-    let expires_secs: u64 = expires_raw.parse().map_err(|_| "malformed X-Amz-Expires")?;
-    if expires_secs > MAX_PRESIGNED_EXPIRES_SECS {
-        return Err("X-Amz-Expires exceeds the maximum");
+    let credential_raw = get(param::CREDENTIAL).ok_or(Reason::MissingCredential)?;
+    let credential = CredentialV4::parse(credential_raw).ok_or(Reason::MalformedCredential)?;
+    let date_raw = get(param::DATE).ok_or(Reason::MissingRequestDate)?;
+    let amz_date = AmzDate::parse(date_raw).ok_or(Reason::MalformedRequestDate)?;
+    let expires_raw = get(param::EXPIRES).ok_or(Reason::MissingExpires)?;
+    let expires_secs: u64 = expires_raw.parse().map_err(|_| Reason::MissingExpires)?;
+    if expires_secs > PROTOCOL_MAX_EXPIRES_SECS {
+        return Err(Reason::ExpiresCapExceeded);
     }
-    let signed_headers_raw = get("X-Amz-SignedHeaders").ok_or("missing X-Amz-SignedHeaders")?;
+    let signed_headers_raw = get(param::SIGNED_HEADERS).ok_or(Reason::MissingSignedHeaders)?;
     if !signed_headers_raw.is_ascii() {
-        return Err("malformed X-Amz-SignedHeaders");
+        return Err(Reason::MalformedSignedHeaders);
     }
-    let signature = get("X-Amz-Signature").ok_or("missing X-Amz-Signature")?;
+    let signature = get(param::SIGNATURE).ok_or(Reason::MissingSignature)?;
     if !is_sha256_checksum(signature) {
-        return Err("malformed X-Amz-Signature");
+        return Err(Reason::MalformedSignature);
     }
 
     // Credential-scope date consistency.
     if credential.date != amz_date.fmt_date() {
-        return Err("credential scope date does not match X-Amz-Date");
+        return Err(Reason::CredentialScopeDateMismatch);
     }
 
     // Expiry: request must not be future-dated beyond skew, and must not
     // be older than its expires window (s3s semantics).
-    let Some(req_unix) = amz_date.to_unix() else { return Err("invalid X-Amz-Date") };
+    let Some(req_unix) = amz_date.to_unix() else { return Err(Reason::InvalidRequestDate) };
     let duration = now_unix - req_unix;
     if duration.is_negative() && duration.abs() > MAX_SKEW_SECS {
-        return Err("request date is later than server time too much");
+        return Err(Reason::RequestDateInFuture);
     }
     if duration > expires_secs as i64 {
-        return Err("request has expired");
+        return Err(Reason::RequestExpired);
     }
 
     // Access key must be one of ours; the signature is checked against
     // THAT tenant's secret.
-    let entry = store.lookup(&credential.access_key_id).ok_or("unknown access key")?;
+    let entry = store.lookup(&credential.access_key_id).ok_or(Reason::UnknownAccessKey)?;
     if credential.aws_service != "s3" {
-        return Err("unsupported service in credential scope");
+        return Err(Reason::UnsupportedService);
     }
 
     // Presigned canonical request: payload literal is always
@@ -852,11 +856,11 @@ fn verify_presigned(
     // signed; X-Amz-Signature is excluded from the canonical query.
     let names: Vec<String> = signed_headers_raw.split(';').map(|s| s.to_ascii_lowercase()).collect();
     if !names.iter().any(|n| n == "host") {
-        return Err("host header is not signed");
+        return Err(Reason::HostNotSigned);
     }
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let lookup = header_lookup(&input.headers);
-    let canonical_headers = canonical_headers(&name_refs, &lookup).ok_or("signed header missing from request")?;
+    let canonical_headers = canonical_headers(&name_refs, &lookup).ok_or(Reason::SignedHeaderAbsent)?;
     let signed_list = signed_headers_list(&name_refs);
     let qs = canonical_query(&input.query_pairs, true);
     let canonical_decoded = format!(
@@ -889,7 +893,7 @@ fn verify_presigned(
         &entry.secret,
         signature,
     ) {
-        return Err("signature does not match");
+        return Err(Reason::SignatureMismatch);
     }
 
     Ok(VerifiedRequest { access_key_id: credential.access_key_id, expires_secs })
@@ -1074,7 +1078,7 @@ mod tests {
         let bad = CredentialStore { entries: bad_entries };
         assert!(matches!(
             verify_optional(Some(&bad), &input, now),
-            VerifyOutcome::Failed("signature does not match")
+            VerifyOutcome::Failed(Reason::SignatureMismatch)
         ));
 
         // Unknown access key.
@@ -1086,13 +1090,13 @@ mod tests {
         let unknown = CredentialStore { entries: unknown_entries };
         assert!(matches!(
             verify_optional(Some(&unknown), &input, now),
-            VerifyOutcome::Failed("unknown access key")
+            VerifyOutcome::Failed(Reason::UnknownAccessKey)
         ));
 
         // Skewed beyond 900s.
         assert!(matches!(
             verify_optional(Some(&cfg), &input, now + 3600),
-            VerifyOutcome::Failed("request time too skewed")
+            VerifyOutcome::Failed(Reason::RequestTimeSkewed)
         ));
 
         // Missing config: anonymous.
@@ -1148,7 +1152,7 @@ mod tests {
         // Expired: now + 400 > expires 300.
         assert!(matches!(
             verify_optional(Some(&cfg), &input, now + 400),
-            VerifyOutcome::Failed("request has expired")
+            VerifyOutcome::Failed(Reason::RequestExpired)
         ));
 
         // Expires over the 604800 cap.
@@ -1162,7 +1166,7 @@ mod tests {
         input.query_pairs = bad_pairs;
         assert!(matches!(
             verify_optional(Some(&cfg), &input, now),
-            VerifyOutcome::Failed("X-Amz-Expires exceeds the maximum")
+            VerifyOutcome::Failed(Reason::ExpiresCapExceeded)
         ));
     }
 }

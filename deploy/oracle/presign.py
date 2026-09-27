@@ -51,7 +51,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="presign one object URL (SigV4 query auth)")
     ap.add_argument("--host", required=True, help="hostname the client will request (the signature covers Host)")
     ap.add_argument("--key", required=True, help="object key, e.g. googledrive1/film.mkv")
-    ap.add_argument("--session", default="", help="session marker the origin's budgets charge (recommended)")
+    ap.add_argument(
+        "--session",
+        default="",
+        help="session marker the origin's budgets charge. REQUIRED: the origin refuses a URL "
+        "without one (an unkeyed URL is an anonymous amplifier), so this tool refuses to mint "
+        "one unless --no-session says the refusal itself is what is being tested.",
+    )
+    ap.add_argument(
+        "--no-session",
+        action="store_true",
+        help="mint a URL with NO session marker. Only useful to reproduce the origin's refusal "
+        "(`403 missing session`); it is never a working ticket.",
+    )
     ap.add_argument("--expires", type=int, default=3600, help="URL lifetime seconds (default 3600)")
     ap.add_argument("--id", default=os.environ.get("SIGV4_ACCESS_KEY_ID", ""))
     ap.add_argument("--secret", default=os.environ.get("SIGV4_SECRET_ACCESS_KEY", ""))
@@ -67,6 +79,18 @@ def main() -> int:
 
     if not args.id or not args.secret:
         print("presign: no credentials -- pass --id/--secret or export SIGV4_ACCESS_KEY_ID/SECRET", file=sys.stderr)
+        return 2
+    if not args.session and not args.no_session:
+        print(
+            "presign: --session is required: the origin requires a session marker on every\n"
+            "signed read (it is the key the per-session budgets charge), so a URL without one\n"
+            "is refused with `403 missing session`. Pass --session <per-viewer id>, or\n"
+            "--no-session to mint the refused URL on purpose. See docs/signing.md.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.session and args.no_session:
+        print("presign: --session and --no-session are mutually exclusive", file=sys.stderr)
         return 2
     if not args.key.startswith("/"):
         args.key = "/" + args.key

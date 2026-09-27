@@ -79,7 +79,7 @@ fn sigv4_gate(
         // The reason string stays out of the response body: AWS-compatible
         // clients only need the code; the detail lives in the log.
         sigv4::VerifyOutcome::Failed(reason) => {
-            tracing::warn!(reason, "sigv4 verification failed");
+            tracing::warn!(reason = reason.as_str(), "sigv4 verification failed");
             let xml = crate::response::s3_error_xml(
                 "AccessDenied",
                 "Access Denied",

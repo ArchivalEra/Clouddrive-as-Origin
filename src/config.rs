@@ -403,14 +403,17 @@ fn default_listen_addr() -> SocketAddr { "127.0.0.1:8080".parse().unwrap() }
 fn default_origin_token_exempt() -> Vec<String> {
     vec!["127.0.0.1/32".into(), "::1/128".into()]
 }
+// The content-auth defaults live in `crate::signing` with the rest of the
+// contract — the gate's enforcement, the boot validation and the documentation
+// all read those constants, so a default cannot drift from what is enforced.
 fn default_content_auth_max_expiry() -> u64 {
-    21_600
+    crate::signing::DEFAULT_MAX_EXPIRY_SECS
 }
 fn default_content_auth_session_rps() -> u32 {
-    30
+    crate::signing::DEFAULT_SESSION_RPS
 }
 fn default_content_auth_session_mib() -> u64 {
-    1024
+    crate::signing::DEFAULT_SESSION_MIB_PER_MIN
 }
 fn default_cache_dir() -> PathBuf { "/var/lib/origin-cache".into() }
 fn default_max_entries() -> usize {

@@ -14,5 +14,6 @@ pub mod net;
 pub mod response;
 pub mod routing;
 pub mod shutdown;
+pub mod signing;
 pub mod sigv4;
 pub mod testsupport;

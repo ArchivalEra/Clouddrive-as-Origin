@@ -869,7 +869,7 @@ url=$(signed 300 "$SIGV4_AK" "labsk_wrong")
 code=$(H -m 20 -o /dev/null -w "%{http_code}" -r 0-1023 "$url")
 [ "$code" = 403 ] && ok "a URL signed with an unknown secret is refused" \
   || bad "a wrong-secret URL returned $code (want 403)"
-url=$(python3 "$PRESIGN" --scheme http --host "$AUTH_HOST" --key "media/$WALK_OBJ" --expires 300 --id "$SIGV4_AK" --secret "$SIGV4_SK")
+url=$(python3 "$PRESIGN" --scheme http --host "$AUTH_HOST" --key "media/$WALK_OBJ" --expires 300 --id "$SIGV4_AK" --secret "$SIGV4_SK" --no-session)
 code=$(H -m 20 -o /dev/null -w "%{http_code}" -r 0-1023 "$url")
 [ "$code" = 403 ] && ok "a URL without its session marker is refused" \
   || bad "a sessionless URL returned $code (want 403)"
