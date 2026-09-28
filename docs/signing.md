@@ -24,6 +24,53 @@ per-session budget that bounds a flood.
 A player never needs a secret, and a backend never needs to call the origin to
 mint a URL — signing is local crypto. That is the point of staying standard.
 
+## Onboarding one site, end to end
+
+The pieces are below (and in the runbook's rollout order); this is the whole
+procedure in one list, because it has two sides and they have to agree.
+
+**The operator does this once per site:**
+
+1. Generate a secret: `python3 -c 'import secrets; print(secrets.token_hex(32))'`.
+2. Append one row to the credential store
+   (`sigv4_credentials_path`, mode 0600):
+   `{"id": "site-a", "secret": "<the secret>", "prefix": "<their key prefix>"}`.
+   Give a `prefix` unless the tenant really may read every object — it is what
+   keeps one site out of another's keys.
+3. Restart both units (the store is read once, at boot). If the file mode
+   changed, check it is still 0600: a group-readable store is a boot failure.
+4. Hand the site four things: **the hostname viewers type** (that is what gets
+   signed), **its `id`**, **the secret**, and **its prefix**. The secret goes over
+   a channel that is not the repository and not a shared document.
+5. Watch `origin_content_auth_total{outcome="deny",reason="..."}` and the front
+   log's `auth=` field for the first day.
+
+**The site backend does this per viewing session:**
+
+6. Mint one URL per session — `presign.py`, or the SDK route above — with a
+   fresh opaque `session` per viewer, `--expires` inside the deployment cap, and
+   a **HEAD ticket** if its player probes with HEAD. Never share one URL across
+   sessions, and never patch a URL after minting (the `session` is signed).
+7. Verify once before shipping it to viewers:
+
+   ```sh
+   curl -sS -o /dev/null -w '%{http_code}\n' -H 'range: bytes=0-1023' '<the signed URL>'   # 206
+   curl -sS -o /dev/null -w '%{http_code}\n' '<the same path, no query>'                    # 403
+   ```
+
+   If the first is 206 and the second is 403, that site's ticket path works and
+   the plain URL does not.
+8. Treat the URL as a credential for its lifetime: keep it out of logs, referrer
+   headers and shared caches, and keep the expiry short.
+
+**What the operator does *not* need to do:** mint URLs, hold a session, or touch
+the origin when a viewer arrives. Signing is local crypto — the backend never
+calls the origin to mint, and the origin never asks the backend who a viewer is.
+
+The switch itself (`front_content_auth = true`) and the edge's cache-key change
+are deployment-wide, not per site: read the rollout order in the runbook before
+the **first** site is onboarded, and again before the line is flipped.
+
 ## Minting one URL
 
 ```sh

@@ -289,8 +289,11 @@ sigv4_credentials_path = "/var/lib/origin-cache/content-auth.json"   # or the SI
   `origin_content_auth_total` appears, then flip the line and restart in a quiet
   window, coordinating with the site.
 
-Minting, the budget rules, rotation, the symptom table and the rollout checklist
-are all in **`docs/signing.md`** and the runbook's "Content reads are presigned".
+Minting, the budget rules, rotation, the symptom table, the rollout checklist and
+the step-by-step for **onboarding one site** (operator side and backend side,
+with a verification command) are all in **`docs/signing.md`**; the runbook's
+"Content reads are presigned" has the deployment-wide rollout order and the
+rollback.
 
 ## 8. Putting a CDN in front
 
