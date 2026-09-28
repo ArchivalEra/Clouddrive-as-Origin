@@ -52,6 +52,13 @@ echo "  built sha256: $BUILT"
 say "3/6 bring it to the node"
 scp -q -i "$COMPILE_KEY" -o IdentitiesOnly=yes "$COMPILE_HOST:/tmp/origin-cache-aarch64-musl" /tmp/origin-cache.new
 scp -q /tmp/origin-cache.new "$NODE:/home/opc/origin-cache.new"
+# The acceptance gate travels with the deploy, for the same reason the build
+# script above does: it used to be read from whatever tree happened to sit at
+# /home/opc/repo on the node, which is a copy that goes stale (measured
+# 2026-09-28: a deploy rolled itself back because that copy still hard-coded a
+# fixture object the bucket no longer holds, so its read checks 404ed and the
+# lazy metric series never appeared).
+scp -q "$REPO/deploy/oracle/accept.sh" "$NODE:/home/opc/accept.sh"
 
 say "4/6 HARD GATE: does this binary run on this node?"
 ARCH=$(ssh "$NODE" 'file /home/opc/origin-cache.new | head -1')
@@ -87,7 +94,7 @@ say "6/6 acceptance gate"
 # One run, and its whole output kept on the node: a verdict that says FAIL while
 # the evidence that would explain it was piped through `tail` cannot be acted on,
 # and running it twice also runs it under two different moments of the restart.
-ssh "$NODE" 'bash /home/opc/repo/deploy/oracle/accept.sh > /home/opc/accept-last.log 2>&1; tail -6 /home/opc/accept-last.log'
+ssh "$NODE" 'bash /home/opc/accept.sh > /home/opc/accept-last.log 2>&1; tail -6 /home/opc/accept-last.log'
 if ssh "$NODE" 'grep -q "VERDICT=PASS" /home/opc/accept-last.log'; then
   echo "  VERDICT=PASS (full output: /home/opc/accept-last.log on the node)"
 else

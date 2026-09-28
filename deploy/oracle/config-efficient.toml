@@ -30,6 +30,22 @@ front_origin_token_env = "ORIGIN_TOKEN"
 # Loopback, spelled out rather than left implicit: accept.sh, the LAB and the
 # watchdog reach the front over loopback and carry no edge stamp.
 front_origin_token_exempt = ["127.0.0.1/32", "::1/128"]
+# Content reads are SIGNED (ADR-0027, 2026-09-28). A site backend mints a SigV4
+# presigned URL per viewing session; the front refuses an unsigned read before
+# the cache, the ledger or the provider is touched, and each `session` marker
+# lives under a request/byte budget (over budget -> 503 SlowDown).
+#
+# The store is a 0600 JSON file with one row per tenant: the node's own SIGV4_*
+# pair stays as a row (so the business plane's verify-if-present layer keeps
+# working exactly as before) and the site's row is confined to the mount it
+# serves. `front_content_auth_exempt` is deliberately NOT set: the default list
+# is loopback, which keeps accept.sh, the LAB and the watchdog able to probe
+# unsigned, while every pull from a CDN node must present a ticket.
+#
+# Rollback: comment both lines out and restart — unsigned reads work again
+# immediately, and signed URLs keep working too.
+front_content_auth = true
+sigv4_credentials_path = "/opt/origin-cache/content-auth.json"
 tls_cert_env = "ORIGIN_TLS_CERT_PATH"
 tls_key_env = "ORIGIN_TLS_KEY_PATH"
 listen_addr = "127.0.0.1:8080"

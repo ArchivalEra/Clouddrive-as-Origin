@@ -59,7 +59,7 @@ pub struct RequestHead<'a> {
     /// Raw path and query, exactly as the client sent them (a signature is
     /// computed over the encoded form).
     pub path_and_query: &'a str,
-    /// The `Host` header, when the request carried one.
+    /// The host a signed request is verified against — see [`request_host`].
     pub host: Option<&'a str>,
     /// The peer that opened the connection. `None` means the transport did not
     /// give us one (a unix socket): a peer we cannot name is never exempt.
@@ -70,6 +70,24 @@ pub struct RequestHead<'a> {
     /// whatever the operator told it to), so the gate looks it up here rather
     /// than the caller guessing which header matters.
     pub headers: &'a http::HeaderMap,
+}
+
+/// The host a signed request must be verified against.
+///
+/// SigV4 signs `Host`, so this has to be the value the client signed. HTTP/1.1
+/// sends it as a header; **HTTP/2 has no `host` header** — the authority
+/// carries it — and the CDN pulls from the origin over h2, so a header-only
+/// lookup refuses every signed read through the edge. Measured 2026-09-28 on
+/// the live deployment: `403 signed header missing from request` for a URL the
+/// command line accepted, on `proto="h2"` requests, while the same URL worked
+/// over h1 to a loopback instance (which is why the LAB's arm passed and the
+/// CDN did not). The header wins when both are present: that is literally what
+/// an h1 client signed.
+pub fn request_host<'a>(headers: &'a http::HeaderMap, uri: &'a http::Uri) -> Option<&'a str> {
+    headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| uri.authority().map(|a| a.as_str()))
 }
 
 /// What the door decided.
@@ -324,8 +342,7 @@ mod tests {
     }
 
     /// A header map carrying the edge stamp (the value the edge would set).
-    fn stamped(value: &str) -> http::HeaderMap {
-        let mut h = http::HeaderMap::new();
+    fn stamped(value: &str) -> http::HeaderMap {        let mut h = http::HeaderMap::new();
         h.insert(
             http::HeaderName::from_static("x-origin-token"),
             value.parse().unwrap(),
@@ -584,5 +601,31 @@ mod tests {
             .unwrap();
         assert!(!exempt.requires(Some(ip("::ffff:127.0.0.1"))), "mapped loopback is exempt");
         assert!(exempt.requires(Some(ip("198.51.100.1"))));
+    }
+
+    /// Where a signed read's host comes from: the `host` header for h1, the URI
+    /// authority for h2. The h2 arm is the one that broke production — the CDN
+    /// pulls over h2, and an h2 request carries no `host` header at all, so a
+    /// header-only lookup refused every signed read through the edge while the
+    /// same URL worked over h1 (measured 2026-09-28). Delete the authority
+    /// fallback and this test, and only this test, goes red.
+    #[test]
+    fn a_signed_read_finds_its_host_in_the_header_or_the_authority() {
+        let uri: http::Uri = "https://cdn.example/googledrive1/film.mkv".parse().unwrap();
+        let mut h1 = http::HeaderMap::new();
+        h1.insert(http::header::HOST, "cdn.example".parse().unwrap());
+        assert_eq!(request_host(&h1, &uri), Some("cdn.example"));
+
+        // HTTP/2: no host header, the authority carries it.
+        let none = http::HeaderMap::new();
+        assert_eq!(request_host(&none, &uri), Some("cdn.example"));
+
+        // Both present: the header wins — it is what an h1 client signed.
+        let elsewhere: http::Uri = "https://other.example/x".parse().unwrap();
+        assert_eq!(request_host(&h1, &elsewhere), Some("cdn.example"));
+
+        // Neither (an origin-form request with no authority).
+        let bare: http::Uri = "/googledrive1/film.mkv".parse().unwrap();
+        assert_eq!(request_host(&none, &bare), None);
     }
 }

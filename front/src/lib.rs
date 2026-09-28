@@ -391,7 +391,7 @@ impl ProxyHttp for BusinessProxy {
             method: req.method.as_str(),
             path,
             path_and_query: req.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(path),
-            host: req.headers.get("host").and_then(|v| v.to_str().ok()),
+            host: admission::request_host(&req.headers, &req.uri),
             // The `[::]` listener reports an IPv4 peer mapped; the admission
             // module canonicalizes before matching, so either form works.
             peer: session.client_addr().and_then(|a| a.as_inet()).map(|a| a.ip()),
