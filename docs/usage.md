@@ -102,8 +102,7 @@ names an environment variable that is not set.
 | `ORIGIN_PREWARM_SECRET` | shared secret for the `/_internal/prewarm/` endpoint |
 | `ORIGIN_TOKEN` | the value the CDN sets in `X-Origin-Token` on every pull (`install.sh` generates 64 hex chars) |
 | `ORIGIN_TLS_CERT_PATH`, `ORIGIN_TLS_KEY_PATH` | certificate and key for the public hostname |
-| `SIGV4_ACCESS_KEY_ID`, `SIGV4_SECRET_ACCESS_KEY` | optional; the single-tenant credential pair for signed reads |
-| `SIGV4_CREDENTIALS_FILE` | optional; path to the multi-tenant 0600 JSON store (see §7) |
+| `SIGV4_ACCESS_KEY_ID`, `SIGV4_SECRET_ACCESS_KEY` | optional; the single-tenant credential pair for signed reads (the multi-tenant store is a path in the config, `sigv4_credentials_path`, not an env var) |
 
 Four units run afterwards:
 
