@@ -16,10 +16,16 @@ per-session budget that bounds a flood.
 
 | role | holds | does |
 |---|---|---|
-| **site backend** | an access key pair | mints one URL per viewing session (`presign.py` or any SDK) and hands it to the player |
+| **site backend** | an access key pair | mints one URL per viewing session (`presign.py`, any SDK, or a ticket endpoint it calls same-origin) and hands it to the player |
 | **player / browser** | nothing | requests the URL as-is; ranged reads, open-ended ranges, pipelining all unchanged |
 | **CDN** | nothing | forwards URL and Host untouched; caches by URL-with-query-ignored (one console setting, see step 0 below) |
 | **origin** | the credential store | verifies the signature, enforces expiry and budgets, serves or refuses |
+
+A backend that cannot run the signer itself (a mini program, a static site)
+deploys a **ticket endpoint** instead — one POST in, one signed URL out, the
+secret bound server-side. A reference implementation that passes the same
+contract tests lives in `deploy/ticket-worker/`; the deploy recipe is in its
+README.
 
 A player never needs a secret, and a backend never needs to call the origin to
 mint a URL — signing is local crypto. That is the point of staying standard.

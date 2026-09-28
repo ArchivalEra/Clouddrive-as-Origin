@@ -1,0 +1,26 @@
+# The ticket endpoint's wrangler config. Copy to wrangler.toml and fill the
+# REPLACE-ME values; the route is deployment-specific and is set here, on the
+# site's zone, because the page calls the endpoint same-origin.
+#
+# The secret is NOT in this file: `wrangler secret put TICKET_SECRET` (the
+# value is the site tenant's secret from the origin's credential store).
+
+name = "mp-ticket"
+main = "worker.mjs"
+compatibility_date = "2026-09-28"
+
+# Same origin as the page, at the path the blog client was configured with
+# (the REQ suggests /mp-ticket; the client takes the path as a setting).
+# routes = [
+#   { pattern = "isui.ren/mp-ticket", zone_name = "REPLACE-ME-zone" },
+# ]
+
+[vars]
+TICKET_HOST = "REPLACE-ME-the-hostname-viewers-type"
+TICKET_ID = "REPLACE-ME-tenant-id"
+TICKET_PREFIX = "googledrive1/"
+ALLOWED_ORIGIN = "https://REPLACE-ME-site-origin"
+# Optional, defaults shown:
+# TICKET_EXPIRES_SECS = "3600"
+# TICKET_SESSION_COOKIE = "ticket_session"
+# TICKET_RATE_PER_MIN = "30"
