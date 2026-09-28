@@ -78,7 +78,8 @@ python3 deploy/oracle/presign.py \
     --host cdn.example.com \              # the host the BROWSER will request
     --key googledrive1/film.mkv \         # object key, same path you already use
     --session viewer-17 \                 # opaque per-viewer id (see Budgets)
-    --expires 3600 \                      # seconds; capped by the deployment
+    --expires 3600 \                      # seconds, inside the deployment cap;
+                                          # how long to pick: "Expiry and budgets"
     --id AKIDEXAMPLE --secret SECRET      # or SIGV4_ACCESS_KEY_ID / _SECRET in env
 # -> https://cdn.example.com/googledrive1/film.mkv?X-Amz-Algorithm=...&X-Amz-Signature=...
 ```
@@ -149,11 +150,22 @@ prefer short `--expires`.
 ## Method matters (GET and HEAD are separate tickets)
 
 SigV4 signs the HTTP method. A GET ticket refuses a HEAD request
-(`403 signature does not match`), and vice versa. Players that probe with HEAD
-before reading — several do — must be given a HEAD ticket for those probes
-(`presign.py --method HEAD ...`), or the backend can hand the same signed
-constructor both. `Range` is *not* part of the signature: a GET ticket
-authorizes any range shape (closed, open-ended, multi-request sequences).
+(`403 signature does not match`), and vice versa. `Range` is *not* part of the
+signature: a GET ticket authorizes any range shape (closed, open-ended,
+multi-request sequences).
+
+So, which tickets does a client need?
+
+| what the client actually sends | ticket |
+| --- | --- |
+| `GET` with any range — including `Range: bytes=0-0` used as a reachability probe | **GET only** |
+| `HEAD` (a size check, a probe that really is a HEAD) | **HEAD** — and a HEAD ticket never serves a body |
+| both | two tickets per session, or, better, probe with `GET` + `bytes=0-0` and ship one ticket |
+
+The last row is the recommended shape: a one-byte ranged GET answers every
+question a HEAD probe answers here (`Content-Range` carries the total size, the
+status is `206`, the content type is there) and it costs one tiny read. A player
+that reaches for HEAD somewhere is the only reason to mint the second ticket.
 
 ## Expiry and budgets
 
@@ -161,6 +173,29 @@ authorizes any range shape (closed, open-ended, multi-request sequences).
   dead (`403 request has expired`). Mint per viewing session rather than
   sharing one long-lived URL; a session that outlives its URL asks its backend
   for the next one.
+- **How long to ask for.** The ceiling is the deployment's
+  (`front_content_auth_max_expiry_secs`, **default 6 h**; the protocol allows
+  **7 days** and the origin refuses anything longer rather than clamping it
+  silently). Ask for a lifetime that comfortably covers one *playback* — and
+  assume the content can outlast any ticket you would want to hand out: a
+  24-hour film is watched over hours, so a 1-hour URL **will** expire
+  mid-playback and the player will see `403 request has expired` in the middle
+  of a stream. That is not a bug to avoid by asking for a week; it is why the
+  ticket's lifetime does not have to cover the viewing session, while the
+  `session` does. Two rules make a short ticket safe:
+  - the backend **re-mints on a timer shorter than the lifetime**, and treats a
+    `403 request has expired` from the player as "mint the next one and retry
+    once" (this is the integration to build, because a native `<video>` will
+    not do it for you);
+  - when it refreshes, it **keeps the same `session` value**. The budgets are
+    charged per session, so a "refresh" that invents a new id hands the viewer a
+    fresh budget — and to anyone with a credential, it is exactly how a
+    per-session budget gets evaded. Rotate the session id when the *session*
+    changes (a new viewer, a new playback), not when the ticket does.
+
+  If the player cannot be taught to re-mint, raise the deployment cap instead
+  (`front_content_auth_max_expiry_secs`, up to `604800`), accepting the other
+  side of the trade: a leaked URL then works for that long.
 - **`session`** is the budget key: an opaque string the backend chooses
   (per viewer, per device, per playback — its call), at most 128 printable
   characters. Two budgets are charged against it:

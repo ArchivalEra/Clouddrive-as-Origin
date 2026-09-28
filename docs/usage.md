@@ -274,7 +274,18 @@ sigv4_credentials_path = "/var/lib/origin-cache/content-auth.json"   # or the SI
 - The **client site's backend** mints one URL per viewing session with
   `deploy/oracle/presign.py` or any S3 SDK (`S3SigV4QueryAuth`, not the generic
   signer), and hands the player a plain URL. **GET and HEAD are separate
-  tickets.**
+  tickets** — mint a HEAD ticket only if something really sends HEAD; a
+  reachability probe of `GET` + `Range: bytes=0-0` needs nothing beyond the GET
+  ticket.
+- **A ticket's lifetime does not have to cover the viewing session; the session
+  does.** A 24-hour film is watched over hours, so a one-hour URL expires
+  mid-playback (`403 request has expired`). Mint a lifetime that covers one
+  playback, re-mint on a timer and on that 403, and **keep the same `session`
+  value when you refresh** — the budgets are charged per session, so inventing a
+  new id on every refresh hands the viewer a fresh budget and is exactly how a
+  per-session budget gets evaded. The ceiling is
+  `front_content_auth_max_expiry_secs` (default 6 h, protocol maximum 7 days);
+  raise it only if the player cannot be taught to re-mint.
 - The `session` parameter is opaque, signed (only the secret holder can set it)
   and is the budget key: over budget answers `503 SlowDown`, which means "back
   off", never "gone".
