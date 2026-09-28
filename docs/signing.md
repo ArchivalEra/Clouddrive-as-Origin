@@ -40,8 +40,13 @@ procedure in one list, because it has two sides and they have to agree.
 3. Restart both units (the store is read once, at boot). If the file mode
    changed, check it is still 0600: a group-readable store is a boot failure.
 4. Hand the site four things: **the hostname viewers type** (that is what gets
-   signed), **its `id`**, **the secret**, and **its prefix**. The secret goes over
-   a channel that is not the repository and not a shared document.
+   signed), **its `id`**, **the secret**, and **its prefix**. One of them cannot
+   be read out of the repository: every document here uses `cdn.example.com` as a
+   placeholder, because the deployment's own hostname and zone were removed from
+   the tree *and* from its history — so the real host comes from you, and a site
+   that signs the placeholder gets `403 signature does not match` on every
+   request (the signature covers `Host`). The secret goes over a channel that is
+   not the repository and not a shared document.
 5. Watch `origin_content_auth_total{outcome="deny",reason="..."}` and the front
    log's `auth=` field for the first day.
 

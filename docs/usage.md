@@ -273,8 +273,11 @@ sigv4_credentials_path = "/var/lib/origin-cache/content-auth.json"   # or the SI
 
 - The **client site's backend** mints one URL per viewing session with
   `deploy/oracle/presign.py` or any S3 SDK (`S3SigV4QueryAuth`, not the generic
-  signer), and hands the player a plain URL. **GET and HEAD are separate
-  tickets** — mint a HEAD ticket only if something really sends HEAD; a
+  signer), and hands the player a plain URL. It signs **the hostname viewers
+  type**, which the operator gives it: this repository names no deployment, so
+  every example here (including `cdn.example.com`) is a placeholder, and signing
+  a placeholder answers `403 signature does not match`. **GET and HEAD are
+  separate tickets** — mint a HEAD ticket only if something really sends HEAD; a
   reachability probe of `GET` + `Range: bytes=0-0` needs nothing beyond the GET
   ticket.
 - **A ticket's lifetime does not have to cover the viewing session; the session
