@@ -1,22 +1,30 @@
-// The ticket endpoint (ADR-0027): the site backend's minting half, for a
-// client that must not hold a secret.
+// The api.mango-mesa.ccwu.cc worker (fleet convention: one API host, path-
+// routed services). Two services live here:
 //
-// Contract (agreed with the blog client, REQ-mp-ticket-endpoint):
-//   POST <this worker>          same origin as the page; no CORS anywhere
-//   body {"src": "https://<host>/<prefix>/<object>"}   the raw, unsigned URL
-//   <- 200 {"url": "<presigned>", "expiresAt": "<ISO 8601>"}
-//      Cache-Control: no-store; a session cookie is set on first success and
-//      every later mint derives its `session` FROM that cookie — one cookie
-//      must always mint with the same session id, because the origin charges
-//      its budgets per session (a refresh that invents a new id hands the
-//      viewer a fresh budget).
-//   refusals are plain non-2xx (the client falls back to the bare URL);
-//   refusals that carry detail teach an attacker more than they teach the site.
+// 1. The ticket endpoint (ADR-0027): the site backend's minting half, for a
+//    client that must not hold a secret.
+//    Contract (agreed with the blog client, REQ-mp-ticket-endpoint-v2):
+//      POST <TICKET_PATH>          same origin as the page; no CORS anywhere
+//      body {"src": "https://<host>/<prefix>/<object>"}   the raw, unsigned URL
+//      <- 200 {"url": "<presigned>", "expiresAt": "<ISO 8601>"}
+//         Cache-Control: no-store; a session cookie is set on first success and
+//         every later mint derives its `session` FROM that cookie — one cookie
+//         must always mint with the same session id, because the origin charges
+//         its budgets per session (a refresh that invents a new id hands the
+//         viewer a fresh budget).
+//      refusals are plain non-2xx (the client falls back to the bare URL);
+//      refusals that carry detail teach an attacker more than they teach the
+//      site. Through the site's reverse proxy these codes pass through
+//      untouched, and the cookie lands on the site's own domain because the
+//      worker sets none.
+//
+// 2. A pass-through to the upstream origin (UPSTREAM_ORIGIN) for every other
+//    path, with an optional rewrite so a service can move under a new public
+//    name without changing its internals (LEGACY_REWRITE="/from=/to,...").
 //
 // Everything deployment-specific comes from bindings — no host, tenant or
 // origin appears in this file. The secret is a wrangler secret (write-only for
-// everyone but the account), so the blog side can ship this worker's route
-// without ever holding it.
+// everyone but the account).
 //
 // Runs on both the Workers runtime and plain node >= 18 (global crypto,
 // Request, Response), which is what the contract tests rely on.
@@ -229,6 +237,36 @@ export async function handleTicketRequest(request, env, deps = {}) {
   );
 }
 
+// The API host's front: the ticket path is served here, everything else goes
+// to the upstream origin untouched (minus the `host` header, which fetch
+// re-derives). `LEGACY_REWRITE` ("/from=/to", comma-separated) lets a service
+// move under a new public name without its internals knowing.
+export async function handleApiRequest(request, env, deps = {}) {
+  const url = new URL(request.url);
+  const ticketPath = (env.TICKET_PATH ?? "/mp-ticket").replace(/\/+$/, "");
+  const upstream = env.UPSTREAM_ORIGIN;
+  if (url.pathname === ticketPath || !upstream) {
+    return handleTicketRequest(request, env, deps);
+  }
+  let path = url.pathname;
+  for (const rule of (env.LEGACY_REWRITE ?? "").split(",").filter(Boolean)) {
+    const [from, to] = rule.split("=");
+    if (from && to && (path === from || path.startsWith(`${from}/`))) {
+      path = to + path.slice(from.length);
+      break;
+    }
+  }
+  const headers = new Headers(request.headers);
+  headers.delete("host");
+  const body = ["GET", "HEAD"].includes(request.method) ? undefined : await request.text();
+  return fetch(`${upstream.replace(/\/+$/, "")}${path}${url.search}`, {
+    method: request.method,
+    headers,
+    body,
+    redirect: "manual",
+  });
+}
+
 export default {
-  fetch: (request, env) => handleTicketRequest(request, env),
+  fetch: (request, env) => handleApiRequest(request, env),
 };

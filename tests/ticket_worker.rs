@@ -297,3 +297,80 @@ console.log(JSON.stringify(out));
         assert_eq!(code, 429, "inside the minute, over budget is refused");
     }
 }
+
+/// The API host is shared: `/mp-ticket` is the ticket mint, everything else
+/// proxies to the upstream origin with the rewrite applied — the blog's
+/// activity card is production traffic that must survive this worker taking
+/// over the hostname.
+#[test]
+fn the_api_host_routes_tickets_and_proxies_the_rest() {
+    if !have("node") {
+        eprintln!("skipping: node not installed");
+        return;
+    }
+    let blob = run_node(
+        r#"
+import http from "node:http";
+const { handleApiRequest } = await import(process.env.WORKER);
+
+// A stand-in upstream that records the path it was hit on.
+const seen = [];
+const upstream = http.createServer((req, res) => {
+    seen.push(req.url);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ served: req.url }));
+});
+await new Promise((ok) => upstream.listen(0, "127.0.0.1", ok));
+const port = upstream.address().port;
+
+const env = {
+    TICKET_HOST: "cdn.example",
+    TICKET_ID: "tenant-a",
+    TICKET_PREFIX: "googledrive1/",
+    TICKET_SECRET: "secret-a",
+    ALLOWED_ORIGIN: "https://site.example",
+    UPSTREAM_ORIGIN: `http://127.0.0.1:${port}`,
+    LEGACY_REWRITE: "/activity=/api/activity",
+};
+const ask = async (path, init = {}) => {
+    const r = await handleApiRequest(new Request(`https://api.example${path}`, init), env);
+    return { status: r.status, body: await r.text() };
+};
+
+const out = {};
+out.legacyRewritten = await ask("/activity");
+out.legacyVerbatim = await ask("/api/activity");
+out.ticketStillMints = (await ask("/mp-ticket", {
+    method: "POST",
+    headers: { origin: "https://site.example", "content-type": "application/json" },
+    body: JSON.stringify({ src: "https://cdn.example/googledrive1/film.mkv" }),
+})).status;
+out.pathsSeen = seen;
+
+console.log(JSON.stringify(out));
+upstream.close();
+"#,
+    );
+
+    let v: serde_json::Value = serde_json::from_str(&blob).expect("the harness prints one JSON object");
+    let body = |key: &str| -> serde_json::Value {
+        serde_json::from_str(v[key]["body"].as_str().expect("a json body")).expect("the proxy passes JSON through")
+    };
+    assert_eq!(
+        body("legacyRewritten"),
+        serde_json::json!({ "served": "/api/activity" }),
+        "the public /activity name must reach the upstream's own path"
+    );
+    assert_eq!(
+        body("legacyVerbatim"),
+        serde_json::json!({ "served": "/api/activity" }),
+        "the old path keeps working verbatim"
+    );
+    assert_eq!(v["ticketStillMints"], 200, "the ticket mint is not proxied away");
+    let seen: Vec<String> = serde_json::from_value(v["pathsSeen"].clone()).expect("paths");
+    assert!(
+        seen.iter().all(|p| !p.starts_with("/mp-ticket")),
+        "the ticket path must never reach the upstream: {seen:?}"
+    );
+}
+
