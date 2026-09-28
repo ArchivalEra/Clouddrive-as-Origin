@@ -6,7 +6,7 @@
 # a 5 MiB cold jump took `segment_bytes` up by exactly 67,108,864 bytes (one
 # 64 MiB window, a 12.8x amplification).
 export no_proxy="*"; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY 2>/dev/null
-F=http://127.0.0.1:8080/googledrive1/<film-key>
+F=http://127.0.0.1:8080/googledrive1/${KEY:?set KEY to the object under googledrive1, percent-encoded if it has CJK}
 MET=http://127.0.0.1:9090/metrics
 
 seg() { curl -s -m 5 http://127.0.0.1:8080/_internal/healthz 2>/dev/null | grep -oE '"segment_bytes":[0-9]+' | cut -d: -f2; }

@@ -18,7 +18,8 @@
 #     seconds   how long to run (default 14400 = 4 h)
 #     parallel  concurrent ranges (default 8)
 #     shard-mib range size (default 5)
-#     key       object under googledrive1/ (default: the real 200 GiB film)
+#     key       object under googledrive1/ (required: the bucket is the
+#               operator's and its contents change)
 #
 # Writes one `"<http code> <bytes>"` line per request to $RESULTS (default
 # /home/opc/cold-load.results) and a progress line every 20 rounds to stdout.
@@ -26,7 +27,12 @@ set -u
 SECS=${1:-14400}
 PAR=${2:-8}
 MIB=${3:-5}
-KEY=${4:-<film-key>}
+KEY=${4:-}
+[ -n "$KEY" ] || {
+  echo "cold-load: give the object key as argument 4, percent-encoded if it has CJK" >&2
+  echo "           e.g. cold-load.sh 600 8 5 my%20film.mp4" >&2
+  exit 2
+}
 BIZ=${BIZ:-http://127.0.0.1:8080}
 RESULTS=${RESULTS:-/home/opc/cold-load.results}
 FILM="$BIZ/googledrive1/$KEY"

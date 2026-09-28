@@ -13,7 +13,7 @@ const pageUrl = process.argv[2];
 const watchSecs = Number(process.argv[3] || 20);
 const progressSecs = Number(process.argv[4] || 0);
 // PW first (documented), then PW_DIR — the name run-lab.sh exports.
-const pwDir = process.env.PW || process.env.PW_DIR || '/home/<user>/.npm/_npx/<hash>/node_modules/playwright-core';
+const { pwDir } = await import('./pwdir.mjs');
 const chrome = process.env.CHROME || '/usr/bin/chromium';
 const { chromium } = await import(join(pwDir, 'index.mjs')).catch(async () => await import(pwDir));
 

@@ -42,7 +42,7 @@
 # Exit codes: 0 ok · 2 refused (data not authoritative) · 3 parse/input failure.
 set -euo pipefail
 
-ZONE=${ZONE:-<zone-id>}
+ZONE=${ZONE:?set ZONE to the EdgeOne zone id, e.g. zone-xxxxxxxxxxxx}
 ENDPOINT=${ENDPOINT:-teo.intl.tencentcloudapi.com}
 MODE=report
 OUT_DIR=.

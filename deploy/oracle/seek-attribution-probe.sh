@@ -12,7 +12,7 @@ set -u
 export no_proxy="*"; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY 2>/dev/null
 MET=${ORIGIN_METRICS:-http://127.0.0.1:9090/metrics}
 BIZ=${BIZ:-http://127.0.0.1:8080}
-F=$BIZ/googledrive1/<film-key>
+F=$BIZ/googledrive1/${KEY:?set KEY to the object under googledrive1, percent-encoded if it has CJK}
 
 val() { # metric-base label-fragment count|sum -> the first sample's value
   curl -s -m 5 "$MET" | grep -E "^$1_$3\{" | grep -F "$2" | awk '{print $NF}' | head -1

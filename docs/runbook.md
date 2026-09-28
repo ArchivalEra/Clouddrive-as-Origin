@@ -1359,10 +1359,9 @@ edge's *fill* and its delivery both cross that same path.
 Where the edge's pull actually comes from (measured 2026-09-22, after a wrong
 guess that the cloudflared tunnel was in this path — it is not: that tunnel
 carries the watchdog's status reports). The peers connected to the origin's front
-port are Tencent's AS139341 nodes: three in **Hong Kong** (<edge-ip>,
-<edge-ip>, <edge-ip>) and two in **New Mexico, US** (<edge-ip>,
-<edge-ip>). The client-facing POP the domestic resolvers hand out is
-**Singapore** (<edge-ip>). So content can cross the Pacific twice:
+port are Tencent's AS139341 nodes: three in **Hong Kong** and two in
+**New Mexico, US**. The client-facing POP the domestic resolvers hand out is
+**Singapore**. So content can cross the Pacific twice:
 origin (Phoenix) to a Hong Kong puller, then to the Singapore POP a domestic
 viewer lands on.
 
@@ -1430,7 +1429,7 @@ For the record, the leg table measured while chasing the wrong shape, which is
 still useful as a description of each leg's ceiling: Google Drive -> origin
 20.3 MB/s cold (64 MiB in 3.31 s); origin -> edge 12 MB/s for bytes already
 staged; a cold 1 MiB is ~1.1 s because that is the upstream OPEN's latency, not a
-rate; and a pony season (`<object>`, 13,009,202,351 B / 21,184 s =
+rate; and a second, smaller film (`<object>`, 13,009,202,351 B / 21,184 s =
 4.9 Mbit/s) needs only 0.61 MB/s, which is why it played smoothly through this
 edge: that session really did use the domain and therefore genuine EdgeOne, and
 the origin's log agrees — it holds almost no pulls for that key, because the edge

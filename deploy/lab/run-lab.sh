@@ -16,7 +16,7 @@
 set -u
 
 LAB=/mnt/hdd/CDN-LAB
-REPO=/mnt/hdd/zcode-on-the-move/Onedrive-as-Origin
+REPO=$(cd "$(dirname "$0")/../.." && pwd)
 BIN=$REPO/target/release/origin-cache
 DAV_USER=labuser
 DAV_PASS=labpass
@@ -634,8 +634,12 @@ note "14. N browser viewers of one object (ADR-0016/0019)"
 # or playwright-core FAILS in --quick and only skips in --smoke: the two browser
 # sections are the strongest evidence in the suite, and a gate that can silently
 # drop them is not a gate. Exported, so the probes (which read PW or PW_DIR)
-# agree with this script about where playwright-core lives.
-PW_DIR=${PW_DIR:-/home/<user>/.npm/_npx/<hash>/node_modules/playwright-core}
+# agree with this script about where playwright-core lives. The npx cache
+# directory carries a machine-specific hash, so it is found rather than named.
+for d in "${PW:-}" "${PW_DIR:-}" "$HOME/.npm/_npx"/*/node_modules/playwright-core; do
+  [ -n "$d" ] && [ -d "$d" ] && { PW_DIR=$d; break; }
+done
+PW_DIR=${PW_DIR:-}
 export PW_DIR
 VIEWER_OBJ=viewer-object.mp4
 VIEWER_SIZE=3416888

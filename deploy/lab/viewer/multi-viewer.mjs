@@ -85,7 +85,7 @@ const uniqueSeeds = args.includes('--unique-seeds');
 const chrome = process.env.CHROME || '/usr/bin/chromium';
 // PW first (documented), then PW_DIR — the name run-lab.sh exports, so a
 // standalone run and a LAB run agree on where playwright-core lives.
-const pwDir = process.env.PW || process.env.PW_DIR || '/home/<user>/.npm/_npx/<hash>/node_modules/playwright-core';
+const { pwDir } = await import('./pwdir.mjs');
 
 const { chromium } = await import(join(pwDir, 'index.mjs')).catch(async () => await import(pwDir));
 const readerSrc = readFileSync(join(here, 'reader.js'), 'utf8');

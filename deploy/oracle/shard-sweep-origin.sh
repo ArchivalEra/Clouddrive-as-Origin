@@ -34,7 +34,7 @@
 # 10 MiB. The client-side numbers and the fit are in the other half's header.
 set -u
 BIZ=${BIZ:-http://127.0.0.1:8080}
-KEY=${KEY:-<object>}
+KEY=${KEY:?set KEY to the object under googledrive1, percent-encoded if it has CJK}
 M=${ORIGIN_METRICS:-http://127.0.0.1:9090/metrics}
 SIZES="2 4 5 10"
 BANDS="6 20"                       # GiB into the object

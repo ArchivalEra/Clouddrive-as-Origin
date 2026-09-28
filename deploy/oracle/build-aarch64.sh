@@ -16,7 +16,7 @@
 #     ordinary acceptance gate (`accept.sh`) instead of being trusted for
 #     being newer.
 #
-# Usage (on the compile machine, user <user>):
+# Usage (on the cross-build machine, as the build user):
 #   bash build-aarch64.sh <source-tarball> [output-path]
 #
 # The source tarball is made on the workstation with:

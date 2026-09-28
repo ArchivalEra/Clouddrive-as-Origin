@@ -9,10 +9,12 @@
 # The origin's side comes from `fill-account.sh` (front-access lines = how much
 # the edge actually asked the origin for) plus the open/stat counter deltas.
 set -u
-cd /mnt/hdd/zcode-on-the-move/Onedrive-as-Origin || exit 1
-# Percent-encoded: the repo's pre-push hook refuses CJK in code.
-FILM=<film-key>
-NODE=oracle-cdn
+cd "$(dirname "$0")/../.." || exit 1
+# The object to read, percent-encoded (the repo's pre-push hook refuses CJK in
+# code). Required rather than defaulted: the bucket belongs to the operator and
+# its contents change.
+FILM=${FILM:?set FILM to the object key under googledrive1, percent-encoded}
+NODE=${NODE:-oracle-cdn}
 VIEWERS=${1:-4}
 CHUNKS=${2:-4}
 TAG="n${VIEWERS}"

@@ -19,9 +19,8 @@ should reach it. Three measured facts narrow the options:
   access mechanism.
 - **The peers are inside the range, and that is not what admits them.** An audit
   first counted `xff=` (the clients EdgeOne was serving) and concluded the catalog
-  was wrong; once the access log carried `peer=` (the actual pull node), the six
-  real peers — <edge-ip>, <edge-ip>, <edge-ip>,
-  <edge-ip> — were all inside `43.160.0.0/12`. The catalog is accurate; it
+  was wrong; once the access log carried `peer=` (the actual pull node), all six
+  real peers turned out to be inside `43.160.0.0/12`. The catalog is accurate; it
   was simply not enforcing anything, which is why a direct GET from outside
   returned 200 before R4.
 - **The perimeter is somebody else's list.** The node's ingress rules live in an

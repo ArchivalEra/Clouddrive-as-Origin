@@ -144,13 +144,23 @@ fn the_generator_builds_a_verifiable_bundle_and_checks_it() {
         String::from_utf8_lossy(&stale.stderr)
     );
 
-    // No deployment identifier travels with the bundle.
+    // No deployment identifier travels with the bundle, and this is how that is
+    // kept true after the 2026-09-28 history scrub removed the last one: every
+    // host the shipped files name must be loopback (their own page server),
+    // elided (`https://...`), a documentation placeholder (`your-cdn-host`, or
+    // a `{template}` the caller fills, as in presign.py), or on the short list
+    // below. Anything else is somebody's deployment getting into a copy that is
+    // handed to another machine -- a deliberate decision, so it fails here
+    // first.
+    const ALLOWED_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "nodejs.org"];
     for entry in walk(&dir) {
         let text = std::fs::read_to_string(&entry).unwrap_or_default();
-        for needle in ["<cdn-host>", "example.com", "example.com"] {
+        for (at, _) in text.match_indices("://") {
+            let host: String = text[at + 3..].chars().take_while(|c| !"/\"' \n)".contains(*c)).collect();
+            let named = ALLOWED_HOSTS.iter().any(|h| host.starts_with(h));
             assert!(
-                !text.contains(needle),
-                "{} carries a deployment identifier ({needle})",
+                named || ["...", "{", "your-"].iter().any(|p| host.starts_with(p)),
+                "{} names a host that is not loopback, elided, a placeholder or allow-listed: {host}",
                 entry.display()
             );
         }

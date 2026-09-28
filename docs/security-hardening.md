@@ -208,9 +208,8 @@ front access ... status="206" bytes=1048576 proto="h2"
    ^ who pulled (a Tencent range, in the catalog)   ^ who was being served (a client)
 ```
 
-Measured that way, the six addresses pulling today are all in the catalog
-(`<edge-ip>`, `<edge-ip>`, `<edge-ip>`, `<edge-ip>` — every one
-inside `43.160.0.0/12`). So the catalog *does* describe today's pullers; what it is not is
+Measured that way, every one of the six addresses pulling today is in the catalog
+(all inside `43.160.0.0/12`). So the catalog *does* describe today's pullers; what it is not is
 **binding**, because the zone reports `offline`, and it is **versioned** (the current family
 activates 2026-10-12), so a new version can move the set. That is the honest risk statement
 for `--force`: it would probably work today and has no guarantee behind it.
