@@ -141,11 +141,12 @@ media — there is no CORS.
 
 ## Definition of done for a change
 
-`cargo test --offline` (expect 361) → a reverse validation (break it, name the
-test that goes red) → `run-lab.sh --quick` (85/0) → node deploy + `accept.sh`
-VERDICT=PASS → docs (ADR / spec / runbook / pitfalls / `deploy/README.md`) →
-commit in English → push with `timeout 100` retries and verify
-`git rev-parse HEAD origin/main` are equal → update `.zcode/handoff.md`.
+`cargo test --offline --workspace` (expect 366) → a reverse validation (break it,
+name the test that goes red) → `run-lab.sh --quick` (85/0) → node deploy +
+`accept.sh` VERDICT=PASS → docs (ADR / spec / runbook / pitfalls /
+`docs/usage.md` / `deploy/README.md`) → commit in English → push with
+`timeout 100` retries and verify `git rev-parse HEAD origin/main` are equal →
+update `.zcode/handoff.md`.
 If a test fails, capture the output to a file **before** re-running: two
 transient failures this project never named were lost to `| grep` pipes.
 

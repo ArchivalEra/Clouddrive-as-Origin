@@ -72,12 +72,15 @@ Measured facts first; each one bought a mechanism. Every decision is one line in
 
 ```sh
 cargo build --release --offline
-bash deploy/lab/run-lab.sh --smoke      # PASS=35 FAIL=0 in about a minute, no cloud
+bash deploy/lab/run-lab.sh --smoke      # PASS=45 FAIL=0 in about a minute, no cloud
 ```
 
-To stand up a node, point a CDN and clients at it, and take its account, read
-**`docs/usage.md`**. An agent can carry the same operations in
-`skills/clouddrive-origin/SKILL.md` (symlink it into `~/.zcode/skills/`).
+**The manual is `docs/usage.md`**: what it is and is not, prerequisites, install
+and first start, the full configuration reference, the client interface (reads,
+listing, error codes), signed reads, putting a CDN in front, the caching model,
+day-two operations, capacity arithmetic and a troubleshooting table. An agent can
+carry the same operations in `skills/clouddrive-origin/SKILL.md` (symlink it into
+`~/.zcode/skills/`).
 
 ## The interface clients get
 
@@ -101,7 +104,7 @@ To stand up a node, point a CDN and clients at it, and take its account, read
 
 ## Docs
 
-`docs/usage.md` (use it) · `docs/spec.md` (the contract) ·
+`docs/usage.md` (the manual) · `docs/spec.md` (the contract) ·
 `docs/signing.md` (signed content reads: mint, use, troubleshoot) ·
 `docs/adr/README.md` (decisions) · `docs/runbook.md` (measurements) ·
 `docs/pitfalls.md` (traps, with evidence) · `docs/security-hardening.md` (the
