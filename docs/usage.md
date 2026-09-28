@@ -189,7 +189,7 @@ directory, and a key that collides with a reserved cache name (`redb.db`, a
 | `GET /<id>/<key>` | `200`, `Content-Length`, `Content-Type` (passed through, with a fallback table for the generic `application/octet-stream` many provider APIs return) |
 | `HEAD /<id>/<key>` | the same headers, no body |
 | `GET` + `Range: bytes=100-199` | `206` with `Content-Range: bytes 100-199/<total>` |
-| `GET` + `Range: bytes=100-` (open-ended) | `206`; the origin promises a bounded span it can serve, e.g. `Content-Range: bytes 100-<100+2^31-2>/<total>` — it never has to read the object to the end |
+| `GET` + `Range: bytes=100-` (open-ended) | `206`; the promised span runs to the end of the object (`Content-Range: bytes 100-<total-1>/<total>`), and the body streams as the source delivers it — the origin does not read the object into memory to answer |
 | `GET` + `Range: bytes=-65536` (suffix) | `206` with the last 64 KiB (the size comes from one `stat`) |
 | multi-range (`bytes=0-1,5-6`) | `416` — a deliberate AWS-compatible answer, not a silent whole-object reply |
 | an unsatisfiable range, or `bytes=-0` | `416` with `Content-Range: bytes */<total>` |
@@ -199,6 +199,14 @@ There is no CORS: no `Access-Control-*` header is emitted, so a browser page tha
 fetches objects must be served from the same origin as the objects. An object
 that changed upstream is picked up by revalidation (`revalidate_ttl_secs`) — no
 restart, no cache flush.
+
+Two notes for a client integrator. An open-ended `bytes=N-` is the shape to avoid
+on a metered path: it holds a read lease for as long as the client keeps reading.
+And **through EdgeOne the edge itself caps an open-ended pull** — measured
+`content-range: N-(N+2147483646)` with `content-length: 2147483647`, i.e. 2 GiB,
+whatever the object's size — which is one more reason bounded shards are the
+shape that behaves the same end to end (runbook, "The real player on the real
+film").
 
 ### 6.3 Listing
 
