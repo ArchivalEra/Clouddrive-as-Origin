@@ -26,7 +26,7 @@ use origin_front::{ContentAuth, ContentDecision, ContentRequest};
 
 use crate::metrics::CONTENT_AUTH_TOTAL;
 use crate::signing::{param, Caps, Reason, PROTOCOL_MAX_EXPIRES_SECS, SESSION_MAX_LEN};
-use crate::sigv4::{self, CredentialStore, VerifyInput};
+use crate::sigv4::{self, CredentialStore};
 
 /// Sessions tracked at once. A session costs a few hundred bytes; this cap
 /// bounds the table under a flood of fresh session ids, which is the same
@@ -202,18 +202,9 @@ impl ContentAuth for ContentGate {
         // first — an unsigned request learns nothing about what else is
         // required.
         let session_param = pairs.iter().find(|(k, _)| k == param::SESSION).map(|(_, v)| v.clone());
-        let header_pairs: Vec<(String, String)> = match request.host {
-            Some(h) => vec![("host".to_string(), h.to_string())],
-            None => vec![],
-        };
-        let input = VerifyInput {
-            method: request.method,
-            uri_path: &decoded_path,
-            raw_uri_path: raw_path,
-            query_pairs: pairs,
-            headers: header_pairs,
-            authorization: None,
-        };
+        // The front's shape of the same construction: the resolved host, no
+        // header map (a presigned URL signs `host` and nothing else).
+        let input = sigv4::verify_input(request.method, &decoded_path, raw_path, pairs, request.host, None);
         let verified = match sigv4::verify_optional(Some(&self.store), &input, now) {
             sigv4::VerifyOutcome::Verified(v) => v,
             sigv4::VerifyOutcome::Anonymous => return deny(Reason::MissingSignature),
@@ -520,5 +511,55 @@ X-Amz-Signature=48ee4d7a5fc6a2913a7e37d7f9749e4908b29114398b17a619fe4062311e8e9f
             let _ = t.admit(&format!("t\u{1}session-{i}"), now, 100, u64::MAX);
         }
         assert!(t.sessions.len() <= SESSION_TABLE_CAP, "table grew to {}", t.sessions.len());
+    }
+
+    /// The two verification entries must agree. The front's gate builds its input
+    /// the way the public seam allows (the resolved host, no header map); the
+    /// business plane's verify-if-present layer builds it with the whole map.
+    /// A URL one accepts and the other refuses is a request that works on the
+    /// CDN path and 403s on the loopback path, or the reverse — and until this
+    /// test, nothing compared them.
+    #[test]
+    fn both_verification_entries_accept_the_same_presigned_url() {
+        let store = Arc::new(sigv4::store_with("tenant-a", "secret-a"));
+        let query = sigv4::test_presign(
+            "tenant-a",
+            "secret-a",
+            DATE,
+            300,
+            "/googledrive1/film.mkv",
+            &[("session".into(), "viewer-1".into())],
+        );
+        let path = "/googledrive1/film.mkv";
+        let host = "cdn.example";
+
+        // Entry one: the front's gate, through the door. One store, with the
+        // clock pinned because the gate reads the real one and this URL is
+        // deliberately dated.
+        let mut g = ContentGate::from_caps(Arc::clone(&store), &Caps::default());
+        g.now = Box::new(|| NOW);
+        let decision = g.admit(&ContentRequest {
+            method: "GET",
+            path_and_query: &format!("{path}?{query}"),
+            host: Some(host),
+        });
+        assert!(
+            matches!(decision, ContentDecision::Allow { .. }),
+            "the front's gate refused a URL the in-crate signer produced"
+        );
+
+        // Entry two: the business plane's shape — the whole header map, and the
+        // same query pairs, which is what `sigv4_gate` hands the verifier.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("host", host.parse().unwrap());
+        let pairs: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        let input = sigv4::verify_input("GET", path, path, pairs, None, Some(&headers));
+        let outcome = sigv4::verify_optional(Some(&store), &input, NOW);
+        assert!(
+            matches!(outcome, sigv4::VerifyOutcome::Verified(_)),
+            "the business plane's entry refused the same URL: {outcome:?}"
+        );
     }
 }

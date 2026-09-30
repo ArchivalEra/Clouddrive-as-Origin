@@ -62,18 +62,10 @@ fn sigv4_gate(
     let pairs: Vec<(String, String)> = query
         .map(|q| form_urlencoded::parse(q.as_bytes()).map(|(k, v)| (k.into_owned(), v.into_owned())).collect())
         .unwrap_or_default();
-    let header_pairs: Vec<(String, String)> = headers
-        .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_ascii_lowercase(), v.to_string())))
-        .collect();
-    let input = sigv4::VerifyInput {
-        method,
-        uri_path: &decoded_path,
-        raw_uri_path,
-        query_pairs: pairs,
-        headers: header_pairs,
-        authorization,
-    };
+    // Which headers the signature covers, and where `Authorization` comes from,
+    // is decided in one place (`sigv4::verify_input`) — this is the shape with
+    // the whole header map; the front's gate passes its resolved host and None.
+    let input = sigv4::verify_input(method, &decoded_path, raw_uri_path, pairs, None, Some(headers));
     match sigv4::verify_optional(store, &input, now_unix) {
         sigv4::VerifyOutcome::Anonymous | sigv4::VerifyOutcome::Verified(_) => None,
         // The reason string stays out of the response body: AWS-compatible

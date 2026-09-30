@@ -15,6 +15,7 @@
 //! v4a (ECDSA-P256) is deferred (no verifier crate exists); v2 unsupported.
 
 use anyhow::Context;
+use axum::http::HeaderMap;
 use crate::signing::{param, Reason, PROTOCOL_MAX_EXPIRES_SECS};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -349,6 +350,42 @@ pub struct VerifyInput<'a> {
     /// Lowercased request headers (name, value); multi-values flattened.
     pub headers: Vec<(String, String)>,
     pub authorization: Option<&'a str>,
+}
+
+/// Build the verification input for an inbound request.
+///
+/// Two call sites verify signatures: the front's content gate (a presigned
+/// ticket on a public read) and the business plane's verify-if-present layer (a
+/// loopback S3 or listing call). What they *have* differs — the front's seam
+/// carries the resolved host and no header map, the business plane has the whole
+/// map — and that difference is an argument here rather than two hand-written
+/// copies of the security-relevant decision: **which headers the signature
+/// covers** and where `Authorization` comes from.
+///
+/// The query pairs arrive already parsed: the caller owns that bound (the front
+/// caps them on the flood path, and an unbounded parse there would itself be a
+/// way to spend memory). `uri_path` must already be decoded — `VerifyInput`
+/// borrows it.
+pub fn verify_input<'a>(
+    method: &'a str,
+    uri_path: &'a str,
+    raw_uri_path: &'a str,
+    query_pairs: Vec<(String, String)>,
+    host: Option<&'a str>,
+    headers: Option<&'a HeaderMap>,
+) -> VerifyInput<'a> {
+    let (header_pairs, authorization) = match headers {
+        Some(map) => (
+            map.iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_ascii_lowercase(), v.to_string())))
+                .collect(),
+            map.get("authorization").and_then(|v| v.to_str().ok()),
+        ),
+        // The front's seam has the resolved host and nothing else: the only
+        // header a presigned URL signs is `host`.
+        None => (host.map(|h| vec![("host".to_string(), h.to_string())]).unwrap_or_default(), None),
+    };
+    VerifyInput { method, uri_path, raw_uri_path, query_pairs, headers: header_pairs, authorization }
 }
 
 /// Outcome of optional verification.
