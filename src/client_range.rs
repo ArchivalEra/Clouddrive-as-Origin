@@ -84,12 +84,11 @@ pub(crate) enum RequestedSpan {
 /// `Multi` is rejected by [`parse`] before this is reached, and `Absent` needs no
 /// size at all — both are here so a caller can pass whatever it parsed.
 ///
-/// Deliberately NOT delegating to `cache::resolve_range`: that one clamps a
-/// range against a KNOWN object size on the serve path, while this one decides
-/// what a request means before any size is known (a suffix needs the size,
-/// `Multi` is a 416, an absent range is the whole object). They overlap only on
-/// the `Single` arm, and merging them would put request parsing and
-/// size-dependent clamping behind one interface.
+/// Two interfaces, one rule: this one answers "what does the header mean", and
+/// [`resolve_byte_range`] gives the serve path the same clamp for its own input
+/// shape. The interfaces stay separate on purpose — request parsing and
+/// size-dependent clamping are different questions — but the clamp itself has
+/// one home, so the two cannot drift apart while both look right.
 pub(crate) fn resolve(parsed: &ClientRange, size: u64) -> RequestedSpan {
     match parsed {
         ClientRange::Absent => RequestedSpan::Whole,
@@ -108,6 +107,27 @@ pub(crate) fn resolve(parsed: &ClientRange, size: u64) -> RequestedSpan {
             let end = r.length.map_or(size, |l| (r.offset + l).min(size));
             RequestedSpan::Span { offset: r.offset, len: end - r.offset }
         }
+    }
+}
+
+/// The same clamp for the serve path's input shape: an optional provider-shaped
+/// [`ByteRange`] against a known total, as `[start, end)`.
+///
+/// `cache::resolve_range` used to carry a second copy of this arithmetic — the
+/// same truncate-at-the-end, refuse-at-or-past-the-end rule — and the two agreed
+/// only by convention and by two separate tests. Now it delegates here, so a
+/// change to the rule breaks one test at its home instead of leaving one side
+/// looking right (the same reason the range arithmetic was collected in the first
+/// place: two of its four old homes had already drifted).
+pub(crate) fn resolve_byte_range(range: Option<ByteRange>, total: u64) -> Result<(u64, u64), ()> {
+    let parsed = match range {
+        None => ClientRange::Absent,
+        Some(r) => ClientRange::Single(r),
+    };
+    match resolve(&parsed, total) {
+        RequestedSpan::Whole => Ok((0, total)),
+        RequestedSpan::Span { offset, len } => Ok((offset, offset + len)),
+        RequestedSpan::Unsatisfiable => Err(()),
     }
 }
 

@@ -59,21 +59,17 @@ pub struct HitMeta {
 }
 
 /// Resolve a client Range against an object of `total` bytes into
-/// `[start, end)`, `end` exclusive. One construction site (C3): the same
-/// arithmetic used to live in four places, and two of them had drifted.
+/// `[start, end)`, `end` exclusive.
+///
+/// The rule itself lives in `client_range::resolve_byte_range` (with the rest of
+/// the range arithmetic, and with the header-shaped interface beside it): this is
+/// the serve path's name for it, and it maps the refusal onto the provider's
+/// error type. It used to be a second copy of the same arithmetic.
 pub(crate) fn resolve_range(
     range: Option<crate::backend::ByteRange>,
     total: u64,
 ) -> Result<(u64, u64), BackendError> {
-    match range {
-        None => Ok((0, total)),
-        Some(r) => {
-            if r.offset >= total {
-                return Err(BackendError::RangeNotSatisfiable);
-            }
-            Ok((r.offset, r.length.map_or(total, |l| (r.offset + l).min(total))))
-        }
-    }
+    crate::client_range::resolve_byte_range(range, total).map_err(|()| BackendError::RangeNotSatisfiable)
 }
 
 /// Build response headers' metadata with MIME fallback applied (§3.9).
