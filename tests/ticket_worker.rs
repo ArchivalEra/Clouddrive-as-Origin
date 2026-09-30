@@ -101,7 +101,7 @@ upstream = "media"
     let store = CredentialStore::load(Some(&creds.to_string_lossy()))
         .expect("load credentials")
         .expect("credentials present");
-    (ContentGate::from_config(Arc::new(store), &cfg), dir)
+    (ContentGate::from_caps(Arc::new(store), &cfg.content_caps()), dir)
 }
 
 fn path_and_query(url: &str) -> String {

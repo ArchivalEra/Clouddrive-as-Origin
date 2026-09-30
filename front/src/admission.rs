@@ -216,12 +216,19 @@ impl ContentAuthGate {
 /// the public hostname, prewarm, an authenticated write-side entry point the
 /// upload pipeline calls through the CDN.
 fn is_internal(path: &str) -> bool {
-    path.starts_with("/_internal/") && !path.starts_with("/_internal/prewarm/")
+    path.starts_with(INTERNAL_PREFIX) && !is_prewarm(path)
 }
 
-fn is_prewarm(path: &str) -> bool {
-    path.starts_with("/_internal/prewarm/")
+/// The one prewarm-shaped entry point. Two decisions hang off this prefix — the
+/// private-surface refusal at the door and the chunked-body cap in the body
+/// filter — so it is a predicate here rather than a literal in each place; a
+/// second prewarm-shaped route would otherwise update one of the two.
+pub fn is_prewarm(path: &str) -> bool {
+    path.starts_with(PREWARM_PREFIX)
 }
+
+const INTERNAL_PREFIX: &str = "/_internal/";
+const PREWARM_PREFIX: &str = "/_internal/prewarm/";
 
 /// The door: the gates and the order they run in.
 pub struct Admission {

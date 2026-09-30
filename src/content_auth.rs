@@ -24,9 +24,8 @@ use std::sync::{Arc, Mutex};
 
 use origin_front::{ContentAuth, ContentDecision, ContentRequest};
 
-use crate::config::Config;
 use crate::metrics::CONTENT_AUTH_TOTAL;
-use crate::signing::{param, Reason, PROTOCOL_MAX_EXPIRES_SECS, SESSION_MAX_LEN};
+use crate::signing::{param, Caps, Reason, PROTOCOL_MAX_EXPIRES_SECS, SESSION_MAX_LEN};
 use crate::sigv4::{self, CredentialStore, VerifyInput};
 
 /// Sessions tracked at once. A session costs a few hundred bytes; this cap
@@ -151,16 +150,11 @@ pub struct ContentGate {
 
 impl ContentGate {
     /// Built once at boot from the loaded credential store and the config's
-    /// budget knobs. The session marker is required: without it the budgets
-    /// have nothing to key on, and an unkeyed URL is exactly the anonymous
-    /// amplification this gate exists to close.
-    pub fn from_config(store: Arc<CredentialStore>, cfg: &Config) -> Self {
-        Self::new(
-            store,
-            cfg.front_content_auth_max_expiry_secs,
-            cfg.front_content_auth_session_rps,
-            cfg.front_content_auth_session_mib_per_min,
-        )
+    /// caps (one derivation: `Config::content_caps`). The session marker is
+    /// required: without it the budgets have nothing to key on, and an unkeyed
+    /// URL is exactly the anonymous amplification this gate exists to close.
+    pub fn from_caps(store: Arc<CredentialStore>, caps: &Caps) -> Self {
+        Self::new(store, caps.max_expiry_secs, caps.session_rps, caps.session_mib_per_min)
     }
 
     pub fn new(store: Arc<CredentialStore>, max_expiry_secs: u64, session_rps: u32, session_mib_per_min: u64) -> Self {

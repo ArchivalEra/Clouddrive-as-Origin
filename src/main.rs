@@ -95,9 +95,9 @@ async fn main() -> anyhow::Result<()> {
             .map(Arc::new);
     let content_auth: Option<Arc<dyn front::ContentAuth>> = if cfg.front_content_auth {
         match sigv4_store.as_ref() {
-            Some(store) if !store.is_empty() => Some(Arc::new(origin_cache::content_auth::ContentGate::from_config(
+            Some(store) if !store.is_empty() => Some(Arc::new(origin_cache::content_auth::ContentGate::from_caps(
                 Arc::clone(store),
-                &cfg,
+                &cfg.content_caps(),
             ))),
             _ => anyhow::bail!(
                 "front_content_auth is on but no credentials loaded: name sigv4_credentials_path, \

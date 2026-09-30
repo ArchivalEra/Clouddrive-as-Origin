@@ -32,7 +32,7 @@ use tracing::{info, warn};
 
 mod admission;
 
-pub use admission::{Admission, Identity, RequestHead, Verdict, PREWARM_MAX_BODY};
+pub use admission::{is_prewarm, Admission, Identity, RequestHead, Verdict, PREWARM_MAX_BODY};
 
 /// Everything the front plane needs at boot. CIDR lists are plain
 /// strings here; parsing (and its errors) happen in this crate so the
@@ -432,7 +432,7 @@ impl ProxyHttp for BusinessProxy {
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> ProxyResult<()> {
-        if session.req_header().uri.path().starts_with("/_internal/prewarm/") {
+        if is_prewarm(session.req_header().uri.path()) {
             if let Some(b) = body {
                 ctx.prewarm_body_bytes = ctx.prewarm_body_bytes.saturating_add(b.len());
             }

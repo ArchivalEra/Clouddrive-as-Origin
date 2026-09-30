@@ -548,10 +548,6 @@ impl CredentialStore {
         self.entries.get(id)
     }
 
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -571,18 +567,23 @@ pub fn now_unix() -> i64 {
 }
 
 /// A store for tests outside this module (the entries map is private on
-/// purpose; production tables come from a file or the env).
+/// purpose; production tables come from a file or the env). Two constructors,
+/// and the deletion test says keep them: the general one takes whatever a test
+/// needs, and the one-entry shorthand hides a four-field struct from the
+/// callers that only want "a store with this key" — deleting it would move that
+/// shape into each of them rather than remove it.
+#[cfg(test)]
+pub(crate) fn test_store(entries: Vec<(String, CredentialEntry)>) -> CredentialStore {
+    CredentialStore { entries: entries.into_iter().collect() }
+}
+
+/// The one-entry case, spelled once so the callers read alike.
 #[cfg(test)]
 pub(crate) fn store_with(id: &str, secret: &str) -> CredentialStore {
     test_store(vec![(
         id.to_string(),
         CredentialEntry { secret: secret.to_string(), prefix: None, session_rps: None, session_mib_per_min: None },
     )])
-}
-
-#[cfg(test)]
-pub(crate) fn test_store(entries: Vec<(String, CredentialEntry)>) -> CredentialStore {
-    CredentialStore { entries: entries.into_iter().collect() }
 }
 
 /// The CLIENT side of the presigned flow, for tests outside this module:

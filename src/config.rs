@@ -580,18 +580,6 @@ impl Config {
                  disabling the disk cache (and the staged-segment sweep)"
             );
         }
-        // ADR-0027: the content-auth caps are validated by the module that
-        // enforces them, so a knob that would turn the gate into a wall cannot
-        // reach the gate at all. (Whether a credential store actually loaded is
-        // checked in main.rs, which knows — config parsing stays a pure
-        // function of the file.)
-        crate::signing::Caps {
-            max_expiry_secs: raw.front_content_auth_max_expiry_secs,
-            session_rps: raw.front_content_auth_session_rps,
-            session_mib_per_min: raw.front_content_auth_session_mib_per_min,
-        }
-        .validate()
-        .map_err(|e| anyhow::anyhow!(e))?;
         {
             // Duplicate ids were silently resolved by "last one wins" in the
             // slot map, so one upstream's config vanished with no message.
@@ -688,7 +676,7 @@ impl Config {
         if !raw.routes.iter().any(|r| r.prefix.is_empty()) {
             anyhow::bail!("at least one [[routes]] with empty prefix (default) required");
         }
-        Ok(Self {
+        let cfg = Self {
             front_listen: raw.front_listen,
             listen_addr: raw.listen_addr,
             tls_cert_env: raw.tls_cert_env,
@@ -727,7 +715,28 @@ impl Config {
             upstreams: raw.upstreams,
             routes: RouteTable::new(raw.routes),
             cache_profiles: profiles,
-        })
+        };
+        // ADR-0027: the content-auth caps are validated by the module that
+        // enforces them, so a knob that would turn the gate into a wall cannot
+        // reach the gate at all. (Whether a credential store actually loaded is
+        // checked in main.rs, which knows — config parsing stays a pure function
+        // of the file.) The caps come from the same derivation the gate is
+        // built from, so knobs become caps in one place rather than two.
+        cfg.content_caps().validate().map_err(|e| anyhow::anyhow!(e))?;
+        Ok(cfg)
+    }
+}
+
+impl Config {
+    /// The content-read caps, derived once. The gate is built from this value
+    /// rather than re-reading (and re-converting) the three knobs, so each
+    /// knob's name and unit has one home.
+    pub fn content_caps(&self) -> crate::signing::Caps {
+        crate::signing::Caps {
+            max_expiry_secs: self.front_content_auth_max_expiry_secs,
+            session_rps: self.front_content_auth_session_rps,
+            session_mib_per_min: self.front_content_auth_session_mib_per_min,
+        }
     }
 }
 
