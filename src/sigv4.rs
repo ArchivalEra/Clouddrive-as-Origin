@@ -289,7 +289,16 @@ fn signed_headers_list(signed_names: &[&str]) -> String {
     seen.join(";")
 }
 
-/// Canonical request over the decoded URI path (s3s uri_encode(path, false)).
+/// The canonical query string: `name=value` pairs, both percent-encoded, sorted
+/// by encoded name and then by encoded value (AWS SigV4's rule). THE rule for
+/// this shape lives here and nowhere else — the external signers
+/// (`deploy/oracle/presign.py`, `deploy/ticket-worker/worker.mjs`) implement the
+/// same order and `tests/signing_contract.rs` runs them against this verifier,
+/// so a change here is a test failure there rather than an intermittent 403.
+///
+/// The value tiebreak only shows up when one name appears twice, which no
+/// signer emits and which the gate reads as "the first one wins" — the case is
+/// pinned by a unit test below so the rule is stated rather than assumed.
 fn canonical_query(pairs: &[(String, String)], skip_signature: bool) -> String {
     let mut qs: Vec<(String, String)> = Vec::new();
     for (n, v) in pairs {
@@ -298,7 +307,7 @@ fn canonical_query(pairs: &[(String, String)], skip_signature: bool) -> String {
         }
         qs.push((uri_encode_string(n, true), uri_encode_string(v, true)));
     }
-    qs.sort_by(|a, b| a.0.cmp(&b.0));
+    qs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let mut out = String::new();
     if let Some((first, rest)) = qs.split_first() {
         out.push_str(&first.0);
@@ -926,6 +935,33 @@ mod tests {
     /// `example_get_object` vector (Apache-2.0 official AWS suite case):
     /// GET /test.txt, canonical headers host;x-amz-content-sha256;
     /// x-amz-date, UNSIGNED-PAYLOAD, 20130524T000000Z us-east-1/s3.
+    /// The canonical query order is AWS's: by encoded name, then by encoded
+    /// value. The tiebreak is invisible for a signer that emits each name once
+    /// (every signer here), and it is exactly the case a second minter could
+    /// disagree about — so it is stated here rather than left to the comment on
+    /// the external tools. Reverse validation: drop `.then_with(...)` and this
+    /// test is the only one that goes red.
+    #[test]
+    fn the_canonical_query_sorts_by_name_then_by_value() {
+        let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter().map(|(n, s)| (n.to_string(), s.to_string())).collect()
+        };
+        // Names in, order out; equal names fall back to the value.
+        let q = canonical_query(&pairs(&[("session", "b"), ("X-Amz-Date", "z"), ("session", "a")]), true);
+        assert_eq!(q, "X-Amz-Date=z&session=a&session=b");
+
+        // Both sides of the comparison are encoded before comparing: a space
+        // and a `%20` sort by their encoded forms.
+        let q = canonical_query(&pairs(&[("b", "x y"), ("a", "z")]), true);
+        assert_eq!(q, "a=z&b=x%20y");
+
+        // X-Amz-Signature is excluded from its own canonical query, and only
+        // from that one.
+        let with_sig = pairs(&[("a", "1"), ("X-Amz-Signature", "deadbeef")]);
+        assert_eq!(canonical_query(&with_sig, true), "a=1");
+        assert_eq!(canonical_query(&with_sig, false), "X-Amz-Signature=deadbeef&a=1");
+    }
+
     /// The self-consistency is cross-checked by the roundtrip test; here
     /// we pin that our canonical assembly yields a *stable* signature and
     /// that re-deriving through verify_optional matches.

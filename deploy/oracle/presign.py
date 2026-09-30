@@ -40,9 +40,11 @@ def uri_encode(value: str, keep_slash: bool) -> str:
 
 
 def canonical_query(pairs):
-    # Sort by (name, value) on the raw pairs, then encode -- the same order
-    # the origin's verifier applies, so both sides agree without either
-    # depending on AWS's tie-breaking corner cases.
+    # Sort by name, then by value; encode each component. The rule's home is
+    # the origin (sigv4::canonical_query, with its own unit test for the
+    # duplicate-name case), and this tool is checked against that verifier by
+    # tests/signing_contract.rs -- so agreement is a test result, not a claim
+    # made in this comment.
     ordered = sorted(pairs, key=lambda kv: (kv[0], kv[1]))
     return "&".join(f"{uri_encode(k, False)}={uri_encode(v, False)}" for k, v in ordered)
 

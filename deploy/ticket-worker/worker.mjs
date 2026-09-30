@@ -73,8 +73,10 @@ async function sha256Hex(data) {
 }
 
 function canonicalQuery(pairs) {
-  // Sort on the RAW pairs, then encode — the order the origin's verifier
-  // applies, so neither side depends on AWS's tie-breaking corner cases.
+  // Sort by name, then by value; encode each component. The rule's home is the
+  // origin (sigv4::canonical_query, which has a unit test for the
+  // duplicate-name case); this worker is checked against it byte-for-byte by
+  // tests/ticket_worker.rs, so agreement is a test result rather than a claim.
   const ordered = [...pairs].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : 1));
   return ordered.map(([k, v]) => `${uriEncode(k, false)}=${uriEncode(v, false)}`).join("&");
 }
