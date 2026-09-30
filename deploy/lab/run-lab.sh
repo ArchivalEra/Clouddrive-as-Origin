@@ -796,6 +796,20 @@ code=$(H -o /dev/null -w "%{http_code}" "http://127.0.0.1:7782/_internal/healthz
 code=$(H -o /dev/null -w "%{http_code}" "http://127.0.0.1:7782/_internal/an-internal-route-nobody-registered")
 [ "$code" = 404 ] && ok "and an unknown internal path with it: the rule is the prefix, not a name" \
   || bad "an unregistered internal path returned $code (want 404)"
+# The prefix rule is applied to the RAW path, while the business plane routes on
+# the decoded one; what keeps a re-encoded or traversing form out of the private
+# surface is the key rule and the namespace, not the prefix test. Probed live on
+# the node (2026-09-29) and pinned here, because this is the only place with a
+# real front AND a real plane in the path: a form the front does not classify as
+# private must never come back as the internal surface.
+for p in "/%5Finternal/healthz" "/%5f_internal/healthz" "/x/../_internal/healthz" "/a/b/../../_internal/healthz"; do
+  body=$(H -m 20 "http://127.0.0.1:7782$p")
+  code=$(H -o /dev/null -w "%{http_code}" -m 20 "http://127.0.0.1:7782$p")
+  case "$body" in
+    *coverage_intervals*) bad "$p served the internal surface (code=$code)" ;;
+    *) ok "not the internal surface: $p -> $code" ;;
+  esac
+done
 # The assertion is that the BUSINESS plane answers on its own port (`hz_field`
 # reads numeric fields only, and `status` is a string). It must NOT require
 # `status:"ok"`: a fresh cache directory whose files predate the metadata store

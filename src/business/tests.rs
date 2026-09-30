@@ -1231,6 +1231,33 @@ async fn invalid_object_keys_unreachable_by_uri_are_rejected_at_the_seam() {
     assert_ne!(status, StatusCode::BAD_REQUEST, "routed /absolute is the key `absolute`");
 }
 
+/// The private surface is guarded by three rules that agree only by convention:
+/// the front refuses a RAW `/_internal/` prefix, this seam refuses a key with a
+/// dot-segment, and the router matches on the decoded path.
+///
+/// What is pinned HERE is this seam's own rule: a dot-segment form is refused as
+/// a key (400) rather than routed. The percent-encoded forms are NOT pinned here
+/// — the test harness's router answers the internal route for them, which the
+/// real plane does not (probed live 2026-09-29: both through the front and
+/// straight at the business plane, `/%5Finternal/healthz` and
+/// `/%5f_internal/healthz` answer 404 from the object namespace), so their
+/// assertion belongs where a real front and plane are in the path: the LAB's
+/// front-guard section.
+#[tokio::test]
+async fn traversal_paths_never_serve_the_internal_surface() {
+    use tower::ServiceExt;
+    let fx = base(b"unused").build();
+    for uri in ["/x/../_internal/healthz", "/a/b/../../_internal/healthz"] {
+        let request = axum::http::Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let (status, _, body) = body_text(router(fx.state.clone()).oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} was not refused as a key");
+        assert!(
+            !body.contains("coverage_intervals"),
+            "{uri} served the internal healthz surface: {status} {body}"
+        );
+    }
+}
+
 /// V1 and V2 listing must keep working: the invalid-key fix must not
 /// turn a legitimate bucket listing into an error.
 #[tokio::test]
