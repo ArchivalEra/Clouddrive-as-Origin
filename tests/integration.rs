@@ -2442,13 +2442,26 @@ async fn the_account_the_ledger_and_the_disk_never_disagree() {
     // And the restart: a second Cache over the same directory rebuilds the
     // account from the FILES (the disk is the authority), so the invariants must
     // hold in the new process's books too.
+    //
+    // Quiesce first, and then drop the first cache: a restart means ONE process
+    // over the directory. Without those two lines the capture below can land
+    // while the last round's body is still sealing its span — the seal then
+    // shows up in the new process's scan but not in the captured number, a
+    // difference this assertion cannot tell from a real account bug. It failed
+    // exactly that way on a loaded CI runner (2026-09-30, run 36712911481:
+    // `54 passed; 1 failed` after 28.9 s, against ~3 s locally), so the walk was
+    // innocent and the window was the test's.
+    wait_map_empty(&cache).await;
+    wait_settled(&cache).await;
     let before = {
         let k = cache.inspect("a.bin").await;
         (cache.snapshot().await.segment_bytes, k.staged_spans)
     };
     let clock2 = Arc::new(MockClock::new(cache.clock.now_millis()));
+    let config = Arc::clone(&cache.config);
+    drop(cache);
     let cache2 = Arc::new(Cache::new(
-        Arc::clone(&cache.config),
+        config,
         clock2,
         BackendRegistry::new(HashMap::new()),
     ));
