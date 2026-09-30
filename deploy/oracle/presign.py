@@ -77,12 +77,20 @@ def main() -> int:
         help="HTTP method the URL authorizes (SigV4 signs the method: a GET URL is not valid for HEAD)",
     )
     ap.add_argument("--date", default="", help="override X-Amz-Date (YYYYmmddTHHMMSSZ), for reproducible vectors")
+    ap.add_argument(
+        "--header-auth",
+        action="store_true",
+        help="sign the Authorization-header shape instead of a presigned URL (prints the "
+        "Authorization and x-amz-* headers, one per line). This is the business plane's "
+        "verify-if-present path -- a loopback S3 or listing call, and the lab's state-2/3 arm; "
+        "it takes no --session and no --expires, which are query-auth concepts.",
+    )
     args = ap.parse_args()
 
     if not args.id or not args.secret:
         print("presign: no credentials -- pass --id/--secret or export SIGV4_ACCESS_KEY_ID/SECRET", file=sys.stderr)
         return 2
-    if not args.session and not args.no_session:
+    if not args.header_auth and not args.session and not args.no_session:
         print(
             "presign: --session is required: the origin requires a session marker on every\n"
             "signed read (it is the key the per-session budgets charge), so a URL without one\n"
@@ -105,6 +113,46 @@ def main() -> int:
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     scope_date = amz_date[:8]
     region, service = "us-east-1", "s3"
+    scope = f"{scope_date}/{region}/{service}/aws4_request"
+
+    def h(key: bytes, data: bytes) -> bytes:
+        return hmac.new(key, data, hashlib.sha256).digest()
+
+    def signature_of(string_to_sign: str) -> str:
+        key = h(h(h(h(("AWS4" + args.secret).encode(), scope_date.encode()), region.encode()), service.encode()), b"aws4_request")
+        return hmac.new(key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+
+    if args.header_auth:
+        # Header auth: `Authorization` plus the two `x-amz-*` headers it names,
+        # one per line. The signed-header list and the payload literal are the
+        # ones the verifier expects (`host;x-amz-content-sha256;x-amz-date`,
+        # UNSIGNED-PAYLOAD), and the shape is pinned against that verifier by
+        # tests/signing_contract.rs -- this tool is its only author, so the three
+        # copies that used to live in the lab's scripts are gone.
+        signed = "host;x-amz-content-sha256;x-amz-date"
+        payload = "UNSIGNED-PAYLOAD"
+        canonical_headers = (
+            f"host:{args.host}\n" f"x-amz-content-sha256:{payload}\n" f"x-amz-date:{amz_date}\n"
+        )
+        canonical_request = "\n".join([
+            args.method,
+            uri_encode(args.key, True),
+            "",
+            canonical_headers,
+            signed,
+            payload,
+        ])
+        string_to_sign = "\n".join([
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            scope,
+            hashlib.sha256(canonical_request.encode()).hexdigest(),
+        ])
+        sig = signature_of(string_to_sign)
+        print(f"Authorization: AWS4-HMAC-SHA256 Credential={args.id}/{scope}, SignedHeaders={signed}, Signature={sig}")
+        print(f"x-amz-date: {amz_date}")
+        print(f"x-amz-content-sha256: {payload}")
+        return 0
 
     pairs = [
         ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
@@ -125,21 +173,13 @@ def main() -> int:
         "host",
         "UNSIGNED-PAYLOAD",
     ])
-    scope = f"{scope_date}/{region}/{service}/aws4_request"
     string_to_sign = "\n".join([
         "AWS4-HMAC-SHA256",
         amz_date,
         scope,
         hashlib.sha256(canonical_request.encode()).hexdigest(),
     ])
-
-    def h(key: bytes, data: bytes) -> bytes:
-        return hmac.new(key, data, hashlib.sha256).digest()
-
-    signing_key = h(h(h(h(("AWS4" + args.secret).encode(), scope_date.encode()), region.encode()), service.encode()), b"aws4_request")
-    signature = hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
-
-    query = canonical_query(pairs) + f"&X-Amz-Signature={signature}"
+    query = canonical_query(pairs) + f"&X-Amz-Signature={signature_of(string_to_sign)}"
     print(f"{args.scheme}://{args.host}{uri_encode(args.key, True)}?{query}")
     return 0
 

@@ -52,7 +52,6 @@ the x86_64 cross-build box (an `ssh`-config alias; `deploy-node.sh` takes
 | `probe-edgeone-range-shape.sh` | what the CDN does with each range SHAPE | node | — | pitfall 27 |
 | `probe-edgeone-viewers.sh` | N concurrent viewers through the CDN, from the NODE | node | — | runbook "…from the NODE" |
 | `run-edgeone.sh` | the live CDN regression wrapper | workstation | the CDN | runbook |
-| `sigv4-test.py` | the S3 listing signature, against a real bucket | workstation | credentials in env | `docs/spec.md` §S3 |
 | `seek-storm.sh` | the scattered-seek shape that card C5 was about — kept as a COUNTER-EXAMPLE: the shape is not production and the question is closed (2026-09-12) | node | — | ADR-0004 "Not decided here" |
 
 ## `deploy/lab/viewer/` — the browsers
@@ -90,5 +89,5 @@ so an end-to-end demo stays reproducible.
 | `measure-client-ttfb.sh` | client-side first-byte latency (spec §10) | client | a URL | `docs/spec.md` §10 |
 | `metrics-report.sh` | latency attribution from the origin's /metrics | node (or via `ssh -L`) | the metrics port 9090 | runbook "Requests are slow" |
 | `shard-sweep-origin.sh` | what a range size costs the ORIGIN: upstream opens/stat and upstream bytes per size, cold then warm, each size on its own offsets | node (loopback) | the metrics port 9090 | runbook "Range size: what it changes" (its client half is `deploy/lab/probe-shard-size.sh`) |
-| `presign.py` | mint one presigned URL (SigV4 query auth) for a site backend or an external check — the ticket `front_content_auth` admits; `--session` is required, `--no-session` mints the refused shape on purpose | workstation / site backend | credentials in env or flags | runbook "Content reads are presigned" (ADR-0027); `docs/signing.md` |
+| `presign.py` | the ONE signer: a presigned URL (SigV4 query auth) for a site backend or an external check — the ticket `front_content_auth` admits (`--session` is required, `--no-session` mints the refused shape on purpose); `--header-auth` signs the Authorization-header shape the business plane's verify-if-present layer takes (the lab's state-2/3 arm), and both shapes are pinned against the verifier by `tests/signing_contract.rs` | workstation / site backend / the lab | credentials in env or flags | runbook "Content reads are presigned" (ADR-0027); `docs/signing.md` |
 | `ticket-worker/` | the ticket ENDPOINT for a client that must not hold a secret: POST the raw embed URL, get one presigned URL + a session cookie (one cookie = one session = one budget); same-origin only, host/prefix checks, a per-session valve. Reference implementation, no deployment identity in it | the site's own platform (e.g. a Worker on the site's zone) | bindings: host/tenant/prefix + the secret (`wrangler secret put`) | `docs/signing.md`; its own README |

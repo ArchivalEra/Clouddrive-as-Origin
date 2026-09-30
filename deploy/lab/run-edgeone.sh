@@ -47,28 +47,14 @@ note "6. SigV4 signed GET (Authorization forwarded)"
 # Sign with the oracle env credentials (must match SIGV4_* on the node).
 AK="${SIGV4_AK:-AKLABTESTKEY1234}"
 SK="${SIGV4_SK:-origin-lab-secret-9f2c}"
-lines=$(python3 - "$SK" "$BASE/googledrive1/IMG_20260904_003601.png" "$AK" <<'PY' 2>/dev/null
-import hashlib, hmac, sys, datetime
-SECRET = sys.argv[1]; URL = sys.argv[2]; AK = sys.argv[3]
-u = URL.split("://",1)[1]; host, path = u.split("/",1); path = "/"+path
-region, service = "us-east-1", "s3"
-now = datetime.datetime.utcnow()
-amzdate = now.strftime("%Y%m%dT%H%M%SZ"); datestamp = now.strftime("%Y%m%d")
-signed = "host;x-amz-content-sha256;x-amz-date"; payload = "UNSIGNED-PAYLOAD"
-ch = f"host:{host}\nx-amz-content-sha256:{payload}\nx-amz-date:{amzdate}\n"
-canonical = f"GET\n{path}\n\n{ch}\n{signed}\n{payload}"
-scope = f"{datestamp}/{region}/{service}/aws4_request"
-sts = f"AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n{hashlib.sha256(canonical.encode()).hexdigest()}"
-def hs(k,d): return hmac.new(k, d.encode(), hashlib.sha256).digest()
-k = hs(hs(hs(hs(("AWS4"+SECRET).encode(), datestamp), region), service), "aws4_request")
-sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
-print(f"Authorization: AWS4-HMAC-SHA256 Credential={AK}/{scope}, SignedHeaders={signed}, Signature={sig}")
-print(amzdate)
-PY
-)
-AUTH=$(echo "$lines" | head -1); DATE=$(echo "$lines" | tail -1)
+lines=$(python3 "$REPO/deploy/oracle/presign.py" --header-auth \
+  --host "${BASE#*://}" --key googledrive1/IMG_20260904_003601.png \
+  --id "$AK" --secret "$SK" 2>/dev/null)
+AUTH=$(printf '%s\n' "$lines" | grep -i '^authorization:')
+DATE=$(printf '%s\n' "$lines" | grep -i '^x-amz-date:' | sed 's/^[^:]*: //')
+SHA=$(printf '%s\n' "$lines" | grep -i '^x-amz-content-sha256:' | sed 's/^[^:]*: //')
 code=$(curl -s -m 20 -o /dev/null -w "%{http_code}" -H "$AUTH" -H "x-amz-date: $DATE" \
-  -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" "$BASE/googledrive1/IMG_20260904_003601.png")
+  -H "x-amz-content-sha256: $SHA" "$BASE/googledrive1/IMG_20260904_003601.png")
 [ "$code" = 200 ] && ok "sigv4 signed 200" || bad "sigv4 signed $code"
 
 note "7. Bad signature -> 403 no-store (cold URL)"

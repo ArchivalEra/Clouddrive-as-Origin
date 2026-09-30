@@ -332,7 +332,6 @@ out=$(H http://127.0.0.1:8081/_internal/healthz)
 echo "$out" | grep -q '"profile":"nocache"' && ok "healthz profile=nocache" || bad "healthz: $out"
 
 note "8. SigV4 three states (standard)"
-sig=$(python3 "$REPO/deploy/lab/sigv4-test.py" "$SIGV4_SK" "http://127.0.0.1:7777/media/hello.txt" "$SIGV4_AK" 2>/dev/null)
 # state 1: anonymous passes
 code=$(H -o /dev/null -w "%{http_code}" http://127.0.0.1:7777/media/hello.txt)
 [ "$code" = 200 ] && ok "sigv4 anon 200" || bad "anon $code"
@@ -344,35 +343,23 @@ SIGV4_ACCESS_KEY_ID=$SIGV4_AK SIGV4_SECRET_ACCESS_KEY=$SIGV4_SK \
   "$BIN" "$REPO/deploy/lab/config-a.toml" >> "$LAB/cache-a/serve.log" 2>&1 & PID_A=$!
 sleep 2
 kill -0 "$PID_A" 2>/dev/null || { echo "FAIL: sigv4 instance died at boot"; tail -5 "$LAB/cache-a/serve.log"; exit 1; }
-# state 2: correct signature passes (sign with the same creds)
-lines=$(python3 - "$SIGV4_SK" "http://127.0.0.1:7777/media/hello.txt" "$SIGV4_AK" <<'PY' 2>/dev/null
-import hashlib, hmac, sys, datetime
-SECRET = sys.argv[1]; URL = sys.argv[2]; AK = sys.argv[3]
-u = URL.split("://",1)[1]; host, path = u.split("/",1); path = "/"+path
-region, service = "us-east-1", "s3"
-now = datetime.datetime.utcnow()
-amzdate = now.strftime("%Y%m%dT%H%M%SZ"); datestamp = now.strftime("%Y%m%d")
-signed = "host;x-amz-content-sha256;x-amz-date"; payload = "UNSIGNED-PAYLOAD"
-ch = f"host:{host}\nx-amz-content-sha256:{payload}\nx-amz-date:{amzdate}\n"
-canonical = f"GET\n{path}\n\n{ch}\n{signed}\n{payload}"
-scope = f"{datestamp}/{region}/{service}/aws4_request"
-sts = f"AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n{hashlib.sha256(canonical.encode()).hexdigest()}"
-def hs(k,d): return hmac.new(k, d.encode(), hashlib.sha256).digest()
-k = hs(hs(hs(hs(("AWS4"+SECRET).encode(), datestamp), region), service), "aws4_request")
-sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
-print(f"Authorization: AWS4-HMAC-SHA256 Credential={AK}/{scope}, SignedHeaders={signed}, Signature={sig}")
-print(amzdate)
-PY
-)
-AUTH=$(echo "$lines" | head -1); DATE=$(echo "$lines" | tail -1)
-scope=$(echo "$AUTH" | sed 's|.*Credential=[^/]*/||; s|,.*||')
+# state 2: correct signature passes. The header shape is signed by the tool the
+# contract tests pin (`presign.py --header-auth`, checked against this verifier
+# in tests/signing_contract.rs) rather than by a copy of the algorithm living
+# here: three such copies existed, and none had a vector.
+sig=$(python3 "$REPO/deploy/oracle/presign.py" --header-auth \
+  --host 127.0.0.1:7777 --key media/hello.txt --id "$SIGV4_AK" --secret "$SIGV4_SK" 2>/dev/null)
+AUTH=$(printf '%s\n' "$sig" | grep -i '^authorization:')
+DATE=$(printf '%s\n' "$sig" | grep -i '^x-amz-date:' | sed 's/^[^:]*: //')
+SHA=$(printf '%s\n' "$sig" | grep -i '^x-amz-content-sha256:' | sed 's/^[^:]*: //')
+scope=$(printf '%s\n' "$AUTH" | sed 's|.*Credential=[^/]*/||; s|,.*||')
 code=$(H -o /dev/null -w "%{http_code}" -H "$AUTH" -H "x-amz-date: $DATE" \
-  -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" http://127.0.0.1:7777/media/hello.txt)
+  -H "x-amz-content-sha256: $SHA" http://127.0.0.1:7777/media/hello.txt)
 [ "$code" = 200 ] && ok "sigv4 good sig 200" || bad "sigv4 good sig $code"
 # state 3: bad sig -> 403 with cache-control: no-store (dump headers, grep)
-BADAUTH=$(echo "$AUTH" | sed 's/Signature=[a-f0-9]*/Signature=0000000000000000000000000000000000000000000000000000000000000000/')
+BADAUTH=$(printf '%s\n' "$AUTH" | sed 's/Signature=[a-f0-9]*/Signature=0000000000000000000000000000000000000000000000000000000000000000/')
 H -sD /tmp/lab-badsig-hdr.txt -o /dev/null \
-  -H "$BADAUTH" -H "x-amz-date: $DATE" -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+  -H "$BADAUTH" -H "x-amz-date: $DATE" -H "x-amz-content-sha256: $SHA" \
   http://127.0.0.1:7777/media/hello.txt
 code=$(head -1 /tmp/lab-badsig-hdr.txt | grep -oE "[0-9]{3}")
 cc=$(grep -i "^cache-control:" /tmp/lab-badsig-hdr.txt | tr -d "\r")

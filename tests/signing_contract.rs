@@ -23,7 +23,7 @@ use std::sync::Arc;
 use origin_cache::config::Config;
 use origin_cache::content_auth::ContentGate;
 use origin_cache::signing::{Reason, PROTOCOL_MAX_EXPIRES_SECS};
-use origin_cache::sigv4::CredentialStore;
+use origin_cache::sigv4::{verify_input, verify_optional, CredentialStore, VerifyOutcome};
 use origin_front::{ContentAuth, ContentDecision, ContentRequest};
 
 const TENANT_A: &str = "tenant-a";
@@ -403,4 +403,73 @@ fn the_documentation_table_matches_the_taxonomy() {
             code.status()
         );
     }
+}
+
+/// The header-auth shape gets the same cross-language pin the presigned one has.
+///
+/// `presign.py --header-auth` signs the Authorization-header request (the
+/// business plane's verify-if-present path: a loopback S3 or listing call, and
+/// the lab's state-2/3 arm), and the origin's verifier must accept what it
+/// prints. The shape — `host;x-amz-content-sha256;x-amz-date` with
+/// `UNSIGNED-PAYLOAD` — used to be written out three times inside the lab's
+/// scripts with no vector anywhere, so a change to header canonicalisation would
+/// have shown up only as a lab arm reporting 403.
+///
+/// Reverse validation: put the canonical headers out of name order in
+/// `presign.py` (or drop one from the signed list) and this test is the one that
+/// goes red. Note what does NOT move it: the payload literal. Header auth takes
+/// the payload hash from the `x-amz-content-sha256` header, so a tool that
+/// changes it consistently still verifies — which is correct (AWS allows a real
+/// body hash there) and is why the check is on the header list and its order.
+#[test]
+fn the_header_auth_shape_the_tool_signs_is_the_one_the_verifier_accepts() {
+    if !have("python3") {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let creds = credentials_file();
+    let store = CredentialStore::load(Some(&creds.to_string_lossy()))
+        .expect("load credentials")
+        .expect("credentials present");
+    // A fixed date and a fixed clock 200 s later: inside the ±900 s skew window,
+    // so the test is deterministic instead of depending on when it runs.
+    let date = "20260926T000000Z";
+    let now = 1_790_381_000;
+    let path = "/googledrive1/film.mkv";
+
+    let out = Command::new("python3")
+        .arg(repo("deploy/oracle/presign.py"))
+        .args([
+            "--header-auth", "--host", HOST, "--key", path.trim_start_matches('/'),
+            "--id", TENANT_A, "--secret", SECRET_A, "--date", date,
+        ])
+        .output()
+        .expect("run presign.py --header-auth");
+    assert!(
+        out.status.success(),
+        "presign.py --header-auth failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed = String::from_utf8_lossy(&out.stdout);
+    let mut headers = axum::http::HeaderMap::new();
+    let mut saw_authorization = false;
+    for line in printed.lines() {
+        let (name, value) = line.split_once(": ").expect("a `Name: value` line");
+        saw_authorization |= name.eq_ignore_ascii_case("authorization");
+        headers.insert(
+            axum::http::HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()).expect("header name"),
+            value.parse().expect("header value"),
+        );
+    }
+    assert!(saw_authorization, "the tool must print the Authorization header:\n{printed}");
+    // The host header is the one the signature covers; the tool is told it, and
+    // the request carries it.
+    headers.insert("host", HOST.parse().expect("host header"));
+
+    let input = verify_input("GET", path, path, Vec::new(), None, Some(&headers));
+    let outcome = verify_optional(Some(&store), &input, now);
+    assert!(
+        matches!(&outcome, VerifyOutcome::Verified(v) if v.access_key_id == TENANT_A),
+        "the origin refused the header shape the tool signs: {outcome:?}"
+    );
 }
