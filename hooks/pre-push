@@ -54,6 +54,40 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     done
 done
 
+# ── Einfacht gates (local, untracked deployment; owner decision 2026-10-04) ──
+# The gates, their ledger and their specs are deliberately NOT tracked (the
+# strict whitelist in .gitignore names them as untracked). When the local
+# clone is absent the block says so and skips -- it never pretends to have
+# checked. With it present, every push replays FACTS.json (the tracked
+# top-level set is pinned there: the verifiable whitelist), runs the
+# declarative invariants, and re-runs the external witnesses (the issue
+# tracker and the pre-scrub history must both come back clean).
+if [ -d einfacht/zreflect ]; then
+    export GATE_REPO="$PWD"
+    export REFLECT_FACTS=FACTS.json
+    export REFLECT_INVARIANTS=invariants.json
+    export REFLECT_DOC=STATE.md
+    export REFLECT_DOCS=STATE.md
+    export REFLECT_QUESTIONS=questions
+    export REFLECT_RETRACTIONS=retractions.json
+    # This repo is English-only by policy (the CJK gate above enforces it), so
+    # the tri-language README gate degrades to the single-entry shape: exists,
+    # non-empty, and the switcher criterion reports itself not-applicable.
+    export REFLECT_READMES=README.md
+    export REFLECT_REPLAY_TIMEOUT=60
+    for g in einfacht/zreflect/check_*.py; do
+        [ -f "$g" ] || continue
+        python3 "$g" || {
+            echo "ERROR: Einfacht gate failed: $g" >&2
+            echo "Push rejected. Re-measure deliberately with:" >&2
+            echo "  GATE_REPO=$PWD python3 einfacht/zreflect/facts.py" >&2
+            exit 1
+        }
+    done
+else
+    echo "NOTE: Einfacht gates NOT run (einfacht/ absent; untracked by design)." >&2
+fi
+
 if [ "$touches_rust" = 1 ]; then
     if command -v cargo >/dev/null 2>&1; then
         count=$(cargo clippy --all-targets --offline 2>&1 | grep -cE '^warning: ')
