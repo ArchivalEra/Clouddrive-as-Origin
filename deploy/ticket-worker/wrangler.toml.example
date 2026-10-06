@@ -12,7 +12,7 @@ compatibility_date = "2026-09-28"
 # Same origin as the page, at the path the blog client was configured with
 # (the REQ suggests /mp-ticket; the client takes the path as a setting).
 # routes = [
-#   { pattern = "isui.ren/mp-ticket", zone_name = "REPLACE-ME-zone" },
+#   { pattern = "REPLACE-ME-site-domain/mp-ticket", zone_name = "REPLACE-ME-zone" },
 # ]
 
 [vars]
