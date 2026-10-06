@@ -1,35 +1,50 @@
 # ============================================================
-# Whitelist-style .gitignore
-# Default: EVERYTHING is ignored. Only files/directories
-# explicitly un-ignored below are tracked.
-# To add a new tracked path, append a negation rule here.
+# Whitelist-style .gitignore -- STRICT mode (2026-10-04).
+# Default: EVERY root-level entry is ignored. Only what is
+# un-ignored below is tracked; a new root-level path must be
+# added here on purpose. There is no blanket directory-descent
+# rule: nothing descends into the tree unless its top-level
+# entry is named.
+#
+# Verifiable: hooks/pre-push replays FACTS.json's
+# `tracked_top_levels` (and `einfacht_tracked_files`) on every
+# push -- the tracked set is pinned as a value, so a stray
+# `git add -f` or a re-whitelisted path turns the gate red.
 # ============================================================
+/*
 
-# Ignore everything at all levels
-*
-
-# But let git descend into directories
-!*/
-
-# --- Repository base files ---
+# --- the whitelist: tracked top-level entries ---
+!/.github/
 !/.gitignore
+!/Cargo.lock
+!/Cargo.toml
+!/CONTEXT.md
 !/LICENSE
 !/README.md
-!/CONTEXT.md
-
-# --- Project directories ---
-!/hooks/**
-!/docs/**
-!/skills/**
-!/.github/**
 !/config.example.toml
-!/docs/adr/**
-!/Cargo.toml
-!/Cargo.lock
-!/src/**
-!/front/**
-!/deploy/**
-!/tests/**
+!/deploy/
+!/docs/
+!/front/
+!/hooks/
+!/skills/
+!/src/
+!/tests/
+
+# --- explicitly untracked: the Einfacht deployment ---
+# Gates, ledgers and the env carrier live local-only by decision
+# (owner, 2026-10-04): a verifiable tracking whitelist is the security
+# line, and Einfacht's own artifacts are not part of the published repo.
+# Naming them keeps `git status` clean and the intent reviewable; the
+# invariants gate forbids ever whitelisting them.
+einfacht/
+FACTS.json
+invariants.json
+Einfacht.env
+STATE.md
+instruments.json
+doctor.json
+retractions.json
+questions/
 
 # --- never tracked, even under a whitelisted directory ---
 # Python bytecode: deploy/oracle/presign.py is run in place, and a stray
